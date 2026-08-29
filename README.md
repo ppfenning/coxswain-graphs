@@ -21,6 +21,11 @@ number, credential, or a path containing a username — and if a graph reads
 `args.cartridge` without throwing when it is absent. Patterns, not a denylist
 of names: a denylist only catches the employer you remembered to add.
 
+Verified against a deliberately-bad graph before shipping: 6 of the checks fire
+on a file carrying a tracker GID, an Atlassian host, a bucket URI, a
+username-bearing path, an inline key, and a silent `args.cartridge` fallback.
+A check nobody has watched fail is not a check.
+
 ## Status: specified, not implemented
 
 The two graphs here are specifications. Working implementations exist from
