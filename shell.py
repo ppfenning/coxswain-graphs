@@ -22,23 +22,40 @@ import json
 import subprocess
 import sys
 import uuid
+from collections import Counter
+from collections.abc import Mapping
 from datetime import date as date_type
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core import ledger
 from core.cartridge import CartridgeError, load
 from core.manifest import build_manifest, gate_diff, record_run
+from core.policy import AUTO, autonomy_policy
 from core.skills import index_from_roots
 
-from graphs import lifecycle_propose, triage_propose
+from graphs import epic_reconcile, lifecycle_propose, triage_propose
 from graphs._contract import ContractViolation
 from runner import ScriptedRunner
 from runner.protocol import RunnerError
 
-GRAPHS = {"lifecycle": lifecycle_propose, "triage": triage_propose}
+GRAPHS = {"lifecycle": lifecycle_propose, "triage": triage_propose, "reconcile": epic_reconcile}
 
 REPO_ROOT = Path(__file__).resolve().parent
+
+# What an apply arm must report back. Small on purpose: the arm says whether it
+# landed the write and names what it touched, and nothing else — a verbose arm
+# is one that has started making decisions the gate already made.
+APPLY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "applied": {"type": "boolean"},
+        "detail": {"type": "string"},
+    },
+    "required": ["applied", "detail"],
+    "additionalProperties": False,
+}
 
 
 def _resolve_cartridge(args: argparse.Namespace) -> dict[str, Any]:
@@ -85,6 +102,84 @@ def _apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
         text=True,
     )
     return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def _split_by_policy(
+    proposals: list[dict[str, Any]],
+    *,
+    cartridge: dict[str, Any],
+    ledger_path: Path | str,
+    provider_profile: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Ask the policy which proposals have earned the right to skip the gate.
+
+    THE CALLER FILTERS. `autonomy_policy` refuses rows spanning more than one
+    configuration rather than averaging across them, so the filter here is not a
+    nicety — it is the precondition that makes the question answerable at all.
+
+    Note what an auto-applied proposal does NOT get: a ledger row. The ledger
+    records what happened at the gate, and an auto-apply never reached one. If
+    acting on a streak could extend that streak, a kind would ratchet itself up
+    forever on its own say-so, which is the exact self-report the ledger exists
+    to disbelieve. Autonomy is spent by acting, and only re-earned at the gate —
+    or lost when a detector files an observation against it.
+    """
+    rows = [
+        row
+        for row in ledger.read(ledger_path)
+        if row.get("cartridge_sha") == cartridge.get("cartridge_sha")
+        and row.get("provider_profile") == provider_profile
+    ]
+    base = {**(cartridge.get("policy") or {}), "write_kinds": cartridge.get("write_kinds") or {}}
+
+    auto: list[dict[str, Any]] = []
+    gated: list[dict[str, Any]] = []
+    applied_so_far: Counter[str] = Counter()
+
+    for item in proposals:
+        config = {**base, "applied_this_run": applied_so_far[item["kind"]]}
+        if autonomy_policy(item["kind"], item["risk"], rows, config) == AUTO:
+            auto.append(item)
+            applied_so_far[item["kind"]] += 1
+        else:
+            gated.append(item)
+    return auto, gated
+
+
+def _apply_arm_for(kind: str, cartridge: dict[str, Any]) -> str | None:
+    spec = (cartridge.get("write_kinds") or {}).get(kind)
+    return spec.get("apply_arm") if isinstance(spec, Mapping) else None
+
+
+def _auto_apply(
+    item: dict[str, Any],
+    *,
+    cartridge: dict[str, Any],
+    runner: Any,
+) -> tuple[bool, str]:
+    """Execute a proposal the policy cleared, through the arm the cartridge names.
+
+    An apply arm is a ROLE, so the same runner that ran the read-only nodes runs
+    the write. `pr` has no executor here and is handed back to the gate rather
+    than quietly reported as done.
+    """
+    arm = _apply_arm_for(item["kind"], cartridge)
+    if arm in (None, "pr"):
+        return False, f"no executable apply arm for '{item['kind']}' (arm: {arm})"
+    if arm == "shell":
+        return False, "shell-armed kinds are applied by the run path that owns them"
+    result = runner.run(
+        role=arm,
+        tier="standard",
+        schema=APPLY_SCHEMA,
+        context=list(cartridge.get("context") or []),
+        prompt=(
+            f"Apply this approved proposal exactly as written. Do not widen it.\n\n"
+            f"kind: {item['kind']}\ntarget: {item['target']}\n"
+            f"action: {item['suggested_action']}\nevidence: {item['evidence']}"
+        ),
+    )
+    return bool(result.get("applied")), str(result.get("detail", ""))
 
 
 def _gate(proposals: list[dict[str, Any]], *, assume: str | None) -> tuple[list[dict[str, Any]], float]:
@@ -143,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--unverified-skills", action="store_true", help="skip skill checks; warns every time")
     parser.add_argument("--ticket", help="lifecycle: the ticket to work")
     parser.add_argument("--alerts", help="triage: path to a JSON list of alerts")
+    parser.add_argument("--epic", help="reconcile: path to the epic's DECLARED state, as JSON")
+    parser.add_argument("--observed", help="reconcile: path to the board's ACTUAL state, as JSON")
     parser.add_argument("--max-alerts", type=int)
     parser.add_argument("--scripted", metavar="JSON", help="run offline against canned node responses")
     parser.add_argument("--assume", choices=["a", "e", "r"], help="answer the gate non-interactively")
@@ -169,6 +266,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.ticket:
             parser.error("lifecycle needs --ticket")
         graph_args["ticket"] = args.ticket
+    elif args.graph == "reconcile":
+        if not (args.epic and args.observed):
+            parser.error("reconcile needs --epic and --observed; this graph does not read the tracker itself")
+        graph_args["epic"] = json.loads(Path(args.epic).read_text(encoding="utf-8"))
+        graph_args["observed"] = json.loads(Path(args.observed).read_text(encoding="utf-8"))
     else:
         if not args.alerts:
             parser.error("triage needs --alerts (a JSON list); this graph does not read the queue itself")
@@ -177,8 +279,9 @@ def main(argv: list[str] | None = None) -> int:
             graph_args["max_alerts"] = args.max_alerts
 
     module = GRAPHS[args.graph]
+    runner = _build_runner(args, cartridge)
     try:
-        result = module.run(graph_args, _build_runner(args, cartridge))
+        result = module.run(graph_args, runner)
     except (ContractViolation, RunnerError) as exc:
         # A contract violation or a dead runner is a bad invocation, and it is
         # reported as one. Anything else is a bug in this code and is allowed to
@@ -186,7 +289,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{module.GRAPH_NAME} failed: {exc}", file=sys.stderr)
         return 1
 
-    diffs, human_minutes = _gate(result.get("proposals", []), assume=args.assume)
+    provider_profile = Path(args.provider_profile).stem
+    proposals = result.get("proposals", [])
+
+    # Consult the policy BEFORE the human sees anything. Without this the gate
+    # asks about every kind forever, no streak is ever spent, and the whole
+    # earned-autonomy argument is decoration.
+    auto, gated = _split_by_policy(
+        proposals, cartridge=cartridge, ledger_path=args.ledger, provider_profile=provider_profile
+    )
+
+    auto_applied: list[dict[str, Any]] = []
+    for item in auto:
+        ok, detail = _auto_apply(item, cartridge=cartridge, runner=runner)
+        if ok:
+            print(f"auto-applied {item['kind']} -> {item['target']}: {detail}")
+            auto_applied.append(item)
+        else:
+            # Cleared by policy but nothing here can execute it. It goes to the
+            # gate rather than being reported as done.
+            print(f"auto-eligible but not executed ({detail}); sending to the gate", file=sys.stderr)
+            gated.append(item)
+
+    diffs, human_minutes = _gate(gated, assume=args.assume)
 
     # A build patch is applied only after the gate approved the work it belongs to.
     if args.graph == "lifecycle" and result.get("build", {}).get("patch"):
@@ -204,15 +329,15 @@ def main(argv: list[str] | None = None) -> int:
         ts=datetime.now(timezone.utc).isoformat(),
         principal=module.GRAPH_NAME,
         cartridge=cartridge,
-        provider_profile=Path(args.provider_profile).stem,
-        proposals=result.get("proposals", []),
+        provider_profile=provider_profile,
+        proposals=proposals,
         gate_diffs=diffs,
         human_minutes=human_minutes,
-        totals=result.get("totals", {}),
+        totals={**result.get("totals", {}), "auto_applied": len(auto_applied), "gated": len(gated)},
     )
     record_run(manifest, runs_dir=args.runs_dir, ledger_path=args.ledger)
 
-    print(f"\nrecorded {run_id}: {len(diffs)} decision(s), {len(result.get('proposals', []))} proposal(s)")
+    print(f"\nrecorded {run_id}: {len(auto_applied)} auto-applied, {len(diffs)} gated decision(s), {len(proposals)} proposal(s)")
     print(f"  manifest: {Path(args.runs_dir) / (run_id + '.json')}")
     print(f"  ledger  : {args.ledger}")
     return 0

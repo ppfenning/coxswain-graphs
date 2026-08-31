@@ -23,7 +23,17 @@ def test_runs_end_to_end_and_returns_the_documented_shape(
     cartridge, plan_response, build_response, review_response
 ) -> None:
     result = lifecycle_propose.run(args(cartridge), runner(plan_response, build_response, review_response))
-    assert set(result) == {"run_id", "date", "ticket", "plan", "build", "review", "change_facts", "proposals"}
+    assert set(result) == {"run_id", "date", "ticket", "scope", "plan", "build", "review", "change_facts", "proposals"}
+
+
+def test_scoping_is_skipped_when_the_team_has_not_bound_the_role(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """`scope_epic` is optional. Unbound means absent, not broken."""
+    assert "scope_epic" not in cartridge["skills"]
+    result = lifecycle_propose.run(args(cartridge), runner(plan_response, build_response, review_response))
+    assert result["scope"] is None
+    assert [p["kind"] for p in result["proposals"]] == ["draft_pr_create"]
 
 
 def test_nodes_ask_for_roles_and_tiers_never_skills_or_models(

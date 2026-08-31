@@ -55,11 +55,24 @@ VERIFY_SCHEMA = {
             },
         },
         "trap_considered": {"type": "string", "description": "the known wrong belief for this symptom"},
+        "trap_held": {"type": "boolean", "description": "did the runbook's stated trap actually apply here"},
+        "runbook_correction": {
+            "type": "string",
+            "description": "what the runbook entry gets wrong, or empty if it held up",
+        },
         "conclusion": {"type": "string"},
         "suggested_action": {"type": "string"},
         "actionable": {"type": "boolean"},
     },
-    "required": ["checks", "trap_considered", "conclusion", "suggested_action", "actionable"],
+    "required": [
+        "checks",
+        "trap_considered",
+        "trap_held",
+        "runbook_correction",
+        "conclusion",
+        "suggested_action",
+        "actionable",
+    ],
     "additionalProperties": False,
 }
 
@@ -72,6 +85,43 @@ def _fetch(alerts: Sequence[Mapping[str, Any]], max_alerts: int) -> tuple[list[M
     """
     taken = list(alerts[:max_alerts])
     return taken, max(0, len(alerts) - len(taken))
+
+
+def _runbook_gap(
+    classification: Mapping[str, Any],
+    verification: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Did this run learn something the runbook does not know?
+
+    Two cases, and only two — both established by the run rather than guessed:
+
+    - Nothing matched, or the match was a guess. That is a missing entry.
+    - The entry's trap did not hold. That is the worse one: a runbook that only
+      states the right answer lets the next person re-derive the wrong one, and
+      a trap that is itself wrong actively points them at it.
+    """
+    entry = str(classification.get("runbook_entry") or "").strip()
+    confidence = str(classification.get("confidence") or "").lower()
+    correction = str(verification.get("runbook_correction") or "").strip()
+
+    if not entry:
+        return (
+            f"no runbook entry matched symptom '{classification.get('symptom_key')}'",
+            f"add a runbook entry for '{classification.get('symptom_key')}', with its trap",
+        )
+    if correction:
+        return (f"the runbook entry needs correcting: {correction}", f"amend '{entry}': {correction}")
+    if verification.get("trap_held") is False:
+        return (
+            f"the trap stated in '{entry}' did not apply to this alert",
+            f"amend the trap in '{entry}' — as written it points at the wrong belief",
+        )
+    if confidence == "low":
+        return (
+            f"'{entry}' matched only weakly (confidence: low)",
+            f"sharpen the match criteria on '{entry}', or add an entry that fits better",
+        )
+    return None
 
 
 def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
@@ -105,6 +155,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     triaged: list[dict[str, Any]] = []
     proposals: list[dict[str, Any]] = []
     deferred_for_capacity = 0
+    runbook_gaps = 0
 
     for index, alert in enumerate(fetched):
         classification = runner.run(
@@ -140,6 +191,37 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             {"alert": dict(alert), "classification": dict(classification), "verification": dict(verification), "verified": True}
         )
 
+        # The runbook improves itself, or it rots. A symptom nothing matched and
+        # a trap that turned out to be wrong are the two facts a runbook can only
+        # learn from a run — nobody goes back to amend one from memory.
+        #
+        # Still propose-only: a doc_update is a proposal like any other, so this
+        # does not put a write into a read-only graph. `doc_update` is `deferred`
+        # in the base taxonomy, so it cannot auto-apply until the basics have
+        # earned their ramp anyway.
+        gap = _runbook_gap(classification, verification)
+        if gap is not None:
+            reason, correction = gap
+            runbook_gaps += 1
+            proposals.append(
+                proposal(
+                    cartridge,
+                    kind="doc_update",
+                    target=str(classification.get("runbook_entry") or classification.get("symptom_key") or "runbook"),
+                    evidence=[
+                        {"check": "classification confidence", "output": str(classification.get("confidence"))},
+                        {"check": "matched runbook entry", "output": str(classification.get("runbook_entry") or "none")},
+                        *(
+                            {"check": c["check"], "output": c["output"]}
+                            for c in (verification.get("checks") or [])
+                            if isinstance(c, Mapping)
+                        ),
+                    ],
+                    rationale=reason,
+                    suggested_action=correction,
+                )
+            )
+
         if verification.get("actionable") and verification.get("checks"):
             proposals.append(
                 proposal(
@@ -167,5 +249,6 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "verified": sum(1 for t in triaged if t["verified"]),
             "deferred_overflow": overflow,
             "deferred_for_capacity": deferred_for_capacity,
+            "runbook_gaps": runbook_gaps,
         },
     }

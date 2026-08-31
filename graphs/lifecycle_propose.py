@@ -16,12 +16,26 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from graphs._contract import proposal, require, require_cartridge
+from graphs._contract import epic_shape, landing_for, proposal, require, require_cartridge
 from runner.protocol import NodeRunner
 
 __all__ = ["run", "GRAPH_NAME"]
 
 GRAPH_NAME = "lifecycle-propose"
+
+SCOPE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "phases": {"type": "array", "items": {"type": "string"}},
+        "tickets": {"type": "array", "items": {"type": "string"}},
+        "repos": {"type": "array", "items": {"type": "string"}},
+        "state": {"type": "string", "enum": ["active", "planned", "future"]},
+        "parent_epic": {"type": "string", "description": "existing epic to attach to, or empty"},
+        "rationale": {"type": "string"},
+    },
+    "required": ["phases", "tickets", "repos", "state", "parent_epic", "rationale"],
+    "additionalProperties": False,
+}
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -105,6 +119,55 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     run_id, date, ticket = require(args, "run_id", "date", "ticket")
 
     context = list(cartridge.get("context") or [])
+    proposals: list[dict[str, Any]] = []
+
+    # Scoping is a SEPARATE ACT from filing, and it runs first: unscoped work
+    # routes to the future-work landing area, never onto the active board.
+    # Optional — a team that has not bound `scope_epic` simply does not get it,
+    # which is what an optional role means.
+    scope: dict[str, Any] | None = None
+    if "scope_epic" in (cartridge.get("skills") or {}):
+        scope = dict(
+            runner.run(
+                role="scope_epic",
+                tier="standard",
+                schema=SCOPE_SCHEMA,
+                context=context,
+                prompt=(
+                    f"Scope this work.\n\nTicket: {ticket}\nDate: {date}\n\n"
+                    "List the phases, the tickets, and the repositories it touches. "
+                    "Say whether it is being worked now (active), scoped and scheduled "
+                    "(planned), or roadmapped for later (future). Name an existing epic "
+                    "to attach to if one covers this area."
+                ),
+            )
+        )
+        shape = epic_shape(
+            cartridge,
+            phases=len(scope.get("phases") or []),
+            tickets=len(scope.get("tickets") or []),
+            repos=len(scope.get("repos") or []),
+        )
+        landing = landing_for(cartridge, scope.get("state", "planned"))
+        scope["shape"] = shape
+        scope["landing"] = landing
+
+        proposals.append(
+            proposal(
+                cartridge,
+                kind="ticket_create",
+                target=str(scope.get("parent_epic") or ticket),
+                evidence=[
+                    {"check": "epic_threshold", "output": f"{shape} ({len(scope.get('tickets') or [])} tickets, {len(scope.get('phases') or [])} phases, {len(scope.get('repos') or [])} repos)"},
+                    {"check": "ticket_routing", "output": f"state '{scope.get('state')}' lands in {landing}"},
+                ],
+                rationale=str(scope.get("rationale", "")),
+                suggested_action=(
+                    f"file as {shape} in {landing}"
+                    + (f", attached to {scope['parent_epic']}" if scope.get("parent_epic") else "")
+                ),
+            )
+        )
 
     plan = runner.run(
         role="plan",
@@ -146,7 +209,6 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         ),
     )
 
-    proposals: list[dict[str, Any]] = []
     if review.get("verdict") == "approve":
         # A draft PR has no effect until someone opens it, which is why it is the
         # one kind that starts eligible. It is still emitted, never executed.
@@ -176,6 +238,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "run_id": run_id,
         "date": date,
         "ticket": ticket,
+        "scope": scope,
         "plan": dict(plan),
         "build": dict(build),
         "review": dict(review),

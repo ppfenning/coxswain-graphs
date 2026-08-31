@@ -35,13 +35,17 @@ flowchart TB
 
     VERIFY -- "actionable, with checks" --> EMIT["emit<br/>proposals + evidence"]
     VERIFY -- "not actionable" --> QUIET["no proposal"]
+    VERIFY -- "no entry matched · trap did not hold ·<br/>weak match · explicit correction" --> HEAL["doc_update proposal<br/><i>the runbook heals itself</i>"]
+
+    HEAL -.->|"amends"| CLASSIFY
 
     OVER --> TOTALS
     CAPD --> TOTALS
     EMIT --> TOTALS
     QUIET --> TOTALS
+    HEAL --> TOTALS
 
-    TOTALS[["totals: received, fetched, verified,<br/>deferred_overflow, deferred_for_capacity"]]
+    TOTALS[["totals: received, fetched, verified,<br/>deferred_overflow, deferred_for_capacity, runbook_gaps"]]
 ```
 
 Every path ends at `totals`. That is deliberate: a graph that drops nine of ten
@@ -54,6 +58,26 @@ evidence, and a claim without evidence is not a proposal.
 Each entry carries `match`, the `kinds` it may emit, a `risk`, and — most
 usefully — the `trap`: the known wrong belief for that symptom. A runbook that
 only states the right answer lets the next person re-derive the wrong one.
+
+## The runbook heals itself
+
+The index is not read-only input. A run is the only moment anyone has the
+evidence to improve an entry, and by the time the incident is over nobody goes
+back, so `verify` reports two things the runbook cannot learn any other way —
+whether the entry's `trap` actually held, and what the entry gets wrong. Four
+cases emit a `doc_update` proposal:
+
+| Case | Proposal |
+|---|---|
+| No entry matched the symptom | add an entry, with its trap |
+| The node named an explicit correction | amend that entry, verbatim |
+| The stated `trap` did not hold | amend the trap — as written it points at the wrong belief |
+| The match was weak (`confidence: low`) | sharpen the match criteria |
+
+This does **not** put a write into a read-only graph: a `doc_update` is a
+proposal like any other, gated like any other. It is `deferred` in the base
+taxonomy, so it cannot auto-apply until the eligible kinds have earned their
+ramp — the runbook does not get to start rewriting itself on day one.
 
 **Fetch cap** must exceed the verify cap comfortably; a busy queue otherwise
 blows the structured-output limit and the run dies mid-flight. Overflow defers

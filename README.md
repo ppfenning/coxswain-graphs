@@ -39,6 +39,20 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
   cartridge maps role → skill; the provider profile maps tier → model.
 - **Nothing writes.** The build node returns a unified diff; the *shell* applies
   it, inside a worktree it created, only after the gate approved it.
+- **The policy runs before the gate.** `shell.py` asks `autonomy_policy` whether
+  each kind has graduated, against the ledger filtered to this exact cartridge
+  hash and provider profile. A graduated kind goes to its apply arm — itself a
+  role — instead of the gate. An auto-applied proposal records **no ledger row**:
+  autonomy is spent by acting and re-earned only at a gate, so a kind can never
+  ratchet itself up on its own say-so.
+
+## The graphs
+
+| Graph | Shape |
+|---|---|
+| `lifecycle-propose` | scope → plan → build (worktree) → review → emit |
+| `triage-propose` | fetch → classify → verify → emit. Zero writes; proposes corrections to the runbook it just used |
+| `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared epic state vs the board |
 
 ## The portability check
 

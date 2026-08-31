@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-__all__ = ["ContractViolation", "require", "require_cartridge", "proposal"]
+__all__ = ["ContractViolation", "require", "require_cartridge", "proposal", "epic_shape", "landing_for"]
 
 PROPOSAL_FIELDS = ("kind", "risk", "target", "evidence", "rationale", "suggested_action")
 
@@ -46,6 +46,42 @@ def require(args: Mapping[str, Any], *names: str) -> tuple[Any, ...]:
     if missing:
         raise ContractViolation(f"missing required arg(s): {', '.join(missing)}")
     return tuple(args[name] for name in names)
+
+
+def epic_shape(cartridge: Mapping[str, Any], *, phases: int, tickets: int, repos: int) -> str:
+    """Decide epic / parent+subtasks / single ticket, from the cartridge's threshold.
+
+    Read off `epic_threshold`, never hardcoded: a team that thinks two tickets is
+    an epic and a team that thinks five is are both right about their own board,
+    and neither belongs in a graph.
+
+    Most work is not an epic. Making everything an epic is how a board becomes
+    unreadable, so the threshold is a bar to clear, not a default.
+    """
+    threshold = cartridge.get("epic_threshold") or {}
+    if (
+        phases >= int(threshold.get("phases_min", 2))
+        or tickets >= int(threshold.get("tickets_min", 3))
+        or (bool(threshold.get("multi_repo", True)) and repos > 1)
+    ):
+        return "epic"
+    return "parent_with_subtasks" if tickets > 1 else "ticket"
+
+
+def landing_for(cartridge: Mapping[str, Any], state: str) -> str:
+    """Where work in this state lands, per `ticket_routing`.
+
+    Route by the state of the work, not by who filed it. Unscoped work must not
+    reach the active board — that is how a board fills with work nobody has
+    thought about and stops meaning anything.
+    """
+    routing = cartridge.get("ticket_routing") or {}
+    states = routing.get("states") or {}
+    landing = states.get(state)
+    if landing is None:
+        known = ", ".join(sorted(states)) or "none"
+        raise ContractViolation(f"cartridge routes no state '{state}'; it declares: {known}")
+    return str(landing)
 
 
 def proposal(

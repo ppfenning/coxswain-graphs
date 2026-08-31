@@ -1,4 +1,5 @@
 {
+  "scope_epic": {"phases": ["p1"], "tickets": ["t1"], "repos": ["agent-graphs"], "state": "planned", "parent_epic": "", "rationale": "single unit of work, one ticket"},
   "plan": {"steps": ["reproduce the failure", "fix the boundary condition"], "files_expected": ["src/window.py"], "out_of_scope": ["the CLI flags"]},
   "build": {"patch": "diff --git a/src/window.py b/src/window.py\nnew file mode 100644\n--- /dev/null\n+++ b/src/window.py\n@@ -0,0 +1,2 @@\n+def window(items, n):\n+    return items[: n + 1]\n", "summary": "off-by-one at the window edge", "files_touched": ["src/window.py"], "commands_run": [{"command": "pytest -q tests/test_window.py", "output": "3 passed"}]},
   "review_charter": {"verdict": "approve", "findings": [], "rationale": "single responsibility preserved; the test names the wrong belief"}
