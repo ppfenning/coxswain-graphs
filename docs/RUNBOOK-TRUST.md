@@ -1,0 +1,86 @@
+# Trust is earned per runbook entry
+
+**Status:** design note. Not implemented. Touches `agent-cartridges/core/policy.py`,
+the ledger schema, and `triage_propose.py`.
+
+## The gap
+
+Today `autonomy_policy` measures a `(kind, risk)` pair, scoped to a
+`cartridge_sha` and a `provider_profile`. For triage that grain is too coarse in
+both directions.
+
+`doc_update` is one kind. But a runbook index is not one thing — it is forty
+entries of wildly different quality. An entry that has classified the same
+symptom correctly thirty times and an entry written yesterday from a single
+sighting are, to the policy, indistinguishable: they graduate together, on a
+streak that is the *average* of every entry's behaviour. That average hides
+exactly the case worth catching. A kind can be riding a clean streak while one
+of its entries is quietly wrong every time it fires, because the other
+thirty-nine carry it.
+
+And it fails the other way too. One bad entry poisons the streak for a kind that
+is otherwise trustworthy, so good entries are held back by a bad neighbour they
+have nothing to do with.
+
+## The change
+
+**The runbook entry is the principal.** Ledger rows from triage carry the entry
+they were produced under — `rb-04` — and streaks are counted per entry, not
+just per kind. `SCOPE_KEYS` grows a third dimension for graphs that have one.
+
+This does not contradict rule 6 ("the principal is the GRAPH, never a person").
+It sharpens it. The thing being trusted was never really the *category* of
+write; it was the encoded judgment that produced it. In triage, that judgment
+lives in the runbook entry — its `match`, its checks, and its `trap`. Trusting
+`doc_update` in the abstract is trusting a container. Trusting `rb-04` is
+trusting a claim that can actually be wrong.
+
+## Incidents demote
+
+An entry loses standing on any of three signals. The first already exists; the
+other two are new:
+
+| Signal | Meaning | Source |
+|---|---|---|
+| Reversal | a human edited or refused the proposal | the gate, as today |
+| `trap_held: false` | the entry's stated wrong belief was itself wrong | `verify` already reports this |
+| **An incident implicating the entry** | someone followed the runbook and it went wrong | post-hoc, after the run |
+
+The second is the interesting one, because `verify` already reports it and today
+it only produces a `doc_update` proposal. An entry whose trap did not hold has
+been demonstrated to point at the wrong belief — that should reset its streak,
+not merely suggest an edit.
+
+The third is the strongest reversal available and rule 3 already contemplates
+its shape ("a post-hoc detector fired"). An incident is the runbook being
+*wrong in production*, which is the only evidence that actually settles the
+question. It arrives late, after the row was written and possibly after the
+write auto-applied. That is fine: the ledger is append-only, and a later row
+demoting an entry is exactly how a track record should work.
+
+## The asymmetry is the safety property
+
+An entry earns trust slowly — `graduation_n` consecutive clean outcomes — and
+loses it on a single incident, with `regraduation_multiplier` raising the bar it
+must clear to come back. Same shape as rule 3, applied at the grain where the
+judgment actually lives. Cheap to earn back a little, expensive to earn back
+after being wrong twice.
+
+## Open questions
+
+- **Where does the incident signal enter?** Triage takes alerts as an argument
+  precisely so the graph never reads a queue. An incident feed has the same
+  constraint and probably the same answer: an argument, not a fetch.
+- **Blast radius.** Does an incident demote only the implicated entry, or its
+  neighbours in the same symptom family? Narrow is more honest; wide is safer.
+  Probably narrow, on the grounds that a policy that punishes uninvolved entries
+  is one nobody will trust enough to leave switched on.
+- **Does an amendment reset the streak?** Likely yes — an amended entry is a new
+  entry, and the track record belonged to the text that was replaced. This
+  mirrors the cartridge-hash rule: a record earned under different rules is not
+  a record.
+- **Schema.** Rows need a `subject` (nullable). Graphs without one behave
+  exactly as today, so this is additive.
+- **Generality.** Triage has runbook entries; `lifecycle-propose` has none, or
+  has something else. Worth resisting the urge to generalise the field before a
+  second graph actually needs it.

@@ -79,6 +79,10 @@ proposal like any other, gated like any other. It is `deferred` in the base
 taxonomy, so it cannot auto-apply until the eligible kinds have earned their
 ramp — the runbook does not get to start rewriting itself on day one.
 
+That ramp is currently measured per *kind*, which averages every entry in the
+index together. It should be measured per *entry*, with incidents demoting the
+entry they implicate — see [`docs/RUNBOOK-TRUST.md`](../docs/RUNBOOK-TRUST.md).
+
 **Fetch cap** must exceed the verify cap comfortably; a busy queue otherwise
 blows the structured-output limit and the run dies mid-flight. Overflow defers
 to the next run and is reported in the totals.
