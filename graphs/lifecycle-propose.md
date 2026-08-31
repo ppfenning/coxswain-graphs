@@ -13,6 +13,46 @@ that only reads other nodes):
 | `review` | `review_charter` | deep | none |
 | `emit` | — | — | proposals as data |
 
+The table says which node writes what. What it cannot show is *where the write
+actually happens* — the build node produces a patch and applies nothing, and the
+shell applies it, on the far side of the gate:
+
+```mermaid
+flowchart TB
+    TICKET["ticket (an arg)"] --> PLAN
+
+    subgraph GRAPH["the graph — pure, no disk, no clock"]
+        PLAN["plan<br/><i>role: plan · standard</i>"]
+        BUILD["build<br/><i>role: build · standard</i>"]
+        REVIEW["review<br/><i>role: review_charter · deep</i>"]
+        FACTS["change_facts<br/><i>counted from the patch,<br/>not asked of the model</i>"]
+        EMIT["emit"]
+
+        PLAN --> BUILD
+        BUILD -- "unified diff<br/>(returned, not applied)" --> FACTS
+        FACTS --> REVIEW
+        REVIEW --> EMIT
+    end
+
+    EMIT -- "draft_pr_create proposal<br/>only if verdict = approve" --> GATE{{"human gate"}}
+
+    subgraph SHELL["shell.py — the only side effects"]
+        APPLY["git apply, in a worktree<br/>the shell created"]
+        RECORD["build_manifest → record_run"]
+    end
+
+    GATE -- "approved" --> APPLY
+    GATE -- "every decision" --> RECORD
+
+    APPLY -.->|"never"| PUSH["push · open PR · merge"]
+
+    style PUSH stroke-dasharray: 5 5
+```
+
+The dashed edge is the point of the graph: a draft PR is *emitted as a proposal*
+and never executed, and nothing is pushed or merged by any path through this
+diagram.
+
 **Args:** `run_id`, `date`, `cartridge` (resolved, required, no fallback),
 `ticket`, optional `worktree_root` (else `cartridge.landing_areas.worktree_root`).
 
