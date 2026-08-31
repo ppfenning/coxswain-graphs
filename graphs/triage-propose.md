@@ -21,4 +21,6 @@ only states the right answer lets the next person re-derive the wrong one.
 blows the structured-output limit and the run dies mid-flight. Overflow defers
 to the next run and is reported in the totals.
 
-**Status:** unimplemented. See the repo README.
+**Status:** implemented in [`triage_propose.py`](triage_propose.py). Alerts
+arrive as an argument — the graph does not read the queue itself, because a node
+that fetches cannot be replayed. Both caps report their overflow in `totals`.

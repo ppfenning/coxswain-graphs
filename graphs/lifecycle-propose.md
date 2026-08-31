@@ -23,4 +23,6 @@ scoping, the adversarial reviewer pair, arbitration, the bounded fix loop,
 verification, retro. Staging a draft PR is *emitted* as a `draft_pr_create`
 proposal and never executed.
 
-**Status:** unimplemented. See the repo README.
+**Status:** implemented in [`lifecycle_propose.py`](lifecycle_propose.py). The
+build node returns a unified diff and applies nothing; `shell.py` applies it in
+a worktree it owns, and only after the gate approved the work.

@@ -79,8 +79,7 @@ def test_graphs_require_a_cartridge_with_no_fallback() -> None:
     offenders = [
         path.name
         for path in _graph_files()
-        if path.suffix in {".js", ".mjs", ".ts"}
-        and "args.cartridge" in path.read_text(encoding="utf-8")
+        if "args.cartridge" in path.read_text(encoding="utf-8")
         and not re.search(r"(?:throw|raise)[^\n]{0,120}cartridge", path.read_text(encoding="utf-8"), re.I)
     ]
     assert not offenders, (
@@ -89,6 +88,64 @@ def test_graphs_require_a_cartridge_with_no_fallback() -> None:
     )
 
 
+# The Python spelling of a fallback. `args.get("cartridge")` with a second
+# argument is exactly the silent default the contract forbids, and it does not
+# look like one at a glance — which is why it gets its own pattern.
+CARTRIDGE_FALLBACK = re.compile(r"""\.get\(\s*['"]cartridge['"]\s*,""")
+
+
+def test_no_python_graph_defaults_the_cartridge() -> None:
+    findings = [
+        f"{path.name}:{n}: {line.strip()[:120]}"
+        for path in _graph_files()
+        if path.suffix == ".py"
+        for n, line in _code_lines(path)
+        if CARTRIDGE_FALLBACK.search(line)
+    ]
+    assert not findings, (
+        "A cartridge default means the seam is never exercised and rots silently:\n" + "\n".join(findings)
+    )
+
+
+def _graph_modules():
+    """Import every module in graphs/ that exposes a graph entrypoint."""
+    import importlib
+    import sys
+
+    sys.path.insert(0, str(GRAPHS_DIR.parent))
+    modules = []
+    for path in _graph_files():
+        if path.suffix != ".py" or path.stem.startswith("__"):
+            continue
+        module = importlib.import_module(f"graphs.{path.stem}")
+        if hasattr(module, "run") and hasattr(module, "GRAPH_NAME"):
+            modules.append(module)
+    return modules
+
+
+def test_every_graph_actually_refuses_to_run_without_a_cartridge() -> None:
+    """The behavioural half of the rule above.
+
+    Scanning text catches an inlined fallback; only running the thing catches a
+    graph that forgot to ask for a cartridge at all. A grep-only check would
+    pass happily on a graph that never mentions the word.
+    """
+    from graphs._contract import ContractViolation
+
+    modules = _graph_modules()
+    assert modules, "no graph modules found — the check would pass by finding nothing"
+    for module in modules:
+        # ContractViolation specifically, not any exception: a graph that dies of
+        # an AttributeError on `args.cartridge` also "fails loudly", but it did so
+        # by accident. Refusing on purpose is the behaviour under test.
+        with pytest.raises(ContractViolation) as exc:
+            module.run({"run_id": "r", "date": "2026-01-01"}, runner=None)
+        assert "cartridge" in str(exc.value).lower(), (
+            f"{module.GRAPH_NAME} refused, but not because a cartridge was missing: {exc.value}"
+        )
+
+
 def test_there_is_something_to_check() -> None:
     """Guard against the check passing because it found no files at all."""
     assert GRAPHS_DIR.is_dir(), f"missing graphs directory: {GRAPHS_DIR}"
+    assert _graph_files(), f"no graph source files under {GRAPHS_DIR}"

@@ -1,0 +1,3 @@
+[{"id": "alert-1", "text": "nightly load reported SUCCESS"},
+ {"id": "alert-2", "text": "partition count unchanged since 02:00Z"},
+ {"id": "alert-3", "text": "downstream view empty"}]

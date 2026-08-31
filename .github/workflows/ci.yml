@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: ppfenning/agent-cartridges
+          path: .agent-cartridges
+          token: ${{ secrets.SUBSTRATE_REPO_TOKEN || github.token }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install ./.agent-cartridges
+      - run: pip install -e ".[dev]"
+      # No API key, no network: the scripted runner is what makes that possible.
+      - run: pytest -q

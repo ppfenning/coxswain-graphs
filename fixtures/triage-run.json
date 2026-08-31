@@ -1,0 +1,4 @@
+{
+  "triage_classify": {"symptom_key": "success_without_landing", "runbook_entry": "rb-04", "confidence": "high"},
+  "evidence_verify": {"checks": [{"check": "object listing at prefix", "output": "0 objects since 2026-08-29", "supports_symptom": true}], "trap_considered": "a SUCCESS status is not evidence the file landed", "conclusion": "upstream feed never delivered", "suggested_action": "comment with the object listing and hold the rerun", "actionable": true}
+}

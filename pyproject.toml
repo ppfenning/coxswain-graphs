@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-graphs"
+version = "0.1.0"
+description = "Portable agent graphs for the agent-cartridges substrate"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pyyaml>=6", "agent-cartridges"]
+
+[project.optional-dependencies]
+# The live runner. Everything else — graphs, tests, the scripted runner — works
+# without it, which is the point: CI never needs a key.
+live = ["anthropic>=0.40"]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["graphs", "runner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
