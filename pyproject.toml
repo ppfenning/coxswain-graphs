@@ -8,9 +8,14 @@ version = "0.1.0"
 description = "Portable agent graphs for the agent-cartridges substrate"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["pyyaml>=6", "agent-cartridges"]
+dependencies = ["pyyaml>=6"]
 
 [project.optional-dependencies]
+# The substrate is what `shell.py` needs to resolve a cartridge and record a
+# run. The GRAPHS never import it — that is the whole seam — so it is an extra
+# rather than a hard dependency. It also is not on PyPI, so making it a hard
+# dependency broke every install that could not reach the private repo.
+shell = ["agent-cartridges"]
 # The live runner. Everything else — graphs, tests, the scripted runner — works
 # without it, which is the point: CI never needs a key.
 live = ["anthropic>=0.40"]
@@ -21,3 +26,8 @@ packages = ["graphs", "runner"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The repo root must be importable: tests import helpers from tests/conftest.py,
+# and the portability check imports `graphs.*` and `shell`. `python -m pytest`
+# adds the cwd, bare `pytest` does not — so without this the suite passes
+# locally and fails in CI.
+pythonpath = ["."]

@@ -1,24 +1,60 @@
 name: ci
 
+# These repos are private, so Actions minutes are billable. Three things keep
+# the bill down: docs-only pushes do not trigger a run, a superseded run is
+# cancelled rather than finishing, and pip is cached. The suite itself takes
+# well under a second — the runner startup and the installs were the whole cost.
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', '.gitignore', 'LICENSE']
   pull_request:
+    paths-ignore: ['**.md', '.gitignore', 'LICENSE']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Mapped here because the `secrets` context is not reliably readable from a
+    # step-level `if`, whereas `env` is.
+    env:
+      SUBSTRATE_TOKEN: ${{ secrets.SUBSTRATE_REPO_TOKEN }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/checkout@v5
-        with:
-          repository: ppfenning/agent-cartridges
-          path: .agent-cartridges
-          token: ${{ secrets.SUBSTRATE_REPO_TOKEN || github.token }}
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install ./.agent-cartridges
-      - run: pip install -e ".[dev]"
-      # No API key, no network: the scripted runner is what makes that possible.
-      - run: pytest -q
+          cache: pip
+
+      # agent-cartridges is a PRIVATE sibling repo and the default GITHUB_TOKEN
+      # is scoped to this repo alone, so it cannot read it — that 404 is what was
+      # failing every run. With a token the whole suite runs; without one the
+      # shell tests are skipped and the rest still runs, because the graphs never
+      # import the substrate. That seam is the reason this degrades cleanly.
+      - name: Check out the substrate (optional)
+        if: env.SUBSTRATE_TOKEN != ''
+        uses: actions/checkout@v5
+        with:
+          repository: ppfenning/agent-cartridges
+          path: .agent-cartridges
+          token: ${{ env.SUBSTRATE_TOKEN }}
+
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+          if [ -d .agent-cartridges ]; then
+            pip install ./.agent-cartridges
+            echo "PYTEST_ARGS=" >> "$GITHUB_ENV"
+          else
+            echo "::notice::SUBSTRATE_REPO_TOKEN is not set, so tests needing agent-cartridges are skipped. Add a fine-grained PAT with read access to ppfenning/agent-cartridges to run the full suite."
+            echo "PYTEST_ARGS=--ignore=tests/test_shell_autonomy.py" >> "$GITHUB_ENV"
+          fi
+
+      # No API key and no network: the scripted runner is what makes that work.
+      - run: pytest -q $PYTEST_ARGS
