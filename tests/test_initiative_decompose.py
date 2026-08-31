@@ -1,0 +1,159 @@
+"""Decomposition, and the adversary whose job is to delete dependency edges.
+
+Every edge that is not real serialises work that could have run at once, and
+the person who just drew the graph is the last person likely to spot one.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from graphs import initiative_decompose
+from graphs._contract import ContractViolation
+from runner import ScriptedRunner
+
+DECOMPOSITION = {
+    "phases": [{"id": "p1", "goal": "foundations"}, {"id": "p2", "goal": "cutover"}],
+    "tasks": [
+        {"id": "t1", "phase": "p1", "title": "schema probe", "body": "b", "needs": [], "surfaces": ["schema"]},
+        {"id": "t2", "phase": "p1", "title": "bench harness", "body": "b", "needs": ["t1"], "surfaces": []},
+        {"id": "t3", "phase": "p2", "title": "cutover", "body": "b", "needs": ["t1", "t2"], "surfaces": ["migration"]},
+    ],
+    "rationale": "multi-phase",
+}
+
+ACCEPTED = {"spurious_edges": [], "missing_edges": [], "verdict": "accept", "summary": "edges hold"}
+
+
+@pytest.fixture
+def cart(cartridge) -> dict:
+    cartridge["skills"]["decompose"] = "acme-skills:decompose"
+    cartridge["work_routing"] = {"states": {"active": "work", "planned": "work", "future": "backlog"}}
+    cartridge["write_kinds"]["item_create"] = {"risk": "low", "ramp": "deferred"}
+    return cartridge
+
+
+def decompose(cart, decomposition=DECOMPOSITION, challenge=None):
+    responses = {"decompose": decomposition}
+    if challenge is not None:
+        # The adversary only runs when the team has bound it — optional means optional.
+        cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+        responses["review_adversary"] = challenge
+    return initiative_decompose.run(
+        {"run_id": "r", "date": "2026-08-30", "cartridge": cart, "idea": "go arrow-native"},
+        ScriptedRunner(responses),
+    )
+
+
+def test_emits_one_proposal_per_task(cart) -> None:
+    result = decompose(cart)
+    assert [p["target"] for p in result["proposals"]] == ["t1", "t2", "t3"]
+    assert all(p["kind"] == "item_create" for p in result["proposals"])
+
+
+def test_totals_report_the_shape_of_the_graph(cart) -> None:
+    totals = decompose(cart)["totals"]
+    assert totals["tasks"] == 3
+    assert totals["phases"] == 2
+    assert totals["edges"] == 3
+    assert totals["immediately_startable"] == 1
+
+
+def test_a_proposal_says_what_blocks_it(cart) -> None:
+    result = decompose(cart)
+    unblocked = next(p for p in result["proposals"] if p["target"] == "t1")
+    assert any("can start immediately" in e["output"] for e in unblocked["evidence"])
+
+
+# ── the adversary on the DAG ───────────────────────────────────────────────
+
+
+def test_a_spurious_edge_is_dropped_and_buys_parallelism(cart) -> None:
+    """The whole point: t2 no longer waits on t1, so both can start at once."""
+    challenge = {
+        "spurious_edges": [{"task": "t2", "needs": "t1", "why_not_real": "the harness needs no schema"}],
+        "missing_edges": [],
+        "verdict": "revise",
+        "summary": "one edge was imagined",
+    }
+    result = decompose(cart, challenge=challenge)
+    t2 = next(t for t in result["tasks"] if t["id"] == "t2")
+    assert t2["needs"] == []
+    assert result["totals"]["immediately_startable"] == 2
+    assert result["totals"]["edges_dropped"] == 1
+
+
+def test_a_real_missing_edge_is_added(cart) -> None:
+    challenge = {
+        "spurious_edges": [],
+        "missing_edges": [{"task": "t1", "needs": "t2", "why_real": "probe needs the harness"}],
+        "verdict": "revise",
+        "summary": "one edge was missed",
+    }
+    # t1 <- t2 and t2 <- t1 would be a cycle, so this challenge must be refused.
+    with pytest.raises(ContractViolation, match="dependency cycle"):
+        decompose(cart, challenge=challenge)
+
+
+def test_the_adversary_cannot_invent_a_task(cart) -> None:
+    challenge = {
+        "spurious_edges": [],
+        "missing_edges": [{"task": "t1", "needs": "t99-imaginary", "why_real": "made up"}],
+        "verdict": "revise",
+        "summary": "s",
+    }
+    result = decompose(cart, challenge=challenge)
+    assert next(t for t in result["tasks"] if t["id"] == "t1")["needs"] == []
+
+
+def test_the_adversary_cannot_stall_a_task_on_itself(cart) -> None:
+    challenge = {
+        "spurious_edges": [],
+        "missing_edges": [{"task": "t1", "needs": "t1", "why_real": "nonsense"}],
+        "verdict": "revise",
+        "summary": "s",
+    }
+    assert next(t for t in decompose(cart, challenge=challenge)["tasks"] if t["id"] == "t1")["needs"] == []
+
+
+def test_the_challenge_is_attached_as_evidence(cart) -> None:
+    result = decompose(cart, challenge=ACCEPTED)
+    assert any(e["check"] == "adversary on the DAG" for e in result["proposals"][0]["evidence"])
+
+
+def test_without_an_adversary_the_edges_stand_unchallenged(cart) -> None:
+    result = decompose(cart)
+    assert result["challenge"] is None
+    assert result["totals"]["edges"] == 3
+
+
+# ── refusing to emit nonsense ──────────────────────────────────────────────
+
+
+def test_a_cycle_from_the_decomposer_is_refused(cart) -> None:
+    cyclic = {
+        **DECOMPOSITION,
+        "tasks": [
+            {"id": "a", "phase": "p1", "title": "a", "body": "b", "needs": ["b"], "surfaces": []},
+            {"id": "b", "phase": "p1", "title": "b", "body": "b", "needs": ["a"], "surfaces": []},
+        ],
+    }
+    with pytest.raises(ContractViolation, match="could ever become ready"):
+        decompose(cart, decomposition=cyclic)
+
+
+def test_an_empty_decomposition_is_refused(cart) -> None:
+    with pytest.raises(ContractViolation, match="no tasks"):
+        decompose(cart, decomposition={**DECOMPOSITION, "tasks": []})
+
+
+def test_a_team_without_the_decompose_role_is_told_so(cartridge) -> None:
+    with pytest.raises(ContractViolation, match="needs the optional role 'decompose'"):
+        initiative_decompose.run(
+            {"run_id": "r", "date": "d", "cartridge": cartridge, "idea": "x"}, ScriptedRunner({})
+        )
+
+
+def test_it_refuses_without_a_cartridge(cart) -> None:
+    with pytest.raises(ContractViolation, match="cartridge"):
+        initiative_decompose.run({"run_id": "r", "date": "d", "idea": "x"}, ScriptedRunner({}))

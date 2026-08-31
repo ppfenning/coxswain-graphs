@@ -28,9 +28,9 @@ OBSERVED = {
 @pytest.fixture
 def cart(cartridge) -> dict:
     cartridge["skills"]["reconcile"] = "acme-skills:reconcile"
-    cartridge["ticket_routing"] = {"states": {"active": "board", "planned": "board_planned", "future": "future"}}
-    cartridge["write_kinds"]["ticket_update"] = {"risk": "low", "ramp": "deferred"}
-    cartridge["write_kinds"]["board_move"] = {"risk": "low", "ramp": "deferred"}
+    cartridge["work_routing"] = {"states": {"active": "board", "planned": "board_planned", "future": "future"}}
+    cartridge["write_kinds"]["item_update"] = {"risk": "low", "ramp": "deferred"}
+    cartridge["write_kinds"]["state_move"] = {"risk": "low", "ramp": "deferred"}
     return cartridge
 
 
@@ -43,9 +43,9 @@ def reconcile(cart, response, epic=EPIC, observed=OBSERVED):
 
 RESPONSE = {
     "drifts": [
-        {"ticket": "T-2", "declared": "in_progress", "actual": "done", "correction": "ticket_update", "detail": "closed on the board"},
+        {"ticket": "T-2", "declared": "in_progress", "actual": "done", "correction": "item_update", "detail": "closed on the board"},
         {"ticket": "T-3", "declared": "done", "actual": "absent from the board", "correction": "none", "detail": "legitimately archived"},
-        {"ticket": "T-4", "declared": "absent from the epic", "actual": "in_progress", "correction": "board_move", "detail": "never attached"},
+        {"ticket": "T-4", "declared": "absent from the epic", "actual": "in_progress", "correction": "state_move", "detail": "never attached"},
     ],
     "summary": "two real drifts",
 }
@@ -71,7 +71,7 @@ def test_an_epic_that_matches_reality_runs_no_node_at_all(cart) -> None:
 def test_corrections_become_proposals_of_the_named_kind(cart) -> None:
     result = reconcile(cart, RESPONSE)
     kinds = sorted(p["kind"] for p in result["proposals"])
-    assert kinds == ["board_move", "ticket_update"]
+    assert kinds == ["item_update", "state_move"]
 
 
 def test_a_legitimate_difference_proposes_nothing(cart) -> None:
@@ -82,7 +82,7 @@ def test_a_legitimate_difference_proposes_nothing(cart) -> None:
 def test_a_correction_for_a_ticket_that_never_drifted_is_refused(cart) -> None:
     """The node does not get to invent a drift the set comparison never found."""
     invented = {
-        "drifts": [{"ticket": "T-1", "declared": "x", "actual": "y", "correction": "ticket_update", "detail": "made up"}],
+        "drifts": [{"ticket": "T-1", "declared": "x", "actual": "y", "correction": "item_update", "detail": "made up"}],
         "summary": "s",
     }
     result = reconcile(cart, invented)
@@ -98,8 +98,8 @@ def test_proposals_carry_both_sides_as_evidence(cart) -> None:
 
 def test_board_moves_cite_the_routing_model(cart) -> None:
     result = reconcile(cart, RESPONSE)
-    proposal = next(p for p in result["proposals"] if p["kind"] == "board_move")
-    assert any(e["check"] == "ticket_routing" for e in proposal["evidence"])
+    proposal = next(p for p in result["proposals"] if p["kind"] == "state_move")
+    assert any(e["check"] == "work_routing" for e in proposal["evidence"])
 
 
 def test_it_refuses_to_fetch_the_board_itself(cart) -> None:
@@ -115,7 +115,7 @@ def test_it_refuses_without_a_cartridge(cart) -> None:
 
 
 def test_a_team_without_the_reconcile_role_is_told_so(cartridge) -> None:
-    cartridge["ticket_routing"] = {"states": {"active": "board"}}
+    cartridge["work_routing"] = {"states": {"active": "board"}}
     with pytest.raises(ContractViolation, match="needs the optional role 'reconcile'"):
         epic_reconcile.run(
             {"run_id": "r", "date": "d", "cartridge": cartridge, "epic": EPIC, "observed": OBSERVED},

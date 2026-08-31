@@ -31,8 +31,8 @@ PROPOSAL = {
 @pytest.fixture
 def cart(cartridge) -> dict:
     cartridge["policy"] = {"graduation_n": 3, "regraduation_multiplier": 2, "caps": {}}
-    cartridge["write_kinds"]["draft_pr_create"]["apply_arm"] = "ticket_apply_arm"
-    cartridge["skills"]["ticket_apply_arm"] = "acme-skills:create-ticket"
+    cartridge["write_kinds"]["draft_pr_create"]["apply_arm"] = "work_item_arm"
+    cartridge["skills"]["work_item_arm"] = "acme-skills:create-ticket"
     return cartridge
 
 
@@ -134,7 +134,7 @@ def test_auto_apply_goes_through_the_arm_the_cartridge_names(cart) -> None:
     arm = Arm()
     ok, detail = _auto_apply(PROPOSAL, cartridge=cart, runner=arm)
     assert ok and detail == "created"
-    assert arm.calls[0]["role"] == "ticket_apply_arm", "the arm is a role, resolved by the cartridge"
+    assert arm.calls[0]["role"] == "work_item_arm", "the arm is a role, resolved by the cartridge"
 
 
 def test_a_pr_armed_kind_is_never_reported_as_applied(cart) -> None:
@@ -144,5 +144,5 @@ def test_a_pr_armed_kind_is_never_reported_as_applied(cart) -> None:
 
 
 def test_apply_arm_lookup_reads_the_cartridge(cart) -> None:
-    assert _apply_arm_for("draft_pr_create", cart) == "ticket_apply_arm"
+    assert _apply_arm_for("draft_pr_create", cart) == "work_item_arm"
     assert _apply_arm_for("merge", cart) is None

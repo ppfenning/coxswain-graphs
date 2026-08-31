@@ -50,9 +50,38 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 
 | Graph | Shape |
 |---|---|
-| `lifecycle-propose` | scope → plan → build (worktree) → review → emit |
+| `initiative-decompose` | decompose → adversary-on-the-edges → emit. An idea into phases and a task DAG |
+| `lifecycle-propose` | scope → plan → build (worktree) → handoff → review → adversary → arbitrate → emit |
 | `triage-propose` | fetch → classify → verify → emit. Zero writes; proposes corrections to the runbook it just used |
-| `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared epic state vs the board |
+| `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared state vs actual |
+
+## A phased build, with no tracker
+
+```bash
+python shell.py decompose --team local --idea "go arrow-native across the reader path"
+python shell.py phase --team local --initiative work/arrow-migration --max-parallel 4
+```
+
+`decompose` turns the idea into phases and tasks and proposes each one; accepted
+tasks land as markdown files under `work/`. `phase` reads that store, works out
+which tasks are unblocked, and runs them **at the same time**, each in its own
+worktree.
+
+Three convictions hold this together:
+
+- **Nothing is one-shot.** Every change gets a reviewer, and `review_tier`
+  decides how many — a four-line migration is reviewed harder than a
+  four-hundred-line rename, because scrutiny follows what a mistake would cost.
+- **A step never builds on an unvalidated handoff.** The `handoff` role checks
+  that what one step produced is what the next actually needs, and stops if it
+  is not.
+- **The dependency graph gets attacked.** An adversary reads the DAG looking for
+  edges that are not real, because each one silently serialises work that could
+  have run at once and nothing downstream will ever question it.
+
+There is no ticketing platform anywhere in this. `cartridges/local/` binds every
+role to the filesystem: work items are markdown files, git is the audit trail,
+and the cartridge has no tracker, no workspace id, and no `auth_env`.
 
 ## The portability check
 

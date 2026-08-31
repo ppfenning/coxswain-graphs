@@ -10,7 +10,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-__all__ = ["ContractViolation", "require", "require_cartridge", "proposal", "epic_shape", "landing_for"]
+__all__ = [
+    "ContractViolation",
+    "require",
+    "require_cartridge",
+    "proposal",
+    "epic_shape",
+    "landing_for",
+    "review_tier",
+]
 
 PROPOSAL_FIELDS = ("kind", "risk", "target", "evidence", "rationale", "suggested_action")
 
@@ -69,19 +77,58 @@ def epic_shape(cartridge: Mapping[str, Any], *, phases: int, tickets: int, repos
 
 
 def landing_for(cartridge: Mapping[str, Any], state: str) -> str:
-    """Where work in this state lands, per `ticket_routing`.
+    """Where work in this state lands, per `work_routing`.
 
     Route by the state of the work, not by who filed it. Unscoped work must not
     reach the active board — that is how a board fills with work nobody has
     thought about and stops meaning anything.
     """
-    routing = cartridge.get("ticket_routing") or {}
+    routing = cartridge.get("work_routing") or {}
     states = routing.get("states") or {}
     landing = states.get(state)
     if landing is None:
         known = ", ".join(sorted(states)) or "none"
         raise ContractViolation(f"cartridge routes no state '{state}'; it declares: {known}")
     return str(landing)
+
+
+def review_tier(
+    cartridge: Mapping[str, Any],
+    *,
+    change_facts: Mapping[str, Any],
+    surfaces: Sequence[str] = (),
+    patterns: Sequence[str] = (),
+) -> int:
+    """How much review this change has to survive. Read off `review_tier`.
+
+    Scrutiny is proportional to what a mistake would cost, not to how large the
+    diff happens to be — a four-line migration outranks a four-hundred-line
+    rename. So the dangerous-surface check runs FIRST and cannot be talked down
+    by size.
+
+    0  trivial and self-evident   -> the charter reviewer alone
+    1  small and contained        -> charter + an adversary
+    2  touches something dangerous, or is simply big -> charter + adversary,
+                                     and arbitration whether or not they disagree
+
+    There is no tier that skips review. "Never one-shot" is the whole point:
+    tier 0 is the cheapest review, not the absence of one.
+    """
+    config = (cartridge.get("policy") or {}).get("review_tier") or {}
+
+    dangerous = set(config.get("tier2_surfaces") or [])
+    if dangerous & set(surfaces):
+        return 2
+
+    trivial = set(config.get("tier0_patterns") or [])
+    if patterns and set(patterns) <= trivial:
+        return 0
+
+    max_lines = int(config.get("tier1_max_changed_lines", 150))
+    max_modules = int(config.get("tier1_max_modules", 1))
+    if int(change_facts.get("changed_lines", 0)) <= max_lines and int(change_facts.get("module_count", 0)) <= max_modules:
+        return 1
+    return 2
 
 
 def proposal(

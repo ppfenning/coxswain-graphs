@@ -17,7 +17,7 @@ that only reads other nodes):
 `scope` runs first and only if the team bound `scope_epic` — unbound means absent,
 which is what an optional role means. It applies the cartridge's `epic_threshold`
 to decide epic / parent-with-subtasks / single ticket, routes the result through
-`ticket_routing`, and emits a `ticket_create` proposal carrying both decisions as
+`work_routing`, and emits a `item_create` proposal carrying both decisions as
 evidence. Scoping is a separate act from filing, and it runs before planning
 because it decides whether this is even one ticket.
 
@@ -30,19 +30,29 @@ flowchart TB
     TICKET["ticket (an arg)"] --> PLAN
 
     subgraph GRAPH["the graph — pure, no disk, no clock"]
-        SCOPE["scope<br/><i>role: scope_epic · standard</i><br/>epic_threshold + ticket_routing"]
+        SCOPE["scope<br/><i>role: scope_epic · standard</i><br/>epic_threshold + work_routing"]
         PLAN["plan<br/><i>role: plan · standard</i>"]
         BUILD["build<br/><i>role: build · standard</i>"]
         REVIEW["review<br/><i>role: review_charter · deep</i>"]
         FACTS["change_facts<br/><i>counted from the patch,<br/>not asked of the model</i>"]
         EMIT["emit"]
 
+        HANDOFF{"handoff<br/><i>does build's output contain<br/>what review needs?</i>"}
+        ADV["adversary<br/><i>role: review_adversary · deep</i>"]
+        ARB["arbitrate<br/><i>role: arbitrate · deep</i>"]
+
         SCOPE --> PLAN
         PLAN --> BUILD
         BUILD -- "unified diff<br/>(returned, not applied)" --> FACTS
-        FACTS --> REVIEW
-        REVIEW --> EMIT
-        SCOPE -. "ticket_create proposal" .-> EMIT
+        FACTS --> HANDOFF
+        HANDOFF -- "incomplete" --> STOP(["graph stops"])
+        HANDOFF -- "complete — small brief" --> REVIEW
+        REVIEW -- "tier 0" --> EMIT
+        REVIEW -- "tier 1+" --> ADV
+        ADV -- "agreed, tier 1" --> EMIT
+        ADV -- "disagreed · or tier 2" --> ARB
+        ARB --> EMIT
+        SCOPE -. "item_create proposal" .-> EMIT
     end
 
     EMIT -- "proposals" --> POLICY{"autonomy_policy<br/><i>has this kind graduated?</i>"}
@@ -62,9 +72,15 @@ flowchart TB
     style PUSH stroke-dasharray: 5 5
 ```
 
-The dashed edge is the point of the graph: a draft PR is *emitted as a proposal*
-and never executed, and nothing is pushed or merged by any path through this
-diagram.
+Two things the node table cannot show. The dashed edge is the point of the
+graph: a draft PR is *emitted as a proposal* and never executed, and nothing is
+pushed or merged by any path. And `handoff` has an edge that leaves the graph
+entirely — an incomplete handoff stops the run rather than letting review form a
+confident opinion about a half-finished change.
+
+How many reviewers a change gets is `review_tier`'s decision, not the author's:
+tier 0 is reviewed once, tier 1 gets an adversary, and tier 2 arbitrates whether
+or not the two agreed. No path skips review.
 
 **Args:** `run_id`, `date`, `cartridge` (resolved, required, no fallback),
 `ticket`, optional `worktree_root` (else `cartridge.landing_areas.worktree_root`).
@@ -77,7 +93,7 @@ retro. Staging a draft PR is *emitted* as a `draft_pr_create` proposal and never
 executed.
 
 *Epic-threshold scoping was on that list and is now implemented* — `epic_threshold`
-and `ticket_routing` were declared in the base cartridge and read by no code,
+and `work_routing` were declared in the base cartridge and read by no code,
 which is exactly the drift the cartridge seam exists to prevent.
 
 **Status:** implemented in [`lifecycle_propose.py`](lifecycle_propose.py). The

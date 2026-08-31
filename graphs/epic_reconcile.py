@@ -42,7 +42,7 @@ RECONCILE_SCHEMA = {
                     "ticket": {"type": "string"},
                     "declared": {"type": "string"},
                     "actual": {"type": "string"},
-                    "correction": {"type": "string", "enum": ["ticket_update", "board_move", "none"]},
+                    "correction": {"type": "string", "enum": ["item_update", "state_move", "none"]},
                     "detail": {"type": "string"},
                 },
                 "required": ["ticket", "declared", "actual", "correction", "detail"],
@@ -142,9 +142,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             {"check": f"declared state of {matching['ticket']}", "output": matching["declared"]},
             {"check": f"observed state of {matching['ticket']}", "output": matching["actual"]},
         ]
-        if kind == "board_move":
+        if kind == "state_move":
             evidence.append(
-                {"check": "ticket_routing", "output": f"active work lands in {landing_for(cartridge, 'active')}"}
+                {"check": "work_routing", "output": f"active work lands in {landing_for(cartridge, 'active')}"}
             )
         proposals.append(
             proposal(

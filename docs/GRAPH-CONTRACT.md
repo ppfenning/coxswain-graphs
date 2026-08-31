@@ -82,12 +82,56 @@ reported as done.
 hashes the resolved cartridge), then record it — which derives ledger outcomes
 from the gate diffs rather than trusting anything the run says about itself.
 
+## Review is proportional to cost, and nothing is one-shot
+
+Every change gets a reviewer. How many it gets is decided by `review_tier` in
+the cartridge, not by the author:
+
+| Tier | When | Reviewers |
+|---|---|---|
+| 0 | matches `tier0_patterns` | charter |
+| 1 | within `tier1_max_changed_lines` / `tier1_max_modules` | charter + adversary |
+| 2 | touches a `tier2_surfaces` surface, or is simply big | charter + adversary + arbitration, **whether or not they disagreed** |
+
+The dangerous-surface check runs first and cannot be talked down by size: a
+four-line migration outranks a four-hundred-line rename. Tier 0 is the cheapest
+review, never the absence of one. At tier 2, two reviewers agreeing is not by
+itself evidence — which is why arbitration runs anyway.
+
+Reviewer roles are optional. A team that binds none of them gets a single
+reviewer, and an unbound adversary is not a silent objection.
+
+## Steps hand off, and a handoff is checked
+
+Between two steps sits a `handoff` node: does what the last step produced
+actually contain what the next one needs? If not, the graph **stops**. A
+reviewer handed half a change produces a confident opinion about the wrong
+thing, and a phase that goes quietly wrong usually did so several steps earlier.
+
+Its second job is compression — the next step gets a small brief rather than
+everything that came before, which is the existing rule about return shapes
+staying small, enforced at the seam where it actually matters.
+
 ## The graphs
 
 | Graph | Shape |
 |---|---|
-| `lifecycle-propose` | scope → plan → build (worktree) → review → emit. The dev loop. |
-| `triage-propose` | fetch → classify against a runbook index → runbook-guided verify → emit. Zero writes; proposes its own runbook corrections. |
+| `initiative-decompose` | decompose → adversary-on-the-edges → emit. Idea into phases and a task DAG. |
+| `lifecycle-propose` | scope → plan → build (worktree) → handoff → review → adversary → arbitrate → emit. One task. |
+| `triage-propose` | fetch → classify → verify → emit. Zero writes; proposes its own runbook corrections. |
 | `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared state vs actual. |
 
-All three are specified in `graphs/` and implemented.
+All four are specified in `graphs/` and implemented.
+
+Running a *phase* is not a graph: the shell runs `lifecycle-propose` once per
+unblocked task, concurrently. Sequence belongs to a graph; concurrency belongs
+to the I/O edge that already owns every side effect. Results are ordered by task
+id before anything is recorded, so wall-clock order never reaches the ledger.
+
+## None of this needs a tracker
+
+The roles and write kinds name work, not vendors: `work_state_arm`,
+`work_item_arm`, `item_create`, `state_move`. `cartridges/local/` binds every one
+of them to the filesystem — work items are markdown files under `work/`, git is
+the audit trail — and resolves with no tracker, no workspace id, and no
+`auth_env`. If a graph needed a tracker, that cartridge could not resolve.

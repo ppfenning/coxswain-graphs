@@ -20,9 +20,9 @@ ROUTING = {"states": {"active": "board", "planned": "board_planned", "future": "
 @pytest.fixture
 def scoped(cartridge) -> dict:
     cartridge["epic_threshold"] = dict(THRESHOLD)
-    cartridge["ticket_routing"] = {"states": dict(ROUTING["states"])}
+    cartridge["work_routing"] = {"states": dict(ROUTING["states"])}
     cartridge["skills"]["scope_epic"] = "acme-skills:scope-epic"
-    cartridge["write_kinds"]["ticket_create"] = {"risk": "low", "ramp": "deferred"}
+    cartridge["write_kinds"]["item_create"] = {"risk": "low", "ramp": "deferred"}
     return cartridge
 
 
@@ -54,18 +54,18 @@ def test_a_team_can_move_its_own_bar(cartridge) -> None:
 
 
 def test_routing_reads_the_cartridge(cartridge) -> None:
-    cartridge["ticket_routing"] = {"states": dict(ROUTING["states"])}
+    cartridge["work_routing"] = {"states": dict(ROUTING["states"])}
     assert landing_for(cartridge, "active") == "board"
     assert landing_for(cartridge, "future") == "future_landing"
 
 
 def test_unscoped_work_never_lands_on_the_active_board(cartridge) -> None:
-    cartridge["ticket_routing"] = {"states": dict(ROUTING["states"])}
+    cartridge["work_routing"] = {"states": dict(ROUTING["states"])}
     assert landing_for(cartridge, "future") != landing_for(cartridge, "active")
 
 
 def test_an_unroutable_state_is_refused_rather_than_guessed(cartridge) -> None:
-    cartridge["ticket_routing"] = {"states": dict(ROUTING["states"])}
+    cartridge["work_routing"] = {"states": dict(ROUTING["states"])}
     with pytest.raises(ContractViolation, match="routes no state 'invented'"):
         landing_for(cartridge, "invented")
 
@@ -100,11 +100,11 @@ def test_scoping_emits_a_routed_proposal(scoped, plan_response, build_response, 
     assert result["scope"]["shape"] == "epic"
     assert result["scope"]["landing"] == "board_planned"
 
-    scoping = [p for p in result["proposals"] if p["kind"] == "ticket_create"]
+    scoping = [p for p in result["proposals"] if p["kind"] == "item_create"]
     assert len(scoping) == 1
     assert "epic" in scoping[0]["suggested_action"]
     assert any("epic_threshold" == e["check"] for e in scoping[0]["evidence"])
-    assert any("ticket_routing" == e["check"] for e in scoping[0]["evidence"])
+    assert any("work_routing" == e["check"] for e in scoping[0]["evidence"])
 
 
 def test_future_work_routes_off_the_active_board(scoped, plan_response, build_response, review_response) -> None:
@@ -133,7 +133,7 @@ def test_it_attaches_to_an_existing_epic_when_one_covers_the_area(
         "rationale": "same area",
     }
     result = scope_run(scoped, response, plan_response, build_response, review_response)
-    scoping = [p for p in result["proposals"] if p["kind"] == "ticket_create"][0]
+    scoping = [p for p in result["proposals"] if p["kind"] == "item_create"][0]
     assert scoping["target"] == "EPIC-9"
     assert "EPIC-9" in scoping["suggested_action"]
 

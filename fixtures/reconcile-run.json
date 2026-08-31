@@ -1,1 +1,1 @@
-{"reconcile":{"drifts":[{"ticket":"T-2","declared":"in_progress","actual":"done","correction":"ticket_update","detail":"closed on the board, still open in the epic"}],"summary":"one drift"}}
+{"reconcile":{"drifts":[{"ticket":"T-2","declared":"in_progress","actual":"done","correction":"item_update","detail":"closed on the board, still open in the epic"}],"summary":"one drift"}}

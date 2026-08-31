@@ -13,7 +13,7 @@ of what someone once intended.
 |---|---|---|---|
 | `compare` | — | — | deterministic set arithmetic over declared vs observed |
 | `reconcile` | `reconcile` | standard | which differences are drift, and what corrects each |
-| `emit` | — | — | `ticket_update` / `board_move` proposals |
+| `emit` | — | — | `item_update` / `state_move` proposals |
 
 **Args:** `run_id`, `date`, `cartridge` (resolved, required, no fallback),
 `epic` (the declared state), `observed` (the board's actual state).

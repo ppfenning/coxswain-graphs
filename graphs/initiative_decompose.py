@@ -1,0 +1,258 @@
+"""initiative-decompose — a large idea into phases and a task DAG.
+
+    decompose -> adversary -> emit
+
+The front of the pipeline, and the step that makes everything after it
+parallelisable. An idea arrives as prose; what comes out is phases, tasks, and
+the dependency edges between them — and one `item_create` proposal per task.
+
+The adversarial pass here is the highest-leverage one in the system, and it has
+a single job: **attack the dependency edges.** Every edge that is not real
+serialises work that could have run at once, and the person who just drew the
+graph is the last person likely to notice they drew too many. An edge that
+exists because the work "feels sequential" costs a phase its parallelism, and
+nothing else in the pipeline will ever question it.
+
+Strictly propose-only, like everything else — the tasks land as proposals, and
+the work store is written by an apply arm after a human said yes.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
+from runner.protocol import NodeRunner
+
+__all__ = ["run", "GRAPH_NAME"]
+
+GRAPH_NAME = "initiative-decompose"
+
+DECOMPOSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "phases": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}, "goal": {"type": "string"}},
+                "required": ["id", "goal"],
+                "additionalProperties": False,
+            },
+        },
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "phase": {"type": "string"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "needs": {"type": "array", "items": {"type": "string"}},
+                    "surfaces": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["id", "phase", "title", "body", "needs", "surfaces"],
+                "additionalProperties": False,
+            },
+        },
+        "rationale": {"type": "string"},
+    },
+    "required": ["phases", "tasks", "rationale"],
+    "additionalProperties": False,
+}
+
+EDGE_CHALLENGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "spurious_edges": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "needs": {"type": "string"},
+                    "why_not_real": {"type": "string"},
+                },
+                "required": ["task", "needs", "why_not_real"],
+                "additionalProperties": False,
+            },
+        },
+        "missing_edges": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "needs": {"type": "string"},
+                    "why_real": {"type": "string"},
+                },
+                "required": ["task", "needs", "why_real"],
+                "additionalProperties": False,
+            },
+        },
+        "verdict": {"type": "string", "enum": ["accept", "revise"]},
+        "summary": {"type": "string"},
+    },
+    "required": ["spurious_edges", "missing_edges", "verdict", "summary"],
+    "additionalProperties": False,
+}
+
+
+def _apply_challenge(tasks: list[dict[str, Any]], challenge: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Drop edges the adversary showed were not real; add ones it showed were.
+
+    Both directions matter. Dropping a spurious edge buys parallelism; adding a
+    missing one prevents a task starting on ground that is not there yet, which
+    is the failure the parallelism would otherwise cause.
+    """
+    by_id = {t["id"]: t for t in tasks}
+
+    for edge in challenge.get("spurious_edges") or []:
+        task = by_id.get(str(edge.get("task")))
+        if task and str(edge.get("needs")) in task["needs"]:
+            task["needs"] = [n for n in task["needs"] if n != str(edge.get("needs"))]
+
+    for edge in challenge.get("missing_edges") or []:
+        task, need = by_id.get(str(edge.get("task"))), str(edge.get("needs"))
+        # Only between tasks that exist, and never a self-edge — the adversary
+        # does not get to invent a task or stall one on itself.
+        if task and need in by_id and need != task["id"] and need not in task["needs"]:
+            task["needs"].append(need)
+
+    return list(by_id.values())
+
+
+def _local_cycle(tasks: list[dict[str, Any]]) -> list[str]:
+    """Cheap cycle check before anything is proposed. The store checks again."""
+    by_id = {t["id"]: t for t in tasks}
+    problems: list[str] = []
+    colour: dict[str, int] = dict.fromkeys(by_id, 0)
+
+    def visit(node: str, trail: list[str]) -> None:
+        colour[node] = 1
+        for need in by_id[node].get("needs") or []:
+            if need not in by_id:
+                continue
+            if colour[need] == 1:
+                problems.append(" -> ".join([*trail, need]))
+            elif colour[need] == 0:
+                visit(need, [*trail, need])
+        colour[node] = 2
+
+    for node in sorted(by_id):
+        if colour[node] == 0:
+            visit(node, [node])
+    return problems
+
+
+def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
+    """Run the graph. The idea arrives as an argument; nothing is read from disk."""
+    cartridge = require_cartridge(args)
+    run_id, date, idea = require(args, "run_id", "date", "idea")
+
+    bound = cartridge.get("skills") or {}
+    if "decompose" not in bound:
+        raise ContractViolation(
+            "this graph needs the optional role 'decompose' bound in the cartridge; "
+            "a team that has not bound it cannot decompose an initiative"
+        )
+
+    context = list(cartridge.get("context") or [])
+
+    decomposition = dict(
+        runner.run(
+            role="decompose",
+            tier="standard",
+            schema=DECOMPOSE_SCHEMA,
+            context=context,
+            prompt=(
+                f"Break this idea into phases and tasks.\n\nIdea: {idea}\nDate: {date}\n\n"
+                "Phases are ordered; tasks within a phase are not necessarily. Draw a "
+                "dependency edge ONLY where order genuinely matters — an edge that exists "
+                "because the work feels sequential blocks work that could have run in "
+                "parallel. Name the surfaces each task touches."
+            ),
+        )
+    )
+
+    tasks = [dict(t, needs=list(t.get("needs") or []), surfaces=list(t.get("surfaces") or [])) for t in decomposition.get("tasks") or []]
+    if not tasks:
+        raise ContractViolation("decompose returned no tasks; there is nothing to propose")
+
+    challenge: dict[str, Any] | None = None
+    if "review_adversary" in bound:
+        challenge = dict(
+            runner.run(
+                role="review_adversary",
+                tier="deep",
+                schema=EDGE_CHALLENGE_SCHEMA,
+                context=context,
+                prompt=(
+                    "Attack this dependency graph. Your job is to find edges that are "
+                    "not real — every one of them serialises work that could have run at "
+                    "the same time.\n\n"
+                    f"Idea: {idea}\nPhases: {decomposition.get('phases')}\nTasks: {tasks}\n\n"
+                    "For each edge you challenge, say why the dependency does not "
+                    "actually hold. Also name any edge that IS real and is missing."
+                ),
+            )
+        )
+        tasks = _apply_challenge(tasks, challenge)
+
+    cycles = _local_cycle(tasks)
+    if cycles:
+        raise ContractViolation(
+            "the decomposed graph contains a dependency cycle, so nothing in it could "
+            "ever become ready: " + "; ".join(cycles)
+        )
+
+    shape = epic_shape(
+        cartridge,
+        phases=len({t["phase"] for t in tasks}),
+        tickets=len(tasks),
+        repos=len({s for t in tasks for s in t.get("surfaces") or []} & {"cross_repo"}) + 1,
+    )
+    landing = landing_for(cartridge, "planned")
+
+    proposals = [
+        proposal(
+            cartridge,
+            kind="item_create",
+            target=str(task["id"]),
+            evidence=[
+                {"check": "phase", "output": str(task.get("phase"))},
+                {"check": "depends on", "output": ", ".join(task["needs"]) or "nothing — can start immediately"},
+                {"check": "surfaces", "output": ", ".join(task.get("surfaces") or []) or "none declared"},
+                *(
+                    [{"check": "adversary on the DAG", "output": str(challenge.get("summary"))}]
+                    if challenge
+                    else []
+                ),
+            ],
+            rationale=str(task.get("body") or decomposition.get("rationale", "")),
+            suggested_action=f"create {task['id']} in {landing}/{task.get('phase')}",
+        )
+        for task in sorted(tasks, key=lambda t: str(t["id"]))
+    ]
+
+    unblocked = [t["id"] for t in tasks if not t["needs"]]
+    return {
+        "run_id": run_id,
+        "date": date,
+        "idea": idea,
+        "shape": shape,
+        "phases": decomposition.get("phases") or [],
+        "tasks": sorted(tasks, key=lambda t: str(t["id"])),
+        "challenge": challenge,
+        "proposals": proposals,
+        "totals": {
+            "phases": len({t["phase"] for t in tasks}),
+            "tasks": len(tasks),
+            "edges": sum(len(t["needs"]) for t in tasks),
+            "edges_dropped": len((challenge or {}).get("spurious_edges") or []),
+            "edges_added": len((challenge or {}).get("missing_edges") or []),
+            "immediately_startable": len(unblocked),
+        },
+    }

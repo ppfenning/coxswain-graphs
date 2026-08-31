@@ -24,6 +24,7 @@ import sys
 import uuid
 from collections import Counter
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as date_type
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,12 +36,21 @@ from core.manifest import build_manifest, gate_diff, record_run
 from core.policy import AUTO, autonomy_policy
 from core.skills import index_from_roots
 
-from graphs import epic_reconcile, lifecycle_propose, triage_propose
+from core import workstore
+from graphs import epic_reconcile, initiative_decompose, lifecycle_propose, triage_propose
 from graphs._contract import ContractViolation
 from runner import ScriptedRunner
 from runner.protocol import RunnerError
 
-GRAPHS = {"lifecycle": lifecycle_propose, "triage": triage_propose, "reconcile": epic_reconcile}
+GRAPHS = {
+    "lifecycle": lifecycle_propose,
+    "triage": triage_propose,
+    "reconcile": epic_reconcile,
+    "decompose": initiative_decompose,
+    # `phase` is not a graph. It runs the lifecycle graph once per ready task,
+    # concurrently, and is handled separately below.
+    "phase": lifecycle_propose,
+}
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -102,6 +112,58 @@ def _apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
         text=True,
     )
     return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def _run_phase(
+    *,
+    tasks: list[dict[str, Any]],
+    cartridge: dict[str, Any],
+    runner: Any,
+    run_id: str,
+    date: str,
+    max_parallel: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Run the lifecycle graph once per ready task, at the same time.
+
+    Concurrency lives here and nowhere else. The graphs stay pure and
+    single-task; this is the I/O edge, and running several HTTP-bound node
+    sequences at once is exactly what an I/O edge is for.
+
+    Results are collected into a dict and read back IN TASK-ID ORDER, so two
+    runs over the same work produce the same manifest no matter who finished
+    first. If wall-clock order could reach the ledger, the record would stop
+    being a record and become a race.
+    """
+    results: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+
+    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+        futures = {
+            pool.submit(
+                lifecycle_propose.run,
+                {
+                    "run_id": f"{run_id}:{task['id']}",
+                    "date": date,
+                    "ticket": task["id"],
+                    "cartridge": cartridge,
+                    "surfaces": task.get("surfaces") or [],
+                },
+                runner,
+            ): task
+            for task in tasks
+        }
+        for future in as_completed(futures):
+            task = futures[future]
+            try:
+                results[task["id"]] = future.result()
+            except (ContractViolation, RunnerError) as exc:
+                # One task failing must not take the phase with it. The others
+                # already ran; their work is still worth gating.
+                failures.append(f"{task['id']}: {exc}")
+
+    ordered = [results[key] for key in sorted(results)]
+    proposals = [p for result in ordered for p in result.get("proposals", [])]
+    return ordered, proposals, sorted(failures)
 
 
 def _split_by_policy(
@@ -191,7 +253,7 @@ def _gate(proposals: list[dict[str, Any]], *, assume: str | None) -> tuple[list[
     if not proposals:
         return [], 0.0
 
-    diffs: list[dict[str, Any]] = []
+    decisions: list[tuple[dict[str, Any], str, bool]] = []
     started = datetime.now(timezone.utc)
 
     for number, item in enumerate(proposals, 1):
@@ -215,10 +277,36 @@ def _gate(proposals: list[dict[str, Any]], *, assume: str | None) -> tuple[list[
             "e": ("approved", True),
             "r": ("refused", False),
         }.get(answer[:1], ("refused", False))
-        diffs.append(gate_diff(item, decision, applied=decision == "approved", edited=edited))
+        decisions.append((item, decision, edited))
 
     minutes = (datetime.now(timezone.utc) - started).total_seconds() / 60
-    return diffs, round(minutes, 2)
+    return decisions, round(minutes, 2)
+
+
+def _apply_decisions(
+    decisions: list[tuple[dict[str, Any], str, bool]],
+    *,
+    cartridge: dict[str, Any],
+    runner: Any,
+) -> list[dict[str, Any]]:
+    """Execute what the gate approved, then record what ACTUALLY happened.
+
+    Approval is not execution. The earlier version passed `applied=decision ==
+    "approved"` straight into `gate_diff`, so the ledger recorded `clean` for
+    proposals nothing had ever run — a self-report, which is the one thing the
+    ledger exists not to accept. `applied` now comes from the arm returning
+    successfully, and an approved proposal that could not be executed records
+    `skipped`, which is exactly what it is.
+    """
+    diffs: list[dict[str, Any]] = []
+    for item, decision, edited in decisions:
+        applied = False
+        if decision == "approved":
+            applied, detail = _auto_apply(item, cartridge=cartridge, runner=runner)
+            if not applied:
+                print(f"  approved but not executed ({detail})", file=sys.stderr)
+        diffs.append(gate_diff(item, decision, applied=applied, edited=edited))
+    return diffs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -240,6 +328,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alerts", help="triage: path to a JSON list of alerts")
     parser.add_argument("--epic", help="reconcile: path to the epic's DECLARED state, as JSON")
     parser.add_argument("--observed", help="reconcile: path to the board's ACTUAL state, as JSON")
+    parser.add_argument("--idea", help="decompose: the initiative, as prose or a path to it")
+    parser.add_argument("--initiative", help="phase: path to the work/<initiative> directory")
+    parser.add_argument("--phase-name", help="phase: which phase to run (default: the first with ready work)")
+    parser.add_argument("--max-parallel", type=int, default=4, help="phase: how many tasks run at once")
     parser.add_argument("--max-alerts", type=int)
     parser.add_argument("--scripted", metavar="JSON", help="run offline against canned node responses")
     parser.add_argument("--assume", choices=["a", "e", "r"], help="answer the gate non-interactively")
@@ -266,6 +358,14 @@ def main(argv: list[str] | None = None) -> int:
         if not args.ticket:
             parser.error("lifecycle needs --ticket")
         graph_args["ticket"] = args.ticket
+    elif args.graph == "decompose":
+        if not args.idea:
+            parser.error("decompose needs --idea (prose, or a path to a file holding it)")
+        idea = Path(args.idea)
+        graph_args["idea"] = idea.read_text(encoding="utf-8") if idea.is_file() else args.idea
+    elif args.graph == "phase":
+        if not args.initiative:
+            parser.error("phase needs --initiative (a work/<initiative> directory)")
     elif args.graph == "reconcile":
         if not (args.epic and args.observed):
             parser.error("reconcile needs --epic and --observed; this graph does not read the tracker itself")
@@ -280,14 +380,56 @@ def main(argv: list[str] | None = None) -> int:
 
     module = GRAPHS[args.graph]
     runner = _build_runner(args, cartridge)
-    try:
-        result = module.run(graph_args, runner)
-    except (ContractViolation, RunnerError) as exc:
-        # A contract violation or a dead runner is a bad invocation, and it is
-        # reported as one. Anything else is a bug in this code and is allowed to
-        # raise with its traceback intact rather than be flattened into "failed".
-        print(f"{module.GRAPH_NAME} failed: {exc}", file=sys.stderr)
-        return 1
+
+    if args.graph == "phase":
+        # Not one graph run but many, one per unblocked task. The work store is
+        # read HERE and the tasks handed in as arguments, because a graph that
+        # reads the filesystem cannot be replayed.
+        try:
+            initiative = workstore.read_initiative(args.initiative)
+        except workstore.WorkStoreError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        phase_name = args.phase_name
+        if phase_name is None:
+            phase_name = next(
+                (p for p in initiative["phases"] if workstore.ready_tasks(initiative["items"], phase=p)), None
+            )
+        ready = workstore.ready_tasks(initiative["items"], phase=phase_name) if phase_name else []
+        if not ready:
+            print(f"nothing ready in {initiative['id']}" + (f" phase {phase_name}" if phase_name else ""))
+            return 0
+
+        print(f"phase {phase_name}: {len(ready)} task(s) ready, running up to {args.max_parallel} at once")
+        print("  " + ", ".join(t["id"] for t in ready))
+        results, proposals, failures = _run_phase(
+            tasks=ready,
+            cartridge=cartridge,
+            runner=runner,
+            run_id=run_id,
+            date=args.date,
+            max_parallel=args.max_parallel,
+        )
+        for failure in failures:
+            print(f"task failed: {failure}", file=sys.stderr)
+        result = {
+            "run_id": run_id,
+            "phase": phase_name,
+            "tasks": [r.get("ticket") for r in results],
+            "proposals": proposals,
+            "totals": {"ready": len(ready), "completed": len(results), "failed": len(failures)},
+        }
+    else:
+        try:
+            result = module.run(graph_args, runner)
+        except (ContractViolation, RunnerError) as exc:
+            # A contract violation or a dead runner is a bad invocation, and it
+            # is reported as one. Anything else is a bug in this code and is
+            # allowed to raise with its traceback intact rather than be
+            # flattened into "failed".
+            print(f"{module.GRAPH_NAME} failed: {exc}", file=sys.stderr)
+            return 1
 
     provider_profile = Path(args.provider_profile).stem
     proposals = result.get("proposals", [])
@@ -311,7 +453,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"auto-eligible but not executed ({detail}); sending to the gate", file=sys.stderr)
             gated.append(item)
 
-    diffs, human_minutes = _gate(gated, assume=args.assume)
+    decisions, human_minutes = _gate(gated, assume=args.assume)
+    diffs = _apply_decisions(decisions, cartridge=cartridge, runner=runner)
 
     # A build patch is applied only after the gate approved the work it belongs to.
     if args.graph == "lifecycle" and result.get("build", {}).get("patch"):

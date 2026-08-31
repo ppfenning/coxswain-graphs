@@ -1,0 +1,10 @@
+{
+  "scope_epic": {"phases": ["p1"], "tickets": ["t"], "repos": ["agent-graphs"], "state": "planned", "parent_epic": "", "rationale": "one unit of work"},
+  "plan": {"steps": ["read the spec", "implement", "test"], "files_expected": ["src/a.py"], "out_of_scope": ["the CLI"]},
+  "build": {"patch": "diff --git a/src/a.py b/src/a.py\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.py\n@@ -0,0 +1,2 @@\n+def probe():\n+    return True\n", "summary": "the probe", "files_touched": ["src/a.py"], "commands_run": [{"command": "pytest -q", "output": "2 passed"}]},
+  "handoff": {"complete": true, "missing": [], "brief": "one file, one behaviour, tests green"},
+  "review_charter": {"verdict": "approve", "findings": [], "rationale": "matches the charter"},
+  "review_adversary": {"verdict": "approve", "objections": [], "strongest_objection": "none that survive contact with the tests"},
+  "arbitrate": {"verdict": "approve", "sided_with": "charter", "reasoning": "the objection was about naming"},
+  "work_item_arm": {"applied": true, "detail": "work item written"}
+}

@@ -1,0 +1,17 @@
+{
+  "decompose": {
+    "phases": [{"id": "p1-foundations", "goal": "prove the shape"}, {"id": "p2-cutover", "goal": "switch over"}],
+    "tasks": [
+      {"id": "t1-schema-probe", "phase": "p1-foundations", "title": "Schema probe", "body": "Probe the schema.", "needs": [], "surfaces": ["schema"]},
+      {"id": "t2-bench-harness", "phase": "p1-foundations", "title": "Bench harness", "body": "Build the harness.", "needs": ["t1-schema-probe"], "surfaces": []},
+      {"id": "t3-cutover", "phase": "p2-cutover", "title": "Cut over", "body": "Switch the reader.", "needs": ["t1-schema-probe", "t2-bench-harness"], "surfaces": ["migration"]}
+    ],
+    "rationale": "two phases, three tasks"
+  },
+  "review_adversary": {
+    "spurious_edges": [{"task": "t2-bench-harness", "needs": "t1-schema-probe", "why_not_real": "the harness measures round-trips and needs no schema"}],
+    "missing_edges": [],
+    "verdict": "revise",
+    "summary": "one edge was imagined; dropping it lets both foundation tasks start at once"
+  }
+}

@@ -1,13 +1,28 @@
-"""lifecycle-propose — the development loop.
+"""lifecycle-propose — the development loop for ONE task.
 
-    plan -> build (worktree) -> review -> emit
+    scope -> plan -> build (worktree) -> handoff -> review -> adversary
+          -> arbitrate -> emit
 
-Takes one ticket, produces reviewed work and proposals. Nothing is pushed,
-opened, or merged. The build node returns a patch; applying it is the shell's
-job, inside a worktree the shell owns.
+Takes one task, produces reviewed work and proposals. Nothing is pushed, opened,
+or merged. The build node returns a patch; applying it is the shell's job,
+inside a worktree the shell owns.
 
-Deferred from v0 (see graphs/lifecycle-propose.md): intake queue, epic-threshold
-scoping, the adversarial reviewer pair, arbitration, the bounded fix loop,
+Two convictions shape the back half of this graph.
+
+**Nothing is one-shot.** Every change gets a reviewer, and how many it gets is
+proportional to what a mistake would cost — `review_tier` decides, not the
+author. A dangerous surface earns an adversary and an arbitrator even when the
+diff is four lines.
+
+**A step never builds on an unvalidated handoff.** The `handoff` node checks
+that what build produced actually satisfies what review needs before review sees
+it, and REFUSES rather than passing a gap along. A phase that goes quietly wrong
+usually did so three steps earlier.
+
+Every node after `build` is an optional role: a team that binds none of them
+gets the original single-reviewer loop, which is what optional means.
+
+Deferred (see graphs/lifecycle-propose.md): intake queue, the bounded fix loop,
 verification, retro.
 """
 
@@ -16,7 +31,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from graphs._contract import epic_shape, landing_for, proposal, require, require_cartridge
+from graphs._contract import (
+    ContractViolation,
+    epic_shape,
+    landing_for,
+    proposal,
+    require,
+    require_cartridge,
+    review_tier,
+)
 from runner.protocol import NodeRunner
 
 __all__ = ["run", "GRAPH_NAME"]
@@ -92,6 +115,48 @@ REVIEW_SCHEMA = {
 }
 
 
+HANDOFF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "complete": {"type": "boolean"},
+        "missing": {"type": "array", "items": {"type": "string"}},
+        "brief": {"type": "string", "description": "the small thing the next step actually needs"},
+    },
+    "required": ["complete", "missing", "brief"],
+    "additionalProperties": False,
+}
+
+ADVERSARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["approve", "revise", "reject"]},
+        "objections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"claim": {"type": "string"}, "why_wrong": {"type": "string"}},
+                "required": ["claim", "why_wrong"],
+                "additionalProperties": False,
+            },
+        },
+        "strongest_objection": {"type": "string"},
+    },
+    "required": ["verdict", "objections", "strongest_objection"],
+    "additionalProperties": False,
+}
+
+ARBITRATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["approve", "revise", "reject"]},
+        "sided_with": {"type": "string", "enum": ["charter", "adversary", "neither"]},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["verdict", "sided_with", "reasoning"],
+    "additionalProperties": False,
+}
+
+
 def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
     """Deterministic facts about the change, for the reviewer and the gate.
 
@@ -155,11 +220,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         proposals.append(
             proposal(
                 cartridge,
-                kind="ticket_create",
+                kind="item_create",
                 target=str(scope.get("parent_epic") or ticket),
                 evidence=[
                     {"check": "epic_threshold", "output": f"{shape} ({len(scope.get('tickets') or [])} tickets, {len(scope.get('phases') or [])} phases, {len(scope.get('repos') or [])} repos)"},
-                    {"check": "ticket_routing", "output": f"state '{scope.get('state')}' lands in {landing}"},
+                    {"check": "work_routing", "output": f"state '{scope.get('state')}' lands in {landing}"},
                 ],
                 rationale=str(scope.get("rationale", "")),
                 suggested_action=(
@@ -195,6 +260,43 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     )
 
     facts = _change_facts(build)
+    bound = cartridge.get("skills") or {}
+    tier = review_tier(
+        cartridge,
+        change_facts=facts,
+        surfaces=list(args.get("surfaces") or []),
+        patterns=list(args.get("patterns") or []),
+    )
+
+    # The shuttle. Between build and review, someone checks that what came out
+    # of the last step is actually what the next one needs — and stops here if
+    # it is not. A review of a half-finished change produces a confident opinion
+    # about the wrong thing.
+    handoff: dict[str, Any] | None = None
+    if "handoff" in bound:
+        handoff = dict(
+            runner.run(
+                role="handoff",
+                tier="standard",
+                schema=HANDOFF_SCHEMA,
+                context=context,
+                prompt=(
+                    "The build step is done and the review step is next. Does what "
+                    "build produced actually contain what a reviewer needs?\n\n"
+                    f"Task: {ticket}\nPlan: {plan}\nSummary: {build.get('summary')}\n"
+                    f"Files: {build.get('files_touched')}\nChange facts: {facts}\n\n"
+                    "List anything missing, and compress the rest into the smallest "
+                    "brief that lets review start."
+                ),
+            )
+        )
+        if not handoff.get("complete"):
+            missing = ", ".join(handoff.get("missing") or []) or "unspecified"
+            raise ContractViolation(
+                f"handoff from build to review is incomplete for '{ticket}': {missing}. "
+                "The graph stops rather than reviewing a change that is not finished — "
+                "a step that builds on a gap is how a phase goes quietly wrong."
+            )
 
     review = runner.run(
         role="review_charter",
@@ -203,13 +305,69 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         context=context,
         prompt=(
             "Review this change against the team's own written charter in your "
-            f"context.\n\nTicket: {ticket}\nSummary: {build.get('summary')}\n"
-            f"Change facts: {facts}\nPatch:\n{build.get('patch')}\n\n"
+            f"context.\n\nTask: {ticket}\nSummary: {build.get('summary')}\n"
+            f"Change facts: {facts}\n"
+            + (f"Handoff brief: {handoff.get('brief')}\n" if handoff else "")
+            + f"Patch:\n{build.get('patch')}\n\n"
             "Cite the charter principle behind every finding."
         ),
     )
 
-    if review.get("verdict") == "approve":
+    # Tier 0 is the cheapest review, never the absence of one.
+    adversary: dict[str, Any] | None = None
+    if tier >= 1 and "review_adversary" in bound:
+        adversary = dict(
+            runner.run(
+                role="review_adversary",
+                tier="deep",
+                schema=ADVERSARY_SCHEMA,
+                context=context,
+                prompt=(
+                    "Your job is to disagree. Find what this change gets wrong, and "
+                    "what the first reviewer accepted too easily.\n\n"
+                    f"Task: {ticket}\nChange facts: {facts}\n"
+                    f"First reviewer said: {review.get('verdict')} — {review.get('rationale')}\n"
+                    f"Patch:\n{build.get('patch')}\n\n"
+                    "State your strongest objection plainly, even if you end up approving."
+                ),
+            )
+        )
+
+    # Arbitration on disagreement, and unconditionally at tier 2 — where the
+    # cost of being wrong is high enough that agreement between two reviewers
+    # is not by itself sufficient reason to believe them.
+    arbitration: dict[str, Any] | None = None
+    disagreed = adversary is not None and adversary.get("verdict") != review.get("verdict")
+    if "arbitrate" in bound and adversary is not None and (disagreed or tier == 2):
+        arbitration = dict(
+            runner.run(
+                role="arbitrate",
+                tier="deep",
+                schema=ARBITRATE_SCHEMA,
+                context=context,
+                prompt=(
+                    "Two reviewers have looked at this change. Decide.\n\n"
+                    f"Task: {ticket}\nReview tier: {tier}\n"
+                    f"Charter reviewer: {review.get('verdict')} — {review.get('rationale')}\n"
+                    f"Adversary: {adversary.get('verdict')} — {adversary.get('strongest_objection')}\n"
+                    f"Change facts: {facts}\n\n"
+                    "Say who you sided with and why. 'neither' is allowed."
+                ),
+            )
+        )
+
+    # The last word: arbitration if it ran, otherwise both reviewers must agree.
+    # Silence from an unbound optional role is not an approval, but neither is it
+    # an objection — an unbound adversary simply leaves the charter reviewer
+    # deciding, exactly as before.
+    if arbitration is not None:
+        verdict = arbitration.get("verdict")
+    elif adversary is not None:
+        verdict = "approve" if review.get("verdict") == adversary.get("verdict") == "approve" else "revise"
+    else:
+        verdict = review.get("verdict")
+
+    if verdict == "approve":
         # A draft PR has no effect until someone opens it, which is why it is the
         # one kind that starts eligible. It is still emitted, never executed.
         proposals.append(
@@ -218,7 +376,19 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 kind="draft_pr_create",
                 target=str(ticket),
                 evidence=[
-                    {"check": "review_charter verdict", "output": "approve"},
+                    {"check": "review tier", "output": str(tier)},
+                    {"check": "review_charter verdict", "output": str(review.get("verdict"))},
+                    *(
+                        [{"check": "adversary verdict", "output": str(adversary.get("verdict"))},
+                         {"check": "strongest objection", "output": str(adversary.get("strongest_objection"))}]
+                        if adversary
+                        else []
+                    ),
+                    *(
+                        [{"check": "arbitration", "output": f"{arbitration.get('sided_with')}: {arbitration.get('reasoning')}"}]
+                        if arbitration
+                        else []
+                    ),
                     {"check": "changed lines", "output": str(facts["changed_lines"])},
                     # Normalised into the evidence shape rather than spread raw:
                     # a commands_run entry is keyed `command`, and everything
@@ -239,6 +409,10 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "date": date,
         "ticket": ticket,
         "scope": scope,
+        "review_tier": tier,
+        "handoff": handoff,
+        "adversary": adversary,
+        "arbitration": arbitration,
         "plan": dict(plan),
         "build": dict(build),
         "review": dict(review),

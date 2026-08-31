@@ -23,7 +23,10 @@ def test_runs_end_to_end_and_returns_the_documented_shape(
     cartridge, plan_response, build_response, review_response
 ) -> None:
     result = lifecycle_propose.run(args(cartridge), runner(plan_response, build_response, review_response))
-    assert set(result) == {"run_id", "date", "ticket", "scope", "plan", "build", "review", "change_facts", "proposals"}
+    assert set(result) == {
+        "run_id", "date", "ticket", "scope", "review_tier", "handoff", "adversary",
+        "arbitration", "plan", "build", "review", "change_facts", "proposals",
+    }
 
 
 def test_scoping_is_skipped_when_the_team_has_not_bound_the_role(
