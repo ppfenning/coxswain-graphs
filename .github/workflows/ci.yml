@@ -50,11 +50,12 @@ jobs:
           pip install -e ".[dev]"
           if [ -d .agent-cartridges ]; then
             pip install ./.agent-cartridges
-            echo "PYTEST_ARGS=" >> "$GITHUB_ENV"
           else
             echo "::notice::SUBSTRATE_REPO_TOKEN is not set, so tests needing agent-cartridges are skipped. Add a fine-grained PAT with read access to ppfenning/agent-cartridges to run the full suite."
-            echo "PYTEST_ARGS=--ignore=tests/test_shell_autonomy.py" >> "$GITHUB_ENV"
           fi
 
       # No API key and no network: the scripted runner is what makes that work.
-      - run: pytest -q $PYTEST_ARGS
+      # Which tests to skip without the substrate is decided in tests/conftest.py
+      # by reading the imports, not by a list here — a list here drifts the
+      # moment someone adds a test, and did.
+      - run: pytest -q

@@ -2,7 +2,30 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
+
+# The graphs never import the substrate; only `shell.py` does. That seam is what
+# lets CI run without agent-cartridges (a private sibling repo needing a token
+# the fork of a PR will not have) — but only if the tests that DO need it are
+# skipped rather than failing at collection.
+#
+# Discovered by reading, not by a hand-maintained list: a list drifts the moment
+# someone adds a test, which is exactly what happened when test_phase_runner.py
+# arrived and CI still only knew about test_shell_autonomy.py.
+try:  # pragma: no cover - depends on what is installed
+    import core  # noqa: F401
+
+    collect_ignore: list[str] = []
+except ImportError:  # pragma: no cover
+    _here = pathlib.Path(__file__).parent
+    collect_ignore = [
+        path.name
+        for path in sorted(_here.glob("test_*.py"))
+        if "from shell import" in path.read_text(encoding="utf-8")
+        or "import shell" in path.read_text(encoding="utf-8")
+    ]
 
 CARTRIDGE = {
     "team": "acme",
