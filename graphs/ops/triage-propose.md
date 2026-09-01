@@ -17,27 +17,25 @@ and the fact that neither one drops anything on the floor:
 
 ```mermaid
 flowchart TB
-    QUEUE["alerts (an arg — the graph<br/>does not read the queue)"]
-
+    QUEUE["alerts arrive as an argument<br/>the graph never reads the queue"]
     QUEUE --> FETCH
 
-    FETCH{"fetch<br/>cap: max_alerts (15)"}
-    FETCH -- "over the cap" --> OVER["deferred_overflow<br/><i>counted, returns next run</i>"]
+    FETCH{"fetch<br/>cap: max_alerts, 15"}
+    FETCH -- "over the cap" --> OVER["deferred_overflow<br/>counted, returns next run"]
     FETCH -- "within the cap" --> CLASSIFY
 
-    CLASSIFY["classify<br/><i>role: triage_classify · cheap</i><br/>against the runbook index"]
-
-    CLASSIFY --> VCAP{"cap: verify_cap (5)"}
-    VCAP -- "over the cap" --> CAPD["deferred_for_capacity<br/><i>classified, not verified</i>"]
+    CLASSIFY["classify<br/>role: triage_classify, cheap<br/>against the runbook index"]
+    CLASSIFY --> VCAP{"cap: verify_cap, 5"}
+    VCAP -- "over the cap" --> CAPD["deferred_for_capacity<br/>classified, not verified"]
     VCAP -- "within the cap" --> VERIFY
 
-    VERIFY["verify<br/><i>role: evidence_verify · deep</i><br/>runbook checks, run verbatim<br/>+ the trap for this symptom"]
+    VERIFY["verify<br/>role: evidence_verify, deep<br/>runbook checks run verbatim<br/>plus the trap for this symptom"]
 
-    VERIFY -- "actionable, with checks" --> EMIT["emit<br/>proposals + evidence"]
+    VERIFY -- "actionable, with checks" --> EMIT["emit<br/>proposals and evidence"]
     VERIFY -- "not actionable" --> QUIET["no proposal"]
-    VERIFY -- "no entry matched · trap did not hold ·<br/>weak match · explicit correction" --> HEAL["doc_update proposal<br/><i>the runbook heals itself</i>"]
+    VERIFY -- "no entry matched, trap did not hold,<br/>weak match, or explicit correction" --> HEAL["doc_update proposal<br/>the runbook heals itself"]
 
-    HEAL -.->|"amends"| CLASSIFY
+    HEAL -. "amends the entry classify used" .-> CLASSIFY
 
     OVER --> TOTALS
     CAPD --> TOTALS

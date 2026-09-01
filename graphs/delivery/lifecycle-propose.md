@@ -27,47 +27,48 @@ shell applies it, on the far side of the gate:
 
 ```mermaid
 flowchart TB
-    TICKET["ticket (an arg)"] --> PLAN
+    TICKET["ticket, an argument"] --> SCOPE
 
-    subgraph GRAPH["the graph — pure, no disk, no clock"]
-        SCOPE["scope<br/><i>role: scope_epic · standard</i><br/>epic_threshold + work_routing"]
-        PLAN["plan<br/><i>role: plan · standard</i>"]
-        BUILD["build<br/><i>role: build · standard</i>"]
-        REVIEW["review<br/><i>role: review_charter · deep</i>"]
-        FACTS["change_facts<br/><i>counted from the patch,<br/>not asked of the model</i>"]
+    subgraph GRAPH["the graph: pure, no disk, no clock"]
+        SCOPE["scope<br/>role: scope_epic, standard<br/>epic_threshold and work_routing"]
+        PLAN["plan<br/>role: plan, standard"]
+        BUILD["build<br/>role: build, standard"]
+        FACTS["change_facts<br/>counted from the patch,<br/>never asked of the model"]
+        HANDOFF{"handoff<br/>does build's output contain<br/>what review needs?"}
+        REVIEW["review<br/>role: review_charter, deep"]
+        ADV["adversary<br/>role: review_adversary, deep"]
+        ARB["arbitrate<br/>role: arbitrate, deep"]
         EMIT["emit"]
-
-        HANDOFF{"handoff<br/><i>does build's output contain<br/>what review needs?</i>"}
-        ADV["adversary<br/><i>role: review_adversary · deep</i>"]
-        ARB["arbitrate<br/><i>role: arbitrate · deep</i>"]
+        STOP(["graph stops"])
 
         SCOPE --> PLAN
         PLAN --> BUILD
-        BUILD -- "unified diff<br/>(returned, not applied)" --> FACTS
+        BUILD -- "unified diff, returned not applied" --> FACTS
         FACTS --> HANDOFF
-        HANDOFF -- "incomplete" --> STOP(["graph stops"])
-        HANDOFF -- "complete — small brief" --> REVIEW
-        REVIEW -- "tier 0" --> EMIT
-        REVIEW -- "tier 1+" --> ADV
+        HANDOFF -- "incomplete" --> STOP
+        HANDOFF -- "complete, with a small brief" --> REVIEW
+        REVIEW -- "review_tier 0" --> EMIT
+        REVIEW -- "review_tier 1 or more" --> ADV
         ADV -- "agreed, tier 1" --> EMIT
-        ADV -- "disagreed · or tier 2" --> ARB
+        ADV -- "disagreed, or tier 2" --> ARB
         ARB --> EMIT
         SCOPE -. "item_create proposal" .-> EMIT
     end
 
-    EMIT -- "proposals" --> POLICY{"autonomy_policy<br/><i>has this kind graduated?</i>"}
+    EMIT -- "proposals" --> POLICY{"autonomy_policy<br/>has this kind graduated?"}
     POLICY -- "propose" --> GATE{{"human gate"}}
-    POLICY -- "auto" --> ARM["apply arm (a role)"]
+    POLICY -- "auto" --> ARM["apply arm, a role"]
 
-    subgraph SHELL["shell.py — the only side effects"]
-        APPLY["git apply, in a worktree<br/>the shell created"]
-        RECORD["build_manifest → record_run"]
+    subgraph HARNESS["harness: the only side effects"]
+        APPLY["git apply, in a worktree<br/>the harness created"]
+        RECORD["build_manifest, then record_run"]
     end
 
     GATE -- "approved" --> APPLY
+    ARM --> APPLY
     GATE -- "every decision" --> RECORD
 
-    APPLY -.->|"never"| PUSH["push · open PR · merge"]
+    APPLY -. "never" .-> PUSH["push, open a PR, merge"]
 
     style PUSH stroke-dasharray: 5 5
 ```
