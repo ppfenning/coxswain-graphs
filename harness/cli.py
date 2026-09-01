@@ -227,6 +227,11 @@ def _materialise(spec: GraphSpec, args: argparse.Namespace, parser: argparse.Arg
             continue
         if need.kind == "json_file":
             out[need.name] = json.loads(Path(raw).read_text(encoding="utf-8"))
+        elif need.kind == "jsonl_file":
+            # One JSON object per line — the ledger's own dialect, parsed with
+            # the ledger's own reader so a bad line is named the same way
+            # everywhere. The graph gets rows; the file stays on this side.
+            out[need.name] = list(ledger.read(raw))
         elif need.kind == "text_or_path":
             path = Path(raw)
             out[need.name] = path.read_text(encoding="utf-8") if path.is_file() else raw
@@ -307,9 +312,78 @@ def main(argv: list[str] | None = None) -> int:
             "proposals": proposals,
             "totals": {"ready": len(ready), "completed": len(results), "failed": len(failures)},
         }
+    elif args.graph == "cos" and not getattr(args, "docket", None):
+        # The chief-of-staff driver path. With --docket the cos graph runs alone
+        # through the generic arm below — judgment only, nothing invoked. Without
+        # it, the driver assembles the docket from what is actually readable
+        # (intake queue, ledger, registry), runs the dispatch graph, and invokes
+        # what it selected through the nested-invocation primitive, so every
+        # dispatched proposal lands in the same policy/gate/record as any other.
+        from harness.cos import CosError, assemble_docket, run_cos
+
+        intake_root = next(
+            (
+                entry.get("path")
+                for entry in cartridge.get("intake") or []
+                if isinstance(entry, Mapping) and entry.get("source") == "queue_dir" and entry.get("path")
+            ),
+            None,
+        )
+        docket = assemble_docket(
+            specs=specs,
+            intake_root=intake_root,
+            ledger_path=args.ledger,
+            alerts_present=bool(getattr(args, "alerts", None)),
+        )
+        alerts = (
+            json.loads(Path(args.alerts).read_text(encoding="utf-8")) if getattr(args, "alerts", None) else None
+        )
+        try:
+            cos_out = run_cos(
+                docket=docket,
+                specs=specs,
+                runner=runner,
+                cartridge=cartridge,
+                run_id=run_id,
+                date=args.date,
+                max_parallel=args.max_parallel,
+                intake_root=intake_root,
+                ledger_path=args.ledger,
+                alerts=alerts,
+            )
+        except (ContractViolation, RunnerError, CosError) as exc:
+            print(f"chief-of-staff failed: {exc}", file=sys.stderr)
+            return 1
+        for failure in cos_out["failures"]:
+            print(f"dispatched run failed: {failure}", file=sys.stderr)
+        picked = ", ".join(str(s.get("graph")) for s in cos_out["selections"]) or "nothing (idle)"
+        print(f"chief-of-staff dispatched: {picked}")
+        if cos_out["consumed"]:
+            print(f"intake consumed: {', '.join(cos_out['consumed'])}")
+        graph_name = "chief-of-staff(dispatch)"
+        result = {
+            "run_id": run_id,
+            "date": args.date,
+            "selections": cos_out["selections"],
+            "results": cos_out["results"],
+            "proposals": cos_out["proposals"],
+            "consumed": cos_out["consumed"],
+            "totals": {
+                "selected": len(cos_out["selections"]),
+                "completed": len(cos_out["results"]),
+                "failed": len(cos_out["failures"]),
+                "consumed": len(cos_out["consumed"]),
+            },
+        }
     else:
         spec = specs[args.graph]
         graph_name = spec.graph_name
+        if args.graph == "retro" and getattr(args, "ledger_rows", None) is None:
+            # The rows retro reasons over default to the ledger this harness
+            # already keeps. Explicit --ledger-rows still points it anywhere —
+            # a retro over some other record is a legitimate ask — but the graph
+            # itself never reads either; the harness does, right here.
+            args.ledger_rows = str(args.ledger)
         graph_args: dict[str, Any] = {"run_id": run_id, "date": args.date, "cartridge": cartridge}
         graph_args.update(_materialise(spec, args, parser))
         try:
