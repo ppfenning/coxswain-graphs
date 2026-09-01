@@ -26,6 +26,7 @@ from core.manifest import build_manifest, record_run
 from graphs._contract import ContractViolation
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, run_checks
+from harness.escalate import escalate_self_modification
 from harness.gate import apply_decisions, auto_apply, gate
 from harness.phase import run_phase
 from harness.registry import GraphSpec, discover
@@ -37,6 +38,14 @@ from runner.protocol import RunnerError
 __all__ = ["main"]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _governance_line(hits: list[str], *, label: str = "") -> str:
+    where = f"{label}: " if label else ""
+    return (
+        f"{where}governance paths touched ({len(hits)}): "
+        f"{', '.join(hits)} — proposals escalated to self_modification"
+    )
 
 
 def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
@@ -250,6 +259,33 @@ def main(argv: list[str] | None = None) -> int:
                     evidence_rows.extend(checks_evidence(check_results))
                 for item in targets:
                     item.setdefault("evidence", []).extend(evidence_rows)
+
+    # Escalation, from the patch's paths alone. Here because it must land AFTER
+    # the graph named its kinds and the check arm attached its verdict — the
+    # gate should see the tests' opinion of a governance change too — and
+    # BEFORE the policy split, which is the only window where no streak on a
+    # mundane kind can carry an edit to the rules past the gate.
+    if args.graph == "phase":
+        escalated: list[dict[str, Any]] = []
+        for r in results:
+            slice_, hits = escalate_self_modification(
+                r.get("proposals", []),
+                patch=r.get("build", {}).get("patch") or "",
+                cartridge=cartridge,
+                ledger_path=args.ledger,
+            )
+            r["proposals"] = slice_
+            if hits:
+                print(_governance_line(hits, label=str(r.get("ticket") or "task")))
+            escalated.extend(slice_)
+        proposals = result["proposals"] = escalated
+    elif result.get("build", {}).get("patch"):
+        proposals, hits = escalate_self_modification(
+            proposals, patch=result["build"]["patch"], cartridge=cartridge, ledger_path=args.ledger
+        )
+        result["proposals"] = proposals
+        if hits:
+            print(_governance_line(hits))
 
     # Consult the policy BEFORE the human sees anything. Without this the gate
     # asks about every kind forever, no streak is ever spent, and the whole

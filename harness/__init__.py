@@ -16,6 +16,7 @@ deliberate: everything worth unit-testing lives on the other side of it.
 """
 
 from harness.autonomy import split_by_policy
+from harness.escalate import escalate_self_modification, touched_paths
 from harness.gate import APPLY_SCHEMA, apply_arm_for, apply_decisions, auto_apply, gate
 from harness.invoke import Invocation, InvokeError, invoke_graphs
 from harness.phase import run_phase
@@ -37,12 +38,14 @@ __all__ = [
     "auto_apply",
     "build_runner",
     "discover",
+    "escalate_self_modification",
     "gate",
     "invoke_graphs",
     "resolve_cartridge",
     "role_skill_bodies",
     "run_phase",
     "split_by_policy",
+    "touched_paths",
 ]
 
 # Compatibility aliases for the shell-era private names, so downstream code and
