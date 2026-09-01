@@ -419,3 +419,16 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "change_facts": facts,
         "proposals": proposals,
     }
+
+
+from graphs._spec import GraphSpec, Need  # noqa: E402
+
+SPEC = GraphSpec(
+    name="lifecycle",
+    graph_name=GRAPH_NAME,
+    run=run,
+    summary="the development loop: scope, plan, build, review — proposals out, nothing pushed",
+    needs=(
+        Need("ticket", flag="--ticket", help="the ticket to work"),
+    ),
+)

@@ -22,7 +22,7 @@ live = ["anthropic>=0.40"]
 dev = ["pytest>=8"]
 
 [tool.setuptools]
-packages = ["graphs", "runner"]
+packages = ["graphs", "runner", "harness"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

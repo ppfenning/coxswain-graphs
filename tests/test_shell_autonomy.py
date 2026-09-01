@@ -1,4 +1,4 @@
-"""The autonomy loop, end to end through the shell.
+"""The autonomy loop, end to end through the harness.
 
 These exist because the policy module was fully implemented and fully unit
 tested while the shell never once called it — every proposal went to the gate
@@ -13,7 +13,9 @@ from pathlib import Path
 import pytest
 
 from core import ledger
-from shell import _apply_arm_for, _auto_apply, _split_by_policy
+from harness import apply_arm_for as _apply_arm_for
+from harness import auto_apply as _auto_apply
+from harness import split_by_policy as _split_by_policy
 
 SHA = "sha-fixture"
 PROFILE = "anthropic-default"

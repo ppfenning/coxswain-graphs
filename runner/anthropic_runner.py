@@ -8,8 +8,8 @@ YAML file.
 
 Two indirections are resolved here and nowhere else:
 
-    tier  -> model     from the provider profile
-    role  -> context   from the resolved cartridge
+    tier  -> model       from the provider profile
+    role  -> skill body  from the cartridge's bindings, handed in by the harness
 
 The provider profile names an env var for the key. It never carries the value,
 and neither does any cartridge, graph, or test fixture.
@@ -62,7 +62,12 @@ class AnthropicRunner:
         client: Any = None,
         max_tokens: int = 16000,
         extra_system: str = "",
+        role_skills: Mapping[str, str] | None = None,
     ) -> None:
+        # role -> path of the skill body the cartridge bound to it, resolved by
+        # the harness. Prepended to the node's system below — the moment a
+        # binding stops being a validated name and becomes what the node knows.
+        self.role_skills = dict(role_skills or {})
         self.profile = dict(profile)
         self.tiers = dict(self.profile.get("tiers") or {})
         if not self.tiers:
@@ -117,7 +122,11 @@ class AnthropicRunner:
         context: Sequence[str] = (),
     ) -> NodeResult:
         model = self._model_for(tier)
-        system = "\n\n".join(part for part in (self._read_context(context), self.extra_system) if part)
+        # The bound skill body leads the system prompt: it is the role's craft,
+        # and the context packs are the team's rules it applies them under.
+        body = self.role_skills.get(role)
+        packs = [body, *context] if body else list(context)
+        system = "\n\n".join(part for part in (self._read_context(packs), self.extra_system) if part)
 
         response = self._client.messages.create(
             model=model,

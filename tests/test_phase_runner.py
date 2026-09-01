@@ -13,7 +13,12 @@ import time
 
 import pytest
 
-from shell import _run_phase
+from functools import partial
+
+from graphs import lifecycle_propose
+from harness import run_phase
+
+_run_phase = partial(run_phase, lifecycle_run=lifecycle_propose.run)
 
 TASKS = [
     {"id": "t2-second", "surfaces": []},

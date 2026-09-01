@@ -256,3 +256,17 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "immediately_startable": len(unblocked),
         },
     }
+
+
+from graphs._spec import GraphSpec, Need  # noqa: E402
+
+SPEC = GraphSpec(
+    name="decompose",
+    graph_name=GRAPH_NAME,
+    run=run,
+    summary="an idea into phases and a task DAG, with the edges attacked before anyone trusts them",
+    needs=(
+        Need("idea", flag="--idea", kind="text_or_path",
+             help="the initiative, as prose or a path to a file holding it"),
+    ),
+)

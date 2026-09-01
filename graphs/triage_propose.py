@@ -252,3 +252,21 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "runbook_gaps": runbook_gaps,
         },
     }
+
+
+# How a harness offers this graph as a subcommand. See graphs/_spec.py for
+# why the spec is declarative and why the types live with the graphs.
+from graphs._spec import GraphSpec, Need  # noqa: E402
+
+SPEC = GraphSpec(
+    name="triage",
+    graph_name=GRAPH_NAME,
+    run=run,
+    summary="morning triage of an alert queue; read-only, proposes runbook corrections",
+    needs=(
+        Need("alerts", flag="--alerts", kind="json_file",
+             help="path to a JSON list of alerts; this graph does not read the queue itself"),
+        Need("max_alerts", flag="--max-alerts", kind="int", required=False,
+             help="fetch cap (default 15)"),
+    ),
+)

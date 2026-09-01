@@ -6,7 +6,7 @@ import pathlib
 
 import pytest
 
-# The graphs never import the substrate; only `shell.py` does. That seam is what
+# The graphs never import the substrate; only the harness does. That seam is what
 # lets CI run without agent-cartridges (a private sibling repo needing a token
 # the fork of a PR will not have) — but only if the tests that DO need it are
 # skipped rather than failing at collection.
@@ -23,8 +23,11 @@ except ImportError:  # pragma: no cover
     collect_ignore = [
         path.name
         for path in sorted(_here.glob("test_*.py"))
-        if "from shell import" in path.read_text(encoding="utf-8")
-        or "import shell" in path.read_text(encoding="utf-8")
+        if any(
+            marker in path.read_text(encoding="utf-8")
+            # the harness imports the substrate; the graphs never do
+            for marker in ("from shell import", "import shell", "from harness", "import harness")
+        )
     ]
 
 CARTRIDGE = {

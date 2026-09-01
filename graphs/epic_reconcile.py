@@ -170,3 +170,19 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "corrections_proposed": len(proposals),
         },
     }
+
+
+from graphs._spec import GraphSpec, Need  # noqa: E402
+
+SPEC = GraphSpec(
+    name="reconcile",
+    graph_name=GRAPH_NAME,
+    run=run,
+    summary="declared state vs actual: set arithmetic first, judgment second",
+    needs=(
+        Need("epic", flag="--epic", kind="json_file",
+             help="the epic's DECLARED state, as JSON; this graph does not read the tracker itself"),
+        Need("observed", flag="--observed", kind="json_file",
+             help="the board's ACTUAL state, as JSON"),
+    ),
+)
