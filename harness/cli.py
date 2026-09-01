@@ -13,14 +13,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import uuid
+from collections.abc import Mapping
 from datetime import date as date_type
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from core import workstore
+from core import ledger, workstore
 from core.cartridge import CartridgeError
 from core.manifest import build_manifest, record_run
 from graphs._contract import ContractViolation
@@ -38,6 +40,103 @@ from runner.protocol import RunnerError
 __all__ = ["main"]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _default_ledger() -> Path:
+    """Where the trust record lives when nobody says otherwise: OUT of the tree.
+
+    The obvious default is `REPO_ROOT / "ledger.jsonl"`, and it is wrong. This
+    system patches its own working tree and, under the epic driver, branches it.
+    Path-protection via escalation only governs changes that arrive as
+    proposals — a file inside the tree can also be edited by any approved patch
+    that claims some other purpose entirely, and a trust record you can reach
+    through the very thing it governs is not a record. Out of the tree, no patch
+    the system applies can touch it; and `governance_hits` still matches the
+    ledger on BASENAME, so a patch that tries to plant a shadow copy inside the
+    tree escalates instead of quietly becoming the ledger.
+
+    Read at call time, not import time: `XDG_STATE_HOME` is environment, and
+    environment is something a test — or a user — gets to change.
+    """
+    state = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(state).expanduser() / "agent-graphs" / "ledger.jsonl"
+
+
+def _observe_trap_failures(
+    result: dict[str, Any],
+    *,
+    graph_name: str,
+    ts: str,
+    cartridge: dict[str, Any],
+    provider_profile: str,
+    ledger_path: Path | str,
+) -> int:
+    """File a `failure` observation for every runbook entry whose trap did not hold.
+
+    Verify is a detector, and detectors file observations. Today its verdict
+    reaches a `doc_update` proposal and nothing else, so an entry demonstrated
+    wrong IN USE keeps its streak until a human happens to refuse something —
+    which is backwards: the run already established the fact, and standing
+    should not wait on someone noticing. Rule 3 has always contemplated this
+    shape ("a post-hoc detector fired"); this is the detector.
+
+    Deliberately narrow:
+
+    -   `is False` exactly. A missing or None `trap_held` is a graph that did
+        not answer, not evidence the trap was wrong, and demoting on silence
+        would make the detector punish incomplete runs.
+    -   Unverified items observe nothing. An item deferred for capacity was
+        never checked; it has no verdict to file.
+    -   A subject_new gap — no runbook entry matched — observes nothing. There
+        is no streak to demote, and inventing a subject for an entry that does
+        not exist yet would create a track record out of its absence.
+
+    Returns how many observations were filed. The row is a `failure` by
+    construction (`append_observation` sets the outcome), which per the policy
+    resets THAT ENTRY's streak and doubles its bar while every other entry's
+    streak stands untouched.
+    """
+    triaged = result.get("triaged") or []
+    hits = [
+        entry
+        for item in triaged
+        if item.get("verified")
+        and (item.get("verification") or {}).get("trap_held") is False
+        and (entry := str((item.get("classification") or {}).get("runbook_entry") or "").strip())
+    ]
+    if not hits:
+        return 0
+
+    # Risk comes off the taxonomy, never from here. A cartridge that cannot name
+    # the kind cannot say what it risks, and a row with an invented risk is a
+    # row the policy would count against the wrong bar.
+    spec = (cartridge.get("write_kinds") or {}).get("doc_update")
+    risk = spec.get("risk") if isinstance(spec, Mapping) else None
+    if not risk:
+        print(
+            f"trap did not hold for {len(hits)} entry(ies) but cartridge "
+            f"'{cartridge.get('team', '?')}' declares no risk for 'doc_update'; "
+            "no observation recorded — risk is read off the taxonomy, never invented",
+            file=sys.stderr,
+        )
+        return 0
+
+    for entry in hits:
+        ledger.append_observation(
+            {
+                "run_id": result.get("run_id"),
+                "ts": ts,
+                "principal": graph_name,
+                "kind": "doc_update",
+                "risk": risk,
+                "subject": entry,
+                "cartridge_sha": cartridge.get("cartridge_sha"),
+                "provider_profile": provider_profile,
+            },
+            ledger_path,
+        )
+        print(f"observation: trap did not hold for '{entry}' — recorded against its streak")
+    return len(hits)
 
 
 def _governance_line(hits: list[str], *, label: str = "") -> str:
@@ -94,7 +193,10 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     parser.add_argument("--scripted", metavar="JSON", help="run offline against canned node responses")
     parser.add_argument("--assume", choices=["a", "e", "r"], help="answer the gate non-interactively")
     parser.add_argument("--runs-dir", default=REPO_ROOT / "runs")
-    parser.add_argument("--ledger", default=REPO_ROOT / "ledger.jsonl")
+    # Runs stay in the tree — they are artifacts, and an artifact is allowed to
+    # be branched away with the work it describes. The ledger is not an
+    # artifact; see `_default_ledger`.
+    parser.add_argument("--ledger", default=_default_ledger())
     parser.add_argument("--worktree-root", help="override the cartridge's worktree_root")
     parser.add_argument(
         "--repo",
@@ -323,9 +425,10 @@ def main(argv: list[str] | None = None) -> int:
             if not ok:
                 print(f"  {detail}", file=sys.stderr)
 
+    ts = datetime.now(timezone.utc).isoformat()
     manifest = build_manifest(
         run_id=run_id,
-        ts=datetime.now(timezone.utc).isoformat(),
+        ts=ts,
         principal=graph_name,
         cartridge=cartridge,
         provider_profile=provider_profile,
@@ -335,6 +438,18 @@ def main(argv: list[str] | None = None) -> int:
         totals={**result.get("totals", {}), "auto_applied": len(auto_applied), "gated": len(gated)},
     )
     record_run(manifest, runs_dir=args.runs_dir, ledger_path=args.ledger)
+
+    # And then what the run itself established, on the same clock as the
+    # manifest. This lands AFTER record_run because it is a post-hoc verdict on
+    # a run already recorded, not a second opinion on the gate.
+    _observe_trap_failures(
+        result,
+        graph_name=graph_name,
+        ts=ts,
+        cartridge=cartridge,
+        provider_profile=provider_profile,
+        ledger_path=args.ledger,
+    )
 
     print(f"\nrecorded {run_id}: {len(auto_applied)} auto-applied, {len(diffs)} gated decision(s), {len(proposals)} proposal(s)")
     print(f"  manifest: {Path(args.runs_dir) / (run_id + '.json')}")
