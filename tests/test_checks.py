@@ -1,0 +1,245 @@
+"""The check arm: run the project's commands, in the state they were applied to.
+
+`_change_facts` in `graphs/delivery/lifecycle_propose.py` counts a diff's shape
+from the patch instead of asking the build node to self-report it. These tests
+hold `harness/checks.py` and `harness/worktree.py`'s `create_worktree` to the
+same discipline: pass/fail counts come from parsing real subprocess output, a
+check missing `name` or `cmd` is refused rather than quietly dropped, a check
+that never finishes is a failure and not an absence, and — the one that would
+be silently wrong if the wiring were off by a step — a check run after
+`apply_patch` actually sees the patched file, not the pre-patch one.
+
+Offline throughout: real `git` and `sys.executable`, no network.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
+from harness.checks import all_passed, checks_evidence, run_checks
+from harness.worktree import apply_patch, create_worktree
+
+
+def _run(cmd: list[str], cwd) -> None:
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    assert result.returncode == 0, f"{cmd} failed: {result.stderr}"
+
+
+def _init_repo(path, *, filename="a.txt", content="one\n"):
+    """A tiny real git repo: init, local identity, one commit."""
+    path.mkdir(parents=True, exist_ok=True)
+    _run(["git", "init", "-q"], cwd=path)
+    _run(["git", "config", "user.email", "test@example.com"], cwd=path)
+    _run(["git", "config", "user.name", "Test"], cwd=path)
+    (path / filename).write_text(content, encoding="utf-8")
+    _run(["git", "add", filename], cwd=path)
+    _run(["git", "commit", "-q", "-m", "initial"], cwd=path)
+    return path
+
+
+def _head(path) -> str:
+    result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def _py(code: str) -> str:
+    """A shell-safe `sys.executable -c <code>` invocation for run_checks.
+
+    Wrapped in literal double quotes rather than `repr()`'d: `repr` turns a
+    real newline into the two characters `\\` and `n`, which survives a shell
+    round-trip as those two characters rather than as a newline — the script
+    it hands to `python -c` is not the script that was written. Every check
+    command here sticks to single quotes internally so the double-quote
+    wrapper never has to escape anything.
+    """
+    return f'{sys.executable} -c "{textwrap.dedent(code).strip()}"'
+
+
+# ---------------------------------------------------------------------------
+# run_checks
+# ---------------------------------------------------------------------------
+
+
+def test_run_checks_passing_cmd_reports_counts_and_passed(tmp_path) -> None:
+    checks = [{"name": "tests", "cmd": _py("print('3 passed')")}]
+    [result] = run_checks(tmp_path, checks)
+    assert result["passed"] is True
+    assert result["exit_code"] == 0
+    assert result["counts"] == {"passed": 3}
+    assert result["name"] == "tests"
+
+
+def test_run_checks_failing_cmd_reports_both_counts_and_failure(tmp_path) -> None:
+    """Mixed output ('1 failed, 2 passed') parses every token, not just the first."""
+    checks = [
+        {
+            "name": "tests",
+            "cmd": _py("import sys; print('1 failed, 2 passed'); sys.exit(1)"),
+        }
+    ]
+    [result] = run_checks(tmp_path, checks)
+    assert result["passed"] is False
+    assert result["exit_code"] == 1
+    assert result["counts"] == {"failed": 1, "passed": 2}
+
+
+def test_run_checks_no_counts_in_output_is_empty_not_invented(tmp_path) -> None:
+    """A check whose output names no pass/fail tokens gets an EMPTY counts dict,
+    never a guessed one — the whole point of counting from reality."""
+    checks = [{"name": "lint", "cmd": _py("print('no complaints here')")}]
+    [result] = run_checks(tmp_path, checks)
+    assert result["passed"] is True
+    assert result["counts"] == {}
+
+
+def test_run_checks_missing_name_is_refused(tmp_path) -> None:
+    with pytest.raises(ValueError):
+        run_checks(tmp_path, [{"cmd": "true"}])
+
+
+def test_run_checks_missing_cmd_is_refused(tmp_path) -> None:
+    with pytest.raises(ValueError):
+        run_checks(tmp_path, [{"name": "tests"}])
+
+
+def test_run_checks_timeout_is_a_failure_not_an_absence(tmp_path) -> None:
+    """A check that never finishes is not 'still pending' — it failed, with no
+    exit code, and the output tail says so."""
+    checks = [{"name": "hangs", "cmd": _py("import time; time.sleep(5)")}]
+    [result] = run_checks(tmp_path, checks, timeout=0.3)
+    assert result["passed"] is False
+    assert result["exit_code"] is None
+    assert "timed out" in result["output_tail"]
+
+
+def test_run_checks_output_tail_is_bounded(tmp_path) -> None:
+    checks = [{"name": "noisy", "cmd": _py("print('x' * 5000)")}]
+    [result] = run_checks(tmp_path, checks)
+    assert len(result["output_tail"]) <= 2000
+
+
+# ---------------------------------------------------------------------------
+# checks_evidence
+# ---------------------------------------------------------------------------
+
+
+def test_checks_evidence_verdict_first_with_counts() -> None:
+    results = [{"name": "tests", "cmd": "pytest -q", "passed": True, "exit_code": 0, "counts": {"passed": 12}}]
+    [row] = checks_evidence(results)
+    assert row["check"] == "checks:tests"
+    assert row["output"].startswith("pass —")
+    assert "12 passed" in row["output"]
+    assert "exit 0" in row["output"]
+
+
+def test_checks_evidence_failure_is_all_caps_fail_with_exit_code() -> None:
+    results = [{"name": "tests", "cmd": "pytest -q", "passed": False, "exit_code": 1, "counts": {"failed": 2, "passed": 10}}]
+    [row] = checks_evidence(results)
+    assert row["output"].startswith("FAIL —")
+    assert "2 failed" in row["output"]
+    assert "10 passed" in row["output"]
+    assert "exit 1" in row["output"]
+
+
+def test_checks_evidence_exit_code_present_even_with_no_counts() -> None:
+    results = [{"name": "lint", "cmd": "lint", "passed": True, "exit_code": 0, "counts": {}}]
+    [row] = checks_evidence(results)
+    assert "exit 0" in row["output"]
+
+
+def test_all_passed() -> None:
+    assert all_passed([{"passed": True}, {"passed": True}]) is True
+    assert all_passed([{"passed": True}, {"passed": False}]) is False
+    assert all_passed([]) is True
+
+
+# ---------------------------------------------------------------------------
+# create_worktree
+# ---------------------------------------------------------------------------
+
+
+def test_create_worktree_creates_it_at_head(tmp_path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    worktree = tmp_path / "wt"
+    ok, detail = create_worktree(repo, worktree, branch="agents/run-1")
+    assert ok, detail
+    assert (worktree / "a.txt").read_text(encoding="utf-8") == "one\n"
+    assert (worktree / ".git").exists()
+
+
+def test_create_worktree_existing_branch_fails_with_gits_message(tmp_path) -> None:
+    """The caller picks unique branch names; guessing a suffix here would
+    silently attach the work to the wrong branch, so this just surfaces
+    git's own refusal."""
+    repo = _init_repo(tmp_path / "repo")
+    _run(["git", "branch", "taken"], cwd=repo)
+    ok, detail = create_worktree(repo, tmp_path / "wt", branch="taken")
+    assert not ok
+    assert "taken" in detail
+
+
+def test_create_worktree_base_ref_respected(tmp_path) -> None:
+    """Two commits; basing on the first must produce the FIRST commit's file
+    state in the new worktree, not the second's."""
+    repo = _init_repo(tmp_path / "repo")
+    first = _head(repo)
+    (repo / "a.txt").write_text("two\n", encoding="utf-8")
+    _run(["git", "add", "a.txt"], cwd=repo)
+    _run(["git", "commit", "-q", "-m", "second"], cwd=repo)
+
+    worktree = tmp_path / "wt"
+    ok, detail = create_worktree(repo, worktree, branch="agents/based", base=first)
+    assert ok, detail
+    assert (worktree / "a.txt").read_text(encoding="utf-8") == "one\n"
+
+
+# ---------------------------------------------------------------------------
+# integration: create_worktree + apply_patch + run_checks see the SAME state
+# ---------------------------------------------------------------------------
+
+
+def test_checks_run_against_the_applied_state_not_the_pre_patch_one(tmp_path) -> None:
+    """The entire point of the check arm: a check that greps for the patched
+    line must find it, which only happens if apply_patch actually landed the
+    diff in the same worktree run_checks executes in."""
+    repo = _init_repo(tmp_path / "repo", filename="status.txt", content="pending\n")
+    worktree = tmp_path / "wt"
+    ok, detail = create_worktree(repo, worktree, branch="agents/patch-run")
+    assert ok, detail
+
+    # Produce a real unified diff by editing inside the worktree and asking git
+    # for it, then undo the edit — the diff is applied for real by apply_patch,
+    # the thing under test, not by this edit.
+    (worktree / "status.txt").write_text("patched\n", encoding="utf-8")
+    diff = subprocess.run(["git", "diff"], cwd=worktree, capture_output=True, text=True).stdout
+    assert diff, "expected git to produce a non-empty diff"
+    _run(["git", "checkout", "--", "status.txt"], cwd=worktree)
+    assert (worktree / "status.txt").read_text(encoding="utf-8") == "pending\n"
+
+    applied_ok, applied_detail = apply_patch(diff, worktree)
+    assert applied_ok, applied_detail
+    assert (worktree / "status.txt").read_text(encoding="utf-8") == "patched\n"
+
+    checks = [
+        {
+            "name": "grep-patched",
+            "cmd": _py(
+                """
+                import sys
+                content = open('status.txt').read()
+                if 'patched' in content:
+                    print('1 passed')
+                    sys.exit(0)
+                print('1 failed')
+                sys.exit(1)
+                """
+            ),
+        }
+    ]
+    [result] = run_checks(worktree, checks)
+    assert result["passed"] is True
+    assert result["counts"] == {"passed": 1}

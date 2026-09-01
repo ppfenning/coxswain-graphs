@@ -25,12 +25,13 @@ from core.cartridge import CartridgeError
 from core.manifest import build_manifest, record_run
 from graphs._contract import ContractViolation
 from harness.autonomy import split_by_policy
+from harness.checks import all_passed, checks_evidence, run_checks
 from harness.gate import apply_decisions, auto_apply, gate
 from harness.phase import run_phase
 from harness.registry import GraphSpec, discover
 from harness.resolve import resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
-from harness.worktree import apply_patch
+from harness.worktree import apply_patch, create_worktree
 from runner.protocol import RunnerError
 
 __all__ = ["main"]
@@ -86,6 +87,14 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     parser.add_argument("--runs-dir", default=REPO_ROOT / "runs")
     parser.add_argument("--ledger", default=REPO_ROOT / "ledger.jsonl")
     parser.add_argument("--worktree-root", help="override the cartridge's worktree_root")
+    parser.add_argument(
+        "--repo",
+        help=(
+            "the repository this change targets; enables the check arm: the patch is "
+            "applied in a real worktree of it and the configured checks run there "
+            "before the gate"
+        ),
+    )
     parser.add_argument("--date", default=date_type.today().isoformat())
     parser.add_argument("--run-id", default=None)
     return parser
@@ -205,6 +214,43 @@ def main(argv: list[str] | None = None) -> int:
     provider_profile = Path(args.provider_profile).stem
     proposals = result.get("proposals", [])
 
+    # The check arm. Only when --repo names the project this change targets,
+    # and only for the single-graph lifecycle path — the epic driver arriving
+    # separately owns fanning this out across a phase's per-task results. It
+    # runs BEFORE the policy and the gate see anything: evidence attached
+    # after the decision is already made is decoration, not evidence.
+    if args.repo and args.graph == "lifecycle" and result.get("build", {}).get("patch"):
+        root = Path(args.worktree_root or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees"))
+        worktree = Path(str(root)).expanduser() / run_id
+        targets = [p for p in proposals if p.get("kind") == "draft_pr_create"]
+
+        wt_ok, wt_detail = create_worktree(Path(args.repo), worktree, branch=f"agents/{run_id}")
+        if not wt_ok:
+            print(f"\nworktree FAILED for agents/{run_id}: {wt_detail}", file=sys.stderr)
+            for item in targets:
+                item.setdefault("evidence", []).append({"check": "patch_apply", "output": f"FAIL — {wt_detail}"})
+        else:
+            ok, detail = apply_patch(result["build"]["patch"], worktree)
+            print(f"\npatch {'applied in' if ok else 'FAILED to apply in'} {worktree}")
+            if not ok:
+                print(f"  {detail}", file=sys.stderr)
+                for item in targets:
+                    item.setdefault("evidence", []).append({"check": "patch_apply", "output": f"FAIL — {detail}"})
+            else:
+                evidence_rows = [{"check": "patch_apply", "output": f"ok — applied in {worktree}"}]
+                checks_config = (cartridge.get("landing_areas") or {}).get("checks") or []
+                if not checks_config:
+                    print("no checks configured; the gate decides on review evidence alone")
+                else:
+                    check_results = run_checks(worktree, checks_config)
+                    result["checks"] = check_results
+                    for r in check_results:
+                        print(f"  check {r['name']}: {'pass' if r['passed'] else 'FAIL'} (exit {r['exit_code']})")
+                    print(f"  checks overall: {'all passed' if all_passed(check_results) else 'FAILURES present'}")
+                    evidence_rows.extend(checks_evidence(check_results))
+                for item in targets:
+                    item.setdefault("evidence", []).extend(evidence_rows)
+
     # Consult the policy BEFORE the human sees anything. Without this the gate
     # asks about every kind forever, no streak is ever spent, and the whole
     # earned-autonomy argument is decoration.
@@ -227,8 +273,11 @@ def main(argv: list[str] | None = None) -> int:
     decisions, human_minutes = gate(gated, assume=args.assume)
     diffs = apply_decisions(decisions, cartridge=cartridge, runner=runner)
 
-    # A build patch is applied only after the gate approved the work it belongs to.
-    if args.graph == "lifecycle" and result.get("build", {}).get("patch"):
+    # A build patch is applied only after the gate approved the work it belongs
+    # to. Skipped when --repo already ran the check arm above: the work is
+    # already applied in a real worktree, and applying it again into the old
+    # scratch dir would be redundant at best and misleading at worst.
+    if not args.repo and args.graph == "lifecycle" and result.get("build", {}).get("patch"):
         approved = any(d["decision"] == "approved" for d in diffs)
         if approved:
             root = Path(args.worktree_root or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees"))

@@ -5,7 +5,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-__all__ = ["apply_patch"]
+__all__ = ["apply_patch", "create_worktree"]
 
 
 def apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
@@ -27,4 +27,27 @@ def apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
         capture_output=True,
         text=True,
     )
+    return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def create_worktree(repo: Path, worktree: Path, *, branch: str, base: str | None = None) -> tuple[bool, str]:
+    """Check out a real worktree OF the project, not a scratch dir beside it.
+
+    The scratch `git init` directory `apply_patch` falls back to can hold a
+    diff, but it has no source tree behind it — no dependencies installed, no
+    project config, nothing a check command could run against. Checks need the
+    project, so they need a worktree of the actual repo, and the harness owns
+    this one for the same reason it owns the scratch one: the one place
+    anything here writes to a working tree is the harness, never the node that
+    produced the patch.
+
+    If `branch` already exists, this fails with git's own message rather than
+    guessing a suffix — the caller is responsible for choosing a unique name,
+    because silently renaming it would attach the work to the wrong branch
+    without anyone deciding that.
+    """
+    cmd = ["git", "-C", str(repo), "worktree", "add", "-b", branch, str(worktree)]
+    if base is not None:
+        cmd.append(base)
+    result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0, (result.stderr or result.stdout).strip()
