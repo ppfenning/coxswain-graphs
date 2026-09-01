@@ -31,6 +31,7 @@ class Need:
         str           pass the flag's value through
         int           integer
         json_file     the flag names a JSON file; the graph gets the parsed data
+        jsonl_file    the flag names a JSON-Lines file; the graph gets the parsed rows
         text_or_path  prose, or a path to a file holding it (read if it exists)
     """
 
