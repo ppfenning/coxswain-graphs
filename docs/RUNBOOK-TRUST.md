@@ -1,7 +1,17 @@
 # Trust is earned per runbook entry
 
-**Status:** design note. Not implemented. Touches `agent-cartridges/core/policy.py`,
-the ledger schema, and `triage_propose.py`.
+**Status:** implemented (2026-09-01). `agent-cartridges/core/policy.py` counts
+streaks per `subject` with a kind-level fallback and gates `subject_new`
+unconditionally; ledger rows carry the optional `subject`; triage's `doc_update`
+proposals name their entry; and the harness files a `failure` observation
+against an entry whose trap did not hold (`harness/cli.py`), so demotion no
+longer waits for a human to refuse something. The open questions below were
+resolved as: the incident signal enters as an argument-shaped observation from
+the harness after the run; blast radius is narrow (only the implicated entry);
+an amendment does not yet reset the entry's streak (deferred — it needs entry
+content hashing, and a wrong amendment still demotes on its next failure); the
+schema grew the nullable `subject` exactly as proposed; and the field was not
+generalised beyond graphs that have one.
 
 ## The gap
 

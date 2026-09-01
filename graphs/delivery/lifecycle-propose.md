@@ -121,9 +121,15 @@ record look better than the run was.
 **Returns:** `{run_id, date, ticket, plan, build, review, change_facts, fix_loop,
 proposals[]}` — `plan`/`build`/`review` hold the final round's values.
 
-**Deferred from v0:** intake queue (the ticket arrives as an arg), the
-adversarial reviewer pair, arbitration, verification, retro. Staging a draft PR
-is *emitted* as a `draft_pr_create` proposal and never executed.
+**Formerly deferred, now landed elsewhere:** the adversarial reviewer pair and
+arbitration live in this graph; verification became the harness's check arm
+(`--repo` applies the patch in a real worktree and runs `landing_areas.checks`,
+attaching machine evidence before the gate); retro is its own graph
+(`graphs/ops/retro-propose.md`); and intake is a queue directory the
+chief-of-staff driver drains (`graphs/ops/chief-of-staff.md`). The ticket still
+arrives as an argument — a graph that read a queue could not be replayed.
+Staging a draft PR is *emitted* as a `draft_pr_create` proposal and never
+executed by this graph.
 
 *Epic-threshold scoping was on that list and is now implemented* — `epic_threshold`
 and `work_routing` were declared in the base cartridge and read by no code,

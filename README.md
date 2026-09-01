@@ -15,8 +15,10 @@ Four nouns, one seam each:
 ```
 harness/   the runtime. resolve, discover, run, gate, apply, record
 graphs/    the programs. pure functions of (args, runner)
-  delivery/   work that produces work: initiative-decompose, lifecycle-propose
-  ops/        keeping a running system honest: triage-propose, epic-reconcile
+  delivery/   work that produces work: initiative-decompose, lifecycle-propose,
+              phase-validate (the epic driver's validators)
+  ops/        keeping a running system honest: triage-propose, epic-reconcile,
+              retro-propose, chief-of-staff
 runner/    node execution: the protocol, a scripted runner, the live one
 shell.py   two-line compatibility shim; `python shell.py ...` still works
 docs/      the contract every graph must satisfy
@@ -77,6 +79,9 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 | `lifecycle-propose` | delivery | scope → plan → build (worktree) → handoff → review → adversary → arbitrate → emit |
 | `triage-propose` | ops | fetch → classify → verify → emit. Zero writes; proposes corrections to the runbook it just used |
 | `epic-reconcile` | ops | compare (set arithmetic) → reconcile → emit. Declared state vs actual |
+| `phase-validate` | delivery | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver |
+| `retro-propose` | ops | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite |
+| `chief-of-staff` | ops | one `dispatch` node over a driver-assembled docket. Selects; the harness invokes |
 
 ## A phased build, with no tracker
 
@@ -99,6 +104,21 @@ over them **at the same time**, each in its own worktree.
 second command has something real to schedule: two ready tasks run in
 parallel, and the third stays blocked because its dependency edges are real.
 
+`epic` is the driver above `phase`: it walks the phase graph in dependency
+order, stacks each phase's branch on its parent's head in the repository
+`--repo` names, fans the lifecycle graph out per ready task, applies and
+CHECKS every patch in a worktree it owns (`landing_areas.checks` — pass/fail
+and parsed counts attach to the proposal as machine evidence), invokes the
+`phase-validate` graph, and holds one gate per phase. Drafts land as local
+branches, `merge_stack` joins them to the phase branch once earned or
+approved, and nothing ever merges to the default branch — `merge_main` is
+human-gated always, and the driver has no code path that emits it. Add
+`--fix-attempts` to bound the lifecycle fix loop; a task that passes on a
+retry carries its attempt count into the ledger, where a repeated-attempt
+pass does not extend a streak. See `graphs/delivery/epic-swarm.md` for the
+decided design, including what each comfort level means after the merge kind
+split.
+
 Three convictions hold this together:
 
 - **Nothing is one-shot.** Every change gets a reviewer, and `review_tier`
@@ -110,6 +130,15 @@ Three convictions hold this together:
 - **The dependency graph gets attacked.** An adversary reads the DAG looking for
   edges that are not real, because each one silently serialises work that could
   have run at once and nothing downstream will ever question it.
+- **Claims are measured, not asked.** Diff shape is counted from the patch,
+  check results come from running the project's own commands in a worktree the
+  harness owns, and both attach to the proposal before the gate sees it.
+- **The system cannot loosen its own rules.** A diff that touches governance —
+  cartridges, skills, `core/policy.py`, `core/ledger.py`, `harness/`, the
+  ledger file — is escalated to `self_modification` (`ramp: never`) from its
+  paths alone, whatever kind the graph claimed. And the ledger itself lives
+  OUTSIDE the working tree (`$XDG_STATE_HOME/agent-graphs/`), because a trust
+  record you can reach through the thing it governs is not a record.
 
 There is no ticketing platform anywhere in this. `cartridges/local/` binds every
 role to the filesystem: work items are markdown files, git is the audit trail,
@@ -140,7 +169,9 @@ Atlassian host, a bucket URI, an AWS ARN and account ID, a username-bearing
 path, an inline key, a silent `args.cartridge` fallback, and a missing-cartridge
 acceptance lit up **9 checks**, including the behavioural refusal — which
 proves the module walk actually descends into the new layout. A check nobody
-has watched fail is not a check.
+has watched fail is not a check. Re-verified 2026-09-01, after three graphs
+and two drivers were added: the same planted file still lights up the same
+**9 checks**, and the suite passes again once it is removed.
 
 ## Status: implemented
 
@@ -153,12 +184,32 @@ for the working rule and
 [`PROVENANCE.md`](https://github.com/ppfenning/agent-cartridges/blob/main/docs/PROVENANCE.md)
 for where the ideas came from.
 
-Deferred from v0, and named in each graph's spec: the intake queue, the bounded
-fix loop, retro — and a **chief-of-staff dispatch graph**, which now has what it
-needs (a registry to select from, and a phase driver to fan out with) and is
-the next graph to write.
+Everything deferred from v0 has since landed: the intake queue (a directory
+the chief-of-staff drains, `agent-cartridges/core/intake.py`), the bounded fix
+loop (in `lifecycle-propose`, with its attempt count carried to the ledger),
+retro (`retro-propose`, which proposes only what it can cite), and the
+chief-of-staff dispatcher — a one-node graph that selects from the registry,
+with a driver (`harness/cos.py`) that invokes the selection through the same
+nested-invocation primitive the epic driver fans out with. What remains
+deferred is named where it is deferred: comfort level 2 (`pr_ready_flip`
+stays gated in base, and nothing yet justifies loosening it for everyone) and
+a forge arm, so a "draft PR" is a local branch until one exists.
 
-### What changed (2026-09-01), and why
+### What changed (2026-09-01, second pass), and why
+
+The system stopped being read-only. The check arm runs the project's own
+tests against the applied patch and attaches the result as evidence; the epic
+driver runs a whole initiative to a stack of branches while landing nothing
+on main; `merge` split by target so within-initiative stack merges became
+earnable without loosening anything; the fix loop retries with the critique
+attached but records its attempts, and the policy refuses to let a third-try
+pass extend a streak; triage's `trap_held` verdict now demotes the exact
+runbook entry that was wrong, because trust is earned per entry, not per
+kind; and the harness escalates any diff that touches governance to a kind
+no streak can graduate. Autonomy became buyable only where the asymmetry was
+measured — and unbuyable where the system would be grading itself.
+
+### What changed (2026-09-01, first pass), and why
 
 `shell.py` grew into a 400-line script that owned every side effect and named
 every graph. The machinery moved into `harness/` with a public API, graphs now

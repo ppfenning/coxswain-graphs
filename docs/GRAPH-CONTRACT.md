@@ -60,7 +60,16 @@ on a busy day.
 Three, and the first one is easy to forget because the contract used only ever
 spelled out the last two:
 
-**1. Before the gate — ask the policy.** For every proposal, consult
+**1. Before the gate — measure, then escalate, then ask the policy.** When
+`--repo` names the project a change targets, the harness applies the build
+patch in a real worktree of it and RUNS the cartridge's configured checks
+(`landing_areas.checks`), attaching pass/fail and parsed counts to the proposal
+the way `change_facts` already work — counted from reality, never asked of a
+model. Then, from the diff's paths alone, it escalates any patch-bearing
+proposal whose change touches governance (`cartridges/`, `skills-plugins/`,
+`core/policy.py`, `core/ledger.py`, `harness/`, the ledger file) to the
+`self_modification` kind, `ramp: never`, whatever kind the graph claimed — a
+system must not loosen its own rules on its own say-so. Only then: For every proposal, consult
 `autonomy_policy` against the ledger, filtered to this exact `cartridge_sha` and
 provider profile. Without this the gate asks about every kind forever, no streak
 is ever spent, and earned autonomy is decoration. *This clause exists because the
@@ -120,13 +129,20 @@ staying small, enforced at the seam where it actually matters.
 | `lifecycle-propose` | scope → plan → build (worktree) → handoff → review → adversary → arbitrate → emit. One task. |
 | `triage-propose` | fetch → classify → verify → emit. Zero writes; proposes its own runbook corrections. |
 | `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared state vs actual. |
+| `phase-validate` | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver. |
+| `retro-propose` | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite. |
+| `chief-of-staff` | one `dispatch` node over a driver-assembled docket. Selects; the driver invokes. |
 
-All four are specified in `graphs/` and implemented.
+All seven are specified in `graphs/` and implemented.
 
 Running a *phase* is not a graph: the shell runs `lifecycle-propose` once per
 unblocked task, concurrently. Sequence belongs to a graph; concurrency belongs
 to the I/O edge that already owns every side effect. Results are ordered by task
 id before anything is recorded, so wall-clock order never reaches the ledger.
+The same ruling, made once in `harness/invoke.py`, governs everything that
+blocks on futures: the phase driver, the epic driver (`harness/epic.py`), and
+the chief-of-staff driver (`harness/cos.py`). None of them carries a `SPEC`,
+and every child run records under the parent's run id.
 
 ## None of this needs a tracker
 
