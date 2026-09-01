@@ -277,15 +277,12 @@ def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) 
         record["quarantine"] = f"patch did not apply: {detail}"
         return record
 
-    if ctx.checks:
-        results = run_checks(worktree, ctx.checks)
-        record["checks"] = results
-        record["evidence"].extend(checks_evidence(results))
-        if not all_passed(results):
-            failed = ", ".join(r["name"] for r in results if not r.get("passed"))
-            record["quarantine"] = f"configured checks failed: {failed}"
-            return record
-
+    # Commit BEFORE the checks run, so the branch holds exactly the applied
+    # patch and nothing else. Checks execute things — a test run drops
+    # __pycache__ and friends into the worktree, and an add -A afterwards would
+    # commit those byproducts, which then differ per task and collide as binary
+    # conflicts at merge time. Found by running the whole driver against a real
+    # repository, which is the only place a bug like this can live.
     ok, detail = _git(*_IDENTITY, "-C", str(worktree), "add", "-A")
     if ok:
         ok, detail = _git(
@@ -294,6 +291,15 @@ def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) 
         )
     if not ok:
         record["quarantine"] = f"the applied patch could not be committed: {detail}"
+        return record
+
+    if ctx.checks:
+        results = run_checks(worktree, ctx.checks)
+        record["checks"] = results
+        record["evidence"].extend(checks_evidence(results))
+        if not all_passed(results):
+            failed = ", ".join(r["name"] for r in results if not r.get("passed"))
+            record["quarantine"] = f"configured checks failed: {failed}"
     return record
 
 

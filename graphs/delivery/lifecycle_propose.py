@@ -631,5 +631,7 @@ SPEC = GraphSpec(
     summary="the development loop: scope, plan, build, review — proposals out, nothing pushed",
     needs=(
         Need("ticket", flag="--ticket", help="the ticket to work"),
+        Need("fix_attempts", flag="--fix-attempts", kind="int", required=False,
+             help="additional build attempts after the first (default 2); 0 disables the fix loop"),
     ),
 )

@@ -154,8 +154,11 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "graph",
-        choices=sorted([*specs, "phase"]),
-        help="which graph to run ('phase' drives the lifecycle graph over a work store)",
+        choices=sorted([*specs, "phase", "epic"]),
+        help=(
+            "which graph to run ('phase' drives the lifecycle graph over one phase; "
+            "'epic' drives a whole initiative, phase by phase, gating each one)"
+        ),
     )
     parser.add_argument("--team", required=True, help="team cartridge to resolve")
     parser.add_argument(
@@ -268,6 +271,55 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     run_id = args.run_id or f"{args.graph}-{args.date}-{uuid.uuid4().hex[:8]}"
+
+    if args.graph == "epic":
+        # The whole initiative. The driver gates and records PER PHASE — phase
+        # N+1's base depends on which merges the gate let into phase N's branch,
+        # so one gate at the end would be deciding after the ground had already
+        # been chosen. Everything below this block (policy split, gate, record)
+        # is therefore already done by the time run_epic returns, and this
+        # branch returns instead of falling through to do it twice.
+        from harness.epic import run_epic
+
+        if not args.initiative:
+            parser.error("epic needs --initiative (a work/<initiative> directory)")
+        if not args.repo:
+            parser.error("epic needs --repo (the repository the initiative's work targets)")
+        try:
+            initiative = workstore.read_initiative(args.initiative)
+        except workstore.WorkStoreError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        result = run_epic(
+            initiative=initiative,
+            repo=Path(args.repo),
+            cartridge=cartridge,
+            runner=runner,
+            specs=specs,
+            run_id=run_id,
+            date=args.date,
+            max_parallel=args.max_parallel,
+            ledger_path=args.ledger,
+            provider_profile=Path(args.provider_profile).stem,
+            runs_dir=args.runs_dir,
+            worktree_root=args.worktree_root
+            or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees"),
+            assume=args.assume,
+            fix_attempts=args.fix_attempts,
+        )
+        totals = result.get("totals") or {}
+        print(
+            f"\nepic {run_id}: {totals.get('phases_complete', 0)} phase(s) complete, "
+            f"{totals.get('phases_partial', 0)} partial, {totals.get('phases_blocked', 0)} blocked, "
+            f"{totals.get('tasks_quarantined', 0)} task(s) quarantined, "
+            f"{totals.get('stacks_rebased', 0)} stack(s) rebased"
+        )
+        for entry in result.get("quarantined") or []:
+            print(f"  quarantined {entry.get('grain')}: {entry.get('id')} — {entry.get('reason')}", file=sys.stderr)
+        print(f"  manifests: {args.runs_dir} (one per phase, under {run_id}:<phase>)")
+        print(f"  ledger   : {args.ledger}")
+        return 0
 
     if args.graph == "phase":
         # Not one graph run but many, one per unblocked task. The work store is
