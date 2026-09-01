@@ -139,12 +139,33 @@ def proposal(
     evidence: Sequence[Mapping[str, Any]],
     rationale: str,
     suggested_action: str,
+    subject: str | None = None,
+    subject_new: bool = False,
+    attempts: int | None = None,
 ) -> dict[str, Any]:
     """Build one proposal, refusing anything the cartridge did not authorise.
 
     `risk` is read off the taxonomy rather than accepted from the caller. A node
     that could name its own risk could downgrade a destructive write to `low`
     and walk it straight past the policy that exists to stop it.
+
+    Three optional fields, each present only when it says something. A field
+    that is always there and usually empty stops being read.
+
+    `subject` is the finer-grained principal inside a kind — the runbook entry,
+    not the `doc_update` category. What earns trust was never the *category* of
+    write; it was the encoded judgment that produced it, and a kind's streak is
+    the average of forty entries of wildly different quality.
+
+    `subject_new` marks a proposal that CREATES its subject. It always gates: a
+    brand-new entry has no track record by definition, and a streak inherited
+    from the kind it happens to belong to is a track record that was never
+    earned.
+
+    `attempts` is the fix loop's count, carried so the ledger can tell a
+    third-try pass from a first-try one. A pass that took three rounds is not
+    the same evidence as a pass that took one, and the difference must survive
+    the trip downstream.
     """
     write_kinds = cartridge.get("write_kinds") or {}
     spec = write_kinds.get(kind)
@@ -169,4 +190,7 @@ def proposal(
         "evidence": [dict(item) for item in evidence],
         "rationale": rationale,
         "suggested_action": suggested_action,
+        **({"subject": subject} if subject is not None else {}),
+        **({"subject_new": True} if subject_new else {}),
+        **({"attempts": attempts} if attempts is not None else {}),
     }

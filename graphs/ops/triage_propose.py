@@ -203,11 +203,22 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         if gap is not None:
             reason, correction = gap
             runbook_gaps += 1
+            # The proposal names the entry it is about, because the entry — not
+            # the `doc_update` category — is the thing with a track record. An
+            # amendment carries the entry it amends; a gap nothing matched
+            # carries the symptom it would be filed under, and says it is new,
+            # because an entry that does not exist yet cannot have earned
+            # anything from the streak of the forty around it.
+            entry = str(classification.get("runbook_entry") or "").strip()
+            symptom = str(classification.get("symptom_key") or "").strip()
+            subject = entry or symptom or None
             proposals.append(
                 proposal(
                     cartridge,
                     kind="doc_update",
                     target=str(classification.get("runbook_entry") or classification.get("symptom_key") or "runbook"),
+                    subject=subject,
+                    subject_new=subject is not None and not entry,
                     evidence=[
                         {"check": "classification confidence", "output": str(classification.get("confidence"))},
                         {"check": "matched runbook entry", "output": str(classification.get("runbook_entry") or "none")},

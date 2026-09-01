@@ -25,7 +25,7 @@ def test_runs_end_to_end_and_returns_the_documented_shape(
     result = lifecycle_propose.run(args(cartridge), runner(plan_response, build_response, review_response))
     assert set(result) == {
         "run_id", "date", "ticket", "scope", "review_tier", "handoff", "adversary",
-        "arbitration", "plan", "build", "review", "change_facts", "proposals",
+        "arbitration", "plan", "build", "review", "change_facts", "fix_loop", "proposals",
     }
 
 
@@ -118,3 +118,173 @@ def test_context_packs_are_passed_to_nodes_never_read_by_the_graph(
     scripted = runner(plan_response, build_response, review_response)
     lifecycle_propose.run(args(cartridge), scripted)
     assert all(call["context"] == cartridge["context"] for call in scripted.calls)
+
+
+# ── the bounded fix loop ───────────────────────────────────────────────────
+#
+# The conviction under test: a fix loop must never launder struggle into trust.
+# A task that passed on attempt three stays distinguishable from one that passed
+# clean — and the loop stops on its own when a retry is not actually a retry.
+
+PATCH_ANSWERED = (
+    "--- a/src/a.py\n+++ b/src/a.py\n-old line\n"
+    "+new line, now with the objection answered\n+another\n+assert covered()\n"
+)
+PATCH_ELSEWHERE = (
+    "--- a/src/a.py\n+++ b/src/a.py\n-old line\n+new line\n+another\n"
+    "+assert retry_path_is_tested()\n"
+)
+# The same patch with a trailing space added: 0.99 similar, and nothing that
+# matters has changed.
+PATCH_COSMETIC = "--- a/src/a.py\n+++ b/src/a.py\n-old line\n+new line\n+another \n"
+
+REVISE = {"verdict": "revise", "findings": [], "rationale": "the error path is untested"}
+OBJECTION = "the retry path has no test"
+ADV_OBJECTS = {
+    "verdict": "revise",
+    "objections": [{"claim": OBJECTION, "why_wrong": "the only test covers the happy path"}],
+    "strongest_objection": OBJECTION,
+}
+ADV_OBJECTS_AGAIN = {
+    "verdict": "revise",
+    # Same complaint, typed differently. Case and whitespace are not the objection.
+    "objections": [{"claim": "  The Retry Path Has No Test  ", "why_wrong": "still only the happy path"}],
+    "strongest_objection": "the retry path still has no test",
+}
+ADV_OBJECTS_ELSEWHERE = {
+    "verdict": "revise",
+    "objections": [{"claim": "the fixture leaks state", "why_wrong": "it mutates a module global"}],
+    "strongest_objection": "the fixture leaks state",
+}
+ADV_APPROVES = {"verdict": "approve", "objections": [], "strongest_objection": "none that survive"}
+
+
+def adversarial(cartridge) -> dict:
+    """Bind the adversary, so a round can actually raise an objection."""
+    cartridge["skills"]["review_adversary"] = "acme-skills:review_adversary"
+    return cartridge
+
+
+def rebuilt(build_response, patch) -> dict:
+    return {**build_response, "patch": patch, "summary": "second attempt"}
+
+
+def roles(scripted, role):
+    return [call for call in scripted.calls if call["role"] == role]
+
+
+def test_a_first_try_approval_records_one_attempt_and_carries_no_count(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """Catches the loop taxing every clean pass with a field about a loop that never ran.
+
+    A proposal that always says `attempts` says nothing when it matters.
+    """
+    result = lifecycle_propose.run(args(cartridge), runner(plan_response, build_response, review_response))
+    assert result["fix_loop"] == {"attempts": 1, "stopped": None}
+    proposal = result["proposals"][0]
+    assert "attempts" not in proposal, "a first-try pass looks exactly as it did before the loop existed"
+    assert "fix loop" not in {e["check"] for e in proposal["evidence"]}
+
+
+def test_a_change_sent_back_is_rebuilt_with_the_critique_and_can_pass_on_the_retry(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """Catches a retry that rebuilds from the plan alone, and a pass that hides its count.
+
+    A builder handed 'review asked for changes' fixes what it already believed
+    was wrong. It has to be handed the objection itself.
+    """
+    scripted = runner(
+        plan_response,
+        [build_response, rebuilt(build_response, PATCH_ANSWERED)],
+        [REVISE, review_response],
+        review_adversary=[ADV_OBJECTS, ADV_APPROVES],
+    )
+    result = lifecycle_propose.run(args(adversarial(cartridge)), scripted)
+
+    builds = roles(scripted, "build")
+    assert len(builds) == 2, "the change was sent back, so it must actually be rebuilt"
+    assert OBJECTION in builds[1]["prompt"], "the retry carries the standing objection verbatim"
+    assert "must actually fall" in builds[1]["prompt"]
+
+    assert result["fix_loop"] == {"attempts": 2, "stopped": None}
+    proposal = result["proposals"][0]
+    assert proposal["kind"] == "draft_pr_create"
+    assert proposal["attempts"] == 2, "the ledger cannot discount what it is never told"
+    assert {"check": "fix loop", "output": "approved on attempt 2 of 3"} in proposal["evidence"]
+    assert result["build"]["patch"] == PATCH_ANSWERED, "the final round's build is the one that went out"
+
+
+def test_a_retry_that_changes_nothing_stops_instead_of_buying_a_second_opinion(
+    cartridge, plan_response, build_response
+) -> None:
+    """Catches a loop that re-reviews a patch it has already reviewed.
+
+    Re-submitting the same diff to a fresh reviewer is not a fix; it is shopping
+    for a verdict, and eventually one of them says yes.
+    """
+    scripted = runner(
+        plan_response,
+        [build_response, rebuilt(build_response, PATCH_COSMETIC)],
+        REVISE,
+        review_adversary=ADV_OBJECTS,
+    )
+    result = lifecycle_propose.run(args(adversarial(cartridge)), scripted)
+
+    assert result["fix_loop"] == {"attempts": 2, "stopped": "no_progress"}
+    assert len(roles(scripted, "review_charter")) == 1, "the near-identical patch was never reviewed"
+    assert result["proposals"] == []
+    assert result["build"]["patch"] == build_response["patch"], (
+        "build and review must describe the same patch, or the record lies about what was reviewed"
+    )
+
+
+def test_the_same_objection_raised_again_stops_the_loop(
+    cartridge, plan_response, build_response
+) -> None:
+    """Catches a loop that re-litigates one objection until the cap runs out.
+
+    Matched case-insensitively and stripped: the same complaint typed
+    differently is still the same complaint, still standing.
+    """
+    scripted = runner(
+        plan_response,
+        [build_response, rebuilt(build_response, PATCH_ANSWERED)],
+        REVISE,
+        review_adversary=[ADV_OBJECTS, ADV_OBJECTS_AGAIN],
+    )
+    result = lifecycle_propose.run(args(adversarial(cartridge)), scripted)
+
+    assert result["fix_loop"] == {"attempts": 2, "stopped": "objection_standing"}
+    assert len(roles(scripted, "build")) == 2, "it stopped rather than spending the second retry"
+    assert result["proposals"] == []
+
+
+def test_the_cap_is_a_cap_and_an_unapproved_change_proposes_nothing(
+    cartridge, plan_response, build_response
+) -> None:
+    """Catches a loop that grinds a change past its reviewers until one blinks."""
+    scripted = runner(
+        plan_response,
+        [build_response, rebuilt(build_response, PATCH_ANSWERED), rebuilt(build_response, PATCH_ELSEWHERE)],
+        REVISE,
+        review_adversary=[ADV_OBJECTS, ADV_OBJECTS_ELSEWHERE],
+    )
+    result = lifecycle_propose.run(args(adversarial(cartridge), fix_attempts=1), scripted)
+
+    assert result["fix_loop"] == {"attempts": 2, "stopped": "attempts_exhausted"}
+    assert len(roles(scripted, "build")) == 2, "one additional attempt means one, not one more each round"
+    assert [p["kind"] for p in result["proposals"]] == [], "nothing approved, so nothing proposed"
+
+
+def test_fix_attempts_zero_disables_the_loop_entirely(
+    cartridge, plan_response, build_response
+) -> None:
+    """Catches a cap of zero that still retries once — an off switch that is not off."""
+    scripted = runner(plan_response, build_response, REVISE, review_adversary=ADV_OBJECTS)
+    result = lifecycle_propose.run(args(adversarial(cartridge), fix_attempts=0), scripted)
+
+    assert len(roles(scripted, "build")) == 1
+    assert result["fix_loop"] == {"attempts": 1, "stopped": "attempts_exhausted"}
+    assert result["proposals"] == []

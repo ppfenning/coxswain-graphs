@@ -83,15 +83,47 @@ How many reviewers a change gets is `review_tier`'s decision, not the author's:
 tier 0 is reviewed once, tier 1 gets an adversary, and tier 2 arbitrates whether
 or not the two agreed. No path skips review.
 
-**Args:** `run_id`, `date`, `cartridge` (resolved, required, no fallback),
-`ticket`, optional `worktree_root` (else `cartridge.landing_areas.worktree_root`).
+## The fix loop is bounded, and it counts
 
-**Returns:** `{run_id, date, ticket, plan, build, review, change_facts, proposals[]}`
+A change the reviewers sent back goes back to the builder with the critique
+attached — the charter findings, the adversary's objections, the arbitrator's
+reasoning — and the instruction that every standing objection must actually
+fall. The retry is then reviewed under *exactly* the same rules as the first
+try: facts recounted from the new patch, handoff re-checked if it is bound, tier
+recomputed, the same reviewers at the same tier. A cheaper second pass would be
+a way of grinding a change past its reviewers, which is the thing this loop must
+not become.
+
+It is bounded three separate ways, and each stop is recorded by name:
+
+| Stop | When | Why it is a stop |
+|---|---|---|
+| `no_progress` | successive patches are ≥ 0.98 similar (`difflib.SequenceMatcher`) | Re-submitting the same diff is not a fix; it is shopping for a verdict, and eventually one reviewer says yes. The near-identical patch is never reviewed. |
+| `objection_standing` | a retry's adversary raises a claim already standing (matched case-insensitively, stripped) | Re-litigating an objection is not progress. A retry that instead ends in `approve` means the reviewers, shown the standing objections, judged them fallen. |
+| `attempts_exhausted` | `fix_attempts` additional attempts (default 2) produced no approval | A cap that can be argued with is not a cap. |
+
+The similarity check is `difflib` — pure, no disk, no clock — so it stays inside
+the graph rather than becoming another thing the shell has to do.
+
+**And the loop refuses to hide the count.** `fix_loop.attempts` is on every run;
+a proposal that took more than one attempt carries `attempts` and an evidence
+row saying which attempt approved it. A task that passed on the third try is not
+the same evidence as one that passed clean, and the difference has to survive
+the trip downstream: the policy in the substrate is what refuses to let a
+repeated-attempt pass extend a streak, and it can only refuse what it can see.
+This graph's job is not to enforce that rule — it is to never quietly make the
+record look better than the run was.
+
+**Args:** `run_id`, `date`, `cartridge` (resolved, required, no fallback),
+`ticket`, optional `fix_attempts` (default 2; `0` disables retries), optional
+`worktree_root` (else `cartridge.landing_areas.worktree_root`).
+
+**Returns:** `{run_id, date, ticket, plan, build, review, change_facts, fix_loop,
+proposals[]}` — `plan`/`build`/`review` hold the final round's values.
 
 **Deferred from v0:** intake queue (the ticket arrives as an arg), the
-adversarial reviewer pair, arbitration, the bounded fix loop, verification,
-retro. Staging a draft PR is *emitted* as a `draft_pr_create` proposal and never
-executed.
+adversarial reviewer pair, arbitration, verification, retro. Staging a draft PR
+is *emitted* as a `draft_pr_create` proposal and never executed.
 
 *Epic-threshold scoping was on that list and is now implemented* — `epic_threshold`
 and `work_routing` were declared in the base cartridge and read by no code,

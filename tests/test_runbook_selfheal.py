@@ -112,3 +112,33 @@ def test_gaps_are_counted_per_alert(cart) -> None:
     result = triage(cart, {**MATCHED, "runbook_entry": ""}, HEALTHY, alerts=3)
     assert result["totals"]["runbook_gaps"] == 3
     assert len(doc_updates(result)) == 3
+
+
+def test_an_amendment_names_the_entry_it_amends_as_its_subject(cart) -> None:
+    """Catches a proposal that can only be trusted at the grain of `doc_update`.
+
+    A runbook index is not one thing. An entry that has been right thirty times
+    and one written yesterday are indistinguishable to a policy that only sees
+    the kind, and they graduate together on the average.
+    """
+    result = triage(cart, MATCHED, {**HEALTHY, "runbook_correction": "the check reads local time"})
+    amendment = doc_updates(result)[0]
+    assert amendment["subject"] == "rb-01", "trust belongs to the entry, not to the category"
+    assert "subject_new" not in amendment, "amending an entry does not create one"
+
+
+def test_a_trap_that_did_not_hold_is_still_an_amendment_of_its_entry(cart) -> None:
+    result = triage(cart, MATCHED, {**HEALTHY, "trap_held": False})
+    assert doc_updates(result)[0]["subject"] == "rb-01"
+
+
+def test_a_missing_entry_says_it_creates_its_subject(cart) -> None:
+    """Catches a new entry inheriting a streak it never earned.
+
+    A brand-new entry has no track record by definition, so it gates — and
+    `subject_new` is how the policy gets to know that without guessing.
+    """
+    result = triage(cart, {**MATCHED, "runbook_entry": ""}, HEALTHY)
+    creation = doc_updates(result)[0]
+    assert creation["subject"] == "late_landing", "the symptom it would be filed under"
+    assert creation["subject_new"] is True
