@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from graphs import lifecycle_propose
+from graphs.delivery import lifecycle_propose
 from graphs._contract import ContractViolation, review_tier
 from runner import ScriptedRunner
 

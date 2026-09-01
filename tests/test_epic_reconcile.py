@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from graphs import epic_reconcile
+from graphs.ops import epic_reconcile
 from graphs._contract import ContractViolation
 from runner import ScriptedRunner
 

@@ -15,7 +15,7 @@ import pytest
 
 from functools import partial
 
-from graphs import lifecycle_propose
+from graphs.delivery import lifecycle_propose
 from harness import run_phase
 
 _run_phase = partial(run_phase, lifecycle_run=lifecycle_propose.run)

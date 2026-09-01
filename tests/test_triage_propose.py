@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from graphs import triage_propose
+from graphs.ops import triage_propose
 from graphs._contract import ContractViolation
 from runner import ScriptedRunner
 

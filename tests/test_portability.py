@@ -117,7 +117,8 @@ def _graph_modules():
     for path in _graph_files():
         if path.suffix != ".py" or path.stem.startswith("__"):
             continue
-        module = importlib.import_module(f"graphs.{path.stem}")
+        dotted = ".".join(("graphs", *path.relative_to(GRAPHS_DIR).with_suffix("").parts))
+        module = importlib.import_module(dotted)
         if hasattr(module, "run") and hasattr(module, "GRAPH_NAME"):
             modules.append(module)
     return modules

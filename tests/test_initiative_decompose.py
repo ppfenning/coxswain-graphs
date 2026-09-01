@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from graphs import initiative_decompose
+from graphs.delivery import initiative_decompose
 from graphs._contract import ContractViolation
 from runner import ScriptedRunner
 
