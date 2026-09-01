@@ -17,6 +17,7 @@ deliberate: everything worth unit-testing lives on the other side of it.
 
 from harness.autonomy import split_by_policy
 from harness.gate import APPLY_SCHEMA, apply_arm_for, apply_decisions, auto_apply, gate
+from harness.invoke import Invocation, InvokeError, invoke_graphs
 from harness.phase import run_phase
 from harness.registry import DiscoveryError, GraphSpec, Need, discover
 from harness.resolve import resolve_cartridge, role_skill_bodies
@@ -27,6 +28,8 @@ __all__ = [
     "APPLY_SCHEMA",
     "DiscoveryError",
     "GraphSpec",
+    "Invocation",
+    "InvokeError",
     "Need",
     "apply_arm_for",
     "apply_decisions",
@@ -35,6 +38,7 @@ __all__ = [
     "build_runner",
     "discover",
     "gate",
+    "invoke_graphs",
     "resolve_cartridge",
     "role_skill_bodies",
     "run_phase",
