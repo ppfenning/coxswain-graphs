@@ -1,0 +1,951 @@
+"""The epic-swarm driver: a whole initiative, phase by phase, landing nothing.
+
+NOT a graph, and it must never acquire a `SPEC`. It walks a phase graph, blocks
+on fan-outs, creates branches, runs checks and merges into a stack — a graph is
+`run(args, runner) -> dict`, pure and replayable, and this is none of those. It
+lives beside `phase.py` and `invoke.py`, which is where the contract already put
+everything that owns a side effect.
+
+What it does, per phase, in this order and no other:
+
+    branch from the parent phase's head -> fan out `lifecycle` per ready task
+    -> apply, check and commit each patch in a worktree the harness owns
+    -> escalate anything whose diff touched governance
+    -> VALIDATE (`phase-validate`, invoked like any other graph)
+    -> one gate for the phase -> execute what was cleared -> record the phase
+
+Validation sits between the fan-out and the merges on purpose. The phase verdict
+judges the union of what the tasks produced, before any of it is joined to the
+phase branch, so a phase that does not add up is caught while nothing has moved.
+The alternative — merge first, re-read the branch afterwards — asks the verdict
+to be about a state the driver has already committed to.
+
+**Nothing here merges to a default branch.** There is no code path that emits or
+executes `merge_main`; the swarm's terminal state is branches and proposals. See
+the comment where the merges execute.
+
+Two things are load-bearing about the record. Every phase records its own
+manifest under `f"{run_id}:{phase}"` — one cartridge, one scope, so
+`_require_single_scope` stays satisfiable — and an auto-cleared proposal gets no
+gate diff and no ledger row, because autonomy is spent by acting and re-earned
+only at a gate.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from core import workstore
+from core.manifest import build_manifest, gate_diff, record_run
+from graphs._contract import proposal
+from harness.autonomy import split_by_policy
+from harness.checks import all_passed, checks_evidence, run_checks
+from harness.escalate import escalate_self_modification
+from harness.gate import auto_apply, gate
+from harness.invoke import Invocation, invoke_graphs
+from harness.worktree import apply_patch, create_worktree
+
+__all__ = ["run_epic", "phase_parents", "phase_order"]
+
+LIFECYCLE = "lifecycle"
+VALIDATE = "validate"
+
+# The principal names the driver AND the graph whose work it records, so a
+# ledger row from a swarm stays distinguishable from the same graph run alone.
+PRINCIPAL = "epic-swarm(lifecycle-propose)"
+
+# Commits the driver makes are mechanical — it saves an applied patch and joins
+# branches, it never authors. The identity is passed with -c so a test, or a
+# machine with no global git config, needs no setup to run this.
+_IDENTITY = ("-c", "user.email=epic-swarm@invalid", "-c", "user.name=epic-swarm")
+
+_DRAFT_KINDS = frozenset({"draft_pr_create", "self_modification"})
+
+
+def _git(*args: str, cwd: Path | None = None) -> tuple[bool, str]:
+    """Run one git command and report what happened, never what was intended."""
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
+
+
+@dataclass(frozen=True)
+class _Ctx:
+    """Everything the per-phase work needs, fixed for the whole run.
+
+    A frozen record rather than a dozen parameters threaded through six
+    functions: the phase loop is where the interesting decisions are, and they
+    read better when the configuration is not standing in front of them.
+    """
+
+    repo: Path
+    cartridge: Mapping[str, Any]
+    runner: Any
+    specs: Mapping[str, Any]
+    run_id: str
+    date: str
+    max_parallel: int
+    ledger_path: Path
+    provider_profile: str
+    runs_dir: Path
+    worktree_root: Path
+    assume: str | None
+    fix_attempts: int | None
+    initiative_id: str
+    default_ref: str
+
+    # ── names, in one place, so the topology is readable ─────────────────────
+    def phase_branch(self, phase: str) -> str:
+        return f"epic/{self.initiative_id}/{phase}"
+
+    def draft_branch(self, phase: str, task: str) -> str:
+        # NOT `epic/<initiative>/<phase>/<task>`: git cannot hold both
+        # `refs/heads/epic/i/p1` and `refs/heads/epic/i/p1/t1`, because one is a
+        # file where the other needs a directory. The draft namespace is
+        # therefore flattened with `--` under the phase, which keeps
+        # `git branch --list 'epic/<initiative>/*'` reading as the stack it is.
+        return f"epic/{self.initiative_id}/{phase}--{task}"
+
+    def scratch_branch(self, task: str) -> str:
+        # Harness-owned, per run, never promoted: this is the namespace the
+        # contract's worktree exception covers. The draft branch above is
+        # created only after the gate.
+        return f"agents/{self.run_id}/{task}"
+
+    def phase_worktree(self, phase: str) -> Path:
+        return self.worktree_root / self.run_id / phase
+
+    def task_worktree(self, phase: str, task: str) -> Path:
+        return self.phase_worktree(phase) / task
+
+    @property
+    def checks(self) -> list[Mapping[str, Any]]:
+        return list((self.cartridge.get("landing_areas") or {}).get("checks") or [])
+
+    @property
+    def bound(self) -> Mapping[str, Any]:
+        return self.cartridge.get("skills") or {}
+
+
+# ── the phase graph ─────────────────────────────────────────────────────────
+
+
+def phase_parents(items: Sequence[Mapping[str, Any]]) -> dict[str, set[str]]:
+    """Phase B depends on phase A iff some task in B needs a task in A.
+
+    Derived from the task edges rather than declared, because the task DAG is
+    the thing `initiative-decompose`'s adversary actually attacked. A separately
+    declared phase order would be a second source of truth that nobody checked.
+    """
+    phase_of = {str(item["id"]): str(item.get("phase") or "") for item in items}
+    parents: dict[str, set[str]] = {phase: set() for phase in phase_of.values() if phase}
+    for item in items:
+        here = str(item.get("phase") or "")
+        for need in item.get("needs") or []:
+            there = phase_of.get(str(need))
+            if here and there and there != here:
+                parents[here].add(there)
+    return parents
+
+
+def phase_order(parents: Mapping[str, set[str]]) -> tuple[list[str], list[str]]:
+    """Phases in dependency order with ties broken by name, then the unorderable.
+
+    Ties break by name so two runs over one initiative walk the phases in the
+    same order — the same reason `invoke_graphs` reads its results back sorted.
+    Whatever is left over sits in a cycle BETWEEN phases: a task DAG can be
+    acyclic while the phase graph it induces is not, and a cycle is reported
+    rather than resolved.
+    """
+    remaining = {phase: set(deps) for phase, deps in parents.items()}
+    ordered: list[str] = []
+    while remaining:
+        free = sorted(phase for phase, deps in remaining.items() if not deps - set(ordered))
+        if not free:
+            break
+        for phase in free:
+            ordered.append(phase)
+            del remaining[phase]
+    return ordered, sorted(remaining)
+
+
+def _phase_goal(initiative: Mapping[str, Any], phase: str) -> str:
+    """The phase's ORIGINAL goal — the thing `validate_phase` judges against.
+
+    A work store's phases are bare names (`workstore.phases` returns the set of
+    directory names), so where a goal was never recorded the honest substitute
+    is the phase's name plus the initiative's own prose. Not a restatement of
+    the task list: that is exactly what the phase verdict must never be allowed
+    to reduce to. Where a decompose-produced initiative carries `{id, goal}`
+    phase entries, they win.
+    """
+    for entry in initiative.get("phases") or []:
+        if isinstance(entry, Mapping) and str(entry.get("id")) == phase and entry.get("goal"):
+            return str(entry["goal"])
+    body = str(initiative.get("body") or "").strip()
+    return f"phase '{phase}' of initiative '{initiative.get('id')}'" + (f"\n\n{body}" if body else "")
+
+
+# ── branch topology ─────────────────────────────────────────────────────────
+
+
+def _branch_exists(ctx: _Ctx, branch: str) -> bool:
+    ok, _ = _git("-C", str(ctx.repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    return ok
+
+
+def _open_phase_worktree(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str, bool]:
+    """Get a worktree on the phase branch. Returns (ok, detail, reused).
+
+    Re-entrancy is the point: a second driver run over the same initiative
+    builds on the branch the first one left, rather than starting a parallel
+    one beside it under a different run id.
+    """
+    branch = ctx.phase_branch(phase)
+    worktree = ctx.phase_worktree(phase)
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    if _branch_exists(ctx, branch):
+        ok, detail = _git("-C", str(ctx.repo), "worktree", "add", str(worktree), branch)
+        return ok, detail, True
+    ok, detail = create_worktree(ctx.repo, worktree, branch=branch, base=base_ref)
+    return ok, detail, False
+
+
+def _parent_head_moved(ctx: _Ctx, phase: str, base_ref: str) -> bool:
+    """Is the phase branch still stacked on the parent's CURRENT head?
+
+    `merge-base --is-ancestor` is the whole question: if the parent's head is no
+    longer an ancestor of this branch, the ground under the stack moved, and
+    everything above it is building on a base that is no longer there.
+    """
+    ok, _ = _git("-C", str(ctx.repo), "merge-base", "--is-ancestor", base_ref, ctx.phase_branch(phase))
+    return not ok
+
+
+def _rebase(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str]:
+    """Replay the phase branch onto the parent's new head, or leave it untouched.
+
+    A conflict aborts and quarantines the phase with git's own diagnosis. There
+    is no path here that resolves one unattended: `stack_rebase` is a write kind
+    precisely because rewriting a branch other work is stacked on can silently
+    discard a commit, and a driver guessing at a resolution would be doing
+    exactly that.
+    """
+    worktree = ctx.phase_worktree(phase)
+    branch = ctx.phase_branch(phase)
+    ok, fork = _git("-C", str(worktree), "merge-base", base_ref, branch)
+    if not ok:
+        return False, f"no merge base between {base_ref} and {branch}: {fork}"
+    ok, detail = _git(*_IDENTITY, "-C", str(worktree), "rebase", "--onto", base_ref, fork.strip())
+    if not ok:
+        _git("-C", str(worktree), "rebase", "--abort")
+        return False, detail
+    return True, f"rebased {branch} onto {base_ref}"
+
+
+# ── one task's build, applied and measured in a worktree the harness owns ────
+
+
+def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply one task's patch on a scratch branch off the phase branch, and check it.
+
+    Returns the record whose evidence rows the gate will read. Whether the tests
+    pass is not something a review node gets to assert, and a task whose checks
+    fail has not met its done criteria — done criteria consume machine evidence,
+    not claims — so a failure here quarantines WITH the evidence attached rather
+    than proposing a merge and hoping.
+    """
+    patch = str((result.get("build") or {}).get("patch") or "")
+    worktree = ctx.task_worktree(phase, task)
+    branch = ctx.scratch_branch(task)
+    record: dict[str, Any] = {"id": task, "phase": phase, "branch": branch, "evidence": []}
+
+    ok, detail = create_worktree(ctx.repo, worktree, branch=branch, base=ctx.phase_branch(phase))
+    if not ok:
+        record["quarantine"] = f"worktree {branch} could not be created: {detail}"
+        return record
+
+    ok, detail = apply_patch(patch, worktree)
+    record["evidence"].append(
+        {"check": "patch_apply", "output": f"ok — applied in {worktree}" if ok else f"FAIL — {detail}"}
+    )
+    if not ok:
+        record["quarantine"] = f"patch did not apply: {detail}"
+        return record
+
+    if ctx.checks:
+        results = run_checks(worktree, ctx.checks)
+        record["checks"] = results
+        record["evidence"].extend(checks_evidence(results))
+        if not all_passed(results):
+            failed = ", ".join(r["name"] for r in results if not r.get("passed"))
+            record["quarantine"] = f"configured checks failed: {failed}"
+            return record
+
+    ok, detail = _git(*_IDENTITY, "-C", str(worktree), "add", "-A")
+    if ok:
+        ok, detail = _git(
+            *_IDENTITY, "-C", str(worktree), "commit", "--allow-empty", "-q",
+            "-m", f"epic {ctx.run_id}: {task}",
+        )
+    if not ok:
+        record["quarantine"] = f"the applied patch could not be committed: {detail}"
+    return record
+
+
+# ── the driver ──────────────────────────────────────────────────────────────
+
+
+def run_epic(
+    *,
+    initiative: Mapping[str, Any],
+    repo: Path | str,
+    cartridge: Mapping[str, Any],
+    runner: Any,
+    specs: Mapping[str, Any],
+    run_id: str,
+    date: str,
+    max_parallel: int,
+    ledger_path: Path | str,
+    provider_profile: str,
+    runs_dir: Path | str,
+    worktree_root: Path | str,
+    assume: str | None = None,
+    fix_attempts: int | None = None,
+) -> dict[str, Any]:
+    """Drive a whole initiative: every phase, in dependency order, landing nothing.
+
+    `initiative` is `core.workstore.read_initiative(...)` output — read by the
+    CLI and passed in, because a driver that read the store itself would put the
+    filesystem back inside the thing under test. `repo` is required: stacking is
+    real branches in a real repository, and there is no honest way to fake that.
+
+    Failure is continued-and-quarantined at BOTH grains. A task that fails its
+    checks is set aside and its siblings still gate; a phase that does not meet
+    its goal blocks its own dependents and nothing else. One task must not take
+    a phase with it, and one phase must not take an initiative with it.
+    """
+    repo = Path(repo)
+    ok, head = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
+    ctx = _Ctx(
+        repo=repo,
+        cartridge=cartridge,
+        runner=runner,
+        specs=specs,
+        run_id=run_id,
+        date=date,
+        max_parallel=max_parallel,
+        ledger_path=Path(ledger_path),
+        provider_profile=provider_profile,
+        runs_dir=Path(runs_dir),
+        worktree_root=Path(str(worktree_root)).expanduser(),
+        assume=assume,
+        fix_attempts=fix_attempts,
+        initiative_id=str(initiative.get("id")),
+        # An unparented phase branches from the repository's current HEAD, read
+        # once here so every phase in a run stacks on the same ground.
+        default_ref=head.strip() if ok else "HEAD",
+    )
+
+    # The driver's own view of the work. `ready_tasks` answers from item state,
+    # so an EXECUTED `state_move` has to be reflected here or the next phase's
+    # tasks never become ready within this run. The arm remains the single
+    # writer of the store on disk; this is the driver keeping its own copy
+    # honest about what the arm just did.
+    items = [dict(item) for item in initiative.get("items") or []]
+
+    parents = phase_parents(items)
+    ordered, cyclic = phase_order(parents)
+
+    phases: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
+    proposals: list[dict[str, Any]] = []
+    complete: set[str] = set()
+    stacks_rebased = 0
+
+    for phase in cyclic:
+        phases.append(
+            {
+                "phase": phase,
+                "status": "blocked",
+                "reason": (
+                    "phase dependency cycle: the task DAG is acyclic but the phase graph it "
+                    "induces is not, so no order over these phases exists"
+                ),
+            }
+        )
+
+    for phase in ordered:
+        parent_phases = sorted(parents.get(phase) or ())
+
+        if len(parent_phases) > 1:
+            # Two parents is a merge of two stacks, and a v1 stack has one base
+            # ref. Refusing beats picking one parent and silently building on
+            # half the ground.
+            phases.append(
+                {
+                    "phase": phase,
+                    "status": "blocked",
+                    "parents": parent_phases,
+                    "reason": (
+                        f"multiple parent phases ({', '.join(parent_phases)}); "
+                        "v1 stacks support one parent"
+                    ),
+                }
+            )
+            continue
+
+        parent = parent_phases[0] if parent_phases else None
+        if parent is not None and parent not in complete:
+            # v1 is blanket no: a phase unblocks its dependents only when
+            # `validate_phase` says the goal is met. The validator reports
+            # `quarantine_blocks_dependents`; nothing acts on it yet.
+            phases.append(
+                {
+                    "phase": phase,
+                    "status": "blocked",
+                    "parents": parent_phases,
+                    "reason": f"parent phase '{parent}' did not meet its goal; dependents do not run",
+                }
+            )
+            continue
+
+        record = _run_phase(ctx, initiative=initiative, phase=phase, parent=parent, items=items)
+        tasks.extend(record.pop("task_records"))
+        quarantined.extend(record.pop("quarantined"))
+        proposals.extend(record.pop("batch"))
+        stacks_rebased += 1 if record.get("rebased") else 0
+        phases.append(record)
+        if record["status"] == "complete":
+            complete.add(phase)
+
+    return {
+        "run_id": run_id,
+        "date": date,
+        "initiative": ctx.initiative_id,
+        "phases": phases,
+        "tasks": tasks,
+        "quarantined": quarantined,
+        "proposals": proposals,
+        "totals": {
+            "phases_complete": sum(1 for p in phases if p["status"] == "complete"),
+            "phases_partial": sum(1 for p in phases if p["status"] == "partial"),
+            "phases_blocked": sum(1 for p in phases if p["status"] == "blocked"),
+            "tasks_quarantined": sum(1 for q in quarantined if q.get("grain") == "task"),
+            "stacks_rebased": stacks_rebased,
+        },
+    }
+
+
+def _run_phase(
+    ctx: _Ctx,
+    *,
+    initiative: Mapping[str, Any],
+    phase: str,
+    parent: str | None,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """One phase: branch, fan out, check, validate, gate, execute, record."""
+    branch = ctx.phase_branch(phase)
+    base_ref = ctx.phase_branch(parent) if parent else ctx.default_ref
+    quarantined: list[dict[str, Any]] = []
+    record: dict[str, Any] = {
+        "phase": phase,
+        "parent": parent,
+        "branch": branch,
+        "base": base_ref,
+        "status": "partial",
+        "rebased": False,
+        "task_records": [],
+        "quarantined": quarantined,
+        "batch": [],
+    }
+
+    ok, detail, reused = _open_phase_worktree(ctx, phase, base_ref)
+    if not ok:
+        record["status"] = "blocked"
+        record["reason"] = f"the phase worktree could not be created: {detail}"
+        quarantined.append({"id": phase, "phase": phase, "grain": "phase", "reason": record["reason"]})
+        return record
+    record["reused_branch"] = reused
+
+    # A rebase is a WRITE, so it is a proposal like any other and joins this
+    # phase's gate batch rather than happening quietly on the way past.
+    rebase: dict[str, Any] | None = None
+    if reused and _parent_head_moved(ctx, phase, base_ref):
+        rebase = proposal(
+            ctx.cartridge,
+            kind="stack_rebase",
+            target=branch,
+            evidence=[
+                {"check": "merge-base --is-ancestor", "output": f"{base_ref} is NOT an ancestor of {branch}"},
+                {"check": "stacked on", "output": f"{branch} was branched from {base_ref}, whose head has moved"},
+            ],
+            rationale=(
+                f"'{base_ref}' moved since '{branch}' was created, so this phase — and "
+                "everything stacked above it — is sitting on ground that is no longer there"
+            ),
+            suggested_action=f"rebase {branch} onto {base_ref}",
+        )
+
+    ready = workstore.ready_tasks(items, phase=phase)
+    results: list[dict[str, Any]] = []
+    if ready:
+        results, _, failures = invoke_graphs(
+            [
+                Invocation(
+                    id=str(task["id"]),
+                    graph=LIFECYCLE,
+                    args={
+                        "date": ctx.date,
+                        "ticket": task["id"],
+                        "cartridge": ctx.cartridge,
+                        "surfaces": list(task.get("surfaces") or []),
+                        **({"fix_attempts": ctx.fix_attempts} if ctx.fix_attempts is not None else {}),
+                    },
+                )
+                for task in ready
+            ],
+            specs=ctx.specs,
+            runner=ctx.runner,
+            run_id=f"{ctx.run_id}:{phase}",
+            max_parallel=ctx.max_parallel,
+        )
+        # A child's failure is a quarantined task, not a failed swarm — the
+        # policy `invoke_graphs` names continue-and-quarantine.
+        for failure in failures:
+            quarantined.append(
+                {"id": failure.split(":", 1)[0], "phase": phase, "grain": "task", "reason": failure}
+            )
+
+    by_id = {str(item["id"]): item for item in items}
+    built: dict[str, dict[str, Any]] = {}
+    surviving: list[str] = []
+    escalated: set[str] = set()
+
+    for result in sorted(results, key=lambda r: str(r.get("ticket"))):
+        task = str(result.get("ticket"))
+        build = _build_task(ctx, phase=phase, task=task, result=result)
+        build["result"] = result
+        built[task] = build
+
+        # Evidence first, escalation second — the same order `cli.py` uses, and
+        # for the same reason: the gate should see the tests' opinion of a
+        # governance change too.
+        for item in result.get("proposals") or []:
+            if item.get("kind") in _DRAFT_KINDS:
+                item.setdefault("evidence", []).extend(build["evidence"])
+
+        # A change to the rules is not whatever kind the graph called it. This
+        # runs after emission and before the policy split, which is the only
+        # window where no streak on a mundane kind can carry a governance edit
+        # past the gate.
+        build["proposals"], hits = escalate_self_modification(
+            result.get("proposals") or [],
+            patch=str((result.get("build") or {}).get("patch") or ""),
+            cartridge=ctx.cartridge,
+            ledger_path=ctx.ledger_path,
+        )
+        if hits:
+            escalated.add(task)
+            build["governance_hits"] = hits
+
+        record["task_records"].append(
+            {
+                "id": task,
+                "phase": phase,
+                "branch": build["branch"],
+                "evidence": build["evidence"],
+                "quarantine": build.get("quarantine"),
+                "governance_hits": hits,
+                "draft": None,
+                "merged": False,
+                "status": "quarantined" if build.get("quarantine") else "built",
+            }
+        )
+        if build.get("quarantine"):
+            quarantined.append(
+                {"id": task, "phase": phase, "grain": "task", "reason": build["quarantine"]}
+            )
+            continue
+        surviving.append(task)
+
+    # ── validation, between the fan-out and the merges ───────────────────────
+    chunk_by_task: dict[str, dict[str, Any]] = {}
+    verdict: dict[str, Any] | None = None
+    validated = "validate_phase" in ctx.bound
+
+    if validated and results:
+        phase_state = {
+            "phase": {"id": phase, "goal": _phase_goal(initiative, phase)},
+            "tasks": [
+                {
+                    "id": task,
+                    "title": str((by_id.get(task) or {}).get("title") or task),
+                    # The work store's own prose, never the builder's summary of
+                    # what it did. See `graphs/delivery/phase_validate.py`: a
+                    # validator handed the owner's account is reviewing a
+                    # recollection, and the graph strips one if it arrives.
+                    "description": str((by_id.get(task) or {}).get("body") or ""),
+                    "evidence": built[task]["evidence"],
+                    "change_facts": dict(built[task]["result"].get("change_facts") or {}),
+                    "review_verdict": str((built[task]["result"].get("review") or {}).get("verdict") or ""),
+                }
+                for task in surviving
+            ],
+            "quarantined": [{"id": q["id"], "reason": q["reason"]} for q in quarantined],
+        }
+        validations, _, failures = invoke_graphs(
+            [
+                Invocation(
+                    id=f"{VALIDATE}:{phase}",
+                    graph=VALIDATE,
+                    args={"date": ctx.date, "cartridge": ctx.cartridge, "phase_state": phase_state},
+                )
+            ],
+            specs=ctx.specs,
+            runner=ctx.runner,
+            run_id=ctx.run_id,
+            max_parallel=1,
+        )
+        if validations:
+            record["chunk_verdicts"] = list(validations[0].get("chunk_verdicts") or [])
+            verdict = record["phase_verdict"] = dict(validations[0].get("phase_verdict") or {})
+            chunk_by_task = {str(v.get("task")): v for v in record["chunk_verdicts"]}
+        else:
+            record["reason"] = f"the validator failed: {'; '.join(failures)}"
+
+    # An unsatisfied chunk verdict quarantines its task BEFORE the gate. A task
+    # the validator says did not do what it said is not a task whose merge
+    # should be up for a decision.
+    for task in list(surviving):
+        chunk = chunk_by_task.get(task)
+        if chunk is not None and not chunk.get("satisfied"):
+            surviving.remove(task)
+            gaps = ", ".join(chunk.get("gaps") or []) or str(chunk.get("reasoning", ""))
+            quarantined.append(
+                {"id": task, "phase": phase, "grain": "task", "reason": f"validate_chunk unsatisfied: {gaps}"}
+            )
+            for task_record in record["task_records"]:
+                if task_record["id"] == task:
+                    task_record["status"] = "quarantined"
+                    task_record["quarantine"] = f"validate_chunk unsatisfied: {gaps}"
+
+    # ── the phase's one gate batch, in task-id order ─────────────────────────
+    batch, slots = _build_batch(
+        ctx,
+        phase=phase,
+        surviving=surviving,
+        built=built,
+        escalated=escalated,
+        chunk_by_task=chunk_by_task,
+        rebase=rebase,
+    )
+    record["batch"] = batch
+
+    # ── policy, then the gate, then execution in batch order ────────────────
+    auto, gated = split_by_policy(
+        batch, cartridge=ctx.cartridge, ledger_path=ctx.ledger_path, provider_profile=ctx.provider_profile
+    )
+    auto_ids = {id(item) for item in auto}
+    decisions, human_minutes = gate(gated, assume=ctx.assume)
+    decided = {id(item): (decision, edited) for item, decision, edited in decisions}
+
+    state = _Execution(landed={}, merged={}, moved={}, quarantined=quarantined)
+    diffs: list[dict[str, Any]] = []
+
+    for item in batch:
+        slot, subject = slots.get(id(item), ("other", ""))
+        if id(item) in auto_ids:
+            applied, _ = _execute(ctx, item, slot=slot, subject=subject, phase=phase, state=state)
+            # Auto-cleared: NO gate diff and NO ledger row. Autonomy is spent by
+            # acting; a row here would let a kind ratchet itself up on its own
+            # say-so, which is the self-report the ledger exists to disbelieve.
+            record["rebased"] = record["rebased"] or (applied and slot == "rebase")
+            continue
+
+        decision, edited = decided.get(id(item), ("refused", False))
+        applied = False
+        if decision == "approved":
+            applied, _ = _execute(ctx, item, slot=slot, subject=subject, phase=phase, state=state)
+            record["rebased"] = record["rebased"] or (applied and slot == "rebase")
+        # Built here rather than by `gate.apply_decisions`, which cannot know
+        # about a branch this driver created: `applied` is what actually
+        # happened, so an approved merge that conflicted records `skipped`.
+        diffs.append(gate_diff(item, decision, applied=applied, edited=edited))
+
+    for task_record in record["task_records"]:
+        task = task_record["id"]
+        task_record["draft"] = ctx.draft_branch(phase, task) if state.landed.get(task) else None
+        task_record["merged"] = bool(state.merged.get(task))
+        if state.merged.get(task) is False and not task_record.get("quarantine"):
+            task_record["status"] = "quarantined"
+
+    # An executed `state_move` is reflected in the driver's own copy of the work
+    # so the next phase's tasks can become ready inside this run.
+    for task, done in state.moved.items():
+        if done:
+            for item in items:
+                if str(item["id"]) == task:
+                    item["state"] = "done"
+
+    record["status"], reason = _phase_status(
+        verdict,
+        validated=validated,
+        ready=ready,
+        quarantined=quarantined,
+        items=items,
+        phase=phase,
+        landed=bool(surviving) and all(state.merged.get(task) for task in surviving),
+        branch=branch,
+    )
+    if reason:
+        record.setdefault("reason", reason)
+
+    # Release the phase branch. Git refuses to check one branch out in two
+    # worktrees, and re-entrancy — a later run building on the branch this one
+    # left — is a stated requirement, so the worktree keeps its files and gives
+    # the branch back. Nothing here deletes work: the branches are the artifact.
+    _git("-C", str(ctx.phase_worktree(phase)), "checkout", "--detach", "-q")
+
+    totals = {
+        "ready": len(ready),
+        "completed": len(results),
+        "surviving": len(surviving),
+        "quarantined": sum(1 for q in quarantined if q.get("grain") == "task"),
+        "auto_applied": len(auto),
+        "gated": len(gated),
+    }
+    manifest = build_manifest(
+        run_id=f"{ctx.run_id}:{phase}",
+        ts=datetime.now(timezone.utc).isoformat(),
+        principal=PRINCIPAL,
+        cartridge=ctx.cartridge,
+        provider_profile=ctx.provider_profile,
+        proposals=batch,
+        gate_diffs=diffs,
+        human_minutes=human_minutes,
+        totals=totals,
+    )
+    record_run(manifest, runs_dir=ctx.runs_dir, ledger_path=ctx.ledger_path)
+    record["manifest"] = f"{ctx.run_id}:{phase}"
+    record["totals"] = totals
+    return record
+
+
+def _phase_status(
+    verdict: Mapping[str, Any] | None,
+    *,
+    validated: bool,
+    ready: Sequence[Mapping[str, Any]],
+    quarantined: Sequence[Mapping[str, Any]],
+    items: Sequence[Mapping[str, Any]],
+    phase: str,
+    landed: bool,
+    branch: str,
+) -> tuple[str, str]:
+    """Complete, or partial — and a phase unblocks its dependents only when complete.
+
+    Blanket no, decided. A partially complete phase turns one quarantined task
+    into a phase of work built on ground that is not there; the refinement
+    (`quarantine_blocks_dependents`) is what the validator reports, and acting
+    on it is a heavier ask of that role than anything else in the spec.
+
+    An unbound `validate_phase` is not an approval. A team that binds no
+    validator gets task completion and NO claim about phase completion, which
+    is honest — so the phase is partial, and its dependents wait.
+
+    A met goal is not sufficient either, and this is where open question 1 gets
+    its answer: the verdict is about work that exists on branches, and the gate
+    decides whether that work reaches the phase branch. If the merges were
+    refused, the next phase would branch from a phase branch with nothing on it,
+    so the phase is partial no matter how good the work was.
+    """
+    if not ready and not quarantined and all(
+        item.get("state") == "done" for item in items if item.get("phase") == phase
+    ):
+        return "complete", "every task in the phase was already done"
+    if not validated:
+        return "partial", "no validator bound"
+    if verdict is None:
+        return "partial", "the validator produced no verdict"
+    if not verdict.get("goal_met"):
+        return "partial", str(verdict.get("reasoning") or "the phase goal was not met")
+    if not landed:
+        return "partial", f"the goal is met, but nothing was merged into {branch}"
+    return "complete", ""
+
+
+def _build_batch(
+    ctx: _Ctx,
+    *,
+    phase: str,
+    surviving: Sequence[str],
+    built: Mapping[str, Mapping[str, Any]],
+    escalated: set[str],
+    chunk_by_task: Mapping[str, Mapping[str, Any]],
+    rebase: Mapping[str, Any] | None,
+) -> tuple[list[dict[str, Any]], dict[int, tuple[str, str]]]:
+    """Everything this phase asks for, in task-id order, plus what each slot means.
+
+    The slot map is by identity rather than by target string, because the same
+    proposal objects travel through `split_by_policy` and `gate` unchanged and
+    the driver has to know, at execution time, which branch a given proposal
+    was about. Reparsing a target would be a second encoding of the same fact.
+    """
+    batch: list[dict[str, Any]] = []
+    slots: dict[int, tuple[str, str]] = {}
+
+    for task in surviving:
+        for item in built[task]["proposals"]:
+            batch.append(item)
+            if item.get("kind") in _DRAFT_KINDS:
+                slots[id(item)] = ("draft", task)
+
+    for task in surviving:
+        merge = proposal(
+            ctx.cartridge,
+            kind="merge_stack",
+            target=f"{ctx.draft_branch(phase, task)} -> {ctx.phase_branch(phase)}",
+            evidence=[
+                *built[task]["evidence"],
+                {
+                    "check": "validate_chunk",
+                    "output": (
+                        f"satisfied — {chunk_by_task[task].get('reasoning')}"
+                        if task in chunk_by_task
+                        else "not bound; no chunk verdict was produced"
+                    ),
+                },
+            ],
+            rationale=f"{task} is reviewed, applied and checked on its own branch off {ctx.phase_branch(phase)}",
+            suggested_action=f"merge {ctx.draft_branch(phase, task)} into {ctx.phase_branch(phase)} (no fast-forward)",
+        )
+        if task in escalated:
+            # The patch touched governance, so the MERGE of that patch is a
+            # governance write too. Escalating it here is what makes "its merge
+            # is impossible to earn" true rather than merely intended.
+            merged, _ = escalate_self_modification(
+                [merge],
+                patch=str((built[task]["result"].get("build") or {}).get("patch") or ""),
+                cartridge=ctx.cartridge,
+                ledger_path=ctx.ledger_path,
+            )
+            merge = merged[0]
+        batch.append(merge)
+        slots[id(merge)] = ("merge", task)
+
+    if rebase is not None:
+        batch.append(dict(rebase))
+        slots[id(batch[-1])] = ("rebase", phase)
+
+    for task in surviving:
+        move = proposal(
+            ctx.cartridge,
+            kind="state_move",
+            target=task,
+            evidence=[
+                {
+                    "check": "review_charter verdict",
+                    "output": str((built[task]["result"].get("review") or {}).get("verdict")),
+                },
+                *built[task]["evidence"],
+            ],
+            rationale=f"{task} was built, checked and reviewed in this run",
+            suggested_action=f"mark {task} done",
+        )
+        batch.append(move)
+        slots[id(move)] = ("state_move", task)
+
+    return batch, slots
+
+
+@dataclass
+class _Execution:
+    """What actually happened, per task, as the batch executes."""
+
+    landed: dict[str, bool]
+    merged: dict[str, bool]
+    moved: dict[str, bool]
+    quarantined: list[dict[str, Any]]
+
+
+def _execute(
+    ctx: _Ctx,
+    item: Mapping[str, Any],
+    *,
+    slot: str,
+    subject: str,
+    phase: str,
+    state: _Execution,
+) -> tuple[bool, str]:
+    """Do what the gate — or the policy — cleared. Dispatch on the KIND, not the slot.
+
+    The kind is what governs, and escalation rewrites it: a `draft_pr_create`
+    whose patch touched governance arrives here as `self_modification`, falls
+    through to the arm the cartridge names (`pr`, which has no executor here),
+    and reports honestly that nothing happened. That is what makes an escalated
+    task's merge impossible to earn rather than merely discouraged.
+    """
+    kind = item.get("kind")
+
+    if kind == "draft_pr_create" and slot == "draft":
+        # Landing the draft IS creating the branch. There is no forge arm here,
+        # so the "draft PR" is a local branch until one exists — and a branch
+        # nobody has opened has exactly the blast radius the taxonomy prices it
+        # at: the cost of a wrong one is a branch nobody reads.
+        draft = ctx.draft_branch(phase, subject)
+        ok, detail = _git("-C", str(ctx.repo), "branch", draft, ctx.scratch_branch(subject))
+        state.landed[subject] = ok
+        return ok, detail or f"created {draft}"
+
+    if kind == "merge_stack" and slot == "merge":
+        # Task branch -> its parent PHASE branch, and nothing else. No path in
+        # this driver merges to a default branch: `merge_main` is never emitted,
+        # never executed, and unreachable from here at any comfort level and on
+        # any streak. The swarm's output is branches and drafts.
+        if not state.landed.get(subject):
+            return False, "the draft did not land, so its merge is refused with it"
+        draft = ctx.draft_branch(phase, subject)
+        ok, detail = _git(
+            *_IDENTITY, "-C", str(ctx.phase_worktree(phase)), "merge", "--no-ff", draft,
+            "-m", f"epic {ctx.run_id}: merge {subject} into {phase}",
+        )
+        if not ok:
+            _git("-C", str(ctx.phase_worktree(phase)), "merge", "--abort")
+            state.quarantined.append(
+                {"id": subject, "phase": phase, "grain": "task", "reason": f"merge conflict: {detail}"}
+            )
+        state.merged[subject] = ok
+        return ok, detail
+
+    if kind == "stack_rebase" and slot == "rebase":
+        ok, detail = _rebase(ctx, phase, _rebase_base(item))
+        if not ok:
+            state.quarantined.append(
+                {"id": phase, "phase": phase, "grain": "phase", "reason": f"rebase conflict: {detail}"}
+            )
+        return ok, detail
+
+    # Everything else goes to the arm the cartridge names — the same call
+    # `gate.apply_decisions` makes, because an apply arm is a role and the same
+    # runner that ran the read-only nodes runs the write.
+    applied, detail = auto_apply(dict(item), cartridge=ctx.cartridge, runner=ctx.runner)
+    if slot == "state_move":
+        state.moved[subject] = applied
+    return applied, detail
+
+
+def _rebase_base(item: Mapping[str, Any]) -> str:
+    """The ref a `stack_rebase` proposal names as the ground that moved.
+
+    Read back off the proposal rather than recomputed, so what executes is the
+    thing the gate was shown: a rebase onto a ref nobody approved is a different
+    write from the one that was decided.
+    """
+    return str(item.get("suggested_action") or "").rsplit(" onto ", 1)[-1].strip()

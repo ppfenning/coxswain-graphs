@@ -33,25 +33,36 @@ and it must not acquire a `SPEC` or appear in the graph registry. If it ever
 does, `test_portability.py` will start asserting purity rules against something
 that cannot satisfy them, and the honest answer will be to weaken the test.
 
+It shipped as `harness/epic.py`, and `run_epic` is the whole of it.
+
 The parts of this that *are* model calls — `validate_chunk`, `validate_phase` —
-are nodes, and nodes belong to graphs. See *Open question 3*.
+are nodes, and nodes belong to graphs. They shipped as
+`graphs/delivery/phase_validate.py`, the `phase-validate` graph, which the driver
+invokes exactly the way it invokes `lifecycle-propose`. See *Decision 3*.
 
 ## Roles and kinds this needs
 
 | Name | Kind | Status | Notes |
 |---|---|---|---|
-| `validate_chunk` | role | **new, optional** | did this task actually satisfy its own description |
-| `validate_phase` | role | **new, optional** | do these tasks, together, accomplish the phase |
-| `stack_rebase` | write kind | **new** | rewriting a branch other work is stacked on |
+| `validate_chunk` | role | **shipped, optional** | did this task actually satisfy its own description |
+| `validate_phase` | role | **shipped, optional** | do these tasks, together, accomplish the phase |
+| `stack_rebase` | write kind | **shipped** | rewriting a branch other work is stacked on |
 
-All three require a base-cartridge change. The two roles are additions to
+All three landed in the base cartridge. The two roles are additions to
 `roles.optional`, which is ordinary. `stack_rebase` is an addition to
-`write_kinds`, also ordinary. What is *not* ordinary is discussed under
-*Comfort levels*, below, and it is the finding that most affects this design.
+`write_kinds`, also ordinary. What was *not* ordinary is discussed under
+*Comfort levels*, below, and it is the finding that most affected this design.
 
 **Args:** `run_id`, `date`, `cartridge` (resolved, required, no fallback),
-`initiative` (the work store path), `max_parallel`, optional `comfort` (a named
-preset; else the cartridge's own ramps stand).
+`initiative` (the work store's own output, read by the CLI and passed in — a
+driver that read the store itself would put the filesystem back inside the thing
+under test), `repo` (required: stacking is real branches in a real repository,
+and there is no honest way to fake that), `max_parallel`, and the harness's usual
+`ledger_path` / `runs_dir` / `worktree_root` / `provider_profile` / `assume`.
+
+There is no `comfort` argument. A comfort level is a cartridge — `local-comfort0`
+and `local-comfort1` in `agent-cartridges` — and a flag that could override the
+resolved ramps would be a second source of truth about what a team has earned.
 
 **Returns:** `{run_id, date, initiative, phases[], tasks[], quarantined[],
 proposals[], totals}` — where `totals` reports `phases_complete`,
@@ -64,7 +75,7 @@ cannot both be true. They can, because they are about different acts.
 
 **The swarm runs to completion producing draft PRs.** A draft PR has no effect
 until a human opens it — that is why `draft_pr_create` carries `risk: low` in the
-base taxonomy while `merge` carries `never`. Producing work is cheap to undo:
+base taxonomy while `merge_main` carries `never`. Producing work is cheap to undo:
 the artifact is a branch and a draft, and the cost of a wrong one is a branch
 nobody reads. Landing work is not, and landing is where the policy lives.
 
@@ -131,10 +142,25 @@ team may never loosen one."* Against the shipped taxonomy:
 
 | Level | Intent | Expressible as a preset? |
 |---|---|---|
-| 0 | everything proposes | **Yes.** Tighten every relevant kind to `gated` |
-| 1 | draft PRs auto-created | **Yes, once earned.** `draft_pr_create` is already `ramp: eligible`; it auto-applies after `graduation_n` clean outcomes, not on being switched on |
-| 2 | graduated kinds may mark ready | **No.** `pr_ready_flip` is `ramp: gated` in base. A team cannot loosen it |
-| 3 | graduated kinds merge within a phase | **No.** `merge` is `ramp: never` in base. A team cannot loosen it |
+| 0 | everything proposes | **Yes.** Tighten every relevant kind to `gated`. Ships as `local-comfort0` |
+| 1 | draft PRs auto-created | **Yes, once earned.** `draft_pr_create` is already `ramp: eligible`; it auto-applies after `graduation_n` clean outcomes, not on being switched on. Ships as `local-comfort1` |
+| 2 | graduated kinds may mark ready | **No, still.** `pr_ready_flip` is `ramp: gated` in base. A team cannot loosen it, and nothing here justifies loosening it for everyone. Unshipped |
+| 3 | graduated kinds merge within a phase | **Yes, now** — by narrowing the kind rather than loosening a ramp. See below |
+
+Level 3 changed, and the way it changed is the point. The old row said `merge` is
+`ramp: never` and a team cannot loosen it, which was true and was the wrong
+question. One `merge` kind priced two unlike acts identically: joining a task
+branch to the phase branch above it, and putting code on the branch everyone else
+builds from. Only the second is irreversible in the way that argues for a
+permanent human. So `merge` split into `merge_stack` (`eligible`) and `merge_main`
+(`never`), and *within-initiative* stack merges became expressible without anyone
+loosening anything — `merge_main` inherited the old kind's posture, and
+`merge_stack` is a new, narrower act that never had a kind of its own.
+
+A team that does not want stack merges earnable tightens `merge_stack` to `gated`
+in its own cartridge, which is exactly what the comfort-1 bundle does. The
+one-way tighten rule is what makes that toggle legal, and it is why the split is
+not a loosening dressed up as a refactor.
 
 Level 1 carries a subtlety that reads as a bug if it surprises you: a preset
 cannot *grant* autonomy, only permit it to be earned. `autonomy_policy` returns
@@ -144,12 +170,12 @@ Setting `graduation_n: 0` to make level 1 immediate would make *every* eligible
 kind immediate. There is no per-kind graduation override, and adding one would be
 a change to the trust model rather than a preset.
 
-Levels 2 and 3 therefore require editing the base taxonomy — loosening `merge`
-and `pr_ready_flip` for everyone — which the base forbids teams from doing and
-which nothing in this spec justifies doing on their behalf. **The recommendation
-is to ship levels 0 and 1 and stop.** The swarm's value does not depend on 2 or
-3: it comes from producing the whole stack unattended, and clicking "ready" on
-work you were going to read anyway is not the expensive part of the job.
+Level 2 still requires editing the base taxonomy — loosening `pr_ready_flip` for
+everyone — which the base forbids teams from doing and which nothing here
+justifies doing on their behalf. **Levels 0 and 1 shipped as bundles; level 3
+became expressible through the split; level 2 remains unshipped.** The swarm's
+value never depended on 2: clicking "ready" on work you were going to read anyway
+is not the expensive part of the job.
 
 ## When a task fails
 
@@ -199,24 +225,28 @@ flowchart TB
     POLICY -- "propose" --> GATE{{"human gate"}}
     POLICY -- "auto, graduated kinds only" --> ARM["apply arm, a role"]
 
-    ARM -. "never reaches" .-> MERGE["merge"]
+    ARM -. "never reaches" .-> MERGE["merge_main"]
 
     style MERGE stroke-dasharray: 5 5
 ```
 
-The dashed edge carries the same weight here as it does in `lifecycle-propose`:
-no path through this driver merges anything, at any comfort level, on any streak.
-The swarm's output is branches and drafts.
+The dashed edge carries the same weight here as it does in `lifecycle-propose`,
+and the split is what made it precise rather than sweeping: no path through this
+driver reaches the default branch, at any comfort level, on any streak. Stack
+merges inside an initiative do happen, once `merge_stack` has been decided or
+earned. The swarm's output is branches and drafts, and the branch everyone else
+builds from is not one of them.
 
 ## Prerequisite: nested invocation
 
-This needs one primitive the harness does not have — **a graph invoking graphs
+This needed one primitive the harness did not have — **a graph invoking graphs
 and waiting on the results**, with the invoked run's proposals flowing into the
 same policy, gate and ledger as everything else rather than into a side channel.
+It shipped as `harness/invoke.py`, and `run_phase` is now a thin wrapper over it.
 
 It is shared with two other pieces of deferred work: the bounded fix loop in
-`lifecycle-propose`, and the chief-of-staff dispatcher. Building it once is the
-point. What this spec needs from it, specifically:
+`lifecycle-propose`, and the chief-of-staff dispatcher. Building it once was the
+point. What this spec needed from it, specifically:
 
 - invoke a named graph from the registry with constructed args
 - bound concurrency, which `run_phase` already does
@@ -224,38 +254,89 @@ point. What this spec needs from it, specifically:
   hashes one cartridge and `_require_single_scope` stays satisfiable
 - surface a child's `ContractViolation` as a task failure, not a swarm failure
 
-It is not designed here.
+All four hold. The driver invokes `lifecycle` and `validate` by registry name,
+bounds concurrency at `max_parallel`, records one manifest per phase under
+`run_id:phase` so the manifest hashes one cartridge, and takes a child's
+`ContractViolation` or `RunnerError` as a quarantined task.
 
-## Open questions
+## Decisions — 2026-09-01
 
-**1. Are phase boundaries ever ungated?** *Recommendation: no.* A phase boundary
-is the last place a human can redirect the work cheaply — after it, the next
-phase's tasks branch from this phase's head and a change means rebasing them all.
-The cost of gating is one decision per phase, which is small against an
-initiative. The tradeoff is that "runs to completion unattended" then means
-"produces every draft and stops at each phase boundary", which is weaker than it
-sounds in a demo and stronger than it sounds at 3am.
+The three open questions, closed.
 
-**2. Can a partially-complete phase unblock its dependents?** *Recommendation:
-only when `validate_phase` says the quarantined tasks are not on the dependent
-path.* Blanket yes turns one quarantined task into a phase of work built on
-ground that is not there; blanket no means a single unfixable task stalls an
-initiative that could have continued. The middle requires `validate_phase` to
-reason about *which* task failed rather than how many, which is a heavier ask of
-that role than anything else in this spec, and may be reason enough to start with
-blanket no.
+**1. Are phase boundaries ever ungated?** *Decided: they are gated by
+`merge_stack`'s ramp, which is the same answer as "no" for every team that has
+not measured one.* A phase boundary is the last place a human can redirect the
+work cheaply — after it, the next phase's tasks branch from this phase's head and
+a change means rebasing them all. Since the split, that boundary has a kind of its
+own: `merge_stack` is `eligible`, so it gates until it is earned and can then be
+earned through the ordinary ramp, and a team that wants it permanently human pins
+it `gated` under the one-way tighten rule. The comfort-1 bundle does exactly that.
+`merge_main` stays `never`, at every comfort level and on every streak, and no
+path through this driver emits or executes it.
 
-**3. Where do the validators live?** They are model calls, and model calls belong
-in graphs, but they are invoked by a driver. Either a tiny `phase-validate` graph
-exists for them to be nodes of, or the driver calls the runner directly and
-becomes the first non-graph thing in the system that does. The first is more
-consistent; the second is less ceremony. Not decided.
+The driver makes that gate load-bearing rather than decorative: **a phase is
+complete only when its merges actually happened.** A met goal on work that never
+reached the phase branch is a phase whose dependents would branch from nothing.
+
+**2. Can a partially-complete phase unblock its dependents?** *Decided: blanket
+no.* A phase unblocks its dependents only when `validate_phase` says the goal is
+met. Blanket yes turns one quarantined task into a phase of work built on ground
+that is not there. The refinement — unblock when the quarantined tasks are not on
+the dependent path — asks `validate_phase` to reason about *which* task failed
+rather than how many, which is a heavier ask of that role than anything else here.
+So the validator *reports* it, as `quarantine_blocks_dependents`, and nothing acts
+on it yet. The field exists so the judgment can be measured before it is trusted,
+which is the same shape as every other ramp in this system.
+
+**3. Where do the validators live?** *Decided: in a graph.* `phase-validate` is a
+two-node graph — `validate_chunk` per task, `validate_phase` once — and the driver
+invokes it through `invoke_graphs` like anything else. The ceremony buys the thing
+that matters: the nodes stay under the portability suite, the cartridge is
+required with no fallback, and the run is replayable. A driver calling the runner
+directly would have put the two judgments the phase boundary rests on outside
+every rule the rest of the system is held to.
+
+## What the implementation deviates on
+
+Four places where the shipped driver is narrower or differently shaped than the
+text above, each recorded rather than quietly absorbed.
+
+**Validators run between the fan-out and the merges.** The phase verdict judges
+the union of what the tasks produced, on their own branches, before any of it is
+joined to the phase branch. It is not a re-read of the merged branch. The verdict
+is therefore about work that exists and is checked, not about a state the driver
+already committed to — and a phase that does not add up is caught while nothing
+has moved.
+
+**A v1 stack supports one parent phase.** A phase with two parent phases is not
+representable as a single git stack: one stack has one base ref. Such a phase is
+marked blocked with that diagnosis and does not run, rather than the driver
+picking a parent and silently building on half the ground.
+
+**Per-phase manifests, under `run_id:phase`.** One phase, one cartridge, one
+scope, so `_require_single_scope` stays satisfiable and a phase's ledger rows are
+attributable to the phase that earned them.
+
+**A draft is a local branch until a forge arm exists.** After the gate, the driver
+creates `epic/<initiative>/<phase>--<task>` from the scratch branch the work was
+built on. The `--` is not cosmetic: git cannot hold both `refs/heads/epic/i/p1`
+and `refs/heads/epic/i/p1/t1`, because one is a file where the other needs a
+directory. Nothing is pushed and nothing is opened, which is the same blast radius
+the taxonomy prices `draft_pr_create` at.
+
+One more, smaller: the work store's phases are bare directory names, so a phase
+goal is reconstructed from the phase name and the initiative's own prose when the
+store carries nothing better. Decompose-produced initiatives should eventually
+land per-phase goals in the store; `validate_phase` is only as good as the goal it
+is handed, and a reconstructed one is the weakest input in this design.
 
 **Deferred from v0:** the bounded fix loop (a task that fails validation is
 quarantined, not retried), cross-initiative scheduling, cost and token budgets
-across a whole swarm (`policy.budgets` bounds a run, not a swarm), and any
-comfort level above 1.
+across a whole swarm (`policy.budgets` bounds a run, not a swarm), acting on
+`quarantine_blocks_dependents`, and comfort level 2.
 
-**Status:** specified only. No implementation, and no `SPEC` — this is not a
-graph. `validate_chunk`, `validate_phase` and `stack_rebase` do not exist in the
-base cartridge yet, so nothing here resolves.
+**Status:** implemented. `harness/epic.py` is the driver — no `SPEC`, not in the
+registry, and it must stay that way. `graphs/delivery/phase_validate.py` is the
+`phase-validate` graph it invokes for the two judgments. `validate_chunk`,
+`validate_phase`, `merge_stack` and `stack_rebase` all exist in the base
+cartridge, so this resolves.
