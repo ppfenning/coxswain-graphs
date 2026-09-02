@@ -41,8 +41,9 @@ class ScriptedRunner:
         schema: Mapping[str, Any],
         prompt: str,
         context: Sequence[str] = (),
+        thread: str | None = None,
     ) -> NodeResult:
-        self.calls.append({"role": role, "tier": tier, "prompt": prompt, "context": list(context)})
+        self.calls.append({"role": role, "tier": tier, "prompt": prompt, "context": list(context), "thread": thread})
         queued = self._responses.get(role)
         if not queued:
             raise RunnerError(

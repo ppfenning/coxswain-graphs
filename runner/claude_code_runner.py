@@ -31,6 +31,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -90,6 +91,7 @@ class ClaudeCodeRunner:
         claude_bin: str | None = None,
         timeout: int = 1800,
         extra_system: str = "",
+        trace_dir: Path | str | None = None,
     ) -> None:
         self.profile = dict(profile)
         self.tiers = dict(self.profile.get("tiers") or {})
@@ -115,6 +117,21 @@ class ClaudeCodeRunner:
         # A tool-computed map of the target repository, set by the harness. Shown
         # to roles that have tools, so they read it instead of drawing their own.
         self.repo_digest: str | None = None
+        # Where to keep a turn-by-turn trace of every node, if anywhere. Set from
+        # AGENT_GRAPHS_TRACE_DIR or by the harness. Without it a 44-turn build
+        # is a number; with it, it is a list of what each turn did.
+        self.trace_dir: Path | None = Path(trace_dir).expanduser() if trace_dir else None
+        # The project's own check commands, verbatim from the cartridge, set by
+        # the harness. Traced builds spent a third of their turns discovering
+        # how to run the tests — the wrong interpreter, `which pytest`,
+        # `--version`, `echo hello`. The harness knows; the builder is told.
+        self.check_commands: list[str] = []
+        # Threads: one Claude Code session and one scratch tree per continuity
+        # hint, so plan, build and a retry run on the same instance and the
+        # retry edits a tree it already edited. Closed by the harness when the
+        # phase is done; never shared across a review boundary, because the
+        # graph never hands review the hint.
+        self._threads: dict[str, dict[str, Any]] = {}
         self.role_skills = dict(role_skills or {})
         self.cwd = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
         self.repo_dir: Path | None = Path(repo_dir).expanduser().resolve() if repo_dir else None
@@ -146,6 +163,45 @@ class ClaudeCodeRunner:
                 raise RunnerError(f"cannot read context pack {path}: {exc}") from exc
         return "\n\n".join(chunks)
 
+    def _make_scratch(self, role: str) -> tuple[Path, Path]:
+        parent = Path(tempfile.mkdtemp(prefix="agent-graphs-build-"))
+        scratch = parent / "tree"
+        proc = subprocess.run(
+            ["git", "-C", str(self.repo_dir), "worktree", "add", "--detach", str(scratch), "HEAD"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            shutil.rmtree(parent, ignore_errors=True)
+            raise RunnerError(f"could not create a scratch worktree for '{role}': {(proc.stderr or '').strip()[:300]}")
+        return parent, scratch
+
+    def _drop_scratch(self, parent: Path, scratch: Path) -> None:
+        subprocess.run(
+            ["git", "-C", str(self.repo_dir), "worktree", "remove", "--force", str(scratch)],
+            capture_output=True, text=True,
+        )
+        shutil.rmtree(parent, ignore_errors=True)
+
+    def _thread(self, name: str, role: str) -> dict[str, Any]:
+        """The thread's state, created on first use: a session id and, given a repository, a scratch."""
+        state = self._threads.get(name)
+        if state is None:
+            state = {"session": str(uuid.uuid4()), "parent": None, "scratch": None, "calls": 0}
+            if self.repo_dir:
+                state["parent"], state["scratch"] = self._make_scratch(role)
+            self._threads[name] = state
+        return state
+
+    def close_thread(self, name: str) -> None:
+        state = self._threads.pop(name, None)
+        if state and state.get("scratch") is not None:
+            self._drop_scratch(state["parent"], state["scratch"])
+
+    def close(self) -> None:
+        """Drop every thread's scratch. The harness calls this when a phase is done."""
+        for name in list(self._threads):
+            self.close_thread(name)
+
     @contextmanager
     def _scratch(self, role: str) -> Iterator[Path | None]:
         """A disposable worktree for a patch-returning role, or nothing.
@@ -159,25 +215,13 @@ class ClaudeCodeRunner:
         if role not in _PATCH_ROLES or not self.repo_dir:
             yield None
             return
-        parent = Path(tempfile.mkdtemp(prefix="agent-graphs-build-"))
-        scratch = parent / "tree"
-        proc = subprocess.run(
-            ["git", "-C", str(self.repo_dir), "worktree", "add", "--detach", str(scratch), "HEAD"],
-            capture_output=True, text=True,
-        )
-        if proc.returncode != 0:
-            shutil.rmtree(parent, ignore_errors=True)
-            raise RunnerError(f"could not create a scratch worktree for '{role}': {(proc.stderr or '').strip()[:300]}")
+        parent, scratch = self._make_scratch(role)
         try:
             yield scratch
         finally:
-            subprocess.run(
-                ["git", "-C", str(self.repo_dir), "worktree", "remove", "--force", str(scratch)],
-                capture_output=True, text=True,
-            )
-            shutil.rmtree(parent, ignore_errors=True)
+            self._drop_scratch(parent, scratch)
 
-    def _workspace(self, scratch: Path | None = None) -> str:
+    def _workspace(self, scratch: Path | None = None, *, patches: bool = True) -> str:
         """Tell the node where the world is. It cannot find out on its own."""
         lines = [
             "<workspace>",
@@ -192,7 +236,13 @@ class ClaudeCodeRunner:
                 "never list or grep the tree to learn what this map already says.\n"
                 f"<repo-digest>\n{self.repo_digest}\n</repo-digest>"
             )
-        if scratch is not None:
+        if scratch is not None and not patches:
+            lines.append(
+                f"You have your own checkout of the target repository at {scratch}, at the commit "
+                "this run builds on. Read it there. A later step on this same thread will edit it "
+                "and produce the patch; you do not."
+            )
+        if scratch is not None and patches:
             lines.append(
                 f"You have a scratch checkout of the target repository at {scratch}, at the commit "
                 "this run builds on, and it is YOURS — nobody else is working in it and it is "
@@ -204,6 +254,15 @@ class ClaudeCodeRunner:
                 "not run is not evidence. The harness applies your patch itself, in a different "
                 "worktree, so leaving the scratch dirty is expected and correct."
             )
+            if self.check_commands:
+                cmds = "; ".join(self.check_commands)
+                lines.append(
+                    f"The project's checks are exactly: `{cmds}`. Run them as written, from the scratch "
+                    "root, and nothing else to test with: the environment is already set up, the "
+                    "right interpreter and packages are on PATH for those commands, and probing for "
+                    "them (`which`, `--version`, `python -m ...`, `echo`) is a wasted turn every time. "
+                    "If a command as written fails to start, report that verbatim and stop."
+                )
             lines.append(
                 "Work in as few turns as you can. Every turn re-sends everything you have read, so "
                 "the cost of a session grows with the square of its length: read the map, open the "
@@ -211,6 +270,16 @@ class ClaudeCodeRunner:
                 "diff, return. Do not re-read a file, do not explore for context you were already "
                 "given, and do not polish. A session that exceeds its budget is stopped and the task "
                 "is quarantined, so a finished-but-plain patch beats an unfinished perfect one."
+            )
+        if self.repo_dir or scratch is not None:
+            where = scratch if scratch is not None else self.repo_dir
+            lines.append(
+                f"Always use ABSOLUTE paths under {where} — a relative path resolves against a "
+                "directory that is not the repository, and every failed read is a wasted turn. "
+                "Read by range: the map gives line numbers, so open the 40–80 lines around the "
+                "symbol you need (Read's offset and limit), and never read a file longer than 300 "
+                "lines whole. Each turn re-sends everything already read, so a whole-file read of "
+                "a large module taxes every turn that follows it."
             )
         if self.repo_dir:
             lines.append(
@@ -229,13 +298,14 @@ class ClaudeCodeRunner:
         lines.append("</workspace>")
         return "\n".join(lines)
 
-    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None) -> list[str]:
+    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = ()) -> list[str]:
         argv = [
             self.claude_bin,
             "-p",
-            "--no-session-persistence",
+            *(session or ["--no-session-persistence"]),
             "--output-format",
-            "json",
+            "stream-json" if self.trace_dir else "json",
+            *(["--verbose"] if self.trace_dir else []),
             "--model",
             model,
             "--effort",
@@ -256,12 +326,76 @@ class ClaudeCodeRunner:
                 argv += ["--add-dir", str(extra)]
         if _WRITE_TOOLS & set(tools):
             argv += ["--permission-mode", "acceptEdits"]
+        # acceptEdits covers Write and Edit and nothing else: every Bash call a
+        # builder made in the first seven epics came back "requires approval",
+        # so no test ever ran and the builder probed the environment instead.
+        # Bash is pre-approved for exactly the project's checks and the git
+        # verbs the diff needs — prefixes, so `pytest tests/x.py -q` passes —
+        # and denied for everything else, which is what a scratch tree wants.
+        if "Bash" in tools:
+            allowed = [f"Bash({cmd.split()[0]}:*)" for cmd in self.check_commands if cmd.split()]
+            allowed += ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
+            argv += ["--allowedTools", *dict.fromkeys(allowed)]
         # Last on purpose: `--tools` is variadic, and nothing may follow it that
         # could be mistaken for a tool name. The prompt travels on stdin.
         argv += ["--tools", *(tools or [""])]
         return argv
 
+    def _payload(self, role: str, stdout: str) -> dict[str, Any]:
+        """The result object — the whole output in json mode, the last event in stream mode.
+
+        In stream mode every event is also written to the trace file, one per
+        line, so the record of WHAT a node did survives the node.
+        """
+        if not self.trace_dir:
+            try:
+                payload = json.loads(stdout)
+            except json.JSONDecodeError as exc:
+                raise RunnerError(f"node '{role}': claude output is not JSON: {stdout[:200]}") from exc
+            return payload if isinstance(payload, dict) else {"is_error": True, "result": f"non-object output: {stdout[:200]}"}
+
+        self.trace_dir.mkdir(parents=True, exist_ok=True)
+        n = sum(1 for c in self.calls if c["role"] == role) + 1
+        path = self.trace_dir / f"{role}-{n}.jsonl"
+        path.write_text(stdout + "\n", encoding="utf-8")
+        last: dict[str, Any] | None = None
+        for line in stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "result":
+                last = event
+        if last is None:
+            raise RunnerError(f"node '{role}': no result event in the stream (trace at {path})")
+        last["trace"] = str(path)
+        return last
+
     # ── execution ───────────────────────────────────────────────────────────
+
+    def _invoke(
+        self, *, role: str, tier: str, model: str, tools: Sequence[str], schema: Mapping[str, Any], prompt: str,
+        packs: Sequence[str], scratch: Path | None, patches: bool, session: Sequence[str],
+    ) -> subprocess.CompletedProcess[str]:
+        system = "\n\n".join(
+            part for part in (self._read_context(packs), self._workspace(scratch, patches=patches), self.extra_system) if part
+        )
+        argv = self._argv(model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role, session=session)
+        try:
+            return subprocess.run(
+                argv,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                # A thread keeps one working directory for its whole life: the
+                # CLI files sessions by directory, and a resume looks there.
+                cwd=scratch or self.cwd,
+                timeout=self.timeout,
+            )
+        except FileNotFoundError as exc:
+            raise RunnerError(f"'{self.claude_bin}' not found; is Claude Code installed and on PATH?") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError(f"node '{role}' did not finish within {self.timeout}s") from exc
 
     def run(
         self,
@@ -271,6 +405,7 @@ class ClaudeCodeRunner:
         schema: Mapping[str, Any],
         prompt: str,
         context: Sequence[str] = (),
+        thread: str | None = None,
     ) -> NodeResult:
         tier = self.tier_overrides.get(role, tier)
         model = self._model_for(tier)
@@ -278,33 +413,26 @@ class ClaudeCodeRunner:
         packs = [body, *context] if body else list(context)
         tools = self.tools.get(role, [])
 
-        with self._scratch(role) as scratch:
-            system = "\n\n".join(
-                part for part in (self._read_context(packs), self._workspace(scratch), self.extra_system) if part
+        if thread:
+            state = self._thread(thread, role)
+            session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
+            state["calls"] += 1
+            proc = self._invoke(
+                role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
+                scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session,
             )
-            argv = self._argv(model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role)
-            try:
-                proc = subprocess.run(
-                    argv,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    cwd=scratch or self.cwd,
-                    timeout=self.timeout,
+        else:
+            with self._scratch(role) as scratch:
+                proc = self._invoke(
+                    role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
+                    scratch=scratch, patches=True, session=(),
                 )
-            except FileNotFoundError as exc:
-                raise RunnerError(f"'{self.claude_bin}' not found; is Claude Code installed and on PATH?") from exc
-            except subprocess.TimeoutExpired as exc:
-                raise RunnerError(f"node '{role}' did not finish within {self.timeout}s") from exc
 
         stdout = (proc.stdout or "").strip()
         if not stdout:
             tail = (proc.stderr or "").strip()[-800:]
             raise RunnerError(f"node '{role}': claude exited {proc.returncode} with no output: {tail}")
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            raise RunnerError(f"node '{role}': claude output is not JSON: {stdout[:200]}") from exc
+        payload = self._payload(role, stdout)
         if not isinstance(payload, dict):
             raise RunnerError(f"node '{role}': claude output is {type(payload).__name__}, expected an object")
         if payload.get("is_error"):
@@ -345,6 +473,7 @@ class ClaudeCodeRunner:
                     for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
                 ),
                 "output_tokens": int(usage.get("output_tokens") or 0),
+                **({"trace": payload["trace"]} if payload.get("trace") else {}),
             }
         )
         return NodeResult(data)

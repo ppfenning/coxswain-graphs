@@ -51,6 +51,7 @@ class NodeRunner(Protocol):
         schema: Mapping[str, Any],
         prompt: str,
         context: Sequence[str] = (),
+        thread: str | None = None,
     ) -> NodeResult:
         """Execute one node.
 
@@ -58,5 +59,12 @@ class NodeRunner(Protocol):
         cartridge. The runner reads them; the graph never does. That is the
         contract rule about scripts having no filesystem access, enforced by
         putting the filesystem on the other side of this boundary.
+
+        `thread` is a continuity hint: nodes that share one may share what
+        earlier nodes in it learned — the same session, the same scratch tree.
+        A graph uses it to keep plan, build and a fix-loop retry on one
+        instance, and withholds it from review, which must never inherit the
+        builder's reasoning. A runner may ignore it entirely; the scripted
+        runner does, which is why the graphs stay replayable.
         """
         ...

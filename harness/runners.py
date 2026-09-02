@@ -48,7 +48,15 @@ def build_runner(
     if profile.get("runner") == "claude-code":
         from runner.claude_code_runner import ClaudeCodeRunner
 
-        return ClaudeCodeRunner(profile, role_skills=role_skills or {}, cwd=workdir, repo_dir=repo)
+        import os
+
+        return ClaudeCodeRunner(
+            profile,
+            role_skills=role_skills or {},
+            cwd=workdir,
+            repo_dir=repo,
+            trace_dir=os.environ.get("AGENT_GRAPHS_TRACE_DIR") or None,
+        )
 
     from runner.anthropic_runner import AnthropicRunner
 

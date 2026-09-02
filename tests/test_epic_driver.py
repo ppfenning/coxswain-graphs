@@ -185,7 +185,7 @@ class Runner:
     def _subject(self, prompt: str, candidates) -> str | None:
         return next((c for c in candidates if c in prompt), None)
 
-    def run(self, *, role, tier, schema, prompt, context=()):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None):
         with self.lock:
             self.calls.append({"role": role, "tier": tier, "prompt": prompt})
 
@@ -468,7 +468,7 @@ def test_no_rebase_is_proposed_when_the_stack_is_still_on_its_base(repo, cart, t
 class Revising(Runner):
     """Reviews everything as `revise`, so the fix loop is the only thing running."""
 
-    def run(self, *, role, tier, schema, prompt, context=()):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None):
         if role == "review_charter":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})

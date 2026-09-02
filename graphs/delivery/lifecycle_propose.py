@@ -168,9 +168,11 @@ ARBITRATE_SCHEMA = {
 
 DEFAULT_FIX_ATTEMPTS = 2
 
-# How much of a patch the handoff sees. Enough to judge that a real diff exists
-# and touches the files it claims; the reviewer reads the whole thing.
-PATCH_PREVIEW_CHARS = 6000
+# How much of a patch the handoff sees: all of it, up to a bound that only a
+# pathological diff reaches. A 6,000-character preview was tried first and the
+# handoff — correctly — refused every patch it could see was cut off. The
+# shuttle judges the cargo; it cannot judge half of it.
+PATCH_PREVIEW_CHARS = 200_000
 
 # Two successive patches this similar are the same patch with the whitespace
 # moved. 0.98 rather than 1.0 because a builder that re-emits its own diff
@@ -449,6 +451,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     plan = runner.run(
         role="plan",
         tier="standard",
+        thread=str(ticket),
         schema=PLAN_SCHEMA,
         context=context,
         prompt=(
@@ -458,9 +461,14 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         ),
     )
 
+    # Plan, build and the fix-loop retry share one thread: the builder starts
+    # from what the planner already read, and a retry from a tree it already
+    # edited. Review never joins the thread — a reviewer that inherits the
+    # builder's reasoning is the failure the seat exists to prevent.
     build = runner.run(
         role="build",
         tier="standard",
+        thread=str(ticket),
         schema=BUILD_SCHEMA,
         context=context,
         prompt=(
@@ -512,12 +520,16 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         retry = runner.run(
             role="build",
             tier="standard",
+            thread=str(ticket),
             schema=BUILD_SCHEMA,
             context=context,
             prompt=(
-                "This change was sent back. Carry out the same plan again and return "
-                "a new unified diff.\n\n"
+                "This change was sent back. Start from the previous patch — apply it "
+                "first, then change only what the critique requires — and return a new "
+                "unified diff of the whole change.\n\n"
                 f"Ticket: {ticket}\nPlan: {plan}\n\n"
+                f"Previous patch (apply this first; do not redo the work it already did):\n"
+                f"{build.get('patch')}\n\n"
                 f"Standing critique:\n{critique}\n\n"
                 "Every objection above must actually fall — a patch that leaves one "
                 "of them standing is not a fix, and saying it is addressed is not the "

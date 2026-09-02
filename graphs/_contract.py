@@ -131,6 +131,15 @@ def review_tier(
     if patterns and set(patterns) <= trivial:
         return 0
 
+    # Size alone can also make a change self-evident — a dozen lines in one
+    # module, on no dangerous surface, is a charter read, not a debate. Off
+    # unless the cartridge sets it: live epics reached tier 0 by no path at
+    # all, because work items rarely carry patterns, so every task bought an
+    # adversary and, on any disagreement, an arbiter.
+    tier0_lines = int(config.get("tier0_max_changed_lines", 0))
+    if tier0_lines and int(change_facts.get("changed_lines", 0)) <= tier0_lines and int(change_facts.get("module_count", 0)) <= 1:
+        return 0
+
     max_lines = int(config.get("tier1_max_changed_lines", 150))
     max_modules = int(config.get("tier1_max_modules", 1))
     if int(change_facts.get("changed_lines", 0)) <= max_lines and int(change_facts.get("module_count", 0)) <= max_modules:

@@ -297,6 +297,9 @@ def main(argv: list[str] | None = None) -> int:
     # phase; this is the single-graph case.
     if args.repo and hasattr(runner, "repo_digest"):
         runner.repo_digest = build_digest(Path(args.repo)) or None
+    if hasattr(runner, "check_commands"):
+        checks = (cartridge.get("landing_areas") or {}).get("checks") or []
+        runner.check_commands = [str(c.get("cmd")) for c in checks if isinstance(c, dict) and c.get("cmd")]
 
     if args.graph == "epic":
         # The whole initiative. The driver gates and records PER PHASE — phase
@@ -609,4 +612,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  manifest: {Path(args.runs_dir) / (run_id + '.json')}")
     print(f"  ledger  : {args.ledger}")
     record_usage(runner, runs_dir=args.runs_dir, run_id=run_id)
+    close = getattr(runner, "close", None)
+    if callable(close):
+        close()
     return 0

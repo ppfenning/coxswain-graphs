@@ -55,6 +55,7 @@ def run_phase(
                 "ticket": task["id"],
                 "cartridge": cartridge,
                 "surfaces": task.get("surfaces") or [],
+                "patterns": task.get("patterns") or [],
             },
         )
         for task in tasks

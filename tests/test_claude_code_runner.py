@@ -434,3 +434,145 @@ def test_the_digest_reaches_roles_with_tools_and_nobody_else(fake_claude, tmp_pa
     system = recorded(fake_claude)["argv"]
     system = system[system.index("--system-prompt") + 1]
     assert "<repo-digest>" not in system, "no repository, no map"
+
+
+# ── tracing, paths, ranged reads ─────────────────────────────────────────────
+
+
+def test_a_trace_dir_switches_to_stream_json_and_keeps_every_event(fake_claude, tmp_path) -> None:
+    script, _, set_output = fake_claude
+    events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/r/f.py"}}]}},
+        {"type": "user", "message": {"content": []}},
+        {"type": "result", "subtype": "success", "is_error": False, "structured_output": {"ok": True},
+         "num_turns": 2, "total_cost_usd": 0.02, "usage": {"input_tokens": 10, "cache_read_input_tokens": 90, "output_tokens": 5}},
+    ]
+    (tmp_path / "output.json").write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, trace_dir=tmp_path / "trace")
+    out = runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--output-format") + 1] == "stream-json" and "--verbose" in argv
+    assert dict(out) == {"ok": True}
+    trace = tmp_path / "trace" / "build-1.jsonl"
+    assert trace.is_file() and len(trace.read_text().splitlines()) == 4
+    assert runner.calls[-1]["trace"] == str(trace) and runner.calls[-1]["turns"] == 2
+    runner.run(role="build", schema=SCHEMA, prompt="again")
+    assert (tmp_path / "trace" / "build-2.jsonl").is_file(), "one file per call, numbered per role"
+
+
+def test_a_stream_with_no_result_event_is_a_named_failure(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    (tmp_path / "output.json").write_text(json.dumps({"type": "system"}) + "\n", encoding="utf-8")
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, trace_dir=tmp_path / "trace")
+    with pytest.raises(RunnerError, match="no result event"):
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+
+
+def test_without_a_trace_dir_nothing_changes(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--output-format") + 1] == "json" and "--verbose" not in argv
+    assert "trace" not in runner.calls[-1]
+
+
+def test_nodes_are_told_to_use_absolute_paths_and_ranged_reads(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    system = argv[argv.index("--system-prompt") + 1]
+    assert f"ABSOLUTE paths under {repo.resolve()}" in system
+    assert "offset and limit" in system and "300" in system
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    system = argv[argv.index("--system-prompt") + 1]
+    scratch = next(argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir" and "agent-graphs-build-" in argv[i + 1])
+    assert f"ABSOLUTE paths under {scratch}" in system, "the builder's paths point at its scratch, not the shared tree"
+
+
+def test_the_builder_is_handed_the_projects_check_commands_verbatim(fake_claude, tmp_path, repo) -> None:
+    """Traced builds spent a third of their turns discovering how to run the tests."""
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.check_commands = ["pytest -q", "ruff check ."]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    system = argv[argv.index("--system-prompt") + 1]
+    assert "exactly: `pytest -q; ruff check .`" in system
+    assert "wasted turn" in system
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert "exactly: `pytest" not in argv[argv.index("--system-prompt") + 1], "only the builder runs anything"
+
+
+def test_bash_is_pre_approved_for_the_checks_and_git_and_nothing_else(fake_claude, tmp_path, repo) -> None:
+    """acceptEdits never covered Bash: seven epics of builds never ran a test."""
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.check_commands = ["pytest -q", "ruff check ."]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    i = argv.index("--allowedTools")
+    allowed = argv[i + 1 : argv.index("--tools")]
+    assert allowed == ["Bash(pytest:*)", "Bash(ruff:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
+    assert argv[argv.index("--permission-mode") + 1] == "acceptEdits", "edits are still accepted up front"
+
+
+def test_no_bash_no_allowlist(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.check_commands = ["pytest -q"]
+    runner.run(role="build", schema=SCHEMA, prompt="go")  # PROFILE grants build Read/Grep/Glob only
+    assert "--allowedTools" not in recorded(fake_claude)["argv"]
+
+
+# ── threads: one session and one scratch across plan, build and retry ────────
+
+
+def _add_dirs(argv):
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
+
+
+def test_a_thread_is_one_session_resumed_and_one_scratch_kept(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.run(role="plan", schema=SCHEMA, prompt="plan it", thread="T-1")
+    first = recorded(fake_claude)["argv"]
+    assert "--no-session-persistence" not in first, "a thread persists so it can be resumed"
+    sid = first[first.index("--session-id") + 1]
+    scratch = next(d for d in _add_dirs(first) if "agent-graphs-build-" in d)
+    assert Path(scratch).is_dir(), "the scratch outlives the call"
+    system = first[first.index("--system-prompt") + 1]
+    assert "your own checkout" in system and "scratch checkout" not in system, "the planner reads; it does not patch"
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T-1")
+    second = recorded(fake_claude)["argv"]
+    assert second[second.index("--resume") + 1] == sid and "--session-id" not in second
+    assert scratch in _add_dirs(second), "the builder edits the tree the planner read"
+    assert "scratch checkout" in second[second.index("--system-prompt") + 1]
+
+    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T-1")
+    third = recorded(fake_claude)["argv"]
+    assert third[third.index("--resume") + 1] == sid and scratch in _add_dirs(third)
+
+    runner.close()
+    assert not Path(scratch).exists(), "closed threads leave nothing behind"
+
+
+def test_threads_never_share_a_session_or_a_tree(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.run(role="plan", schema=SCHEMA, prompt="a", thread="T-A")
+    a = recorded(fake_claude)["argv"]
+    runner.run(role="plan", schema=SCHEMA, prompt="b", thread="T-B")
+    b = recorded(fake_claude)["argv"]
+    assert a[a.index("--session-id") + 1] != b[b.index("--session-id") + 1]
+    assert set(_add_dirs(a)) != set(_add_dirs(b))
+    runner.close()
+
+
+def test_a_call_without_a_thread_is_unchanged(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert "--no-session-persistence" in argv and "--session-id" not in argv and "--resume" not in argv

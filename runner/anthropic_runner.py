@@ -120,7 +120,11 @@ class AnthropicRunner:
         schema: Mapping[str, Any],
         prompt: str,
         context: Sequence[str] = (),
+        thread: str | None = None,
     ) -> NodeResult:
+        # `thread` is accepted for the protocol and ignored: each call here is
+        # one stateless Messages request. Carrying history would be this
+        # runner's own feature, and nothing in it is needed for correctness.
         model = self._model_for(tier)
         # The bound skill body leads the system prompt: it is the role's craft,
         # and the context packs are the team's rules it applies them under.
