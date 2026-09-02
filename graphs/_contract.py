@@ -89,7 +89,14 @@ def landing_for(cartridge: Mapping[str, Any], state: str) -> str:
     if landing is None:
         known = ", ".join(sorted(states)) or "none"
         raise ContractViolation(f"cartridge routes no state '{state}'; it declares: {known}")
-    return str(landing)
+    # The routing names an ABSTRACT landing (`planned_work`); the cartridge's
+    # `landing_areas` binds it to a real place (a directory, a board). A
+    # proposal must name the bound place — the first live decompose run named
+    # the abstract one, and the arm rightly refused to invent a directory for
+    # it. Unbound, the abstract name stands, which is what a base cartridge
+    # with no bindings means.
+    areas = cartridge.get("landing_areas") or {}
+    return str(areas.get(str(landing), landing))
 
 
 def review_tier(

@@ -209,6 +209,14 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
             "before the gate"
         ),
     )
+    parser.add_argument(
+        "--workdir",
+        default=REPO_ROOT,
+        help=(
+            "where a runner whose nodes can read the world stands: the work store root "
+            "the apply arms write under (default: this repository)"
+        ),
+    )
     parser.add_argument("--date", default=date_type.today().isoformat())
     parser.add_argument("--run-id", default=None)
     return parser
@@ -268,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
         scripted=args.scripted,
         provider_profile=args.provider_profile,
         role_skills=role_skill_bodies(cartridge, skill_index),
+        workdir=args.workdir,
+        repo=args.repo,
     )
 
     run_id = args.run_id or f"{args.graph}-{args.date}-{uuid.uuid4().hex[:8]}"

@@ -480,6 +480,14 @@ def _run_phase(
         return record
     record["reused_branch"] = reused
 
+    # A runner whose nodes can read the world reads THIS phase's branch — not
+    # whatever the repository happens to have checked out. Phase N+1 stacks on
+    # N, so a build that read the default branch would be patching ground that
+    # is no longer there. Duck-typed: the API runner has no such attribute and
+    # nothing to point anywhere.
+    if hasattr(ctx.runner, "repo_dir"):
+        ctx.runner.repo_dir = ctx.phase_worktree(phase)
+
     # A rebase is a WRITE, so it is a proposal like any other and joins this
     # phase's gate batch rather than happening quietly on the way past.
     rebase: dict[str, Any] | None = None

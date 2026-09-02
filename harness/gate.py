@@ -52,10 +52,15 @@ def auto_apply(
         tier="standard",
         schema=APPLY_SCHEMA,
         context=list(cartridge.get("context") or []),
+        # The rationale travels too: for an item_create it IS the body the arm
+        # writes, and an arm handed only the action and the evidence was left
+        # to refuse — correctly — for want of the content it was told to land.
         prompt=(
             f"Apply this approved proposal exactly as written. Do not widen it.\n\n"
             f"kind: {item['kind']}\ntarget: {item['target']}\n"
-            f"action: {item['suggested_action']}\nevidence: {item['evidence']}"
+            f"action: {item['suggested_action']}\n"
+            f"rationale (the content, where the action calls for one):\n{item['rationale']}\n\n"
+            f"evidence: {item['evidence']}"
         ),
     )
     return bool(result.get("applied")), str(result.get("detail", ""))
