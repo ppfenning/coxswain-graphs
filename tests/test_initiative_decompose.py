@@ -157,3 +157,17 @@ def test_a_team_without_the_decompose_role_is_told_so(cartridge) -> None:
 def test_it_refuses_without_a_cartridge(cart) -> None:
     with pytest.raises(ContractViolation, match="cartridge"):
         initiative_decompose.run({"run_id": "r", "date": "d", "idea": "x"}, ScriptedRunner({}))
+
+
+def test_a_proposal_names_the_bound_landing_not_the_abstract_one(cart) -> None:
+    """The first live run said `planned_work/...` and the arm refused to invent
+    that directory. The routing's abstract name resolves through landing_areas."""
+    bound = dict(cart, landing_areas={**(cart.get("landing_areas") or {}), "planned_work": "work"})
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "2026-01-01", "cartridge": bound, "idea": "x", "initiative_id": "init"},
+        ScriptedRunner({"decompose": DECOMPOSITION}),
+    )
+    action = result["proposals"][0]["suggested_action"]
+    assert action.startswith("create work/init/"), action
+    assert "planned_work" not in action
+    assert "title=" in action and "needs=[" in action

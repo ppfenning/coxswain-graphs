@@ -232,7 +232,12 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 ),
             ],
             rationale=str(task.get("body") or decomposition.get("rationale", "")),
-            suggested_action=f"create {task['id']} in {landing}/{task.get('phase')}",
+            # The whole item, in the action. The arm sees the proposal and
+            # nothing else, so an action that named only an id would leave it
+            # inventing the title and guessing the initiative — the first live
+            # run proved exactly that. `initiative_id` is optional: absent, the
+            # store root's name is the initiative, as `read_initiative` reads it.
+            suggested_action=_item_action(task, landing=landing, initiative_id=args.get("initiative_id")),
         )
         for task in sorted(tasks, key=lambda t: str(t["id"]))
     ]
@@ -258,6 +263,18 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     }
 
 
+def _item_action(task: Mapping[str, Any], *, landing: str, initiative_id: str | None) -> str:
+    """Pure: the create action, carrying every field the work-item arm must write."""
+    where = "/".join(part for part in (landing, initiative_id, str(task.get("phase"))) if part)
+    needs = ", ".join(str(n) for n in task.get("needs") or []) or "none"
+    surfaces = ", ".join(str(x) for x in task.get("surfaces") or []) or "none"
+    return (
+        f"create {where}/{task['id']}.md with frontmatter id={task['id']}, "
+        f"title={task.get('title') or task['id']!s}, phase={task.get('phase')}, state=ready, "
+        f"needs=[{needs}], surfaces=[{surfaces}]; body = the rationale"
+    )
+
+
 from graphs._spec import GraphSpec, Need  # noqa: E402
 
 SPEC = GraphSpec(
@@ -268,5 +285,7 @@ SPEC = GraphSpec(
     needs=(
         Need("idea", flag="--idea", kind="text_or_path",
              help="the initiative, as prose or a path to a file holding it"),
+        Need("initiative_id", flag="--initiative-id", required=False,
+             help="directory name for the initiative under the work store (default: the store root itself)"),
     ),
 )
