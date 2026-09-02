@@ -168,6 +168,16 @@ ARBITRATE_SCHEMA = {
 
 DEFAULT_FIX_ATTEMPTS = 2
 
+
+def _ticket_text(ticket: Any, title: Any, body: Any) -> str:
+    """Pure: the id, then the title and body when the harness supplied them."""
+    parts = [str(ticket)]
+    if title:
+        parts[0] = f"{ticket} — {title}"
+    if body:
+        parts.append(str(body).strip())
+    return "\n".join(parts)
+
 # How much of a patch the handoff sees: all of it, up to a bound that only a
 # pathological diff reaches. A 6,000-character preview was tried first and the
 # handoff — correctly — refused every patch it could see was cut off. The
@@ -396,6 +406,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     """Run the graph. Every input arrives as an argument — no clock, no disk."""
     cartridge = require_cartridge(args)
     run_id, date, ticket = require(args, "run_id", "date", "ticket")
+    # The work item's own words travel with its id. Traced plan nodes spent
+    # their first turns globbing the repository for a file named like the
+    # ticket, because the id was all they were given; a title and a body in
+    # the prompt is the difference between a 10-turn plan and a 24-turn one.
+    ticket_text = _ticket_text(ticket, args.get("ticket_title"), args.get("ticket_body"))
 
     context = list(cartridge.get("context") or [])
     proposals: list[dict[str, Any]] = []
@@ -413,7 +428,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 schema=SCOPE_SCHEMA,
                 context=context,
                 prompt=(
-                    f"Scope this work.\n\nTicket: {ticket}\nDate: {date}\n\n"
+                    f"Scope this work.\n\nTicket: {ticket_text}\nDate: {date}\n\n"
                     "List the phases, the tickets, and the repositories it touches. "
                     "Say whether it is being worked now (active), scoped and scheduled "
                     "(planned), or roadmapped for later (future). Name an existing epic "
@@ -455,7 +470,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         schema=PLAN_SCHEMA,
         context=context,
         prompt=(
-            f"Decompose this ticket into an ordered plan.\n\nTicket: {ticket}\n"
+            f"Decompose this ticket into an ordered plan.\n\nTicket: {ticket_text}\n"
             f"Date: {date}\n\nName the files you expect to touch, and state what is "
             "explicitly out of scope."
         ),
@@ -473,7 +488,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         context=context,
         prompt=(
             f"Carry out this plan and return the change as a unified diff.\n\n"
-            f"Ticket: {ticket}\nPlan: {plan}\n\nReturn the patch only — it is applied "
+            f"Ticket: {ticket_text}\nPlan: {plan}\n\nReturn the patch only — it is applied "
             "by the shell into a worktree, never by you. Include the deterministic "
             "commands you ran and their output."
         ),
@@ -487,13 +502,13 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 
     handoff: dict[str, Any] | None = None
     if "handoff" in bound:
-        handoff = _handoff(runner, context=context, ticket=ticket, plan=plan, build=build, facts=facts)
+        handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts)
 
     review, adversary, arbitration, verdict = _review_round(
         runner,
         context=context,
         bound=bound,
-        ticket=ticket,
+        ticket=ticket_text,
         build=build,
         facts=facts,
         handoff=handoff,
@@ -527,7 +542,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 "This change was sent back. Start from the previous patch — apply it "
                 "first, then change only what the critique requires — and return a new "
                 "unified diff of the whole change.\n\n"
-                f"Ticket: {ticket}\nPlan: {plan}\n\n"
+                f"Ticket: {ticket_text}\nPlan: {plan}\n\n"
                 f"Previous patch (apply this first; do not redo the work it already did):\n"
                 f"{build.get('patch')}\n\n"
                 f"Standing critique:\n{critique}\n\n"
@@ -554,13 +569,13 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         build = retry
         facts = _change_facts(build)
         if "handoff" in bound:
-            handoff = _handoff(runner, context=context, ticket=ticket, plan=plan, build=build, facts=facts)
+            handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts)
         tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
         review, adversary, arbitration, verdict = _review_round(
             runner,
             context=context,
             bound=bound,
-            ticket=ticket,
+            ticket=ticket_text,
             build=build,
             facts=facts,
             handoff=handoff,

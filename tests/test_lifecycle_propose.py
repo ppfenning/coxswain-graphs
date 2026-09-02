@@ -312,3 +312,28 @@ def test_plan_build_and_retry_share_a_thread_and_review_never_does(
     assert all(c["thread"] == "TICKET-1" for c in roles(scripted, "build")), "both builds, first and retry"
     for role in ("review_charter", "review_adversary", "arbitrate", "handoff"):
         assert all(c["thread"] is None for c in roles(scripted, role)), role
+
+
+def test_the_work_items_words_travel_with_its_id(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """A plan node given only 'wake-phrase-env' globbed the repository for a file
+    by that name. Given the title and body, it plans."""
+    scripted = runner(plan_response, build_response, review_response)
+    lifecycle_propose.run(
+        args(cartridge, ticket_title="Make the wake phrase configurable", ticket_body="WAKE_WORDS is a literal tuple; read VOICE_HUD_WAKE_PHRASES instead."),
+        scripted,
+    )
+    plan = roles(scripted, "plan")[0]["prompt"]
+    assert "TICKET-1 — Make the wake phrase configurable" in plan
+    assert "VOICE_HUD_WAKE_PHRASES" in plan
+    review = roles(scripted, "review_charter")[0]["prompt"]
+    assert "Make the wake phrase configurable" in review, "reviewers judge against the ask, not the id"
+
+
+def test_without_title_or_body_the_id_stands_alone(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(plan_response, build_response, review_response)
+    lifecycle_propose.run(args(cartridge), scripted)
+    assert "Ticket: TICKET-1\n" in roles(scripted, "plan")[0]["prompt"]

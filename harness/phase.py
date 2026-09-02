@@ -53,6 +53,8 @@ def run_phase(
             args={
                 "date": date,
                 "ticket": task["id"],
+                "ticket_title": task.get("title") or "",
+                "ticket_body": task.get("body") or "",
                 "cartridge": cartridge,
                 "surfaces": task.get("surfaces") or [],
                 "patterns": task.get("patterns") or [],
