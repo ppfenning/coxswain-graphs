@@ -270,3 +270,21 @@ def test_a_runner_with_nothing_to_count_records_nothing(tmp_path) -> None:
 
     assert record_usage(Mute(), runs_dir=tmp_path, run_id="r") is None
     assert not (tmp_path / "r.usage.json").exists()
+
+
+def test_the_node_is_told_patches_are_not_applied_in_the_checkout(fake_claude, tmp_path) -> None:
+    """Handoff once quarantined every task for 'no changes present in the repo'."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.run(role="handoff", schema=SCHEMA, prompt="go")
+    system = recorded(fake_claude)["argv"]
+    assert "NOT applied in that checkout" in system[system.index("--system-prompt") + 1]
+
+
+def test_a_claude_error_names_its_subtype(fake_claude, tmp_path) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": True, "subtype": "error_max_turns", "result": None, "num_turns": 40})
+    runner = runner_for(fake_claude, tmp_path)
+    with pytest.raises(RunnerError, match="error_max_turns"):
+        runner.run(role="build", schema=SCHEMA, prompt="go")

@@ -130,7 +130,10 @@ class ClaudeCodeRunner:
             lines.append(
                 f"The repository this run targets is checked out at {self.repo_dir}. Read it there. "
                 "Any unified diff you return uses paths relative to that repository's root "
-                "(with a/ and b/ prefixes) and is applied by the harness, never by you."
+                "(with a/ and b/ prefixes) and is applied by the harness, never by you. "
+                "Patches returned by earlier nodes in this run are NOT applied in that checkout: "
+                "the harness applies them later, in a worktree of its own. Judge a patch from its "
+                "text, never from whether the checkout already contains it."
             )
         lines.append(
             "You have exactly the tools listed for this session and no others. If you have "
@@ -210,7 +213,10 @@ class ClaudeCodeRunner:
         if not isinstance(payload, dict):
             raise RunnerError(f"node '{role}': claude output is {type(payload).__name__}, expected an object")
         if payload.get("is_error"):
-            raise RunnerError(f"node '{role}' failed in claude: {str(payload.get('result'))[:500]}")
+            # Name everything the CLI said about it. A bare `None` result was
+            # the whole diagnosis of a build failure once; never again.
+            detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
+            raise RunnerError(f"node '{role}' failed in claude: {json.dumps(detail)[:800]}")
 
         data = payload.get("structured_output")
         if data is None:
