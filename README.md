@@ -226,3 +226,7 @@ being a special case.
 | [`agent-cartridges`](https://github.com/ppfenning/agent-cartridges) | Substrate: cartridge merge, policy, manifest, ledger — and the reference `local-skills` plugin |
 | **`agent-graphs`** | Harness (the runtime) + graphs (the programs) |
 | a skills plugin | Craft: the skill bodies a cartridge binds roles to — `local-skills` ships with the substrate; teams point `--skills-root` at their own |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
