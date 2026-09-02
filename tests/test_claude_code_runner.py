@@ -253,9 +253,11 @@ def test_usage_is_recorded_per_call_and_summarised(fake_claude, tmp_path) -> Non
     runner = runner_for(fake_claude, tmp_path)
     runner.run(role="plan", schema=SCHEMA, prompt="go")
     runner.run(role="review_charter", tier="deep", schema=SCHEMA, prompt="go")
-    assert runner.calls[0]["input_tokens"] == 1000 and runner.calls[0]["output_tokens"] == 50
+    call = runner.calls[0]
+    assert (call["input_tokens"], call["cache_read_tokens"], call["input_total"], call["output_tokens"]) == (100, 900, 1000, 50)
     summary = summarize(runner.calls)
-    assert summary["calls"] == 2 and summary["cost_usd"] == 0.04 and summary["input_tokens"] == 2000
+    assert summary["calls"] == 2 and summary["cost_usd"] == 0.04 and summary["input_total"] == 2000
+    assert summary["cache_read_tokens"] == 1800, "the split survives the summary"
     assert set(summary["by_model"]) == {"sonnet", "opus"}
     out = record_usage(runner, runs_dir=tmp_path / "runs", run_id="r1")
     assert out == summary
@@ -368,3 +370,67 @@ def test_a_builder_pointed_at_a_non_repository_fails_loudly(fake_claude, tmp_pat
     runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
     with pytest.raises(RunnerError, match="scratch worktree"):
         runner.run(role="build", schema=SCHEMA, prompt="go")
+
+
+# ── cost ceilings, tier overrides, the digest ────────────────────────────────
+
+
+def test_a_tier_budget_becomes_a_dollar_ceiling(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 0.35}}, claude_bin=str(script), cwd=tmp_path)
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.3500"
+
+
+def test_a_role_budget_beats_its_tier(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner(
+        {**PROFILE, "budget_usd": {"standard": 0.35}, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path
+    )
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.6000"
+
+
+def test_no_budget_means_no_ceiling(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    assert "--max-budget-usd" not in recorded(fake_claude)["argv"]
+
+
+def test_a_profile_may_reassign_a_roles_tier(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "tier_overrides": {"scope_epic": "cheap"}}, claude_bin=str(script), cwd=tmp_path)
+    runner.run(role="scope_epic", tier="standard", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--model") + 1] == "haiku" and argv[argv.index("--effort") + 1] == "low"
+    assert runner.calls[-1]["tier"] == "cheap", "the record says what actually ran"
+
+
+def test_over_budget_is_named(fake_claude, tmp_path) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": True, "subtype": "error_max_budget_usd", "result": None})
+    runner = runner_for(fake_claude, tmp_path)
+    with pytest.raises(RunnerError, match="error_max_budget_usd"):
+        runner.run(role="build", schema=SCHEMA, prompt="go")
+
+
+def test_the_digest_reaches_roles_with_tools_and_nobody_else(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.repo_digest = "2 tracked files\nf.txt (1)"
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    system = recorded(fake_claude)["argv"]
+    system = system[system.index("--system-prompt") + 1]
+    assert "<repo-digest>" in system and "f.txt (1)" in system
+    assert "as few turns as you can" in system, "the builder is told why turns cost"
+    runner.run(role="handoff", schema=SCHEMA, prompt="go")
+    system = recorded(fake_claude)["argv"]
+    system = system[system.index("--system-prompt") + 1]
+    assert "<repo-digest>" in system, "reading roles with a repo see the map too"
+    runner.repo_dir = None
+    runner.run(role="handoff", schema=SCHEMA, prompt="go")
+    system = recorded(fake_claude)["argv"]
+    system = system[system.index("--system-prompt") + 1]
+    assert "<repo-digest>" not in system, "no repository, no map"

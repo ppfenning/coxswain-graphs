@@ -35,6 +35,7 @@ from harness.registry import GraphSpec, discover
 from harness.resolve import resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
 from harness.usage import record_usage
+from harness.digest import build_digest
 from harness.worktree import apply_patch, create_worktree
 from runner.protocol import RunnerError
 
@@ -203,6 +204,14 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     parser.add_argument("--ledger", default=_default_ledger())
     parser.add_argument("--worktree-root", help="override the cartridge's worktree_root")
     parser.add_argument(
+        "--resume-from",
+        metavar="RUN_ID",
+        help=(
+            "epic: reuse tasks an earlier run already produced an approved patch for "
+            "(saved under runs/<RUN_ID>/tasks/); everything else runs again"
+        ),
+    )
+    parser.add_argument(
         "--repo",
         help=(
             "the repository this change targets; enables the check arm: the patch is "
@@ -283,6 +292,12 @@ def main(argv: list[str] | None = None) -> int:
 
     run_id = args.run_id or f"{args.graph}-{args.date}-{uuid.uuid4().hex[:8]}"
 
+    # A runner whose nodes can read the world gets a tool-computed map of it
+    # first, so no node pays turns to draw one. The epic driver refreshes it per
+    # phase; this is the single-graph case.
+    if args.repo and hasattr(runner, "repo_digest"):
+        runner.repo_digest = build_digest(Path(args.repo)) or None
+
     if args.graph == "epic":
         # The whole initiative. The driver gates and records PER PHASE — phase
         # N+1's base depends on which merges the gate let into phase N's branch,
@@ -318,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
             or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees"),
             assume=args.assume,
             fix_attempts=args.fix_attempts,
+            resume_from=args.resume_from,
         )
         totals = result.get("totals") or {}
         print(

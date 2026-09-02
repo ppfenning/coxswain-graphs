@@ -49,6 +49,8 @@ from harness.escalate import escalate_self_modification
 from harness.gate import auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.worktree import apply_patch, create_worktree
+from harness.digest import build_digest
+from harness.resume import load_result, reusable, save_result
 
 __all__ = ["run_epic", "phase_parents", "phase_order"]
 
@@ -97,6 +99,7 @@ class _Ctx:
     fix_attempts: int | None
     initiative_id: str
     default_ref: str
+    resume_from: str | None = None
 
     # ── names, in one place, so the topology is readable ─────────────────────
     def phase_branch(self, phase: str) -> str:
@@ -322,6 +325,7 @@ def run_epic(
     worktree_root: Path | str,
     assume: str | None = None,
     fix_attempts: int | None = None,
+    resume_from: str | None = None,
 ) -> dict[str, Any]:
     """Drive a whole initiative: every phase, in dependency order, landing nothing.
 
@@ -351,6 +355,7 @@ def run_epic(
         worktree_root=Path(str(worktree_root)).expanduser(),
         assume=assume,
         fix_attempts=fix_attempts,
+        resume_from=resume_from,
         initiative_id=str(initiative.get("id")),
         # An unparented phase branches from the repository's current HEAD, read
         # once here so every phase in a run stacks on the same ground.
@@ -487,6 +492,8 @@ def _run_phase(
     # nothing to point anywhere.
     if hasattr(ctx.runner, "repo_dir"):
         ctx.runner.repo_dir = ctx.phase_worktree(phase)
+    if hasattr(ctx.runner, "repo_digest"):
+        ctx.runner.repo_digest = build_digest(ctx.phase_worktree(phase)) or None
 
     # A rebase is a WRITE, so it is a proposal like any other and joins this
     # phase's gate batch rather than happening quietly on the way past.
@@ -509,7 +516,24 @@ def _run_phase(
 
     ready = workstore.ready_tasks(items, phase=phase)
     results: list[dict[str, Any]] = []
-    if ready:
+
+    # Resume: a task whose earlier run already produced an approved patch is
+    # reused at no cost. Applying and checking it below is unchanged, so a
+    # patch that no longer fits the phase branch quarantines on its own merits.
+    reused: list[dict[str, Any]] = []
+    to_run = list(ready)
+    if ctx.resume_from:
+        to_run = []
+        for task in ready:
+            saved = load_result(ctx.runs_dir, ctx.resume_from, phase, str(task["id"]))
+            if reusable(saved):
+                reused.append(saved)
+                print(f"  reused {task['id']} from {ctx.resume_from} (approved patch, no model call)")
+            else:
+                to_run.append(task)
+    record["reused_tasks"] = [str(r.get("ticket")) for r in reused]
+
+    if to_run:
         results, _, failures = invoke_graphs(
             [
                 Invocation(
@@ -523,7 +547,7 @@ def _run_phase(
                         **({"fix_attempts": ctx.fix_attempts} if ctx.fix_attempts is not None else {}),
                     },
                 )
-                for task in ready
+                for task in to_run
             ],
             specs=ctx.specs,
             runner=ctx.runner,
@@ -536,6 +560,11 @@ def _run_phase(
             quarantined.append(
                 {"id": failure.split(":", 1)[0], "phase": phase, "grain": "task", "reason": failure}
             )
+    # Every result — fresh or reused — is saved under THIS run, so the next
+    # resume has one place to look and the record of what ran is complete.
+    results = [*reused, *results]
+    for result in results:
+        save_result(result, runs_dir=ctx.runs_dir, run_id=ctx.run_id, phase=phase, task=str(result.get("ticket")))
 
     by_id = {str(item["id"]): item for item in items}
     built: dict[str, dict[str, Any]] = {}

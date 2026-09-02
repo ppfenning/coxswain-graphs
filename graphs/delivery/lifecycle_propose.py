@@ -168,6 +168,10 @@ ARBITRATE_SCHEMA = {
 
 DEFAULT_FIX_ATTEMPTS = 2
 
+# How much of a patch the handoff sees. Enough to judge that a real diff exists
+# and touches the files it claims; the reviewer reads the whole thing.
+PATCH_PREVIEW_CHARS = 6000
+
 # Two successive patches this similar are the same patch with the whitespace
 # moved. 0.98 rather than 1.0 because a builder that re-emits its own diff
 # rarely re-emits it byte-identically, and "it changed a comment" is not the
@@ -260,6 +264,11 @@ def _handoff(
     attempt is still incomplete, and "we were already fixing it" is not a reason
     to review a gap.
     """
+    # The artifact travels with the question. An earlier version handed the
+    # handoff only the summary, the file list and the line counts — and it
+    # correctly refused every build for "no patch text was handed off", five
+    # epics running. A shuttle that cannot see the cargo cannot judge it.
+    patch = str(build.get("patch") or "")
     handoff = dict(
         runner.run(
             role="handoff",
@@ -270,9 +279,14 @@ def _handoff(
                 "The build step is done and the review step is next. Does what "
                 "build produced actually contain what a reviewer needs?\n\n"
                 f"Task: {ticket}\nPlan: {plan}\nSummary: {build.get('summary')}\n"
-                f"Files: {build.get('files_touched')}\nChange facts: {facts}\n\n"
+                f"Files: {build.get('files_touched')}\nChange facts: {facts}\n"
+                f"Commands run (with their real output): {build.get('commands_run')}\n"
+                f"Patch ({len(patch)} chars, {'complete' if len(patch) <= PATCH_PREVIEW_CHARS else 'head shown'}):\n"
+                f"{patch[:PATCH_PREVIEW_CHARS]}\n\n"
                 "List anything missing, and compress the rest into the smallest "
-                "brief that lets review start."
+                "brief that lets review start. The patch above IS the artifact under "
+                "review: judge whether it and the command evidence are sufficient, not "
+                "whether a repository somewhere already contains them."
             ),
         )
     )

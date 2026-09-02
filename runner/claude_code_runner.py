@@ -103,6 +103,18 @@ class ClaudeCodeRunner:
         if not isinstance(raw_effort, Mapping):
             raise RunnerError("provider profile 'effort' must map tier -> effort level")
         self.effort = {**TIER_EFFORT, **{str(k): str(v) for k, v in raw_effort.items()}}
+        # Cost ceilings, in dollars, per tier and optionally per role. The CLI
+        # stops the session when it is reached and says so (`error_max_budget_usd`),
+        # which the harness records as a quarantine — bounded and visible beats
+        # a 101-turn build that finished anyway.
+        self.budget_usd = {str(k): float(v) for k, v in (self.profile.get("budget_usd") or {}).items()}
+        self.role_budget_usd = {str(k): float(v) for k, v in (self.profile.get("role_budget_usd") or {}).items()}
+        # A profile may reassign a role's tier — the vendor axis owning cost.
+        # Extraction-shaped roles a graph asked "standard" for can run cheap here.
+        self.tier_overrides = {str(k): str(v) for k, v in (self.profile.get("tier_overrides") or {}).items()}
+        # A tool-computed map of the target repository, set by the harness. Shown
+        # to roles that have tools, so they read it instead of drawing their own.
+        self.repo_digest: str | None = None
         self.role_skills = dict(role_skills or {})
         self.cwd = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
         self.repo_dir: Path | None = Path(repo_dir).expanduser().resolve() if repo_dir else None
@@ -172,6 +184,14 @@ class ClaudeCodeRunner:
             f"Your working directory is {self.cwd}. It is the work store root: `work/` under it "
             "holds initiatives as work/<initiative>/<phase>/<task>.md.",
         ]
+        if self.repo_digest and (scratch is not None or self.repo_dir):
+            lines.append(
+                "A map of the target repository, computed by tools, follows. Consult it FIRST: it "
+                "tells you which files exist, how long they are, and which functions and classes "
+                "live at which line. Open only the files you actually need, read a file once, and "
+                "never list or grep the tree to learn what this map already says.\n"
+                f"<repo-digest>\n{self.repo_digest}\n</repo-digest>"
+            )
         if scratch is not None:
             lines.append(
                 f"You have a scratch checkout of the target repository at {scratch}, at the commit "
@@ -183,6 +203,14 @@ class ClaudeCodeRunner:
                 "Report the commands you actually ran and their real output; a command you did "
                 "not run is not evidence. The harness applies your patch itself, in a different "
                 "worktree, so leaving the scratch dirty is expected and correct."
+            )
+            lines.append(
+                "Work in as few turns as you can. Every turn re-sends everything you have read, so "
+                "the cost of a session grows with the square of its length: read the map, open the "
+                "few files you must, make the edits, run the test command at most twice, produce the "
+                "diff, return. Do not re-read a file, do not explore for context you were already "
+                "given, and do not polish. A session that exceeds its budget is stopped and the task "
+                "is quarantined, so a finished-but-plain patch beats an unfinished perfect one."
             )
         if self.repo_dir:
             lines.append(
@@ -201,7 +229,7 @@ class ClaudeCodeRunner:
         lines.append("</workspace>")
         return "\n".join(lines)
 
-    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None) -> list[str]:
+    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None) -> list[str]:
         argv = [
             self.claude_bin,
             "-p",
@@ -216,6 +244,11 @@ class ClaudeCodeRunner:
             json.dumps(dict(schema)),
             *_ISOLATION,
         ]
+        budget = self.role_budget_usd.get(role) if role is not None else None
+        if budget is None:
+            budget = self.budget_usd.get(tier)
+        if budget is not None:
+            argv += ["--max-budget-usd", f"{budget:.4f}"]
         if system:
             argv += ["--system-prompt", system]
         for extra in (self.repo_dir, scratch):
@@ -239,6 +272,7 @@ class ClaudeCodeRunner:
         prompt: str,
         context: Sequence[str] = (),
     ) -> NodeResult:
+        tier = self.tier_overrides.get(role, tier)
         model = self._model_for(tier)
         body = self.role_skills.get(role)
         packs = [body, *context] if body else list(context)
@@ -248,7 +282,7 @@ class ClaudeCodeRunner:
             system = "\n\n".join(
                 part for part in (self._read_context(packs), self._workspace(scratch), self.extra_system) if part
             )
-            argv = self._argv(model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch)
+            argv = self._argv(model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role)
             try:
                 proc = subprocess.run(
                     argv,
@@ -300,7 +334,13 @@ class ClaudeCodeRunner:
                 "cost_usd": payload.get("total_cost_usd"),
                 "turns": payload.get("num_turns"),
                 "duration_ms": payload.get("duration_ms"),
-                "input_tokens": sum(
+                # Split, not summed: a cache read costs a tenth of a fresh token,
+                # and "4.6M input" meant nothing until the price revealed that most
+                # of it was cached. Now the record says so itself.
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
+                "cache_creation_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+                "input_total": sum(
                     int(usage.get(k) or 0)
                     for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
                 ),
