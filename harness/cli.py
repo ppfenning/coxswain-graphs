@@ -34,6 +34,7 @@ from harness.phase import run_phase
 from harness.registry import GraphSpec, discover
 from harness.resolve import resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
+from harness.usage import record_usage
 from harness.worktree import apply_patch, create_worktree
 from runner.protocol import RunnerError
 
@@ -329,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  quarantined {entry.get('grain')}: {entry.get('id')} — {entry.get('reason')}", file=sys.stderr)
         print(f"  manifests: {args.runs_dir} (one per phase, under {run_id}:<phase>)")
         print(f"  ledger   : {args.ledger}")
+        record_usage(runner, runs_dir=args.runs_dir, run_id=run_id)
         return 0
 
     if args.graph == "phase":
@@ -590,4 +592,5 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nrecorded {run_id}: {len(auto_applied)} auto-applied, {len(diffs)} gated decision(s), {len(proposals)} proposal(s)")
     print(f"  manifest: {Path(args.runs_dir) / (run_id + '.json')}")
     print(f"  ledger  : {args.ledger}")
+    record_usage(runner, runs_dir=args.runs_dir, run_id=run_id)
     return 0

@@ -40,7 +40,22 @@ __all__ = ["ClaudeCodeRunner", "TIER_EFFORT", "DEFAULT_TIER"]
 DEFAULT_TIER = "standard"
 
 # Same mapping the API runner uses: effort belongs to the tier, not the node.
+# A profile may override it under `effort:` — the vendor axis owns cost.
 TIER_EFFORT = {"cheap": "low", "standard": "high", "deep": "xhigh"}
+
+# A node is a model call, not a workstation. Measured 2026-09-02 on a login
+# with the usual MCP servers and plugins configured: a trivial no-tool node
+# cost ~52k input tokens with the MCP schemas loaded and ~1k without them.
+# Every node in a ten-task epic was paying that before reading a line. So
+# each session starts with no MCP servers and no user settings — no plugins,
+# no hooks, no per-user permissions — and only the tools the profile grants.
+_ISOLATION = (
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--setting-sources",
+    "",
+)
 
 # Tools that mutate. A role granted any of these needs edits accepted up front —
 # headless mode has nobody to ask — and the profile is where that grant lives.
@@ -69,6 +84,10 @@ class ClaudeCodeRunner:
         if not isinstance(raw_tools, Mapping):
             raise RunnerError("provider profile 'tools' must map role -> list of tool names")
         self.tools = {str(role): [str(t) for t in (names or [])] for role, names in raw_tools.items()}
+        raw_effort = self.profile.get("effort") or {}
+        if not isinstance(raw_effort, Mapping):
+            raise RunnerError("provider profile 'effort' must map tier -> effort level")
+        self.effort = {**TIER_EFFORT, **{str(k): str(v) for k, v in raw_effort.items()}}
         self.role_skills = dict(role_skills or {})
         self.cwd = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
         self.repo_dir: Path | None = Path(repo_dir).expanduser().resolve() if repo_dir else None
@@ -130,9 +149,10 @@ class ClaudeCodeRunner:
             "--model",
             model,
             "--effort",
-            TIER_EFFORT.get(tier, "high"),
+            self.effort.get(tier, "high"),
             "--json-schema",
             json.dumps(dict(schema)),
+            *_ISOLATION,
         ]
         if system:
             argv += ["--system-prompt", system]
@@ -203,6 +223,7 @@ class ClaudeCodeRunner:
         if not isinstance(data, dict):
             raise RunnerError(f"node '{role}' returned {type(data).__name__}, expected an object")
 
+        usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
         self.calls.append(
             {
                 "role": role,
@@ -212,6 +233,11 @@ class ClaudeCodeRunner:
                 "cost_usd": payload.get("total_cost_usd"),
                 "turns": payload.get("num_turns"),
                 "duration_ms": payload.get("duration_ms"),
+                "input_tokens": sum(
+                    int(usage.get(k) or 0)
+                    for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+                ),
+                "output_tokens": int(usage.get("output_tokens") or 0),
             }
         )
         return NodeResult(data)

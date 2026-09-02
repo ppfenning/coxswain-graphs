@@ -1,0 +1,48 @@
+"""What a run spent, per node — written beside the manifest, never guessed.
+
+A runner that can count (the headless Claude Code runner records cost and
+tokens per call) exposes `.calls`; this writes them next to the run's manifest
+and prints one honest line. A runner that cannot count records nothing, and
+the absence is visible rather than papered over with an estimate.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+from typing import Any
+
+__all__ = ["summarize", "record_usage"]
+
+
+def summarize(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Pure: totals and a per-model breakdown over the recorded calls."""
+    by_model: dict[str, dict[str, Any]] = {}
+    for call in calls:
+        row = by_model.setdefault(str(call.get("model")), {"calls": 0, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0})
+        row["calls"] += 1
+        row["cost_usd"] = round(row["cost_usd"] + float(call.get("cost_usd") or 0.0), 4)
+        row["input_tokens"] += int(call.get("input_tokens") or 0)
+        row["output_tokens"] += int(call.get("output_tokens") or 0)
+    return {
+        "calls": len(calls),
+        "cost_usd": round(sum(float(c.get("cost_usd") or 0.0) for c in calls), 4),
+        "input_tokens": sum(int(c.get("input_tokens") or 0) for c in calls),
+        "output_tokens": sum(int(c.get("output_tokens") or 0) for c in calls),
+        "by_model": by_model,
+    }
+
+
+def record_usage(runner: Any, *, runs_dir: Path | str, run_id: str) -> dict[str, Any] | None:
+    """Write `<runs_dir>/<run_id>.usage.json` from `runner.calls`, if it has any. Returns the summary."""
+    calls = getattr(runner, "calls", None)
+    if not calls:
+        return None
+    summary = summarize(calls)
+    path = Path(runs_dir) / f"{run_id}.usage.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"run_id": run_id, "summary": summary, "calls": list(calls)}, indent=2), encoding="utf-8")
+    models = ", ".join(f"{m}: {r['calls']} call(s) ${r['cost_usd']}" for m, r in summary["by_model"].items())
+    print(f"  usage   : {summary['calls']} node call(s), ${summary['cost_usd']} — {models} → {path}")
+    return summary

@@ -219,3 +219,54 @@ def test_build_runner_picks_this_runner_from_the_profile(tmp_path) -> None:
     assert isinstance(runner, ClaudeCodeRunner)
     assert runner.cwd == tmp_path.resolve()
     assert runner.repo_dir == (tmp_path / "r").resolve()
+
+
+# ── isolation and cost ───────────────────────────────────────────────────────
+
+
+def test_every_session_starts_with_no_mcp_servers_and_no_user_settings(fake_claude, tmp_path) -> None:
+    """Measured: ~52k input tokens per node with the login's MCP schemas loaded, ~1k without."""
+    runner = runner_for(fake_claude, tmp_path)
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert "--strict-mcp-config" in argv
+    assert json.loads(argv[argv.index("--mcp-config") + 1]) == {"mcpServers": {}}
+    assert argv[argv.index("--setting-sources") + 1] == ""
+
+
+def test_the_profile_may_set_effort_per_tier(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "effort": {"deep": "high"}}, claude_bin=str(script), cwd=tmp_path)
+    runner.run(role="plan", tier="deep", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--effort") + 1] == "high"
+    runner.run(role="plan", tier="cheap", schema=SCHEMA, prompt="go")
+    assert recorded(fake_claude)["argv"][recorded(fake_claude)["argv"].index("--effort") + 1] == "low", "unset tiers keep the default"
+
+
+def test_usage_is_recorded_per_call_and_summarised(fake_claude, tmp_path) -> None:
+    from harness.usage import record_usage, summarize
+
+    _, _, set_output = fake_claude
+    set_output({"is_error": False, "structured_output": {"ok": True}, "total_cost_usd": 0.02, "num_turns": 3,
+                "usage": {"input_tokens": 100, "cache_read_input_tokens": 900, "output_tokens": 50}})
+    runner = runner_for(fake_claude, tmp_path)
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    runner.run(role="review_charter", tier="deep", schema=SCHEMA, prompt="go")
+    assert runner.calls[0]["input_tokens"] == 1000 and runner.calls[0]["output_tokens"] == 50
+    summary = summarize(runner.calls)
+    assert summary["calls"] == 2 and summary["cost_usd"] == 0.04 and summary["input_tokens"] == 2000
+    assert set(summary["by_model"]) == {"sonnet", "opus"}
+    out = record_usage(runner, runs_dir=tmp_path / "runs", run_id="r1")
+    assert out == summary
+    assert json.loads((tmp_path / "runs" / "r1.usage.json").read_text())["summary"]["calls"] == 2
+
+
+def test_a_runner_with_nothing_to_count_records_nothing(tmp_path) -> None:
+    from harness.usage import record_usage
+
+    class Mute:
+        pass
+
+    assert record_usage(Mute(), runs_dir=tmp_path, run_id="r") is None
+    assert not (tmp_path / "r.usage.json").exists()
