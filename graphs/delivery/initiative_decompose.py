@@ -266,8 +266,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 def _item_action(task: Mapping[str, Any], *, landing: str, initiative_id: str | None) -> str:
     """Pure: the create action, carrying every field the work-item arm must write."""
     where = "/".join(part for part in (landing, initiative_id, str(task.get("phase"))) if part)
-    needs = ", ".join(str(n) for n in task.get("needs") or []) or "none"
-    surfaces = ", ".join(str(x) for x in task.get("surfaces") or []) or "none"
+    # Empty stays `[]`, never a placeholder word: the arm copies this text into
+    # frontmatter verbatim, and `needs: [none]` is an edge to a task that does
+    # not exist — the third live run landed exactly that and the DAG refused.
+    needs = ", ".join(str(n) for n in task.get("needs") or [])
+    surfaces = ", ".join(str(x) for x in task.get("surfaces") or [])
     return (
         f"create {where}/{task['id']}.md with frontmatter id={task['id']}, "
         f"title={task.get('title') or task['id']!s}, phase={task.get('phase')}, state=ready, "
