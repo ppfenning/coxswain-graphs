@@ -171,3 +171,5 @@ def test_a_proposal_names_the_bound_landing_not_the_abstract_one(cart) -> None:
     assert action.startswith("create work/init/"), action
     assert "planned_work" not in action
     assert "title=" in action and "needs=[" in action
+    empty = next(p["suggested_action"] for p in result["proposals"] if "needs=[]" in p["suggested_action"])
+    assert "none" not in empty, "an empty list prints as [], never as a word the arm would copy"
