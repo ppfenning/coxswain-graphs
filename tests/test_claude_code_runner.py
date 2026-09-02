@@ -126,7 +126,7 @@ def test_repo_dir_is_added_and_named(fake_claude, tmp_path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
-    runner.run(role="build", schema=SCHEMA, prompt="go")
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
     argv = recorded(fake_claude)["argv"]
     assert argv[argv.index("--add-dir") + 1] == str(repo.resolve())
     assert str(repo.resolve()) in argv[argv.index("--system-prompt") + 1]
@@ -134,12 +134,12 @@ def test_repo_dir_is_added_and_named(fake_claude, tmp_path) -> None:
 
 def test_repo_dir_is_a_plain_attribute_the_driver_may_move(fake_claude, tmp_path) -> None:
     runner = runner_for(fake_claude, tmp_path)
-    runner.run(role="build", schema=SCHEMA, prompt="go")
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
     assert "--add-dir" not in recorded(fake_claude)["argv"]
     later = tmp_path / "phase-worktree"
     later.mkdir()
     runner.repo_dir = later
-    runner.run(role="build", schema=SCHEMA, prompt="go")
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
     argv = recorded(fake_claude)["argv"]
     assert argv[argv.index("--add-dir") + 1] == str(later)
 
@@ -287,4 +287,84 @@ def test_a_claude_error_names_its_subtype(fake_claude, tmp_path) -> None:
     set_output({"is_error": True, "subtype": "error_max_turns", "result": None, "num_turns": 40})
     runner = runner_for(fake_claude, tmp_path)
     with pytest.raises(RunnerError, match="error_max_turns"):
+        runner.run(role="build", schema=SCHEMA, prompt="go")
+
+
+# ── the builder's scratch worktree ───────────────────────────────────────────
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    """A real one-commit git repository, so worktree operations are real."""
+    import subprocess as sp
+
+    root = tmp_path / "target"
+    root.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
+    sp.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    (root / "f.txt").write_text("one\n", encoding="utf-8")
+    sp.run(["git", "-C", str(root), "add", "-A"], check=True, env=env)
+    sp.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True, env=env)
+    return root
+
+
+def test_the_builder_gets_a_scratch_worktree_and_runs_in_it(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    system = argv[argv.index("--system-prompt") + 1]
+    assert "scratch checkout" in system and "git add -A && git diff --cached" in system
+    assert "VERBATIM" in system, "the patch is transcribed from git, never authored"
+    scratch = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir" and "agent-graphs-build-" in argv[i + 1]]
+    assert scratch, "the scratch is readable by the node"
+
+
+def test_the_scratch_is_removed_afterwards(fake_claude, tmp_path, repo) -> None:
+    import subprocess as sp
+
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    scratch = next(argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir" and "agent-graphs-build-" in argv[i + 1])
+    assert not Path(scratch).exists()
+    listed = sp.run(["git", "-C", str(repo), "worktree", "list"], capture_output=True, text=True).stdout
+    assert "agent-graphs-build-" not in listed, "no worktree is left registered"
+
+
+def test_two_builders_never_share_a_scratch(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    seen = []
+    for _ in range(2):
+        runner.run(role="build", schema=SCHEMA, prompt="go")
+        argv = recorded(fake_claude)["argv"]
+        seen.append(next(argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir" and "agent-graphs-build-" in argv[i + 1]))
+    assert seen[0] != seen[1], "parallel tasks in one phase must not edit the same tree"
+
+
+def test_a_reading_role_gets_no_scratch(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert "agent-graphs-build-" not in " ".join(argv)
+    assert "scratch checkout" not in argv[argv.index("--system-prompt") + 1]
+    assert "never edit it" in argv[argv.index("--system-prompt") + 1]
+
+
+def test_without_a_target_repo_there_is_no_scratch(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert "agent-graphs-build-" not in " ".join(recorded(fake_claude)["argv"])
+
+
+def test_a_builder_pointed_at_a_non_repository_fails_loudly(fake_claude, tmp_path) -> None:
+    """No git, no computed diff. Say so rather than let it hand-write one."""
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    runner = runner_for(fake_claude, tmp_path, repo_dir=not_a_repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    with pytest.raises(RunnerError, match="scratch worktree"):
         runner.run(role="build", schema=SCHEMA, prompt="go")
