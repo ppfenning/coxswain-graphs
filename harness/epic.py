@@ -68,6 +68,10 @@ _IDENTITY = ("-c", "user.email=epic-swarm@invalid", "-c", "user.name=epic-swarm"
 
 _DRAFT_KINDS = frozenset({"draft_pr_create", "self_modification"})
 
+# How much of a task's patch the validators see. All of it for any real task;
+# the bound only stops a pathological diff from swamping the phase prompt.
+PATCH_FOR_VALIDATION_CHARS = 120_000
+
 
 def _git(*args: str, cwd: Path | None = None) -> tuple[bool, str]:
     """Run one git command and report what happened, never what was intended."""
@@ -647,6 +651,10 @@ def _run_phase(
                     "evidence": built[task]["evidence"],
                     "change_facts": dict(built[task]["result"].get("change_facts") or {}),
                     "review_verdict": str((built[task]["result"].get("review") or {}).get("verdict") or ""),
+                    # The patch is machine evidence — the diff git applied — not
+                    # the builder's account of it. A validator without it said,
+                    # in its own words, that it could not verify anything.
+                    "patch": str((built[task]["result"].get("build") or {}).get("patch") or "")[:PATCH_FOR_VALIDATION_CHARS],
                 }
                 for task in surviving
             ],

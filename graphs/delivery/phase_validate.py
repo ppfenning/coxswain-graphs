@@ -69,7 +69,10 @@ VALIDATE_PHASE_SCHEMA = {
 # What a task entry may carry into a prompt. `summary` is absent on purpose and
 # actively dropped below: it is the builder's own account of its own change, and
 # a validator that reads it is being told the answer by the party under review.
-_TASK_FIELDS = ("id", "title", "description", "evidence", "change_facts", "review_verdict")
+# `patch` IS on the list: the diff git applied is machine evidence, not the
+# builder's account of it. A validator without it reported, in its own words,
+# that it could not verify anything and refused a task the reviewers approved.
+_TASK_FIELDS = ("id", "title", "description", "evidence", "change_facts", "review_verdict", "patch")
 
 
 def _task_view(task: Mapping[str, Any]) -> dict[str, Any]:

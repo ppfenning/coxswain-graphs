@@ -146,3 +146,15 @@ def test_the_tiers_are_cheap_per_task_and_deep_once(cart) -> None:
     _, runner = run(cart)
     tiers = {call["role"]: call["tier"] for call in runner.calls}
     assert tiers == {"validate_chunk": "standard", "validate_phase": "deep"}
+
+
+def test_the_validators_see_the_patch_itself(cart) -> None:
+    """The diff is machine evidence; the summary is a recollection. One is shown, one is not."""
+    import copy
+    state = copy.deepcopy(PHASE_STATE)
+    for task in state["tasks"]:
+        task["patch"] = "--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-old\n+PATCH_MARKER_LINE\n"
+    _, runner = run(cart, state=state)
+    chunk_prompts = [c["prompt"] for c in runner.calls if c["role"] == "validate_chunk"]
+    assert chunk_prompts and all("PATCH_MARKER_LINE" in p for p in chunk_prompts)
+    assert all(PLANTED not in c["prompt"] for c in runner.calls), "the summary stays out"

@@ -266,6 +266,7 @@ def _handoff(
     plan: Mapping[str, Any],
     build: Mapping[str, Any],
     facts: Mapping[str, Any],
+    ticket_id: Any = None,
 ) -> dict[str, Any]:
     """The shuttle. Between build and review, someone checks that what came out
     of the last step is actually what the next one needs — and stops here if it
@@ -305,7 +306,7 @@ def _handoff(
     if not handoff.get("complete"):
         missing = ", ".join(handoff.get("missing") or []) or "unspecified"
         raise ContractViolation(
-            f"handoff from build to review is incomplete for '{ticket}': {missing}. "
+            f"handoff from build to review is incomplete for '{ticket_id if ticket_id is not None else ticket}': {missing}. "
             "The graph stops rather than reviewing a change that is not finished — "
             "a step that builds on a gap is how a phase goes quietly wrong."
         )
@@ -502,7 +503,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 
     handoff: dict[str, Any] | None = None
     if "handoff" in bound:
-        handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts)
+        handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts, ticket_id=ticket)
 
     review, adversary, arbitration, verdict = _review_round(
         runner,
@@ -569,7 +570,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         build = retry
         facts = _change_facts(build)
         if "handoff" in bound:
-            handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts)
+            handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts, ticket_id=ticket)
         tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
         review, adversary, arbitration, verdict = _review_round(
             runner,
