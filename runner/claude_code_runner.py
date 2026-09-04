@@ -221,6 +221,17 @@ class ClaudeCodeRunner:
         finally:
             self._drop_scratch(parent, scratch)
 
+    def _allowed_bash(self) -> list[str]:
+        """The Bash prefixes this session permits, in `--allowedTools` form.
+
+        One source for two consumers: `_argv` enforces this list and
+        `_workspace` tells the node what is on it. Computing it twice is how a
+        builder ends up discovering the boundary by hitting it.
+        """
+        allowed = [f"Bash({cmd.split()[0]}:*)" for cmd in self.check_commands if cmd.split()]
+        allowed += ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
+        return list(dict.fromkeys(allowed))
+
     def _workspace(self, scratch: Path | None = None, *, patches: bool = True) -> str:
         """Tell the node where the world is. It cannot find out on its own."""
         lines = [
@@ -263,6 +274,20 @@ class ClaudeCodeRunner:
                     "them (`which`, `--version`, `python -m ...`, `echo`) is a wasted turn every time. "
                     "If a command as written fails to start, report that verbatim and stop."
                 )
+            permitted = ", ".join(
+                f"`{name[len('Bash('):-len(':*)')]}`" for name in self._allowed_bash()
+            )
+            lines.append(
+                f"The ONLY shell commands permitted in this session are: {permitted}. Anything "
+                "else is refused by the sandbox before it runs. If your task text asks you to "
+                "run a command that is not on that list, do not attempt it and do not record "
+                "the refusal in `commands_run` as though it were output: a refusal is not "
+                "evidence, and downstream it reads as a builder that did not do its job rather "
+                "than as a sandbox that said no. Say plainly in your summary that the command "
+                "is not permitted in this session and that the harness must arrange for it. "
+                "Substituting your own reading of the diff for a command you could not run is "
+                "the same mistake in the other direction — that is a recollection, not a check."
+            )
             lines.append(
                 "Work in as few turns as you can. Every turn re-sends everything you have read, so "
                 "the cost of a session grows with the square of its length: read the map, open the "
@@ -333,9 +358,7 @@ class ClaudeCodeRunner:
         # verbs the diff needs — prefixes, so `pytest tests/x.py -q` passes —
         # and denied for everything else, which is what a scratch tree wants.
         if "Bash" in tools:
-            allowed = [f"Bash({cmd.split()[0]}:*)" for cmd in self.check_commands if cmd.split()]
-            allowed += ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
-            argv += ["--allowedTools", *dict.fromkeys(allowed)]
+            argv += ["--allowedTools", *self._allowed_bash()]
         # Last on purpose: `--tools` is variadic, and nothing may follow it that
         # could be mistaken for a tool name. The prompt travels on stdin.
         argv += ["--tools", *(tools or [""])]

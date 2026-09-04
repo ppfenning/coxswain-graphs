@@ -576,3 +576,44 @@ def test_a_call_without_a_thread_is_unchanged(fake_claude, tmp_path, repo) -> No
     runner.run(role="review_charter", schema=SCHEMA, prompt="go")
     argv = recorded(fake_claude)["argv"]
     assert "--no-session-persistence" in argv and "--session-id" not in argv and "--resume" not in argv
+
+
+# ── the sandbox boundary is told to the node, not discovered by hitting it ──
+
+
+def _system_prompt(record_path: Path) -> str:
+    argv = json.loads(record_path.read_text())["argv"]
+    return argv[argv.index("--system-prompt") + 1]
+
+
+def test_the_builder_is_told_exactly_which_commands_it_may_run(fake_claude, tmp_path, repo) -> None:
+    """Run 21's build was complete and was refused for evidence it was not allowed to produce."""
+    _, record, _ = fake_claude
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.check_commands = ["pytest -q"]
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it")
+    system = _system_prompt(record)
+
+    assert "`pytest`" in system and "`git status`" in system
+    assert "refused by the sandbox before it runs" in system
+    assert "a refusal is not evidence" in system
+
+
+def test_the_permitted_list_is_the_list_that_is_enforced(fake_claude, tmp_path, repo) -> None:
+    """One source. A prompt naming a different set than `--allowedTools` leaves
+    the boundary something the builder still has to find by hitting it."""
+    _, record, _ = fake_claude
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Bash"]
+    runner.check_commands = ["uv run pytest", "ruff check"]
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it")
+    argv = json.loads(record.read_text())["argv"]
+    enforced = argv[argv.index("--allowedTools") + 1 : argv.index("--tools")]
+    system = _system_prompt(record)
+
+    assert enforced == ["Bash(uv:*)", "Bash(ruff:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
+    for name in enforced:
+        assert f"`{name[len('Bash('):-len(':*)')]}`" in system
