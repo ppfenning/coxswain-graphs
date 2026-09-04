@@ -177,34 +177,119 @@ def test_binding_nothing_leaves_the_original_single_reviewer_loop(cart, plan_res
 
 def test_a_complete_handoff_passes_its_brief_to_review(cart, plan_response, build_response) -> None:
     bind(cart, "handoff")
-    complete = {"complete": True, "missing": [], "brief": "one file, one behaviour, tests green"}
+    complete = {"complete": True, "blocking": False, "missing": [], "brief": "one file, one behaviour, tests green"}
     result, scripted = run(cart, plan_response, build_response, extra={"handoff": complete})
     assert result["handoff"]["brief"].startswith("one file")
     review_prompt = next(c["prompt"] for c in scripted.calls if c["role"] == "review_charter")
     assert "one file, one behaviour" in review_prompt
 
 
-def test_an_incomplete_handoff_stops_the_graph(cart, plan_response, build_response) -> None:
+def test_a_blocking_handoff_stops_the_graph(cart, plan_response, build_response) -> None:
     """A reviewer handed half a change produces a confident opinion about the wrong thing."""
     bind(cart, "handoff")
-    incomplete = {"complete": False, "missing": ["the migration script", "any test"], "brief": ""}
+    incomplete = {"complete": False, "blocking": True, "missing": ["the migration script", "any test"], "brief": ""}
     with pytest.raises(ContractViolation, match="handoff from build to review is incomplete"):
         run(cart, plan_response, build_response, extra={"handoff": incomplete})
 
 
-def test_the_incomplete_handoff_names_what_is_missing(cart, plan_response, build_response) -> None:
+def test_the_blocking_handoff_names_what_is_missing(cart, plan_response, build_response) -> None:
     bind(cart, "handoff")
-    incomplete = {"complete": False, "missing": ["any test"], "brief": ""}
+    incomplete = {"complete": False, "blocking": True, "missing": ["any test"], "brief": ""}
     with pytest.raises(ContractViolation, match="any test"):
         run(cart, plan_response, build_response, extra={"handoff": incomplete})
 
 
-def test_review_never_runs_after_a_failed_handoff(cart, plan_response, build_response) -> None:
+def test_review_never_runs_after_a_blocking_handoff(cart, plan_response, build_response) -> None:
     bind(cart, "handoff")
-    incomplete = {"complete": False, "missing": ["x"], "brief": ""}
+    incomplete = {"complete": False, "blocking": True, "missing": ["x"], "brief": ""}
     scripted = ScriptedRunner({"plan": plan_response, "build": build_response, "handoff": incomplete})
     with pytest.raises(ContractViolation):
         lifecycle_propose.run(
             {"run_id": "r", "date": "d", "ticket": "T", "cartridge": cart}, scripted
         )
+    assert "review_charter" not in [c["role"] for c in scripted.calls]
+
+
+# ── the split: a missing artifact stops, missing evidence revises ───────────
+
+
+def test_an_absent_artifact_is_blocking_whatever_the_node_flagged(cart, plan_response) -> None:
+    """The graph decides this from the patch, not from the shuttle's opinion.
+
+    A handoff holding no patch cannot truthfully be told it is only short of
+    evidence: there is no change for a builder to add evidence about.
+    """
+    bind(cart, "handoff")
+    empty = {"patch": "   ", "summary": "nothing", "files_touched": [], "commands_run": []}
+    incomplete = {"complete": False, "blocking": False, "missing": ["the patch"], "brief": ""}
+    with pytest.raises(ContractViolation, match="artifact or an input is missing"):
+        run(cart, plan_response, empty, extra={"handoff": incomplete})
+
+
+def test_an_under_evidenced_handoff_revises_instead_of_quarantining(cart, plan_response, build_response) -> None:
+    """The artifact is present; what is missing is a check nobody ran.
+
+    That is a gap one more build attempt closes. Stopping the run here throws
+    away a finished change and buys a whole replan to return to where the run
+    already was — which is what three of four handoff stops in one day did.
+    """
+    bind(cart, "handoff")
+    second = {**build_response, "patch": build_response["patch"] + "+evidence attached\n"}
+    result, scripted = run(
+        cart, plan_response, [build_response, second],
+        extra={
+            "handoff": [
+                {"complete": False, "blocking": False, "missing": ["output of the cleanliness check"], "brief": ""},
+                {"complete": True, "blocking": False, "missing": [], "brief": "checks attached"},
+            ]
+        },
+    )
+    assert [p["kind"] for p in result["proposals"]] == ["draft_pr_create"]
+    assert result["fix_loop"] == {"attempts": 2, "stopped": None}
+    assert result["handoff"]["complete"] is True
+
+    # No reviewer was bought for the change the shuttle had already refused.
+    roles = [c["role"] for c in scripted.calls]
+    assert roles.index("build") < roles.index("handoff") < roles.index("review_charter")
+    assert roles.count("review_charter") == 1, "review runs once, on the change that was handed over"
+
+
+def test_the_builder_is_sent_back_the_handoff_s_own_words(cart, plan_response, build_response) -> None:
+    """Verbatim, like any other critique. 'The handoff refused' fixes nothing."""
+    bind(cart, "handoff")
+    second = {**build_response, "patch": build_response["patch"] + "+evidence\n"}
+    _, scripted = run(
+        cart, plan_response, [build_response, second],
+        extra={
+            "handoff": [
+                {"complete": False, "blocking": False, "missing": ["output of the cleanliness check"],
+                 "brief": "attach the check output"},
+                {"complete": True, "blocking": False, "missing": [], "brief": "ok"},
+            ]
+        },
+    )
+    retry = [c["prompt"] for c in scripted.calls if c["role"] == "build"][1]
+    assert "output of the cleanliness check" in retry
+    assert "attach the check output" in retry
+
+
+def test_an_under_evidenced_handoff_costs_one_attempt_not_the_run(cart, plan_response, build_response) -> None:
+    """It buys a build attempt out of the same bounded budget as any revise.
+
+    With the fix loop disabled there is no attempt to spend, so the run ends
+    unapproved — but it ends with the loop's accounting, not with an exception,
+    and the record says which.
+    """
+    bind(cart, "handoff")
+    result, scripted = run(
+        cart, plan_response, build_response,
+        extra={"handoff": {"complete": False, "blocking": False, "missing": ["a test"], "brief": ""}},
+        fix_attempts=0,
+    )
+    assert result["proposals"] == []
+    assert result["fix_loop"] == {"attempts": 1, "stopped": "attempts_exhausted"}
+    assert result["review"]["verdict"] == "revise"
+    assert result["review"]["findings"][0]["detail"] == "a test"
+    # No second opinion was invented out of the shuttle's objection.
+    assert result["adversary"] is None and result["arbitration"] is None
     assert "review_charter" not in [c["role"] for c in scripted.calls]

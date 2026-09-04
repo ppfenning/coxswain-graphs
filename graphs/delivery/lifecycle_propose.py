@@ -143,10 +143,23 @@ HANDOFF_SCHEMA = {
     "type": "object",
     "properties": {
         "complete": {"type": "boolean"},
+        # Not every refusal costs the same thing, so the shuttle has to say which
+        # kind it is. Missing ARTIFACT or missing INPUT — no patch, a file the
+        # plan needed that nobody produced — is blocking: there is nothing for a
+        # builder to improve and the line stops. Missing EVIDENCE or a thin
+        # summary, with the artifact present, is not: the work exists and what
+        # it lacks is exactly what one more build attempt can add.
+        "blocking": {
+            "type": "boolean",
+            "description": (
+                "true when the artifact itself or an input the plan needed is missing; "
+                "false when the artifact is present and only its evidence or summary is incomplete"
+            ),
+        },
         "missing": {"type": "array", "items": {"type": "string"}},
         "brief": {"type": "string", "description": "the small thing the next step actually needs"},
     },
-    "required": ["complete", "missing", "brief"],
+    "required": ["complete", "blocking", "missing", "brief"],
     "additionalProperties": False,
 }
 
@@ -500,6 +513,21 @@ def _handoff(
     A retry gets exactly the same check as the first try. An incomplete second
     attempt is still incomplete, and "we were already fixing it" is not a reason
     to review a gap.
+
+    But an incomplete handoff is not one thing. Stopping the line is right when
+    the artifact or an input is missing, because no amount of rebuilding
+    conjures an input nobody produced. It is wrong when the patch is there and
+    what is missing is evidence about it: that is a gap one more build attempt
+    closes, and quarantining it throws away a finished change and buys a whole
+    replan to get back to where the run already was. Three of four handoff stops
+    in one day were the second kind. So this raises only on the blocking kind,
+    and returns the incomplete handoff otherwise for the caller to route into
+    the fix loop.
+
+    Whether the artifact is present is decided HERE, from the patch, and only
+    then refined by the node's own flag: a shuttle cannot truthfully call an
+    artifact missing while holding it, and a graph that took its word for it
+    would be re-deciding a deterministic fact with a model call.
     """
     # The artifact travels with the question. An earlier version handed the
     # handoff only the summary, the file list and the line counts — and it
@@ -523,18 +551,60 @@ def _handoff(
                 "List anything missing, and compress the rest into the smallest "
                 "brief that lets review start. The patch above IS the artifact under "
                 "review: judge whether it and the command evidence are sufficient, not "
-                "whether a repository somewhere already contains them."
+                "whether a repository somewhere already contains them.\n\n"
+                "If it is not complete, say whether the refusal is BLOCKING. Blocking "
+                "means the artifact itself or an input the plan needed is absent — "
+                "there is no change here, or the work depended on something nobody "
+                "produced, and no amount of rebuilding will conjure it. Not blocking "
+                "means the change is present and what it lacks is evidence about it: "
+                "a check nobody ran, output nobody attached, a claim nobody tested. "
+                "That second kind buys one more build attempt; it does not stop the "
+                "line, so do not mark it blocking to signal that it matters."
             ),
         )
     )
-    if not handoff.get("complete"):
+    # No patch is an absent artifact as a matter of fact, whatever the node
+    # said; with a patch in hand, only the node knows whether an INPUT was
+    # missing, so its flag decides.
+    blocking = not patch.strip() or bool(handoff.get("blocking"))
+    if not handoff.get("complete") and blocking:
         missing = ", ".join(handoff.get("missing") or []) or "unspecified"
         raise ContractViolation(
             f"handoff from build to review is incomplete for '{ticket_id if ticket_id is not None else ticket}': {missing}. "
-            "The graph stops rather than reviewing a change that is not finished — "
-            "a step that builds on a gap is how a phase goes quietly wrong."
+            "The artifact or an input is missing, so the graph stops rather than "
+            "reviewing a change that is not finished — a step that builds on a gap "
+            "is how a phase goes quietly wrong."
         )
     return handoff
+
+
+def _handoff_critique(
+    handoff: Mapping[str, Any],
+) -> tuple[dict[str, Any], None, None, str]:
+    """A non-blocking handoff refusal, in the shape the fix loop already carries.
+
+    The loop moves on a review verdict and a critique, so a handoff that refused
+    for missing evidence enters it as exactly that: a `revise` whose findings are
+    the handoff's own `missing` list, verbatim. No reviewer ran and none is
+    invented — the adversary and the arbitration stay `None`, so nothing
+    downstream can mistake the shuttle's objection for a second opinion about
+    the code.
+    """
+    missing = [str(item) for item in handoff.get("missing") or [] if str(item).strip()]
+    return (
+        {
+            "verdict": "revise",
+            "findings": [
+                {"charter_principle": "handoff evidence", "detail": item, "file": ""}
+                for item in missing
+            ],
+            "rationale": str(handoff.get("brief") or "")
+            or f"the handoff refused for missing evidence: {', '.join(missing) or 'unspecified'}",
+        },
+        None,
+        None,
+        "revise",
+    )
 
 
 def _review_round(
@@ -751,16 +821,24 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     if "handoff" in bound:
         handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts, ticket_id=ticket)
 
-    review, adversary, arbitration, verdict = _review_round(
-        runner,
-        context=context,
-        bound=bound,
-        ticket=ticket_text,
-        build=build,
-        facts=facts,
-        handoff=handoff,
-        tier=tier,
-    )
+    # A non-blocking refusal costs a build attempt, not the run. Review is
+    # skipped — there is nothing yet worth a deep-tier opinion — and the
+    # handoff's own list of what is missing is what the builder is sent back
+    # with. Paying two reviewers to read a change the shuttle already said is
+    # under-evidenced would buy an opinion about the wrong thing.
+    if handoff is not None and not handoff.get("complete"):
+        review, adversary, arbitration, verdict = _handoff_critique(handoff)
+    else:
+        review, adversary, arbitration, verdict = _review_round(
+            runner,
+            context=context,
+            bound=bound,
+            ticket=ticket_text,
+            build=build,
+            facts=facts,
+            handoff=handoff,
+            tier=tier,
+        )
 
     # The bounded fix loop. A change sent back goes back to the builder with the
     # critique attached — but the loop is bounded in three separate ways, because
@@ -817,6 +895,12 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         facts = _change_facts(build)
         if "handoff" in bound:
             handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts, ticket_id=ticket)
+            # Still under-evidenced. The same rule as the first pass: another
+            # attempt if the cap allows one, and never a review round bought
+            # for a change the shuttle has already refused to hand over.
+            if not handoff.get("complete"):
+                review, adversary, arbitration, verdict = _handoff_critique(handoff)
+                continue
         tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
         review, adversary, arbitration, verdict = _review_round(
             runner,
