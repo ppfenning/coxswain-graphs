@@ -76,7 +76,7 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 | Graph | Namespace | Shape |
 |---|---|---|
 | `initiative-decompose` | delivery | decompose → adversary-on-the-edges → emit. An idea into phases and a task DAG |
-| `lifecycle-propose` | delivery | scope → plan → build (worktree) → handoff → review → adversary → arbitrate → emit |
+| `lifecycle-propose` | delivery | scope → plan → [alternative plan → arbitrate plans] → [attack the plan] → build (worktree) → handoff → review → adversary → arbitrate → emit |
 | `triage-propose` | ops | fetch → classify → verify → emit. Zero writes; proposes corrections to the runbook it just used |
 | `epic-reconcile` | ops | compare (set arithmetic) → reconcile → emit. Declared state vs actual |
 | `phase-validate` | delivery | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver |
@@ -119,7 +119,25 @@ pass does not extend a streak. See `graphs/delivery/epic-swarm.md` for the
 decided design, including what each comfort level means after the merge kind
 split.
 
-Three convictions hold this together:
+Solutions can compete before anyone builds. `lifecycle-propose` has three
+optional roles between `plan` and `build`: `plan_alternative` writes a second
+plan told to differ, `plan_arbitrate` picks one or merges them and names the
+price, and `plan_adversary` attacks the winning plan's claims before a builder
+spends a budget on it. Unbound means absent — a team that binds none keeps
+the single-plan loop, and the competition itself needs both the alternative
+and the arbiter, since an alternative nobody judges is a plan nobody builds.
+A pick hands the source plan to the builder verbatim, so what was compared is
+what gets built; only a merge is the arbiter's own plan. An objection the
+adversary sustains buys ONE revision, routed back to whoever wrote the plan
+on that seat's thread — the first planner, the second, or the arbiter when
+the plan is a merge — and the revision is not attacked again. It sits before
+build because a plan costs a fraction of a build, so two alternatives are
+compared as two short documents rather than two diffs. The gap: there is no
+tier gate yet. Once a cartridge binds these roles they run on every task,
+whatever the change costs, so a one-line fix pays for a second plan, an
+arbiter and an attack it did not need.
+
+Five convictions hold this together:
 
 - **Nothing is one-shot.** Every change gets a reviewer, and `review_tier`
   decides how many — a four-line migration is reviewed harder than a
@@ -169,8 +187,8 @@ Atlassian host, a bucket URI, an AWS ARN and account ID, a username-bearing
 path, an inline key, a silent `args.cartridge` fallback, and a missing-cartridge
 acceptance lit up **9 checks**, including the behavioural refusal — which
 proves the module walk actually descends into the new layout. A check nobody
-has watched fail is not a check. Re-verified 2026-09-01, after three graphs
-and two drivers were added: the same planted file still lights up the same
+has watched fail is not a check. Re-verified 2026-09-04, with seven graphs
+and three drivers in the tree: the same planted file still lights up the same
 **9 checks**, and the suite passes again once it is removed.
 
 ## Status: implemented
@@ -194,6 +212,25 @@ nested-invocation primitive the epic driver fans out with. What remains
 deferred is named where it is deferred: comfort level 2 (`pr_ready_flip`
 stays gated in base, and nothing yet justifies loosening it for everyone) and
 a forge arm, so a "draft PR" is a local branch until one exists.
+
+### What changed (2026-09-04), and why
+
+Three fixes from live runs, and one new shape. The chunk validator was
+refusing tasks both reviewers had approved, saying no diff was provided —
+it had been handed the description, the evidence rows, the change facts and
+the review verdict, and never the patch; the diff git applied is machine
+evidence, not the builder's account of it, so it now joins what validators
+see, and the handoff's `ContractViolation` names the work item's id again
+instead of embedding its whole text where the id belongs (#6). A patch that
+arrives through a JSON field can lose its final newline, and git then rejects
+it as corrupt at its last line although every hunk is intact — two
+gate-approved patches were lost that way in one epic, so the worktree restores
+the newline before `git apply` (#7). And the lifecycle graph grew the plan
+competition described above — `plan_alternative`, `plan_arbitrate`,
+`plan_adversary` — with the arbiter's `plan` field required only on a merge,
+because a plan written alongside a pick is a plan nobody reads, and a merge
+that claims the name without the plan stops the graph rather than quietly
+building the first plan under it (#8).
 
 ### What changed (2026-09-01, second pass), and why
 
