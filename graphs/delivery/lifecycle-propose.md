@@ -10,6 +10,9 @@ that only reads other nodes):
 |---|---|---|---|
 | `scope` | `scope_epic` | standard | none (read-only, **optional role**) |
 | `plan` | `plan` | standard | none (read-only) |
+| `plan_alternative` | `plan_alternative` | standard | none (**optional**; runs only with `plan_arbitrate`) |
+| `plan_arbitrate` | `plan_arbitrate` | deep | none (**optional**; picks a plan or merges, names the price) |
+| `plan_adversary` | `plan_adversary` | deep | none (**optional**; attacks the chosen plan's claims; one revision at most) |
 | `build` | `build` | standard | its own worktree only |
 | `review` | `review_charter` | deep | none |
 | `emit` | — | — | proposals as data |
@@ -32,6 +35,9 @@ flowchart TB
     subgraph GRAPH["the graph: pure, no disk, no clock"]
         SCOPE["scope<br/>role: scope_epic, standard<br/>epic_threshold and work_routing"]
         PLAN["plan<br/>role: plan, standard"]
+        ALT["plan_alternative<br/>role: plan_alternative, standard<br/>told to differ"]
+        PARB["plan_arbitrate<br/>role: plan_arbitrate, deep<br/>first / second / merged"]
+        PADV["plan_adversary<br/>role: plan_adversary, deep<br/>attacks the plan's claims"]
         BUILD["build<br/>role: build, standard"]
         FACTS["change_facts<br/>counted from the patch,<br/>never asked of the model"]
         HANDOFF{"handoff<br/>does build's output contain<br/>what review needs?"}
@@ -42,7 +48,12 @@ flowchart TB
         STOP(["graph stops"])
 
         SCOPE --> PLAN
-        PLAN --> BUILD
+        PLAN -- "both roles bound" --> ALT
+        ALT --> PARB
+        PARB -- "the chosen plan, verbatim" --> PADV
+        PARB -- "adversary unbound" --> BUILD
+        PLAN -- "unbound" --> PADV
+        PADV -- "proceed, or revised once<br/>by the plan's author" --> BUILD
         BUILD -- "unified diff, returned not applied" --> FACTS
         FACTS --> HANDOFF
         HANDOFF -- "incomplete" --> STOP
@@ -83,6 +94,43 @@ How many reviewers a change gets is `review_tier`'s decision, not the author's:
 tier 0 is reviewed once, tier 1 gets an adversary, and tier 2 arbitrates whether
 or not the two agreed. No path skips review.
 
+## Solutions compete before build
+
+The reviewers after `build` judge one diff. They can say ship, revise or
+reject, and nothing else; a different design only appears if the one planner
+thought of it. The three optional roles between `plan` and `build` are where
+alternatives get a hearing, and they sit there for a reason of cost: a plan
+node finishes in about ten turns for a tenth of a build, and comparing two
+short plans is a small document where comparing two diffs is not.
+
+- **`plan_alternative`** writes a second plan, shown the first only so it can
+  avoid repeating it. It is told to differ, not to critique, and it works on
+  a thread of its own, never the first planner's — independence is the whole
+  value.
+- **`plan_arbitrate`** picks `first`, `second` or `merged`, and names the
+  price. A pick hands the source plan to the builder VERBATIM; what was
+  compared is what gets built, and the `plan` field is not required on a
+  pick. Only a merge is the arbiter's own plan, and a `merged` that names no
+  plan stops the graph: neither planner's plan is built under the arbiter's
+  name. The arbiter, too, keeps a thread of its own. The competition runs only when both roles are bound: an
+  alternative nobody judges is a budget spent on a plan nobody builds.
+- **`plan_adversary`** attacks the chosen plan's claims — a file it assumes,
+  a signature it assumes, a step that cannot be checked without doing the
+  next one — while an objection still costs one more plan instead of a
+  rebuild. It gets ONE revision, by the plan's AUTHOR on the author's own
+  thread, with the objections verbatim: the first planner when its plan won
+  or no competition ran, the second planner when the arbiter chose `second`,
+  and the arbiter itself when the plan is a merge, since neither planner
+  wrote that one. A planner is never handed another's plan and told it is
+  its own. The revision is not attacked again: the review round after build
+  judges it, and a loop here would be a second fix loop with none of the
+  first one's accounting.
+
+The record keeps the loser, the choice and its price under
+`plan_competition`, and the attack and whether it revised under
+`plan_attack`; the draft-PR proposal carries both as evidence rows, and only
+when they ran.
+
 ## The fix loop is bounded, and it counts
 
 A change the reviewers sent back goes back to the builder with the critique
@@ -118,8 +166,10 @@ record look better than the run was.
 `ticket`, optional `fix_attempts` (default 2; `0` disables retries), optional
 `worktree_root` (else `cartridge.landing_areas.worktree_root`).
 
-**Returns:** `{run_id, date, ticket, plan, build, review, change_facts, fix_loop,
-proposals[]}` — `plan`/`build`/`review` hold the final round's values.
+**Returns:** `{run_id, date, ticket, plan, plan_competition, plan_attack, build,
+review, change_facts, fix_loop, proposals[]}` — `plan`/`build`/`review` hold the
+final round's values; `plan_competition` and `plan_attack` are `None` when the
+roles are unbound.
 
 **Formerly deferred, now landed elsewhere:** the adversarial reviewer pair and
 arbitration live in this graph; verification became the harness's check arm

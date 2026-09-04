@@ -126,7 +126,7 @@ staying small, enforced at the seam where it actually matters.
 | Graph | Shape |
 |---|---|
 | `initiative-decompose` | decompose → adversary-on-the-edges → emit. Idea into phases and a task DAG. |
-| `lifecycle-propose` | scope → plan → build (worktree) → handoff → review → adversary → arbitrate → emit. One task. |
+| `lifecycle-propose` | scope → plan → [alternative plan → arbitrate plans] → [attack the plan] → build (worktree) → handoff → review → adversary → arbitrate → emit. One task. |
 | `triage-propose` | fetch → classify → verify → emit. Zero writes; proposes its own runbook corrections. |
 | `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared state vs actual. |
 | `phase-validate` | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver. |

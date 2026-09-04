@@ -1,11 +1,26 @@
 """lifecycle-propose — the development loop for ONE task.
 
-    scope -> plan -> build (worktree) -> handoff -> review -> adversary
-          -> arbitrate -> emit
+    scope -> plan -> [plan_alternative -> plan_arbitrate] -> [plan_adversary]
+          -> build (worktree) -> handoff -> review -> adversary -> arbitrate -> emit
 
 Takes one task, produces reviewed work and proposals. Nothing is pushed, opened,
 or merged. The build node returns a patch; applying it is the shell's job,
 inside a worktree the shell owns.
+
+**Solutions compete before anyone builds.** The reviewers after `build` judge
+one diff; they can say ship, revise or reject, and nothing else. A different
+design only ever appears if the one planner happens to think of it. So the
+bracketed nodes let a team hold a competition at the cheap end of the loop: a
+second planner writes an independent plan told to differ, an arbiter picks
+one or merges them and names the price, and an adversary attacks the winning
+plan's claims — files it assumes, steps that cannot be checked, scope that
+grew — before a builder spends a budget on it. A plan costs a tenth of a
+build, which is why the competition happens here and not between two diffs.
+An objection the adversary sustains buys one revision, and the revision goes
+back to whoever wrote the plan — the first planner on its thread, the second
+on its own, or the arbiter when the plan is a merge of both. A planner is
+never handed another planner's plan and told it is its own. Every one of
+these roles is optional; unbound means absent.
 
 Three convictions shape the back half of this graph.
 
@@ -38,7 +53,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, NamedTuple
 
 from graphs._contract import (
     ContractViolation,
@@ -165,8 +180,61 @@ ARBITRATE_SCHEMA = {
     "additionalProperties": False,
 }
 
+PLAN_CHOICE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "chosen": {"type": "string", "enum": ["first", "second", "merged"]},
+        # Not required: a pick hands the source plan over verbatim, so a plan
+        # emitted alongside `first` or `second` is a plan nobody reads, and a
+        # deep-tier model should not have to write one to be discarded. A
+        # merge with no plan is enforced in _plan_competition, not here: this
+        # schema goes to the model's structured-output subset, which has no
+        # if/then, and a merge that names no plan is a stopped graph, not a
+        # fallback to either planner's.
+        "plan": {**PLAN_SCHEMA, "description": "the merged plan; required when chosen is 'merged', omitted on a pick"},
+        "reasoning": {"type": "string"},
+        "price": {"type": "string", "description": "what choosing this plan costs, in one sentence"},
+    },
+    "required": ["chosen", "reasoning", "price"],
+    "additionalProperties": False,
+}
+
+PLAN_ATTACK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["proceed", "revise"]},
+        "objections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"claim": {"type": "string"}, "why_wrong": {"type": "string"}},
+                "required": ["claim", "why_wrong"],
+                "additionalProperties": False,
+            },
+        },
+        "strongest_objection": {"type": "string"},
+    },
+    "required": ["verdict", "objections", "strongest_objection"],
+    "additionalProperties": False,
+}
+
 
 DEFAULT_FIX_ATTEMPTS = 2
+
+
+class _Author(NamedTuple):
+    """Who wrote a plan: the role, its tier, and the thread it was written on.
+
+    A revision has to go back to the seat that holds the plan's context. The
+    first planner keeps the ticket's thread, which build later joins; the
+    second planner and the arbiter each keep a thread of their own, so that a
+    revision can continue where they left off without ever joining the first
+    planner's — independence is the whole value of a second plan.
+    """
+
+    role: str
+    tier: str
+    thread: str
 
 
 def _ticket_text(ticket: Any, title: Any, body: Any) -> str:
@@ -256,6 +324,162 @@ def _critique(
     if arbitration is not None:
         lines.append(f"Arbitration sided with {arbitration.get('sided_with')}: {arbitration.get('reasoning')}")
     return "\n".join(lines)
+
+
+def _plan_competition(
+    runner: NodeRunner,
+    *,
+    context: list[str],
+    ticket: Any,
+    date: Any,
+    plan: Mapping[str, Any],
+    first: _Author,
+) -> tuple[dict[str, Any], dict[str, Any], _Author]:
+    """A second, independent plan, and a decision between the two.
+
+    The second planner is shown the first plan only so it can avoid repeating
+    it — it is told to differ, not to critique — and it never joins the first
+    planner's thread, for the same reason review never joins the builder's.
+    The arbiter picks, or merges. When it picks, the builder gets the source
+    plan VERBATIM, not the arbiter's restatement of it: what was compared is
+    what gets built. Only a merge is the arbiter's own plan.
+
+    Returns the winning plan, the record, and the winner's AUTHOR — the seat
+    a revision goes back to. A pick's author is the planner that wrote it; a
+    merge's author is the arbiter, because neither planner wrote that plan.
+    """
+    second = _Author("plan_alternative", "standard", f"{first.thread}/plan_alternative")
+    arbiter = _Author("plan_arbitrate", "deep", f"{first.thread}/plan_arbitrate")
+    alternative = dict(
+        runner.run(
+            role=second.role,
+            tier=second.tier,
+            thread=second.thread,
+            schema=PLAN_SCHEMA,
+            context=context,
+            prompt=(
+                "A first plan for this ticket already exists. Write a second one "
+                "that takes a materially different route — a different "
+                "decomposition, different files, or a different order — so that "
+                "a comparison is worth making. Do not critique the first plan; "
+                "produce a whole plan of your own.\n\n"
+                f"Ticket: {ticket}\nDate: {date}\n\n"
+                f"First plan (do not repeat it): {plan}\n\n"
+                "Name the files you expect to touch, and state what is explicitly "
+                "out of scope."
+            ),
+        )
+    )
+    choice = dict(
+        runner.run(
+            role=arbiter.role,
+            tier=arbiter.tier,
+            thread=arbiter.thread,
+            schema=PLAN_CHOICE_SCHEMA,
+            context=context,
+            prompt=(
+                "Two independent plans exist for this ticket. Choose the one the "
+                "builder should carry out, or merge them into one that is better "
+                "than either. Judge them against the ticket and the repository in "
+                "front of you: steps that can be checked, files that exist, scope "
+                "that stays bounded. Say what choosing it costs.\n\n"
+                f"Ticket: {ticket}\n\nFirst plan: {plan}\n\nSecond plan: {alternative}"
+            ),
+        )
+    )
+    chosen = str(choice.get("chosen"))
+    merged = choice.get("plan")
+    if chosen == "merged" and not merged:
+        raise ContractViolation(
+            f"plan_arbitrate claimed 'merged' for '{first.thread}' but returned no plan. "
+            "A merge is the arbiter's own plan; the graph stops rather than "
+            "building the first plan under that name — a revision would go "
+            "back to the arbiter carrying a plan it never wrote."
+        )
+    winner, author = (
+        (dict(plan), first) if chosen == "first"
+        else (alternative, second) if chosen == "second"
+        else (dict(merged), arbiter)
+    )
+    record = {
+        "alternative": alternative,
+        "chosen": chosen,
+        "reasoning": str(choice.get("reasoning") or ""),
+        "price": str(choice.get("price") or ""),
+    }
+    return winner, record, author
+
+
+def _plan_attack(
+    runner: NodeRunner,
+    *,
+    context: list[str],
+    ticket: Any,
+    author: _Author,
+    plan: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The adversary, moved to the front of the loop.
+
+    After `build`, an objection costs a rebuild. Before it, an objection costs
+    one more plan. So the plan's claims — this file exists, this signature is
+    what the test will call, this step can be checked without doing the next
+    one — get attacked while they are still cheap to be wrong about.
+
+    Bounded to ONE revision, by the plan's AUTHOR on the author's own thread:
+    the first planner when its plan won or no competition ran, the second
+    planner when the arbiter chose `second`, the arbiter itself when the plan
+    is a merge. The objections travel verbatim. Sending a planner another
+    planner's plan would hand it a thread already holding its own losing plan
+    and call the result a revision. The revision is not attacked again: the
+    review round after build is where the built plan gets judged, and a loop
+    here would be a second fix loop with none of the first one's accounting.
+    """
+    attack = dict(
+        runner.run(
+            role="plan_adversary",
+            tier="deep",
+            schema=PLAN_ATTACK_SCHEMA,
+            context=context,
+            prompt=(
+                "Your job is to disagree with this plan before anyone builds it. "
+                "Attack the claims it rests on: a file or function it assumes "
+                "exists, a signature it assumes, a step that cannot be checked, a "
+                "step that depends on the next one, scope that has quietly grown. "
+                "Check what you can against the repository.\n\n"
+                f"Ticket: {ticket}\nPlan: {plan}\n\n"
+                "State your strongest objection plainly, even if you conclude the "
+                "plan can proceed."
+            ),
+        )
+    )
+    if attack.get("verdict") != "revise":
+        return dict(plan), {"attack": attack, "revised": False}
+
+    objections = "\n".join(
+        f"- {objection.get('claim')} — {objection.get('why_wrong')}"
+        for objection in attack.get("objections") or []
+        if isinstance(objection, Mapping)
+    )
+    revised = dict(
+        runner.run(
+            role=author.role,
+            tier=author.tier,
+            thread=author.thread,
+            schema=PLAN_SCHEMA,
+            context=context,
+            prompt=(
+                "This plan was sent back before build. Revise it so that every "
+                "objection below actually falls — a plan that leaves one standing "
+                "is not a revision.\n\n"
+                f"Ticket: {ticket}\nPlan: {plan}\n\n"
+                f"Objections:\n{objections}\n"
+                f"Strongest: {attack.get('strongest_objection')}\n\n"
+                "Name the files you expect to touch, and state what is explicitly "
+                "out of scope."
+            ),
+        )
+    )
+    return revised, {"attack": attack, "revised": True}
 
 
 def _handoff(
@@ -464,10 +688,14 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             )
         )
 
-    plan = runner.run(
-        role="plan",
-        tier="standard",
-        thread=str(ticket),
+    bound = cartridge.get("skills") or {}
+
+    # The first planner keeps the ticket's own thread; build joins it later.
+    author = _Author("plan", "standard", str(ticket))
+    first_plan = runner.run(
+        role=author.role,
+        tier=author.tier,
+        thread=author.thread,
         schema=PLAN_SCHEMA,
         context=context,
         prompt=(
@@ -476,6 +704,25 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "explicitly out of scope."
         ),
     )
+
+    # The competition needs both halves: an alternative nobody judges is a
+    # plan nobody builds, and an arbiter with one plan has nothing to decide.
+    competition: dict[str, Any] | None = None
+    if "plan_alternative" in bound and "plan_arbitrate" in bound:
+        chosen_plan, competition, author = _plan_competition(
+            runner, context=context, ticket=ticket_text, date=date, plan=first_plan, first=author
+        )
+    else:
+        chosen_plan = dict(first_plan)
+
+    # A revision goes to whoever wrote the chosen plan, on that seat's thread.
+    plan_attack: dict[str, Any] | None = None
+    if "plan_adversary" in bound:
+        plan, plan_attack = _plan_attack(
+            runner, context=context, ticket=ticket_text, author=author, plan=chosen_plan
+        )
+    else:
+        plan = chosen_plan
 
     # Plan, build and the fix-loop retry share one thread: the builder starts
     # from what the planner already read, and a retry from a tree it already
@@ -496,7 +743,6 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     )
 
     facts = _change_facts(build)
-    bound = cartridge.get("skills") or {}
     surfaces = list(args.get("surfaces") or [])
     patterns = list(args.get("patterns") or [])
     tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
@@ -606,6 +852,18 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 target=str(ticket),
                 evidence=[
                     {"check": "review tier", "output": str(tier)},
+                    # Only when a competition or an attack ran: a row that
+                    # always reads "no competition" is a row nobody reads.
+                    *(
+                        [{"check": "plan competition", "output": f"chose {competition['chosen']}: {competition['reasoning']} (price: {competition['price']})"}]
+                        if competition
+                        else []
+                    ),
+                    *(
+                        [{"check": "plan adversary", "output": f"{plan_attack['attack'].get('verdict')} — strongest: {plan_attack['attack'].get('strongest_objection')}" + (" — plan revised once" if plan_attack["revised"] else "")}]
+                        if plan_attack
+                        else []
+                    ),
                     {"check": "review_charter verdict", "output": str(review.get("verdict"))},
                     *(
                         [{"check": "adversary verdict", "output": str(adversary.get("verdict"))},
@@ -656,6 +914,8 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "adversary": adversary,
         "arbitration": arbitration,
         "plan": dict(plan),
+        "plan_competition": competition,
+        "plan_attack": plan_attack,
         "build": dict(build),
         "review": dict(review),
         "change_facts": facts,

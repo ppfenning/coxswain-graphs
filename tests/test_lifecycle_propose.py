@@ -25,7 +25,8 @@ def test_runs_end_to_end_and_returns_the_documented_shape(
     result = lifecycle_propose.run(args(cartridge), runner(plan_response, build_response, review_response))
     assert set(result) == {
         "run_id", "date", "ticket", "scope", "review_tier", "handoff", "adversary",
-        "arbitration", "plan", "build", "review", "change_facts", "fix_loop", "proposals",
+        "arbitration", "plan", "plan_competition", "plan_attack", "build", "review",
+        "change_facts", "fix_loop", "proposals",
     }
 
 
@@ -337,3 +338,262 @@ def test_without_title_or_body_the_id_stands_alone(
     scripted = runner(plan_response, build_response, review_response)
     lifecycle_propose.run(args(cartridge), scripted)
     assert "Ticket: TICKET-1\n" in roles(scripted, "plan")[0]["prompt"]
+
+
+# ── the plan competition ───────────────────────────────────────────────────
+#
+# The conviction under test: solutions compete where they are cheap. A second
+# plan and a decision between two plans cost a fraction of a build, and an
+# objection raised against a plan costs one more plan, not a rebuild.
+
+PLAN_B = {"steps": ["add a guard in parse_row", "test the guard"], "files_expected": ["src/b.py"], "out_of_scope": ["src/a.py"]}
+PLAN_MERGED = {"steps": ["read the failing test", "add a guard in parse_row", "test both"], "files_expected": ["src/a.py", "src/b.py"], "out_of_scope": ["the CLI"]}
+PLAN_REVISED = {"steps": ["read the failing test", "fix parse_row, which is the function that exists"], "files_expected": ["src/a.py"], "out_of_scope": ["the CLI"]}
+CHOOSE_FIRST_WITH_A_RESTATEMENT = {"chosen": "first", "plan": PLAN_MERGED, "reasoning": "a names the file the test imports", "price": "b's guard goes unwritten"}
+CHOOSE_SECOND = {"chosen": "second", "plan": PLAN_B, "reasoning": "b's steps are checkable", "price": "a second file to review"}
+CHOOSE_MERGED = {"chosen": "merged", "plan": PLAN_MERGED, "reasoning": "a's first step plus b's guard", "price": "two files instead of one"}
+ATTACK_PROCEED = {"verdict": "proceed", "objections": [], "strongest_objection": "none that survive"}
+ATTACK_REVISE = {
+    "verdict": "revise",
+    "objections": [{"claim": "the plan names a Reader class", "why_wrong": "src/a.py has parse_row and no Reader"}],
+    "strongest_objection": "the plan names a Reader class that does not exist",
+}
+
+
+def competitive(cartridge) -> dict:
+    cartridge["skills"]["plan_alternative"] = "acme-skills:plan"
+    cartridge["skills"]["plan_arbitrate"] = "acme-skills:arbitrate-plans"
+    return cartridge
+
+
+def attacked(cartridge) -> dict:
+    cartridge["skills"]["plan_adversary"] = "acme-skills:review_adversary"
+    return cartridge
+
+
+def test_an_unbound_competition_is_absent_not_broken(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(plan_response, build_response, review_response)
+    result = lifecycle_propose.run(args(cartridge), scripted)
+    assert [c["role"] for c in scripted.calls] == ["plan", "build", "review_charter"]
+    assert result["plan_competition"] is None and result["plan_attack"] is None
+    assert result["plan"] == plan_response
+    assert "plan competition" not in {e["check"] for e in result["proposals"][0]["evidence"]}
+
+
+def test_an_alternative_without_an_arbiter_is_never_asked_for(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """A second plan nobody judges is a plan nobody builds — and a budget spent."""
+    cartridge["skills"]["plan_alternative"] = "acme-skills:plan"
+    scripted = runner(plan_response, build_response, review_response, plan_alternative=PLAN_B)
+    lifecycle_propose.run(args(cartridge), scripted)
+    assert roles(scripted, "plan_alternative") == []
+
+
+def test_the_chosen_plan_is_the_one_the_builder_gets(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate=CHOOSE_SECOND,
+    )
+    result = lifecycle_propose.run(args(competitive(cartridge)), scripted)
+    assert [(c["role"], c["tier"]) for c in scripted.calls][:4] == [
+        ("plan", "standard"), ("plan_alternative", "standard"), ("plan_arbitrate", "deep"), ("build", "standard"),
+    ]
+    assert result["plan"] == PLAN_B
+    assert "add a guard in parse_row" in roles(scripted, "build")[0]["prompt"]
+    assert "read the failing test" not in roles(scripted, "build")[0]["prompt"], "the losing plan does not travel"
+    assert result["plan_competition"]["chosen"] == "second"
+    evidence = {e["check"]: e["output"] for e in result["proposals"][0]["evidence"]}
+    assert evidence["plan competition"] == "chose second: b's steps are checkable (price: a second file to review)"
+
+
+def test_a_pick_hands_the_source_plan_over_verbatim_not_the_arbiters_restatement(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """What was compared is what gets built. An arbiter that picks `first` and
+    also returns its own improved plan has not been asked for the improvement."""
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate=CHOOSE_FIRST_WITH_A_RESTATEMENT,
+    )
+    result = lifecycle_propose.run(args(competitive(cartridge)), scripted)
+    assert result["plan"] == plan_response
+
+
+def test_a_merge_is_the_arbiters_own_plan(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate=CHOOSE_MERGED,
+    )
+    result = lifecycle_propose.run(args(competitive(cartridge)), scripted)
+    assert result["plan"] == PLAN_MERGED
+    assert result["plan_competition"]["alternative"] == PLAN_B, "the record keeps the loser"
+
+
+def test_the_second_planner_and_the_arbiter_never_join_the_first_planners_thread(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """Independence is the whole value of a second plan."""
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate=CHOOSE_SECOND,
+    )
+    lifecycle_propose.run(args(competitive(cartridge)), scripted)
+    threads = {
+        role: roles(scripted, role)[0]["thread"] for role in ("plan", "plan_alternative", "plan_arbitrate")
+    }
+    assert threads["plan"] == "TICKET-1"
+    assert len(set(threads.values())) == 3, "three seats, three threads"
+    assert all(thread for thread in threads.values()), "each seat keeps a thread a revision can continue"
+    assert "do not repeat it" in roles(scripted, "plan_alternative")[0]["prompt"]
+
+
+def test_the_plan_adversary_can_let_a_plan_proceed_untouched(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(plan_response, build_response, review_response, plan_adversary=ATTACK_PROCEED)
+    result = lifecycle_propose.run(args(attacked(cartridge)), scripted)
+    assert [c["role"] for c in scripted.calls] == ["plan", "plan_adversary", "build", "review_charter"]
+    assert result["plan"] == plan_response
+    assert result["plan_attack"] == {"attack": ATTACK_PROCEED, "revised": False}
+    evidence = {e["check"]: e["output"] for e in result["proposals"][0]["evidence"]}
+    assert evidence["plan adversary"] == "proceed — strongest: none that survive"
+
+
+def test_the_plan_adversary_sends_a_plan_back_exactly_once(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """Catches a second fix loop growing at the front of the graph. One revision,
+    carrying the objections verbatim, and the revision is what gets built — the
+    review round after build is where it gets judged, not a second attack."""
+    scripted = runner(
+        [plan_response, PLAN_REVISED], build_response, review_response,
+        plan_adversary=[ATTACK_REVISE, ATTACK_REVISE],
+    )
+    result = lifecycle_propose.run(args(attacked(cartridge)), scripted)
+    assert [c["role"] for c in scripted.calls] == ["plan", "plan_adversary", "plan", "build", "review_charter"]
+    revision = roles(scripted, "plan")[1]
+    assert revision["thread"] == "TICKET-1", "the revision is the same planner, continuing"
+    assert "src/a.py has parse_row and no Reader" in revision["prompt"]
+    assert result["plan"] == PLAN_REVISED
+    assert "which is the function that exists" in roles(scripted, "build")[0]["prompt"]
+    assert result["plan_attack"]["revised"] is True
+    evidence = {e["check"]: e["output"] for e in result["proposals"][0]["evidence"]}
+    assert evidence["plan adversary"].endswith("— plan revised once")
+
+
+def test_the_attack_targets_the_plan_the_competition_chose(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate=CHOOSE_SECOND, plan_adversary=ATTACK_PROCEED,
+    )
+    lifecycle_propose.run(args(attacked(competitive(cartridge))), scripted)
+    assert [c["role"] for c in scripted.calls][:5] == ["plan", "plan_alternative", "plan_arbitrate", "plan_adversary", "build"]
+    assert "add a guard in parse_row" in roles(scripted, "plan_adversary")[0]["prompt"]
+
+
+# A revision goes back to whoever wrote the plan, on that seat's own thread.
+# The failure these three guard against: the competition chooses `second`, the
+# adversary says revise, and the first planner — on a thread already holding
+# its own losing plan — is handed the second planner's plan and told it is its
+# own.
+
+
+def test_a_revision_of_the_first_plan_goes_back_to_the_first_planner(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(
+        [plan_response, PLAN_REVISED], build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate=CHOOSE_FIRST_WITH_A_RESTATEMENT, plan_adversary=ATTACK_REVISE,
+    )
+    result = lifecycle_propose.run(args(attacked(competitive(cartridge))), scripted)
+    assert [c["role"] for c in scripted.calls][:6] == [
+        "plan", "plan_alternative", "plan_arbitrate", "plan_adversary", "plan", "build",
+    ]
+    revision = roles(scripted, "plan")[1]
+    assert revision["thread"] == "TICKET-1", "the first planner, continuing on its own thread"
+    assert "read the failing test" in revision["prompt"] and "add a guard in parse_row" not in revision["prompt"]
+    assert len(roles(scripted, "plan_alternative")) == 1 and len(roles(scripted, "plan_arbitrate")) == 1
+    assert result["plan"] == PLAN_REVISED
+
+
+def test_a_revision_of_the_second_plan_goes_back_to_the_second_planner_on_its_own_thread(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """The first planner's thread already holds the plan that lost. Handing it
+    the winner and calling that a revision is neither planner continuing."""
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=[PLAN_B, PLAN_REVISED], plan_arbitrate=CHOOSE_SECOND, plan_adversary=ATTACK_REVISE,
+    )
+    result = lifecycle_propose.run(args(attacked(competitive(cartridge))), scripted)
+    assert [c["role"] for c in scripted.calls][:6] == [
+        "plan", "plan_alternative", "plan_arbitrate", "plan_adversary", "plan_alternative", "build",
+    ]
+    original, revision = roles(scripted, "plan_alternative")
+    assert revision["thread"] == original["thread"], "the second planner, continuing"
+    assert revision["thread"] != "TICKET-1", "never the first planner's thread"
+    assert "add a guard in parse_row" in revision["prompt"]
+    assert "src/a.py has parse_row and no Reader" in revision["prompt"]
+    assert len(roles(scripted, "plan")) == 1, "the first planner is not asked to revise a plan it did not write"
+    assert result["plan"] == PLAN_REVISED
+    assert result["plan_attack"]["revised"] is True
+
+
+def test_a_revision_of_a_merged_plan_goes_back_to_the_arbiter_not_to_either_planner(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """A merge is the arbiter's plan. Neither planner wrote it, so neither is
+    the author a revision can go back to."""
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate=[CHOOSE_MERGED, PLAN_REVISED], plan_adversary=ATTACK_REVISE,
+    )
+    result = lifecycle_propose.run(args(attacked(competitive(cartridge))), scripted)
+    assert [c["role"] for c in scripted.calls][:6] == [
+        "plan", "plan_alternative", "plan_arbitrate", "plan_adversary", "plan_arbitrate", "build",
+    ]
+    decision, revision = roles(scripted, "plan_arbitrate")
+    assert revision["thread"] == decision["thread"], "the arbiter, continuing"
+    assert revision["thread"] not in ("TICKET-1", roles(scripted, "plan_alternative")[0]["thread"])
+    assert revision["tier"] == "deep"
+    assert "test both" in revision["prompt"], "the merged plan is what gets revised"
+    assert len(roles(scripted, "plan")) == 1 and len(roles(scripted, "plan_alternative")) == 1
+    assert result["plan"] == PLAN_REVISED
+
+
+def test_a_pick_does_not_require_the_arbiter_to_write_a_plan(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """A plan emitted alongside a pick is a plan nobody reads."""
+    assert "plan" not in lifecycle_propose.PLAN_CHOICE_SCHEMA["required"]
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate={"chosen": "second", "reasoning": "b's steps are checkable", "price": "a second file"},
+    )
+    result = lifecycle_propose.run(args(competitive(cartridge)), scripted)
+    assert result["plan"] == PLAN_B
+
+
+def test_a_merge_without_a_plan_stops_the_graph_instead_of_building_the_first_plan(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """A merge is the arbiter's own plan; an arbiter that says `merged` and
+    writes nothing has claimed a plan that does not exist. Quietly building the
+    first plan under that claim would send a later revision to the arbiter
+    carrying a plan it never wrote."""
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate={"chosen": "merged", "reasoning": "both halves", "price": "two files"},
+    )
+    with pytest.raises(ContractViolation, match="claimed 'merged'"):
+        lifecycle_propose.run(args(competitive(cartridge)), scripted)
+    assert roles(scripted, "build") == [], "no plan was built under the false claim"
