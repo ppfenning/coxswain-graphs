@@ -77,6 +77,30 @@ _PATCH_ROLES = frozenset({"build"})
 
 _DIFF_CMD = "git add -A && git diff --cached"
 
+# Errors that are about the CALL, not about the work. The provider's own
+# safeguard classifier occasionally flags an ordinary node message — an
+# arbitration prompt quoting two reviewers reads, to a classifier, like an
+# argument — and the CLI returns an error with nothing wrong on this side of
+# the boundary. It hit `arbitrate` in runs 9 and 16, and each time quarantined
+# a task whose builds and reviews were already complete, at roughly $4 a time.
+#
+# Matched on the CLI's own words rather than on an exit code, because the exit
+# code is the same one a real refusal returns.
+_TRANSIENT_ERRORS = ("safeguards flagged", "reasoning_extraction")
+
+
+def _is_transient(payload: Mapping[str, Any]) -> bool:
+    """Pure: is this error about the call rather than about the node's work?
+
+    Everything the CLI said, lowercased and searched. A false negative costs
+    what it already costs today; a false positive costs one repeated node, once,
+    which is why the retry below is capped at one and not made a loop.
+    """
+    said = " ".join(
+        str(payload.get(key) or "") for key in ("subtype", "result", "errors")
+    ).lower()
+    return any(marker in said for marker in _TRANSIENT_ERRORS)
+
 
 class ClaudeCodeRunner:
     """Runs nodes as headless Claude Code sessions with structured output."""
@@ -413,33 +437,48 @@ class ClaudeCodeRunner:
         packs = [body, *context] if body else list(context)
         tools = self.tools.get(role, [])
 
-        if thread:
-            state = self._thread(thread, role)
-            session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
-            state["calls"] += 1
-            proc = self._invoke(
-                role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
-                scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session,
-            )
-        else:
-            with self._scratch(role) as scratch:
+        # Two attempts at most, and the second only for an error that is about
+        # the call rather than about the work. A retry loop on a model error is
+        # how a budget disappears; one retry is how a transient classifier
+        # misfire stops costing a finished task its run.
+        for attempt in (1, 2):
+            if thread:
+                state = self._thread(thread, role)
+                session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
+                state["calls"] += 1
                 proc = self._invoke(
                     role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
-                    scratch=scratch, patches=True, session=(),
+                    scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session,
                 )
+            else:
+                with self._scratch(role) as scratch:
+                    proc = self._invoke(
+                        role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
+                        scratch=scratch, patches=True, session=(),
+                    )
 
-        stdout = (proc.stdout or "").strip()
-        if not stdout:
-            tail = (proc.stderr or "").strip()[-800:]
-            raise RunnerError(f"node '{role}': claude exited {proc.returncode} with no output: {tail}")
-        payload = self._payload(role, stdout)
-        if not isinstance(payload, dict):
-            raise RunnerError(f"node '{role}': claude output is {type(payload).__name__}, expected an object")
-        if payload.get("is_error"):
+            stdout = (proc.stdout or "").strip()
+            if not stdout:
+                tail = (proc.stderr or "").strip()[-800:]
+                raise RunnerError(f"node '{role}': claude exited {proc.returncode} with no output: {tail}")
+            payload = self._payload(role, stdout)
+            if not isinstance(payload, dict):
+                raise RunnerError(f"node '{role}': claude output is {type(payload).__name__}, expected an object")
+            if not payload.get("is_error"):
+                break
+
             # Name everything the CLI said about it. A bare `None` result was
             # the whole diagnosis of a build failure once; never again.
             detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
-            raise RunnerError(f"node '{role}' failed in claude: {json.dumps(detail)[:800]}")
+            if attempt == 2 or not _is_transient(payload):
+                raise RunnerError(f"node '{role}' failed in claude: {json.dumps(detail)[:800]}")
+
+            # Keep the failed attempt's trace. The retry writes to the same
+            # filename, and a transient error that leaves no record behind is
+            # one nobody can measure the frequency of later.
+            if payload.get("trace"):
+                failed = Path(payload["trace"])
+                failed.replace(failed.with_suffix(".error.jsonl"))
 
         data = payload.get("structured_output")
         if data is None:

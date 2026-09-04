@@ -576,3 +576,99 @@ def test_a_call_without_a_thread_is_unchanged(fake_claude, tmp_path, repo) -> No
     runner.run(role="review_charter", schema=SCHEMA, prompt="go")
     argv = recorded(fake_claude)["argv"]
     assert "--no-session-persistence" in argv and "--session-id" not in argv and "--resume" not in argv
+
+
+# ── one retry, for an error about the call rather than about the work ───────
+
+SAFEGUARD = {
+    "type": "result",
+    "is_error": True,
+    "subtype": "[reasoning_extraction]",
+    "result": "Opus 5's safeguards flagged this message",
+    "num_turns": 1,
+}
+REFUSED = {
+    "type": "result",
+    "is_error": True,
+    "subtype": "error_max_budget_usd",
+    "result": "the session reached its budget ceiling",
+    "num_turns": 24,
+}
+OK = {"type": "result", "is_error": False, "structured_output": {"ok": True}, "total_cost_usd": 0.02, "num_turns": 3}
+
+
+@pytest.fixture
+def sequenced_claude(tmp_path: Path):
+    """A stand-in that answers differently on each call.
+
+    Returns (bin_path, set_sequence, calls). The last entry repeats, so a test
+    only has to script the answers it cares about.
+    """
+    outputs = tmp_path / "outputs.json"
+    counter = tmp_path / "calls"
+    helper = tmp_path / "sequence.py"
+    helper.write_text(
+        "import json, pathlib\n"
+        f"c = pathlib.Path({str(counter)!r}); n = int(c.read_text() or 0) if c.exists() else 0\n"
+        "c.write_text(str(n + 1))\n"
+        f"outs = json.load(open({str(outputs)!r}))\n"
+        "print(json.dumps(outs[min(n, len(outs) - 1)]))\n",
+        encoding="utf-8",
+    )
+    script = tmp_path / "claude"
+    script.write_text(f"#!/bin/sh\ncat >/dev/null\npython3 {helper}\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+
+    def set_sequence(*payloads) -> None:
+        outputs.write_text(json.dumps(list(payloads)), encoding="utf-8")
+
+    def calls() -> int:
+        return int(counter.read_text()) if counter.exists() else 0
+
+    set_sequence(OK)
+    return script, set_sequence, calls
+
+
+def test_a_safeguard_error_is_retried_once_and_the_node_returns(sequenced_claude, tmp_path) -> None:
+    """It hit arbitrate in two runs and quarantined a finished task each time."""
+    script, set_sequence, calls = sequenced_claude
+    set_sequence(SAFEGUARD, OK)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    assert dict(runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")) == {"ok": True}
+    assert calls() == 2, "asked twice, not more"
+    assert len(runner.calls) == 1, "the failed attempt is not billed as a node result"
+
+
+def test_a_safeguard_error_twice_is_still_a_failure(sequenced_claude, tmp_path) -> None:
+    """One retry, never a loop. A budget disappears in loops like that."""
+    script, set_sequence, calls = sequenced_claude
+    set_sequence(SAFEGUARD)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    with pytest.raises(RunnerError, match="safeguards flagged"):
+        runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")
+    assert calls() == 2
+
+
+def test_an_error_about_the_work_is_not_retried(sequenced_claude, tmp_path) -> None:
+    """A budget stop is a real answer about a real session; asking again spends again."""
+    script, set_sequence, calls = sequenced_claude
+    set_sequence(REFUSED, OK)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    with pytest.raises(RunnerError, match="error_max_budget_usd"):
+        runner.run(role="build", schema=SCHEMA, prompt="build it")
+    assert calls() == 1
+
+
+def test_the_failed_attempt_keeps_its_trace(sequenced_claude, tmp_path) -> None:
+    """A transient error nobody can count later is one nobody can fix."""
+    script, set_sequence, _ = sequenced_claude
+    set_sequence({**SAFEGUARD, "type": "result"}, OK)
+    traces = tmp_path / "traces"
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, trace_dir=traces)
+
+    runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")
+    written = sorted(p.name for p in traces.glob("*.jsonl"))
+    assert written == ["arbitrate-1.error.jsonl", "arbitrate-1.jsonl"]
