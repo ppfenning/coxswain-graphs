@@ -564,3 +564,83 @@ def test_two_runs_over_the_same_work_propose_the_same_things(repo, cart, tmp_pat
     second, _ = drive(repo, cart, tmp_path, assume="r", run_id="epic-2")
     shape = lambda result: [(p["kind"], p["target"].replace("epic-2", "epic-1")) for p in result["proposals"]]  # noqa: E731
     assert shape(first) == shape(second)
+
+
+# ── a build the fix loop refused never reaches a validator ──────────────────
+
+REVISE = {
+    "verdict": "revise",
+    "findings": [{"charter_principle": "evidence", "detail": "the status line does not match the code", "file": "t1-probe.txt"}],
+    "rationale": "the claim and the code disagree",
+}
+
+
+class RefusedRunner(Runner):
+    """One task whose reviewer says revise and whose fix build changes nothing.
+
+    The builder returns the same patch on the retry — which is what a real
+    no-progress fix build does — so `lifecycle-propose` stops the loop with
+    `no_progress`, emits no `draft_pr_create`, and leaves `review.verdict` at
+    `revise`. That is the exact shape of the record this driver used to apply,
+    check, and then hand to a chunk validator as though the verdict were live.
+    """
+
+    def __init__(self, patches: dict[str, str], *, refused: str, **kw) -> None:
+        super().__init__(patches, **kw)
+        self.refused = refused
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None):
+        if role == "review_charter" and self.refused in prompt:
+            with self.lock:
+                self.calls.append({"role": role, "tier": tier, "prompt": prompt})
+            return dict(REVISE)
+        return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread)
+
+
+def test_a_build_the_fix_loop_refused_is_quarantined_with_the_loop_s_own_reason(repo, cart, tmp_path) -> None:
+    runner = RefusedRunner(
+        {t: new_file_patch(f"{t}.txt") for t in TASK_IDS}, refused="t1-probe"
+    )
+    result, runner = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    quarantined = [q for q in result["quarantined"] if q["grain"] == "task"]
+    assert [q["id"] for q in quarantined] == ["t1-probe"]
+    reason = quarantined[0]["reason"]
+
+    # The loop's diagnosis, not a validator's restatement of a stale verdict.
+    assert "no_progress" in reason, reason
+    assert "validate_chunk" not in reason, reason
+    assert "'revise'" in reason, reason
+
+
+def test_a_refused_build_is_never_applied_and_never_shown_to_a_validator(repo, cart, tmp_path) -> None:
+    """The saving, and the correctness, are the same change.
+
+    A patch the reviewers rejected should cost nothing further: no scratch
+    branch, no check run, and above all no chunk validator paid to adjudicate a
+    `review_verdict` the fix loop already settled.
+    """
+    runner = RefusedRunner(
+        {t: new_file_patch(f"{t}.txt") for t in TASK_IDS}, refused="t1-probe"
+    )
+    result, runner = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    # No validator was ever asked about the refused task.
+    chunk_prompts = [c["prompt"] for c in runner.calls if c["role"] == "validate_chunk"]
+    assert all("t1-probe" not in p for p in chunk_prompts), chunk_prompts
+    assert any("t2-bench" in p for p in chunk_prompts), "the healthy sibling is still validated"
+
+    # The patch was never applied: no scratch branch and no draft branch for it.
+    assert "agents/epic-1/t1-probe" not in branches(repo)
+    assert "epic/demo-initiative/p1-foundations--t1-probe" not in branches(repo)
+
+    # The sibling is unaffected and still merges.
+    assert is_ancestor(
+        repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations"
+    )
+
+    # The run's task record says quarantined, with the loop's reason attached.
+    refused = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert refused["status"] == "quarantined"
+    assert refused["evidence"] == [{"check": "fix_loop", "output": refused["quarantine"]}]
+    assert "no_progress" in refused["quarantine"]

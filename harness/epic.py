@@ -310,6 +310,39 @@ def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) 
     return record
 
 
+def _unapproved(result: Mapping[str, Any]) -> str | None:
+    """Why the fix loop refused this task, or None when it approved it.
+
+    Read from the loop's own record, not re-derived. `lifecycle-propose` emits a
+    `draft_pr_create` proposal when and only when its reviewers approved the
+    build; a result carrying none is a change the loop already decided against,
+    and `fix_loop.stopped` says on what grounds.
+
+    The epic used to apply that patch anyway: it opened a worktree, ran the
+    checks, and then paid a chunk validator and a phase validator to look at a
+    task whose `review_verdict` still read `revise`. The validator refused it —
+    correctly, on evidence that said the reviewers wanted changes — but it
+    refused with its own reasoning rather than the loop's, so the record named
+    a validator gap where the real answer was "the fix build changed nothing".
+    A verdict a later build was supposed to supersede, and did not, must never
+    reach a validator as though it were current.
+    """
+    if any(
+        isinstance(item, Mapping) and item.get("kind") == "draft_pr_create"
+        for item in result.get("proposals") or []
+    ):
+        return None
+    loop = result.get("fix_loop") or {}
+    stopped = str(loop.get("stopped") or "") or "the reviewers did not approve the build"
+    attempts = loop.get("attempts")
+    verdict = str((result.get("review") or {}).get("verdict") or "") or "none recorded"
+    counted = f" after {attempts} build attempt{'s' if attempts != 1 else ''}" if attempts else ""
+    return (
+        f"the fix loop stopped: {stopped}{counted}; the last review verdict was "
+        f"'{verdict}' and no build was approved"
+    )
+
+
 # ── the driver ──────────────────────────────────────────────────────────────
 
 
@@ -586,6 +619,29 @@ def _run_phase(
 
     for result in sorted(results, key=lambda r: str(r.get("ticket"))):
         task = str(result.get("ticket"))
+
+        # The loop's refusal is the answer, and it is free. Applying a patch the
+        # reviewers rejected costs a worktree, a check run and both validators
+        # before anything says no, and what finally says no is a validator
+        # reading a stale verdict rather than the loop that actually decided.
+        refused = _unapproved(result)
+        if refused is not None:
+            record["task_records"].append(
+                {
+                    "id": task,
+                    "phase": phase,
+                    "branch": ctx.scratch_branch(task),
+                    "evidence": [{"check": "fix_loop", "output": refused}],
+                    "quarantine": refused,
+                    "governance_hits": [],
+                    "draft": None,
+                    "merged": False,
+                    "status": "quarantined",
+                }
+            )
+            quarantined.append({"id": task, "phase": phase, "grain": "task", "reason": refused})
+            continue
+
         build = _build_task(ctx, phase=phase, task=task, result=result)
         build["result"] = result
         built[task] = build
