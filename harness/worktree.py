@@ -20,9 +20,14 @@ def apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
     worktree.mkdir(parents=True, exist_ok=True)
     if not (worktree / ".git").exists():
         subprocess.run(["git", "init", "-q"], cwd=worktree, capture_output=True, text=True)
+    # A diff that arrives through a JSON field can lose its final newline,
+    # and git rejects such a patch as corrupt at its last line even though
+    # every hunk is intact. Restoring the newline changes no hunk; it only
+    # lets git read the one it already has.
+    normalised = patch if patch.endswith("\n") or not patch else patch + "\n"
     result = subprocess.run(
         ["git", "apply", "--verbose", "--allow-empty", "-"],
-        input=patch,
+        input=normalised,
         cwd=worktree,
         capture_output=True,
         text=True,
