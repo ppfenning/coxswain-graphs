@@ -263,6 +263,29 @@ def _materialise(spec: GraphSpec, args: argparse.Namespace, parser: argparse.Arg
     return out
 
 
+def _cos_docket_args(*, cartridge: Mapping[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """The kwargs the cos arm hands `assemble_docket` — pulled out so the wire
+    from `--runs-dir` (and the cartridge) into the docket it builds is one
+    function a test can call directly, rather than something only a full CLI
+    invocation could exercise.
+    """
+    intake_root = next(
+        (
+            entry.get("path")
+            for entry in cartridge.get("intake") or []
+            if isinstance(entry, Mapping) and entry.get("source") == "queue_dir" and entry.get("path")
+        ),
+        None,
+    )
+    return {
+        "intake_root": intake_root,
+        "ledger_path": args.ledger,
+        "alerts_present": bool(getattr(args, "alerts", None)),
+        "cartridge": cartridge,
+        "runs_dir": args.runs_dir,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     specs = discover()
     parser = _build_parser(specs)
@@ -404,20 +427,12 @@ def main(argv: list[str] | None = None) -> int:
         # dispatched proposal lands in the same policy/gate/record as any other.
         from harness.cos import CosError, assemble_docket, run_cos
 
-        intake_root = next(
-            (
-                entry.get("path")
-                for entry in cartridge.get("intake") or []
-                if isinstance(entry, Mapping) and entry.get("source") == "queue_dir" and entry.get("path")
-            ),
-            None,
-        )
-        docket = assemble_docket(
-            specs=specs,
-            intake_root=intake_root,
-            ledger_path=args.ledger,
-            alerts_present=bool(getattr(args, "alerts", None)),
-        )
+        # `--runs-dir` is the same global flag every other arm already writes
+        # manifests under; reusing it here (default: the real runs directory)
+        # is safe because assemble_docket only counts a live `*.pid` as
+        # in flight — everything else already down there is ignored.
+        docket_args = _cos_docket_args(cartridge=cartridge, args=args)
+        docket = assemble_docket(specs=specs, **docket_args)
         alerts = (
             json.loads(Path(args.alerts).read_text(encoding="utf-8")) if getattr(args, "alerts", None) else None
         )
@@ -430,7 +445,7 @@ def main(argv: list[str] | None = None) -> int:
                 run_id=run_id,
                 date=args.date,
                 max_parallel=args.max_parallel,
-                intake_root=intake_root,
+                intake_root=docket_args["intake_root"],
                 ledger_path=args.ledger,
                 alerts=alerts,
             )
@@ -439,8 +454,18 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         for failure in cos_out["failures"]:
             print(f"dispatched run failed: {failure}", file=sys.stderr)
-        picked = ", ".join(str(s.get("graph")) for s in cos_out["selections"]) or "nothing (idle)"
+        deferred = cos_out["deferred"]
+        invoked = cos_out["invoked"]
+        if invoked:
+            picked = ", ".join(str(s.get("graph")) for s in invoked)
+        elif deferred:
+            picked = "nothing (at capacity)"
+        else:
+            picked = "nothing (idle)"
         print(f"chief-of-staff dispatched: {picked}")
+        if deferred:
+            reasons = "; ".join(f"{d['graph']} ({d['reason']})" for d in deferred)
+            print(f"chief-of-staff deferred: {reasons}")
         if cos_out["consumed"]:
             print(f"intake consumed: {', '.join(cos_out['consumed'])}")
         graph_name = "chief-of-staff(dispatch)"
@@ -451,11 +476,13 @@ def main(argv: list[str] | None = None) -> int:
             "results": cos_out["results"],
             "proposals": cos_out["proposals"],
             "consumed": cos_out["consumed"],
+            "deferred": deferred,
             "totals": {
                 "selected": len(cos_out["selections"]),
                 "completed": len(cos_out["results"]),
                 "failed": len(cos_out["failures"]),
                 "consumed": len(cos_out["consumed"]),
+                "deferred": len(deferred),
             },
         }
     else:

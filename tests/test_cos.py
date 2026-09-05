@@ -15,7 +15,7 @@ from core.ledger import append as ledger_append
 from graphs._contract import ContractViolation
 from graphs._spec import GraphSpec
 from graphs.ops import chief_of_staff
-from harness import cos
+from harness import cli, cos
 from runner import ScriptedRunner
 
 
@@ -278,7 +278,15 @@ def test_an_idle_decision_invokes_nothing(cart) -> None:
         max_parallel=1,
         cos_result={"selections": [], "idle": True, "reasoning": "nothing to do"},
     )
-    assert result == {"selections": [], "results": [], "proposals": [], "failures": [], "consumed": []}
+    assert result == {
+        "selections": [],
+        "invoked": [],
+        "results": [],
+        "proposals": [],
+        "failures": [],
+        "consumed": [],
+        "deferred": [],
+    }
 
 
 def test_run_cos_runs_the_cos_graph_itself_when_no_result_is_given(cart) -> None:
@@ -290,7 +298,15 @@ def test_run_cos_runs_the_cos_graph_itself_when_no_result_is_given(cart) -> None
         docket=empty_docket, specs=specs, runner=runner, cartridge=cart, run_id="parent", date="d", max_parallel=1
     )
 
-    assert result == {"selections": [], "results": [], "proposals": [], "failures": [], "consumed": []}
+    assert result == {
+        "selections": [],
+        "invoked": [],
+        "results": [],
+        "proposals": [],
+        "failures": [],
+        "consumed": [],
+        "deferred": [],
+    }
     assert runner.calls[0]["role"] == "dispatch"
 
 
@@ -337,3 +353,251 @@ def test_proposals_aggregate_under_the_parent_run_id_in_invocation_order(tmp_pat
     # Invocation ids are "retro-1" and "triage-0"; results/proposals come back
     # sorted by invocation id, never by selection or finish order.
     assert [r["run_id"] for r in result["results"]] == ["parent:retro-1", "parent:triage-0"]
+
+
+# --------------------------------------------------------- in-flight / free_slots
+
+
+def _pidfile(runs_dir, run_id: str, pid: int) -> None:
+    runs_dir.mkdir(exist_ok=True)
+    (runs_dir / f"{run_id}.pid").write_text(str(pid), encoding="utf-8")
+
+
+def test_pid_alive_reads_liveness_off_a_faked_kill_never_the_real_process_table(tmp_path, monkeypatch) -> None:
+    # `os.kill(pid, 0)` against a real pid depends on what the host happens to
+    # have running (and a recycled or high pid_max can make an "obviously
+    # dead" number answer alive) — faking it makes every branch deterministic.
+    def fake_kill(pid: int, _sig: int) -> None:
+        if pid == 222:
+            raise PermissionError
+        if pid != 111:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(cos.os, "kill", fake_kill)
+
+    live = tmp_path / "live.pid"
+    live.write_text("111", encoding="utf-8")
+    perm = tmp_path / "perm.pid"
+    perm.write_text("222", encoding="utf-8")
+    dead = tmp_path / "dead.pid"
+    dead.write_text("333", encoding="utf-8")
+    bad = tmp_path / "bad.pid"
+    bad.write_text("not-a-pid", encoding="utf-8")
+
+    assert cos._pid_alive(live) is True  # noqa: SLF001
+    assert cos._pid_alive(perm) is True, "PermissionError still means the process exists"  # noqa: SLF001
+    assert cos._pid_alive(dead) is False  # noqa: SLF001
+    assert cos._pid_alive(bad) is False, "unparsable content reads as dead"  # noqa: SLF001
+
+
+def test_free_slots_is_a_pure_function_over_plain_rows() -> None:
+    rows = [{"run_id": "a", "alive": True}, {"run_id": "b", "alive": False}, {"run_id": "c", "alive": True}]
+    assert cos._free_slots(3, rows) == 1  # noqa: SLF001
+    assert cos._free_slots(2, rows) == 0, "never negative"  # noqa: SLF001
+    assert cos._free_slots(5, []) == 5  # noqa: SLF001
+
+
+def test_max_in_flight_defaults_to_three_off_plain_cartridge_data() -> None:
+    assert cos._max_in_flight({"policy": {"dispatch": {"max_in_flight": 7}}}) == 7  # noqa: SLF001
+    assert cos._max_in_flight({}) == 3  # noqa: SLF001
+    assert cos._max_in_flight(None) == 3  # noqa: SLF001
+
+
+def test_assemble_docket_reports_in_flight_runs_and_the_free_slots_left(tmp_path, monkeypatch) -> None:
+    alive_pids = {111, 222}
+
+    def fake_kill(pid: int, _sig: int) -> None:
+        if pid not in alive_pids:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(cos.os, "kill", fake_kill)
+
+    runs_dir = tmp_path / "runs"
+    _pidfile(runs_dir, "run-a", 111)
+    _pidfile(runs_dir, "run-b", 222)
+    _pidfile(runs_dir, "run-c", 333)  # not a live pid
+
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+        runs_dir=runs_dir,
+    )
+
+    assert docket["in_flight"] == [
+        {"run_id": "run-a", "alive": True},
+        {"run_id": "run-b", "alive": True},
+        {"run_id": "run-c", "alive": False},
+    ]
+    assert docket["max_in_flight"] == 3
+    assert docket["free_slots"] == 1
+
+
+def test_assemble_docket_without_a_runs_dir_leaves_every_slot_free() -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+    )
+    assert docket["in_flight"] == []
+    assert docket["free_slots"] == docket["max_in_flight"] == 3
+
+
+def test_assemble_docket_defaults_max_in_flight_to_three_without_a_dispatch_policy() -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("retro"), intake_root=None, ledger_path=None, alerts_present=False, cartridge={}
+    )
+    assert docket["max_in_flight"] == 3
+    assert docket["free_slots"] == 3
+
+
+def test_assemble_docket_ignores_everything_in_runs_dir_that_is_not_a_live_pidfile(tmp_path, monkeypatch) -> None:
+    # The default `--runs-dir` points at the real runs directory, which also
+    # holds logs, usage files, and pidfiles left behind by runs that already
+    # ended. None of that should ever count as in flight — only a `*.pid`
+    # file naming a pid that is still alive does.
+    monkeypatch.setattr(cos.os, "kill", lambda _pid, _sig: (_ for _ in ()).throw(ProcessLookupError))
+
+    runs_dir = tmp_path / "runs"
+    runs_dir.mkdir()
+    (runs_dir / "run-a.pid").write_text("111", encoding="utf-8")  # a real but dead pid
+    (runs_dir / "run-b.pid").write_text("not-a-pid", encoding="utf-8")  # garbage content
+    (runs_dir / "run-a.log").write_text("hello", encoding="utf-8")
+    (runs_dir / "run-a.usage.json").write_text("{}", encoding="utf-8")
+
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+        runs_dir=runs_dir,
+    )
+
+    assert docket["in_flight"] == [
+        {"run_id": "run-a", "alive": False},
+        {"run_id": "run-b", "alive": False},
+    ]
+    assert docket["free_slots"] == docket["max_in_flight"] == 3
+
+
+def test_run_cos_invokes_only_the_free_slots_and_defers_the_rest(cart) -> None:
+    retro_spec, retro_calls = _stub_spec("retro", "retro-propose")
+    triage_spec, triage_calls = _stub_spec("triage", "triage-propose")
+    specs = {"retro": retro_spec, "triage": triage_spec}
+
+    docket = {**DOCKET, "in_flight": [{"run_id": "run-a", "alive": True}], "max_in_flight": 2, "free_slots": 1}
+    cos_result = {
+        "selections": [
+            {"graph": "retro", "why": "a"},
+            {"graph": "triage", "why": "b"},
+            {"graph": "retro", "why": "c"},
+        ],
+        "idle": False,
+        "reasoning": "r",
+    }
+
+    result = cos.run_cos(
+        docket=docket,
+        specs=specs,
+        runner=None,
+        cartridge=cart,
+        run_id="parent",
+        date="d",
+        max_parallel=2,
+        cos_result=cos_result,
+    )
+
+    assert len(retro_calls) == 1
+    assert triage_calls == []
+    assert result["deferred"] == [
+        {"graph": "triage", "reason": "at capacity: 1 in flight of 2"},
+        {"graph": "retro", "reason": "at capacity: 1 in flight of 2"},
+    ]
+
+
+def test_run_cos_with_zero_free_slots_invokes_nothing(cart) -> None:
+    retro_spec, retro_calls = _stub_spec("retro", "retro-propose")
+    specs = {"retro": retro_spec}
+
+    docket = {**DOCKET, "in_flight": [{"run_id": "run-a", "alive": True}], "max_in_flight": 1, "free_slots": 0}
+    cos_result = {"selections": [{"graph": "retro", "why": "a"}], "idle": False, "reasoning": "r"}
+
+    result = cos.run_cos(
+        docket=docket,
+        specs=specs,
+        runner=None,
+        cartridge=cart,
+        run_id="parent",
+        date="d",
+        max_parallel=1,
+        cos_result=cos_result,
+    )
+
+    assert retro_calls == []
+    assert result["results"] == []
+    assert result["deferred"] == [{"graph": "retro", "reason": "at capacity: 1 in flight of 1"}]
+
+
+def test_a_docket_missing_free_slots_falls_back_to_the_cartridges_bound_not_uncapped(cart) -> None:
+    # DOCKET (module-level fixture) predates in-flight bookkeeping and carries
+    # none of in_flight/max_in_flight/free_slots. A missing key must still
+    # cap at the cartridge's own bound, not dispatch every selection through.
+    cart["policy"] = {"dispatch": {"max_in_flight": 1}}
+    retro_spec, retro_calls = _stub_spec("retro", "retro-propose")
+    triage_spec, triage_calls = _stub_spec("triage", "triage-propose")
+    specs = {"retro": retro_spec, "triage": triage_spec}
+    cos_result = {
+        "selections": [{"graph": "retro", "why": "a"}, {"graph": "triage", "why": "b"}],
+        "idle": False,
+        "reasoning": "r",
+    }
+
+    result = cos.run_cos(
+        docket=DOCKET,
+        specs=specs,
+        runner=None,
+        cartridge=cart,
+        run_id="parent",
+        date="d",
+        max_parallel=2,
+        cos_result=cos_result,
+    )
+
+    assert len(retro_calls) == 1
+    assert triage_calls == [], "the bound is 1 and nothing is reported in flight, so only one may run"
+    assert result["deferred"] == [{"graph": "triage", "reason": "at capacity: 0 in flight of 1"}]
+
+
+def test_the_cos_cli_arm_resolves_runs_dir_off_the_existing_global_flag() -> None:
+    # `--runs-dir` is not new: it already exists as a global flag (used
+    # elsewhere for run manifests). The cos arm reuses that same flag as
+    # assemble_docket's pidfile directory rather than declaring a second,
+    # colliding `--runs-dir` of its own — argparse forbids two options
+    # sharing one string. Parsing "cos" here proves `args.runs_dir` resolves
+    # for the cos arm with no AttributeError, not just that the name is
+    # present somewhere in the source.
+    parser = cli._build_parser({"cos": chief_of_staff.SPEC})
+    args = parser.parse_args(["cos", "--team", "acme"])
+    assert args.runs_dir is not None
+
+
+def test_the_cos_arm_wires_runs_dir_and_the_cartridge_into_the_docket_call() -> None:
+    # The check above only proves the parser resolves `--runs-dir`; it holds
+    # whether or not the cos arm ever passes that value on. This exercises
+    # the actual kwargs the arm hands `assemble_docket`, so it goes red if
+    # the wire from `--runs-dir` (or the cartridge) to the docket ever breaks.
+    parser = cli._build_parser({"cos": chief_of_staff.SPEC})
+    args = parser.parse_args(["cos", "--team", "acme", "--runs-dir", "/tmp/some-runs"])
+    cart = {"intake": [{"source": "queue_dir", "path": "/tmp/intake"}]}
+
+    kwargs = cli._cos_docket_args(cartridge=cart, args=args)
+
+    assert kwargs["runs_dir"] == "/tmp/some-runs"
+    assert kwargs["cartridge"] is cart
+    assert kwargs["intake_root"] == "/tmp/intake"
+    assert kwargs["ledger_path"] == args.ledger

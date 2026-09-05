@@ -38,6 +38,7 @@ nothing and returns an empty record, honestly.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,51 @@ class CosError(Exception):
 # selection outside this set — `CosError` exists for the day something drifts.
 _KNOWN_GRAPHS = ("retro", "decompose", "triage")
 
+_DEFAULT_MAX_IN_FLIGHT = 3
+
+
+def _pid_alive(pid_file: Path) -> bool:
+    """Is the process a pidfile names still running? Bad content reads as dead.
+
+    `PermissionError` means the process exists but belongs to someone else —
+    that is still alive, just not ours to signal. `ProcessLookupError` means
+    it is gone.
+
+    This trusts that the pid still names the run that wrote the file: a pid
+    is reused by the kernel, so a finished run's pidfile, if never removed,
+    can have its number reissued to an unrelated process and read back as
+    alive. Keeping `in_flight` honest depends on whoever writes `*.pid` also
+    removing it once the run ends; this driver only reads what is there.
+    """
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _max_in_flight(cartridge: Mapping[str, Any] | None) -> int:
+    """The cartridge's dispatch concurrency bound, defaulting to 3 when unset.
+
+    A pure lookup over plain data, shared by `assemble_docket` (which
+    computes the docket's own bound) and `run_cos` (which falls back to it
+    when handed a docket built without in-flight bookkeeping at all).
+    """
+    dispatch_policy = ((cartridge or {}).get("policy") or {}).get("dispatch") or {}
+    return int(dispatch_policy.get("max_in_flight", _DEFAULT_MAX_IN_FLIGHT))
+
+
+def _free_slots(max_in_flight: int, in_flight: Sequence[Mapping[str, Any]]) -> int:
+    """How much of the bound is not already occupied by something alive. Plain data in, an int out."""
+    alive = sum(1 for row in in_flight if row.get("alive"))
+    return max(0, max_in_flight - alive)
+
 
 def assemble_docket(
     *,
@@ -76,6 +122,8 @@ def assemble_docket(
     intake_root: Path | str | None,
     ledger_path: Path | str | None,
     alerts_present: bool,
+    cartridge: Mapping[str, Any] | None = None,
+    runs_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Read what is on hand, and mark each registered graph runnable or not.
 
@@ -93,9 +141,26 @@ def assemble_docket(
     Both reads tolerate their source being absent: `read_queue` returns `[]`
     for a missing directory, `read_ledger` returns `()` for a missing file —
     a docket assembled on day one, before either exists, is not an error.
+
+    `runs_dir`, when given, is globbed for `*.pid` files — one per run
+    presumed in flight — and each is tested for liveness so the docket can
+    say how many of `policy.dispatch.max_in_flight` (default 3, off the
+    cartridge) are actually free. Without `runs_dir` there is nothing to
+    glob, so `in_flight` is empty and every slot reads free.
     """
     intake_items = read_queue(intake_root) if intake_root is not None else []
     ledger_rows = read_ledger(ledger_path) if ledger_path is not None else ()
+
+    max_in_flight = _max_in_flight(cartridge)
+    in_flight = (
+        sorted(
+            ({"run_id": pid_file.stem, "alive": _pid_alive(pid_file)} for pid_file in Path(runs_dir).glob("*.pid")),
+            key=lambda row: row["run_id"],
+        )
+        if runs_dir is not None
+        else []
+    )
+    free_slots = _free_slots(max_in_flight, in_flight)
 
     clean = sum(1 for row in ledger_rows if row.get("outcome") == "clean")
     reversal = sum(1 for row in ledger_rows if row.get("outcome") == "reversal")
@@ -121,6 +186,9 @@ def assemble_docket(
         "intake": [{"id": item["id"], "kind": item["kind"], "title": item["title"]} for item in intake_items],
         "ready_tasks": [],
         "ledger": {"rows": len(ledger_rows), "agreement": agreement},
+        "in_flight": in_flight,
+        "max_in_flight": max_in_flight,
+        "free_slots": free_slots,
     }
 
 
@@ -152,6 +220,15 @@ def run_cos(
     full body or the ledger's actual rows, and constructing a `decompose`
     invocation's `idea` — or a `retro` invocation's `ledger_rows` — needs
     exactly that.
+
+    Only the docket's `free_slots` selections, in the order given, are
+    invoked — returned as `invoked`, alongside `selections` in full — and the
+    rest come back as `deferred`, each with a reason naming how many runs are
+    already in flight against the bound. This is a floor under the dispatch
+    skill's own "fill only the free slots" rule, not a substitute for it. A
+    caller reporting what ran reads `invoked` rather than re-deriving it from
+    `selections` and `deferred`, which would just be this same slice done
+    twice.
     """
     intake_items = read_queue(intake_root) if intake_root is not None else []
     ledger_rows = read_ledger(ledger_path) if ledger_path is not None else ()
@@ -163,6 +240,30 @@ def run_cos(
 
     selections = list(cos_result.get("selections") or [])
 
+    # A docket missing `in_flight`/`max_in_flight`/`free_slots` — hand-built
+    # in a test, or built before this bookkeeping existed — is not license to
+    # dispatch uncapped. It falls back to the cartridge's own bound with
+    # nothing presumed already running, the same floor `assemble_docket`
+    # would compute given an empty `runs_dir`; the cap never disappears just
+    # because the docket that carried it did.
+    in_flight = docket.get("in_flight")
+    max_in_flight = (
+        docket.get("max_in_flight") if docket.get("max_in_flight") is not None else _max_in_flight(cartridge)
+    )
+    free_slots = (
+        docket.get("free_slots")
+        if docket.get("free_slots") is not None
+        else _free_slots(max_in_flight, in_flight or [])
+    )
+
+    allowed = selections[:free_slots]
+    held_back = selections[free_slots:]
+    alive_count = sum(1 for row in (in_flight or []) if row.get("alive"))
+    deferred = [
+        {"graph": str(selection.get("graph")), "reason": f"at capacity: {alive_count} in flight of {max_in_flight}"}
+        for selection in held_back
+    ]
+
     invocations: list[Invocation] = []
     decompose_queue = list(intake_items)
     # Only decompose invocations consume anything, so only they need their
@@ -170,7 +271,7 @@ def run_cos(
     # whether it actually ran.
     decompose_by_invocation: list[tuple[str, Mapping[str, Any]]] = []
 
-    for index, selection in enumerate(selections):
+    for index, selection in enumerate(allowed):
         graph = str(selection.get("graph"))
         invocation_id = f"{graph}-{index}"
 
@@ -214,8 +315,10 @@ def run_cos(
 
     return {
         "selections": selections,
+        "invoked": allowed,
         "results": results,
         "proposals": proposals,
         "failures": failures,
         "consumed": consumed,
+        "deferred": deferred,
     }
