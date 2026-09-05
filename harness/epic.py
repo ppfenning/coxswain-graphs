@@ -29,13 +29,17 @@ manifest under `f"{run_id}:{phase}"` — one cartridge, one scope, so
 `_require_single_scope` stays satisfiable — and an auto-cleared proposal gets no
 gate diff and no ledger row, because autonomy is spent by acting and re-earned
 only at a gate.
+
+Checks are the cartridge's `landing_areas.checks` plus whatever the repository
+itself declares in a root `.agent-checks` file, read once at the edge and
+merged in by `_Ctx.checks`.
 """
 
 from __future__ import annotations
 
 import subprocess
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,7 +49,7 @@ from core.manifest import build_manifest, gate_diff, record_run
 from core.workstore import WorkStoreError, record_attempt
 from graphs._contract import proposal
 from harness.autonomy import split_by_policy
-from harness.checks import all_passed, checks_evidence, run_checks
+from harness.checks import all_passed, checks_evidence, repo_checks, run_checks
 from harness.escalate import escalate_self_modification
 from harness.gate import auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
@@ -105,6 +109,7 @@ class _Ctx:
     initiative_id: str
     default_ref: str
     resume_from: str | None = None
+    repo_checks: list = field(default_factory=list)
 
     # ── names, in one place, so the topology is readable ─────────────────────
     def phase_branch(self, phase: str) -> str:
@@ -132,7 +137,10 @@ class _Ctx:
 
     @property
     def checks(self) -> list[Mapping[str, Any]]:
-        return list((self.cartridge.get("landing_areas") or {}).get("checks") or [])
+        cartridge_checks = list((self.cartridge.get("landing_areas") or {}).get("checks") or [])
+        known = {c.get("cmd") for c in cartridge_checks}
+        extra = [c for c in self.repo_checks if c.get("cmd") not in known]
+        return cartridge_checks + extra
 
     @property
     def bound(self) -> Mapping[str, Any]:
@@ -379,6 +387,14 @@ def run_epic(
     """
     repo = Path(repo)
     ok, head = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
+    try:
+        # `utf-8-sig` also strips a leading BOM, which would otherwise survive
+        # into the first command's name and cmd and never resolve as a shell
+        # command. Either way a malformed file degrades to no repo checks,
+        # never to a run that dies on somebody else's typo.
+        agent_checks_text = (repo / ".agent-checks").read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        agent_checks_text = ""
     ctx = _Ctx(
         repo=repo,
         cartridge=cartridge,
@@ -394,6 +410,7 @@ def run_epic(
         assume=assume,
         fix_attempts=fix_attempts,
         resume_from=resume_from,
+        repo_checks=repo_checks(agent_checks_text),
         initiative_id=str(initiative.get("id")),
         # An unparented phase branches from the repository's current HEAD, read
         # once here so every phase in a run stacks on the same ground.

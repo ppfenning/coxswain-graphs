@@ -380,6 +380,61 @@ def test_the_failing_checks_evidence_reaches_the_record(repo, cart, tmp_path) ->
     assert any(row["check"] == "checks:state" and "FAIL" in row["output"] for row in failed["evidence"])
 
 
+# ── repo-declared checks, from a root `.agent-checks` file ──────────────────
+
+
+def test_a_repo_declared_check_runs_alongside_the_cartridges(repo, cart, tmp_path) -> None:
+    cmd = f'{sys.executable} -c "pass"'
+    (repo / ".agent-checks").write_text(cmd + "\n", encoding="utf-8")
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
+    landed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    seen = {row["check"] for row in landed["evidence"]}
+    assert "checks:state" in seen  # the cartridge's own check still ran
+    assert f"checks:{sys.executable}" in seen  # and the repo's is merged in beside it
+
+
+def test_a_bom_prefixed_agent_checks_file_does_not_mangle_the_command(repo, cart, tmp_path) -> None:
+    """A BOM would otherwise land inside the first name and cmd, and no shell resolves it."""
+    cmd = f'{sys.executable} -c "pass"'
+    (repo / ".agent-checks").write_bytes(b"\xef\xbb\xbf" + (cmd + "\n").encode("utf-8"))
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
+    landed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert landed["status"] == "built"
+    assert f"checks:{sys.executable}" in {row["check"] for row in landed["evidence"]}
+
+
+def test_an_undecodable_agent_checks_file_falls_back_to_no_repo_checks(repo, cart, tmp_path) -> None:
+    """A malformed file degrades to no repo checks, never to a run that dies on it."""
+    (repo / ".agent-checks").write_bytes(b"\xff\xfe\x00bad")
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
+    landed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert landed["status"] == "built"
+
+
+def test_a_failing_repo_declared_check_quarantines_naming_it(repo, cart, tmp_path) -> None:
+    (repo / ".agent-checks").write_text("false\n", encoding="utf-8")
+    runner = Runner(
+        {"t1-probe": new_file_patch("t1-probe.txt"), "t2-bench": new_file_patch("t2-bench.txt")},
+        verdicts={"p1-foundations": GOAL_UNMET},
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+    quarantined = result["quarantined"]
+    reason = next(q["reason"] for q in quarantined if q["id"] == "t1-probe")
+    assert "configured checks failed" in reason and "false" in reason
+
+
+def test_a_repo_without_the_file_gets_only_the_cartridges_checks(repo, cart) -> None:
+    from harness.epic import _Ctx
+
+    ctx = _Ctx(
+        repo=repo, cartridge=cart, runner=None, specs={}, run_id="r", date="d",
+        max_parallel=1, ledger_path=Path("/tmp/ledger.jsonl"), provider_profile="p",
+        runs_dir=Path("/tmp/runs"), worktree_root=Path("/tmp/worktrees"), assume=None,
+        fix_attempts=None, initiative_id="i", default_ref="HEAD",
+    )
+    assert ctx.checks == cart["landing_areas"]["checks"]
+
+
 def test_a_task_the_lifecycle_could_not_run_is_quarantined_not_fatal(repo, cart, tmp_path) -> None:
     runner = Runner({"t2-bench": new_file_patch("t2-bench.txt")}, verdicts={"p1-foundations": GOAL_UNMET})
     result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
