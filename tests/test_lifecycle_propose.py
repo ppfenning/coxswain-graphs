@@ -182,7 +182,7 @@ def test_a_first_try_approval_records_one_attempt_and_carries_no_count(
     A proposal that always says `attempts` says nothing when it matters.
     """
     result = lifecycle_propose.run(args(cartridge), runner(plan_response, build_response, review_response))
-    assert result["fix_loop"] == {"attempts": 1, "stopped": None}
+    assert result["fix_loop"] == {"attempts": 1, "stopped": None, "continuations": 0}
     proposal = result["proposals"][0]
     assert "attempts" not in proposal, "a first-try pass looks exactly as it did before the loop existed"
     assert "fix loop" not in {e["check"] for e in proposal["evidence"]}
@@ -214,7 +214,7 @@ def test_a_change_sent_back_is_rebuilt_with_the_critique_and_can_pass_on_the_ret
     )
     assert "apply it first" in builds[1]["prompt"]
 
-    assert result["fix_loop"] == {"attempts": 2, "stopped": None}
+    assert result["fix_loop"] == {"attempts": 2, "stopped": None, "continuations": 0}
     proposal = result["proposals"][0]
     assert proposal["kind"] == "draft_pr_create"
     assert proposal["attempts"] == 2, "the ledger cannot discount what it is never told"
@@ -238,7 +238,7 @@ def test_a_retry_that_changes_nothing_stops_instead_of_buying_a_second_opinion(
     )
     result = lifecycle_propose.run(args(adversarial(cartridge)), scripted)
 
-    assert result["fix_loop"] == {"attempts": 2, "stopped": "no_progress"}
+    assert result["fix_loop"] == {"attempts": 2, "stopped": "no_progress", "continuations": 0}
     assert len(roles(scripted, "review_charter")) == 1, "the near-identical patch was never reviewed"
     assert result["proposals"] == []
     assert result["build"]["patch"] == build_response["patch"], (
@@ -262,7 +262,7 @@ def test_the_same_objection_raised_again_stops_the_loop(
     )
     result = lifecycle_propose.run(args(adversarial(cartridge)), scripted)
 
-    assert result["fix_loop"] == {"attempts": 2, "stopped": "objection_standing"}
+    assert result["fix_loop"] == {"attempts": 2, "stopped": "objection_standing", "continuations": 0}
     assert len(roles(scripted, "build")) == 2, "it stopped rather than spending the second retry"
     assert result["proposals"] == []
 
@@ -279,7 +279,7 @@ def test_the_cap_is_a_cap_and_an_unapproved_change_proposes_nothing(
     )
     result = lifecycle_propose.run(args(adversarial(cartridge), fix_attempts=1), scripted)
 
-    assert result["fix_loop"] == {"attempts": 2, "stopped": "attempts_exhausted"}
+    assert result["fix_loop"] == {"attempts": 2, "stopped": "attempts_exhausted", "continuations": 0}
     assert len(roles(scripted, "build")) == 2, "one additional attempt means one, not one more each round"
     assert [p["kind"] for p in result["proposals"]] == [], "nothing approved, so nothing proposed"
 
@@ -292,7 +292,7 @@ def test_fix_attempts_zero_disables_the_loop_entirely(
     result = lifecycle_propose.run(args(adversarial(cartridge), fix_attempts=0), scripted)
 
     assert len(roles(scripted, "build")) == 1
-    assert result["fix_loop"] == {"attempts": 1, "stopped": "attempts_exhausted"}
+    assert result["fix_loop"] == {"attempts": 1, "stopped": "attempts_exhausted", "continuations": 0}
     assert result["proposals"] == []
 
 

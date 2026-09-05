@@ -12,7 +12,7 @@ import pytest
 from graphs.delivery import lifecycle_propose
 from graphs._contract import ContractViolation, review_tier
 from runner import ScriptedRunner
-from runner.protocol import RunnerError
+from runner.protocol import BudgetStop, RunnerError
 
 REVIEW_TIER_CONFIG = {
     "tier0_patterns": ["docs_only", "rename_only", "config_bump", "param_tweak"],
@@ -246,7 +246,7 @@ def test_an_under_evidenced_handoff_revises_instead_of_quarantining(cart, plan_r
         },
     )
     assert [p["kind"] for p in result["proposals"]] == ["draft_pr_create"]
-    assert result["fix_loop"] == {"attempts": 2, "stopped": None}
+    assert result["fix_loop"] == {"attempts": 2, "stopped": None, "continuations": 0}
     assert result["handoff"]["complete"] is True
 
     # No reviewer was bought for the change the shuttle had already refused.
@@ -344,7 +344,7 @@ def test_an_under_evidenced_handoff_costs_one_attempt_not_the_run(cart, plan_res
         fix_attempts=0,
     )
     assert result["proposals"] == []
-    assert result["fix_loop"] == {"attempts": 1, "stopped": "attempts_exhausted"}
+    assert result["fix_loop"] == {"attempts": 1, "stopped": "attempts_exhausted", "continuations": 0}
     assert result["review"]["verdict"] == "revise"
     assert result["review"]["findings"][0]["detail"] == "a test"
     # No second opinion was invented out of the shuttle's objection.
@@ -357,7 +357,14 @@ def test_an_under_evidenced_handoff_costs_one_attempt_not_the_run(cart, plan_res
 REVISE = {"verdict": "revise",
           "findings": [{"charter_principle": "x", "detail": "needs a test", "file": "src/a.py"}],
           "rationale": "needs a test"}
-BUDGET_STOP = RunnerError("node 'build' failed in claude: {\"subtype\": \"error_max_budget_usd\"}")
+# A stop with no session names the simplest of the three no-go reasons — it
+# is a no-go on both call sites regardless of `surfaces`, which is what makes
+# it safe to reuse across the pinned first-build and retry tests below.
+BUDGET_STOP = BudgetStop(
+    role="build", thread="T-1", session=None, spent_usd=0.4,
+    detail="node 'build' failed in claude: {\"subtype\": \"error_max_budget_usd\"}",
+    partial_patch="",
+)
 
 
 def test_a_budget_stop_on_a_retry_keeps_the_last_reviewed_build(cart, plan_response, build_response) -> None:
@@ -366,7 +373,10 @@ def test_a_budget_stop_on_a_retry_keeps_the_last_reviewed_build(cart, plan_respo
         cart, plan_response, build_response,
         extra={"review_charter": REVISE, "build": [build_response, BUDGET_STOP]},
     )
-    assert result["fix_loop"] == {"attempts": 2, "stopped": "budget"}
+    assert result["fix_loop"] == {
+        "attempts": 2, "stopped": "budget", "continuations": 0,
+        "continuation_refused": "no session to resume",
+    }
     assert result["build"]["patch"] == build_response["patch"]
     assert result["review"]["verdict"] == "revise"
     assert result["proposals"] == []
@@ -383,6 +393,69 @@ def test_a_budget_stop_on_the_first_build_still_propagates(cart, plan_response) 
     """There is no earlier build to keep, so the honest behaviour is to raise."""
     with pytest.raises(RunnerError):
         run(cart, plan_response, build_response=BUDGET_STOP)
+
+
+# ── the go/no-go: idle the build, decide on facts, resume the same session ──
+
+
+def _stop_with_patch(patch: str, *, session: str = "sess-1") -> BudgetStop:
+    return BudgetStop(
+        role="build", thread="T-1", session=session, spent_usd=0.4,
+        detail="node 'build' failed in claude: {\"subtype\": \"error_max_budget_usd\"}",
+        partial_patch=patch,
+    )
+
+
+PARTIAL_IN_SURFACE = "--- a/src/a.py\n+++ b/src/a.py\n+partial line\n"
+PARTIAL_OUTSIDE_SURFACE = "--- a/src/rogue.py\n+++ b/src/rogue.py\n+partial line\n"
+
+
+def test_a_go_on_the_first_build_resumes_the_same_session(cart, plan_response, build_response) -> None:
+    """The second build call is a continuation, not a second try from scratch."""
+    stop = _stop_with_patch(PARTIAL_IN_SURFACE)
+    result, scripted = run(cart, plan_response, [stop, build_response], surfaces=["src/a.py"])
+    assert result["fix_loop"]["continuations"] == 1
+    assert result["review"]["verdict"] == "approve"
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 2
+    assert "Continue from exactly where you stopped" in build_calls[1]["prompt"]
+
+
+def test_partial_work_outside_surfaces_is_a_no_go_naming_the_remedy(cart, plan_response) -> None:
+    """The builder wandered outside its scope; continuing would compound it."""
+    stop = _stop_with_patch(PARTIAL_OUTSIDE_SURFACE)
+    with pytest.raises(RunnerError) as excinfo:
+        run(cart, plan_response, build_response=stop, surfaces=["src/a.py"])
+    assert "re-scope" in str(excinfo.value)
+
+
+def test_an_empty_partial_patch_gets_exactly_one_free_continuation(cart, plan_response) -> None:
+    """The session spent its slice reading; the next slice is the cheapest build there is."""
+    first = _stop_with_patch("")
+    second = _stop_with_patch("   ")
+    with pytest.raises(RunnerError) as excinfo:
+        run(cart, plan_response, build_response=[first, second], surfaces=["src/a.py"])
+    assert "budget_usd" in str(excinfo.value)
+
+
+def test_the_continuation_cap_recommends_a_split(cart, plan_response) -> None:
+    """Three consecutive stops with partial work are the too-large case."""
+    stops = [_stop_with_patch(PARTIAL_IN_SURFACE) for _ in range(3)]
+    scripted = ScriptedRunner({"plan": plan_response, "build": stops, "review_charter": APPROVE})
+    with pytest.raises(RunnerError) as excinfo:
+        lifecycle_propose.run(
+            {
+                "run_id": "r", "date": "2026-08-30", "ticket": "T-1", "cartridge": cart,
+                "surfaces": ["src/a.py", "src/other.py"],
+            },
+            scripted,
+        )
+    message = str(excinfo.value)
+    assert "split recommended" in message
+    assert "src/a.py" in message
+    assert "src/other.py" in message
+    continuation_calls = [c for c in scripted.calls if "Continue from exactly where you stopped" in c["prompt"]]
+    assert len(continuation_calls) == lifecycle_propose.CONTINUATIONS_MAX
 
 
 # ── gating the plan competition on tier ─────────────────────────────────────

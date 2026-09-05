@@ -67,7 +67,7 @@ from graphs._contract import (
     require_cartridge,
     review_tier,
 )
-from runner.protocol import NodeRunner, RunnerError
+from runner.protocol import BudgetStop, NodeRunner, RunnerError
 
 __all__ = ["run", "GRAPH_NAME"]
 
@@ -274,6 +274,12 @@ PATCH_PREVIEW_CHARS = 200_000
 # objection falling.
 NO_PROGRESS_RATIO = 0.98
 
+# A budget stop is not a failure to discard; the worktree holds the partial
+# patch and the session holds the context. Two continuations, not unbounded —
+# past this the task is too large for the slice it was given, and that is a
+# scoping problem, not a reason to keep burning budget on the same session.
+CONTINUATIONS_MAX = 2
+
 
 def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
     """Deterministic facts about the change, for the reviewer and the gate.
@@ -316,6 +322,95 @@ def _claims(adversary: Mapping[str, Any] | None) -> set[str]:
 def _is_budget_stop(exc: Exception) -> bool:
     """Whether a `RunnerError` is the CLI's dollar-ceiling stop, not some other failure."""
     return "error_max_budget_usd" in str(exc).lower()
+
+
+def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int) -> tuple[bool, str]:
+    """Whether a budget-stopped build is worth resuming, and why not when it isn't.
+
+    A fact-only check — no model is asked whether to continue, so it costs
+    nothing to run on every stop. The three no-go reasons are different
+    signals and each names its own remedy: whoever reads the quarantine acts
+    on the text, not on a bare "no".
+    """
+    if not stop.session:
+        return False, "no session to resume"
+
+    touched = [
+        line[len("+++ b/") :].strip()
+        for line in (stop.partial_patch or "").splitlines()
+        if line.startswith("+++ b/")
+    ]
+    if surfaces:
+        outside = [path for path in touched if path not in surfaces]
+        if outside:
+            return False, (
+                f"partial work touches {outside[0]} outside the task's surfaces: "
+                "re-scope the task"
+            )
+
+    if not (stop.partial_patch or "").strip():
+        if continuations == 0:
+            return True, ""
+        return False, (
+            "two budget slices produced no change: set budget_usd on the work "
+            "item if the task is legitimately this large, otherwise the task "
+            "body is the problem"
+        )
+
+    if continuations < CONTINUATIONS_MAX:
+        return True, ""
+
+    untouched = [surface for surface in surfaces if surface not in touched]
+    return False, (
+        "continuation cap reached with partial work: split recommended — "
+        f"done: {', '.join(touched)}; untouched: {', '.join(untouched)}"
+    )
+
+
+def _resume_build(
+    runner: NodeRunner,
+    *,
+    context: list[str],
+    ticket: Any,
+    budget_usd: float | None,
+    surfaces: list[str],
+    stop: BudgetStop,
+    continuations: int,
+) -> tuple[dict[str, Any] | None, int, str, BudgetStop]:
+    """Decide go/no-go on a budget stop and, on go, resume until one finishes
+    or the cap refuses another.
+
+    Returns the finished build (`None` on no-go), the updated continuation
+    count, the no-go reason (empty on go), and the last `BudgetStop` seen —
+    the caller needs it to report what a first-build no-go could not keep.
+    """
+    while True:
+        go, reason = _continue_ok(stop, surfaces=surfaces, continuations=continuations)
+        if not go:
+            return None, continuations, reason, stop
+        try:
+            build = runner.run(
+                role="build",
+                tier="standard",
+                thread=str(ticket),
+                schema=BUILD_SCHEMA,
+                context=context,
+                budget_usd=budget_usd,
+                prompt=(
+                    "Your previous session stopped at its budget ceiling. Nothing "
+                    "you did is lost: the worktree holds your partial change and "
+                    "this session holds your context. Continue from exactly where "
+                    "you stopped — do not start over and do not re-read what you "
+                    "already read. Finish the change, run the checks, and return "
+                    "the unified diff of the WHOLE change."
+                ),
+            )
+        except BudgetStop as exc:
+            continuations += 1
+            stop = exc
+            continue
+        continuations += 1
+        return dict(build), continuations, "", stop
 
 
 def _critique(
@@ -872,22 +967,43 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # from what the planner already read, and a retry from a tree it already
     # edited. Review never joins the thread — a reviewer that inherits the
     # builder's reasoning is the failure the seat exists to prevent.
-    build = runner.run(
-        role="build",
-        tier="standard",
-        thread=str(ticket),
-        schema=BUILD_SCHEMA,
-        context=context,
-        budget_usd=build_budget_usd,
-        prompt=(
-            f"Carry out this plan and return the change as a unified diff.\n\n"
-            f"Ticket: {ticket_text}\nPlan: {plan}\n\nReturn the patch only — it is applied "
-            "by the shell into a worktree, never by you. No tags, no fences, no trailing "
-            "markup of any kind — the text is fed to `git apply` verbatim and a stray "
-            "`</patch>` fails the checks. Include the deterministic "
-            "commands you ran and their output."
-        ),
-    )
+    continuations = 0
+    continuation_refused: str | None = None
+    try:
+        build = runner.run(
+            role="build",
+            tier="standard",
+            thread=str(ticket),
+            schema=BUILD_SCHEMA,
+            context=context,
+            budget_usd=build_budget_usd,
+            prompt=(
+                f"Carry out this plan and return the change as a unified diff.\n\n"
+                f"Ticket: {ticket_text}\nPlan: {plan}\n\nReturn the patch only — it is applied "
+                "by the shell into a worktree, never by you. No tags, no fences, no trailing "
+                "markup of any kind — the text is fed to `git apply` verbatim and a stray "
+                "`</patch>` fails the checks. Include the deterministic "
+                "commands you ran and their output."
+            ),
+        )
+    except BudgetStop as exc:
+        resumed, continuations, reason, stop = _resume_build(
+            runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
+            surfaces=surfaces, stop=exc, continuations=continuations,
+        )
+        if resumed is None:
+            # There is no reviewed build yet to keep — nothing to idle. The
+            # reason travels on the exception itself, since no result is
+            # returned for a `continuation_refused` field to live on.
+            raise BudgetStop(
+                role=stop.role,
+                thread=stop.thread,
+                session=stop.session,
+                spent_usd=stop.spent_usd,
+                partial_patch=stop.partial_patch,
+                detail=f"{stop.detail} — continuation refused: {reason}",
+            ) from stop
+        build = resumed
 
     facts = _change_facts(build)
     tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
@@ -957,16 +1073,22 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     "commands you ran and their output."
                 ),
             )
-        except RunnerError as exc:
-            if not _is_budget_stop(exc):
-                raise
-            # The retry spent the budget without returning a patch. `build` and
-            # `review` still describe the last patch actually reviewed — that is
-            # the thing worth keeping, not an exception that loses it along with
-            # everything the run already earned.
-            attempts += 1
-            stopped = "budget"
-            break
+        except BudgetStop as exc:
+            resumed, continuations, reason, _stop = _resume_build(
+                runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
+                surfaces=surfaces, stop=exc, continuations=continuations,
+            )
+            if resumed is None:
+                # The retry spent the budget without returning a patch, and a
+                # continuation was refused. `build` and `review` still
+                # describe the last patch actually reviewed — that is the
+                # thing worth keeping, not an exception that loses it along
+                # with everything the run already earned.
+                attempts += 1
+                stopped = "budget"
+                continuation_refused = reason
+                break
+            retry = resumed
         attempts += 1
 
         # No progress. Comparing the two patches is cheap, deterministic and
@@ -1119,7 +1241,12 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "build": dict(build),
         "review": dict(review),
         "change_facts": facts,
-        "fix_loop": {"attempts": attempts, "stopped": stopped},
+        "fix_loop": {
+            "attempts": attempts,
+            "stopped": stopped,
+            "continuations": continuations,
+            **({"continuation_refused": continuation_refused} if continuation_refused is not None else {}),
+        },
         "proposals": proposals,
     }
 
