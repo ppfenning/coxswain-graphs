@@ -40,7 +40,7 @@ from graphs._contract import ContractViolation
 from graphs._spec import GraphSpec
 from runner.protocol import RunnerError
 
-__all__ = ["InvokeError", "Invocation", "invoke_graphs"]
+__all__ = ["Invocation", "InvokeError", "invoke_graphs"]
 
 
 class InvokeError(Exception):

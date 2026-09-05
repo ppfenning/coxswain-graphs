@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from core.manifest import gate_diff
 
-__all__ = ["APPLY_SCHEMA", "apply_arm_for", "auto_apply", "gate", "apply_decisions"]
+__all__ = ["APPLY_SCHEMA", "apply_arm_for", "apply_decisions", "auto_apply", "gate"]
 
 # What an apply arm must report back. Small on purpose: the arm says whether it
 # landed the write and names what it touched, and nothing else — a verbose arm
@@ -76,7 +76,7 @@ def gate(proposals: list[dict[str, Any]], *, assume: str | None) -> tuple[list[d
         return [], 0.0
 
     decisions: list[tuple[dict[str, Any], str, bool]] = []
-    started = datetime.now(timezone.utc)
+    started = datetime.now(UTC)
 
     for number, item in enumerate(proposals, 1):
         print(f"\n── proposal {number}/{len(proposals)} " + "─" * 44)
@@ -101,7 +101,7 @@ def gate(proposals: list[dict[str, Any]], *, assume: str | None) -> tuple[list[d
         }.get(answer[:1], ("refused", False))
         decisions.append((item, decision, edited))
 
-    minutes = (datetime.now(timezone.utc) - started).total_seconds() / 60
+    minutes = (datetime.now(UTC) - started).total_seconds() / 60
     return decisions, round(minutes, 2)
 
 

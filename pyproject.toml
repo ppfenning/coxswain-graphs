@@ -31,3 +31,16 @@ testpaths = ["tests"]
 # adds the cwd, bare `pytest` does not — so without this the suite passes
 # locally and fails in CI.
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+# Pat, 2026-09-05: "ruff over the repos in CI or pre-commit". The set leans on the
+# charter (pure core, no rebinding, no side doors): E/F correctness, I imports,
+# UP modern syntax, B bugbear, SIM, RET, C4, DTZ clocks, RUF. Ignored on purpose:
+# E501/E701/E702 (the codebase uses dense one-liners at the edge), E741 (single
+# letters in short comprehensions), PLW1510 (edges read subprocess returncodes
+# deliberately), RUF005/RUF043/RUF059/B905/ISC004 (style calls, not defects).
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "DTZ", "ISC", "RET", "C4", "PLW"]
+ignore = ["E501", "E701", "E702", "E741", "PLW1510", "RUF005", "RUF043", "RUF059", "B905", "ISC004"]

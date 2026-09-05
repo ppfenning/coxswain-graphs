@@ -18,7 +18,7 @@ import pkgutil
 
 from graphs._spec import GraphSpec, Need
 
-__all__ = ["Need", "GraphSpec", "DiscoveryError", "discover"]
+__all__ = ["DiscoveryError", "GraphSpec", "Need", "discover"]
 
 
 class DiscoveryError(Exception):

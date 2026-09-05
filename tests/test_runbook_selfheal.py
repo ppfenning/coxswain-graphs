@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from graphs.ops import triage_propose
 from graphs._contract import ContractViolation
+from graphs.ops import triage_propose
 from runner import ScriptedRunner
 
 MATCHED = {"symptom_key": "late_landing", "runbook_entry": "rb-01", "confidence": "high"}

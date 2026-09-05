@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-__all__ = ["run_checks", "checks_evidence", "all_passed", "repo_checks"]
+__all__ = ["all_passed", "checks_evidence", "repo_checks", "run_checks"]
 
 # Tokens like "12 passed", "2 failed", "1 error"/"errors", "3 skipped". Generic
 # on purpose: it reads whatever a test runner prints rather than special-casing

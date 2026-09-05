@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 
 from runner import RunnerError
-from runner.protocol import BudgetStop
 from runner.claude_code_runner import ClaudeCodeRunner
+from runner.protocol import BudgetStop
 from runner.scripted import ScriptedRunner
 
 PROFILE = {

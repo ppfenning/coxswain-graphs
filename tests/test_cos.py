@@ -10,8 +10,8 @@ invoking exactly what got selected and consuming only what actually ran.
 from __future__ import annotations
 
 import pytest
-
 from core.ledger import append as ledger_append
+
 from graphs._contract import ContractViolation
 from graphs._spec import GraphSpec
 from graphs.ops import coxswain
@@ -384,23 +384,23 @@ def test_pid_alive_reads_liveness_off_a_faked_kill_never_the_real_process_table(
     bad = tmp_path / "bad.pid"
     bad.write_text("not-a-pid", encoding="utf-8")
 
-    assert cos._pid_alive(live) is True  # noqa: SLF001
-    assert cos._pid_alive(perm) is True, "PermissionError still means the process exists"  # noqa: SLF001
-    assert cos._pid_alive(dead) is False  # noqa: SLF001
-    assert cos._pid_alive(bad) is False, "unparsable content reads as dead"  # noqa: SLF001
+    assert cos._pid_alive(live) is True
+    assert cos._pid_alive(perm) is True, "PermissionError still means the process exists"
+    assert cos._pid_alive(dead) is False
+    assert cos._pid_alive(bad) is False, "unparsable content reads as dead"
 
 
 def test_free_slots_is_a_pure_function_over_plain_rows() -> None:
     rows = [{"run_id": "a", "alive": True}, {"run_id": "b", "alive": False}, {"run_id": "c", "alive": True}]
-    assert cos._free_slots(3, rows) == 1  # noqa: SLF001
-    assert cos._free_slots(2, rows) == 0, "never negative"  # noqa: SLF001
-    assert cos._free_slots(5, []) == 5  # noqa: SLF001
+    assert cos._free_slots(3, rows) == 1
+    assert cos._free_slots(2, rows) == 0, "never negative"
+    assert cos._free_slots(5, []) == 5
 
 
 def test_max_in_flight_defaults_to_three_off_plain_cartridge_data() -> None:
-    assert cos._max_in_flight({"policy": {"dispatch": {"max_in_flight": 7}}}) == 7  # noqa: SLF001
-    assert cos._max_in_flight({}) == 3  # noqa: SLF001
-    assert cos._max_in_flight(None) == 3  # noqa: SLF001
+    assert cos._max_in_flight({"policy": {"dispatch": {"max_in_flight": 7}}}) == 7
+    assert cos._max_in_flight({}) == 3
+    assert cos._max_in_flight(None) == 3
 
 
 def test_assemble_docket_reports_in_flight_runs_and_the_free_slots_left(tmp_path, monkeypatch) -> None:
