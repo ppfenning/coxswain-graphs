@@ -226,6 +226,26 @@ def phase_order(parents: Mapping[str, set[str]]) -> tuple[list[str], list[str]]:
     return ordered, sorted(remaining)
 
 
+_EVIDENCE_LINE_CAP = 400
+
+
+def _read_evidence_file(worktree: str, rel: str) -> str | None:
+    """The reader `phase-validate` calls for a chunk verdict's `needs_evidence`.
+
+    The one place this driver opens a file on the graph's behalf, injected in
+    as an argument per docs/GRAPH-CONTRACT.md clause 4 — the graph itself
+    never touches a filesystem. The file-count cap and the check that keeps a
+    request inside `worktree` are the graph's own, over the names alone; this
+    only caps line count and reports an unreadable path as `None`, never a
+    raise, because one bad name must not cost the rest of the phase's verdict.
+    """
+    try:
+        text = Path(worktree, rel).read_text()
+    except OSError:
+        return None
+    return "\n".join(text.splitlines()[:_EVIDENCE_LINE_CAP])
+
+
 def _phase_goal(initiative: Mapping[str, Any], phase: str) -> str:
     """The phase's ORIGINAL goal — the thing `validate_phase` judges against.
 
@@ -855,6 +875,10 @@ def _run_phase(
                     # the builder's account of it. A validator without it said,
                     # in its own words, that it could not verify anything.
                     "patch": str((built[task]["result"].get("build") or {}).get("patch") or "")[:PATCH_FOR_VALIDATION_CHARS],
+                    # Where `validate_chunk`'s needs_evidence, if any, gets
+                    # read from — still on disk here, since validation runs
+                    # before the merges that would retire it.
+                    "worktree": str(ctx.task_worktree(phase, task)),
                 }
                 for task in surviving
             ],
@@ -865,7 +889,12 @@ def _run_phase(
                 Invocation(
                     id=f"{VALIDATE}:{phase}",
                     graph=VALIDATE,
-                    args={"date": ctx.date, "cartridge": ctx.cartridge, "phase_state": phase_state},
+                    args={
+                        "date": ctx.date,
+                        "cartridge": ctx.cartridge,
+                        "phase_state": phase_state,
+                        "reader": _read_evidence_file,
+                    },
                 )
             ],
             specs=ctx.specs,

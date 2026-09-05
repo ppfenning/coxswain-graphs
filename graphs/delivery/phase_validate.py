@@ -32,7 +32,8 @@ found; the driver decides what that costs.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import posixpath
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from graphs._contract import ContractViolation, require, require_cartridge
@@ -48,6 +49,8 @@ VALIDATE_CHUNK_SCHEMA = {
         "satisfied": {"type": "boolean"},
         "gaps": {"type": "array", "items": {"type": "string"}},
         "reasoning": {"type": "string"},
+        # Optional: relative paths the validator would need to read to rule.
+        "needs_evidence": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["satisfied", "gaps", "reasoning"],
     "additionalProperties": False,
@@ -193,8 +196,41 @@ def _harness_fault_verdict(second: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_MAX_EVIDENCE_FILES = 5
+
+# What the harness injects to fetch a named file's text; `None` means it could
+# not be read. The graph never opens a file itself — per
+# docs/GRAPH-CONTRACT.md clause 4, "Scripts have no filesystem access... Both
+# are arguments" — so the read itself lives at the caller's edge, and this
+# module only ever calls the one it was handed.
+EvidenceReader = Callable[[str, str], "str | None"]
+
+
+def _partition_evidence(worktree: str | None, paths: Sequence[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Pure: which requested names may be read, and why the rest may not.
+
+    String arithmetic only, over `worktree` and `paths` — no filesystem
+    access, so a name that escapes the tree is caught without touching disk.
+    Anything past the fifth in-tree name is refused too, reported rather
+    than silently dropped, per docs/GRAPH-CONTRACT.md clause 6.
+    """
+    if not worktree:
+        return [], [(path, "no worktree was supplied") for path in paths]
+    root = posixpath.normpath(str(worktree))
+
+    def _contained(rel: str) -> bool:
+        joined = posixpath.normpath(posixpath.join(root, rel))
+        return joined == root or joined.startswith(root + "/")
+
+    in_tree = [rel for rel in paths if _contained(rel)]
+    outside = [(rel, "outside the worktree") for rel in paths if not _contained(rel)]
+    accepted, overflow_names = in_tree[:_MAX_EVIDENCE_FILES], in_tree[_MAX_EVIDENCE_FILES:]
+    overflow = [(rel, f"over the {_MAX_EVIDENCE_FILES}-file cap") for rel in overflow_names]
+    return accepted, [*outside, *overflow]
+
+
 def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
-    """Run the graph. The phase's state arrives as an argument; nothing is read."""
+    """Run the graph. It touches no filesystem itself; see `EvidenceReader`."""
     cartridge = require_cartridge(args)
     run_id, date, phase_state = require(args, "run_id", "date", "phase_state")
 
@@ -218,34 +254,77 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # leaves this list empty rather than fabricating an opinion per task.
     chunk_verdicts: list[dict[str, Any]] = []
     if "validate_chunk" in bound:
+        # The reader is the injected edge: `harness/epic.py` supplies the one
+        # that actually opens a file. Absent here, every needs_evidence
+        # request is refused rather than guessed at.
+        reader: EvidenceReader | None = args.get("reader")
         for task in tasks:
+            chunk_prompt = (
+                "Did this task actually satisfy its own description?\n\n"
+                f"Date: {date}\nPhase: {phase.get('id')}\n"
+                f"Task: {_task_view(task)}\n\n"
+                "Judge the machine evidence and the change facts, not anyone's "
+                "account of the work. Name every gap you find; an empty list "
+                "means you found none, not that you did not look.\n\n"
+                "If you cannot rule without reading a file the diff does not "
+                "show, list it in needs_evidence instead of guessing."
+            )
             raw_verdict, stalled = _verdict(
                 runner,
                 role="validate_chunk",
                 tier="standard",
                 schema=VALIDATE_CHUNK_SCHEMA,
                 context=context,
-                prompt=(
-                    "Did this task actually satisfy its own description?\n\n"
-                    f"Date: {date}\nPhase: {phase.get('id')}\n"
-                    f"Task: {_task_view(task)}\n\n"
-                    "Judge the machine evidence and the change facts, not anyone's "
-                    "account of the work. Name every gap you find; an empty list "
-                    "means you found none, not that you did not look."
-                ),
+                prompt=chunk_prompt,
             )
             # The epic driver invokes this graph once for the whole phase; a
             # raise here would lose every sibling's verdict to one task's
             # fault. Narrow the failure back to the task it belongs to.
-            verdict = _harness_fault_verdict(raw_verdict) if stalled else raw_verdict
-            chunk_verdicts.append(
-                {
-                    "task": str(task.get("id")),
-                    "satisfied": bool(verdict.get("satisfied")),
-                    "gaps": list(verdict.get("gaps") or []),
-                    "reasoning": str(verdict.get("reasoning", "")),
-                }
-            )
+            first_verdict = _harness_fault_verdict(raw_verdict) if stalled else raw_verdict
+            requested = [] if stalled else list(first_verdict.get("needs_evidence") or [])
+
+            # A typed, one-shot ask, independent of the placeholder retry
+            # above: what comes back second is final, routed through the same
+            # `_verdict` guard so a placeholder answer here is not believed
+            # either. Not chased further, even if it asks again.
+            base_verdict = first_verdict
+            evidence_supplied: list[str] | None = None
+            refusal_gaps: list[str] = []
+            if first_verdict.get("satisfied") is False and requested:
+                accepted, refused = _partition_evidence(task.get("worktree"), requested)
+                reads = [(rel, reader(task.get("worktree"), rel) if reader is not None else None) for rel in accepted]
+                read_pairs = [(rel, text) for rel, text in reads if text is not None]
+                unread = [
+                    *refused,
+                    *(
+                        (rel, "could not be read" if reader is not None else "no evidence reader was supplied")
+                        for rel, text in reads
+                        if text is None
+                    ),
+                ]
+                if read_pairs:
+                    evidence_block = "\n\n".join(f"--- {path} ---\n{text}" for path, text in read_pairs)
+                    second_raw, second_stalled = _verdict(
+                        runner,
+                        role="validate_chunk",
+                        tier="standard",
+                        schema=VALIDATE_CHUNK_SCHEMA,
+                        context=[*context, f"Evidence you asked for:\n{evidence_block}"],
+                        prompt=chunk_prompt,
+                    )
+                    base_verdict = _harness_fault_verdict(second_raw) if second_stalled else second_raw
+                    evidence_supplied = [path for path, _ in read_pairs]
+                refusal_gaps = [f"needs_evidence named '{path}', {reason}; refused" for path, reason in unread]
+
+            entry = {
+                "task": str(task.get("id")),
+                "satisfied": bool(base_verdict.get("satisfied")),
+                "gaps": [*(base_verdict.get("gaps") or []), *refusal_gaps],
+                "reasoning": str(base_verdict.get("reasoning", "")),
+            }
+            if evidence_supplied is not None:
+                entry["evidence_supplied"] = evidence_supplied
+            chunk_verdicts.append(entry)
 
     phase_verdict, phase_stalled = _verdict(
         runner,

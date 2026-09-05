@@ -8,11 +8,24 @@ a planted summary NEVER reaches a prompt.
 
 from __future__ import annotations
 
+import copy
+from pathlib import Path
+
 import pytest
 
 from graphs._contract import ContractViolation
 from graphs.delivery import phase_validate
 from runner import ScriptedRunner
+
+_UNSET = object()
+
+
+def _fs_reader(worktree: str, rel: str) -> str | None:
+    """A reader double standing in for the one `harness/epic.py` injects."""
+    try:
+        return Path(worktree, rel).read_text()
+    except OSError:
+        return None
 
 CHUNK_OK = {"satisfied": True, "gaps": [], "reasoning": "the description is satisfied"}
 CHUNK_BAD = {"satisfied": False, "gaps": ["no migration"], "reasoning": "half of it is missing"}
@@ -67,12 +80,22 @@ def cart(cartridge) -> dict:
     return cartridge
 
 
-def run(cart, responses=None, state=None):
+def run(cart, responses=None, state=None, worktree=None, reader=_UNSET):
+    """`worktree`, given, is stamped onto every task; `reader` defaults to
+    `_fs_reader` whenever a worktree is given, and is omitted otherwise — pass
+    `reader=None` explicitly to simulate the harness supplying no reader at all.
+    """
     runner = ScriptedRunner(responses or {"validate_chunk": CHUNK_OK, "validate_phase": PHASE_MET})
-    result = phase_validate.run(
-        {"run_id": "r1", "date": "2026-09-01", "cartridge": cart, "phase_state": state or PHASE_STATE},
-        runner,
-    )
+    phase_state = copy.deepcopy(state or PHASE_STATE)
+    if worktree is not None:
+        for task in phase_state["tasks"]:
+            task["worktree"] = str(worktree)
+    args = {"run_id": "r1", "date": "2026-09-01", "cartridge": cart, "phase_state": phase_state}
+    if reader is not _UNSET:
+        args["reader"] = reader
+    elif worktree is not None:
+        args["reader"] = _fs_reader
+    result = phase_validate.run(args, runner)
     return result, runner
 
 
@@ -250,3 +273,152 @@ def test_a_placeholdering_phase_verdict_still_raises(cart) -> None:
         run(cart, {"validate_chunk": CHUNK_OK, "validate_phase": stalling})
     assert "placeholder rather than a verdict" in str(exc.value)
     assert "p1-foundations" in str(exc.value)
+
+
+# ── needs_evidence: a typed ask, fulfilled once ─────────────────────────────
+
+CHUNK_NEEDS_EVIDENCE = {
+    "satisfied": False,
+    "gaps": [],
+    "reasoning": "cannot tell without reading the migration",
+    "needs_evidence": ["migrations/0007_add_col.sql"],
+}
+
+CHUNK_NEEDS_EVIDENCE_OUTSIDE = {
+    "satisfied": False,
+    "gaps": [],
+    "reasoning": "cannot tell without reading a file outside the tree",
+    "needs_evidence": ["../secrets.env"],
+}
+
+CHUNK_OK_WITH_NEEDS_EVIDENCE = {
+    "satisfied": True,
+    "gaps": [],
+    "reasoning": "confirmed by the diff alone",
+    "needs_evidence": ["some/file.py"],
+}
+
+SECOND_STILL_ASKS = {
+    "satisfied": False,
+    "gaps": ["still missing something"],
+    "reasoning": "even with the file, it is incomplete",
+    "needs_evidence": ["migrations/0008_more.sql"],
+}
+
+
+def test_needs_evidence_asks_once_more_with_the_file_in_context(cart, tmp_path) -> None:
+    target = tmp_path / "migrations" / "0007_add_col.sql"
+    target.parent.mkdir(parents=True)
+    target.write_text("ALTER TABLE vendor ADD COLUMN drift_flag boolean;\n")
+
+    result, runner = run(
+        cart,
+        {"validate_chunk": [CHUNK_NEEDS_EVIDENCE, CHUNK_OK], "validate_phase": PHASE_MET},
+        worktree=tmp_path,
+    )
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 3, "two tasks; one of them asks a follow-up"
+    follow_up = " ".join(chunk_calls[1]["context"])
+    assert "Evidence you asked for" in follow_up
+    assert "ALTER TABLE vendor ADD COLUMN drift_flag boolean;" in follow_up
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t1-probe"]["evidence_supplied"] == ["migrations/0007_add_col.sql"]
+    assert by_task["t1-probe"]["satisfied"] is True, "the second verdict is final, as returned"
+
+
+def test_a_path_outside_the_worktree_is_refused_with_no_second_call(cart, tmp_path) -> None:
+    result, runner = run(
+        cart,
+        {"validate_chunk": CHUNK_NEEDS_EVIDENCE_OUTSIDE, "validate_phase": PHASE_MET},
+        worktree=tmp_path,
+    )
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 2, "one ask per task; a refusal buys no follow-up"
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert "evidence_supplied" not in by_task["t1-probe"]
+    assert "outside the worktree" in " ".join(by_task["t1-probe"]["gaps"])
+
+
+def test_more_than_five_requested_paths_are_truncated_to_five_and_the_rest_are_reported(cart, tmp_path) -> None:
+    names = [f"f{i}.txt" for i in range(7)]
+    for name in names:
+        (tmp_path / name).write_text(f"contents of {name}\n")
+    needs_seven = {
+        "satisfied": False,
+        "gaps": [],
+        "reasoning": "need several files",
+        "needs_evidence": names,
+    }
+    result, runner = run(
+        cart,
+        {"validate_chunk": [needs_seven, CHUNK_OK], "validate_phase": PHASE_MET},
+        worktree=tmp_path,
+    )
+    follow_up = " ".join([c for c in runner.calls if c["role"] == "validate_chunk"][1]["context"])
+    assert sum(1 for name in names if f"contents of {name}" in follow_up) == 5
+
+    gaps = " ".join(next(v for v in result["chunk_verdicts"] if v["task"] == "t1-probe")["gaps"])
+    assert "f5.txt" in gaps and "f6.txt" in gaps, "the two dropped names are named, not silently gone"
+    assert "cap" in gaps
+
+
+def test_a_second_needs_evidence_is_not_chased(cart, tmp_path) -> None:
+    target = tmp_path / "migrations" / "0007_add_col.sql"
+    target.parent.mkdir(parents=True)
+    target.write_text("ALTER TABLE vendor ADD COLUMN drift_flag boolean;\n")
+
+    result, runner = run(
+        cart,
+        {"validate_chunk": [CHUNK_NEEDS_EVIDENCE, SECOND_STILL_ASKS], "validate_phase": PHASE_MET},
+        worktree=tmp_path,
+    )
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 3, "one follow-up only, whatever the follow-up itself answers"
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t1-probe"] == {
+        "task": "t1-probe",
+        "satisfied": False,
+        "gaps": ["still missing something"],
+        "reasoning": "even with the file, it is incomplete",
+        "evidence_supplied": ["migrations/0007_add_col.sql"],
+    }
+
+
+def test_a_satisfied_verdict_never_gets_a_second_call_even_with_needs_evidence(cart, tmp_path) -> None:
+    _, runner = run(
+        cart,
+        {"validate_chunk": CHUNK_OK_WITH_NEEDS_EVIDENCE, "validate_phase": PHASE_MET},
+        worktree=tmp_path,
+    )
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 2, "one ask per task; satisfied needs no follow-up"
+
+
+def test_no_worktree_on_the_task_refuses_without_touching_a_reader(cart) -> None:
+    """The graph itself opens nothing; with no worktree there is nothing to ask a reader for."""
+    result, runner = run(cart, {"validate_chunk": CHUNK_NEEDS_EVIDENCE, "validate_phase": PHASE_MET})
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 2, "one ask per task; no worktree buys no follow-up"
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert "evidence_supplied" not in by_task["t1-probe"]
+    assert "no worktree was supplied" in " ".join(by_task["t1-probe"]["gaps"])
+
+
+def test_a_worktree_with_no_reader_is_refused_not_guessed(cart, tmp_path) -> None:
+    """A worktree names where to look; without a reader the graph still reads nothing itself."""
+    result, runner = run(
+        cart,
+        {"validate_chunk": CHUNK_NEEDS_EVIDENCE, "validate_phase": PHASE_MET},
+        worktree=tmp_path,
+        reader=None,
+    )
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 2, "one ask per task; no reader buys no follow-up"
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert "evidence_supplied" not in by_task["t1-probe"]
+    assert "no evidence reader was supplied" in " ".join(by_task["t1-probe"]["gaps"])
