@@ -61,3 +61,6 @@ jobs:
       # by reading the imports, not by a list here — a list here drifts the
       # moment someone adds a test, and did.
       - run: pytest -q
+
+      - name: ruff (rules in pyproject.toml; pre-commit mirrors it)
+        run: pip install ruff==0.16.6 && ruff check .

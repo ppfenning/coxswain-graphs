@@ -21,7 +21,7 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path
 
-__all__ = ["build_digest", "MAX_DIGEST_CHARS"]
+__all__ = ["MAX_DIGEST_CHARS", "build_digest"]
 
 MAX_DIGEST_CHARS = 12_000
 

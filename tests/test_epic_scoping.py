@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from graphs.delivery import lifecycle_propose
 from graphs._contract import ContractViolation, epic_shape, landing_for
+from graphs.delivery import lifecycle_propose
 from runner import ScriptedRunner
 
 THRESHOLD = {"phases_min": 2, "tickets_min": 3, "multi_repo": True}
@@ -103,8 +103,8 @@ def test_scoping_emits_a_routed_proposal(scoped, plan_response, build_response, 
     scoping = [p for p in result["proposals"] if p["kind"] == "item_create"]
     assert len(scoping) == 1
     assert "epic" in scoping[0]["suggested_action"]
-    assert any("epic_threshold" == e["check"] for e in scoping[0]["evidence"])
-    assert any("work_routing" == e["check"] for e in scoping[0]["evidence"])
+    assert any(e["check"] == "epic_threshold" for e in scoping[0]["evidence"])
+    assert any(e["check"] == "work_routing" for e in scoping[0]["evidence"])
 
 
 def test_future_work_routes_off_the_active_board(scoped, plan_response, build_response, review_response) -> None:
@@ -133,7 +133,7 @@ def test_it_attaches_to_an_existing_epic_when_one_covers_the_area(
         "rationale": "same area",
     }
     result = scope_run(scoped, response, plan_response, build_response, review_response)
-    scoping = [p for p in result["proposals"] if p["kind"] == "item_create"][0]
+    scoping = next(p for p in result["proposals"] if p["kind"] == "item_create")
     assert scoping["target"] == "EPIC-9"
     assert "EPIC-9" in scoping["suggested_action"]
 
@@ -158,4 +158,4 @@ def test_the_scope_node_runs_before_planning(scoped, plan_response, build_respon
     lifecycle_propose.run(
         {"run_id": "r", "date": "2026-08-30", "ticket": "T", "cartridge": scoped}, scripted
     )
-    assert [c["role"] for c in scripted.calls][0] == "scope_epic"
+    assert next(c["role"] for c in scripted.calls) == "scope_epic"

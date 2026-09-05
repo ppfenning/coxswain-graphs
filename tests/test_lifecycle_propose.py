@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from graphs.delivery import lifecycle_propose
 from graphs._contract import ContractViolation
+from graphs.delivery import lifecycle_propose
 from runner import ScriptedRunner
 
 

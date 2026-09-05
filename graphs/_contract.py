@@ -12,11 +12,11 @@ from typing import Any
 
 __all__ = [
     "ContractViolation",
-    "require",
-    "require_cartridge",
-    "proposal",
     "epic_shape",
     "landing_for",
+    "proposal",
+    "require",
+    "require_cartridge",
     "review_tier",
 ]
 

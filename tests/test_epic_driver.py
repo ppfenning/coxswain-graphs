@@ -19,8 +19,8 @@ import threading
 from pathlib import Path
 
 import pytest
-
 from core import ledger, workstore
+
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
 from harness.epic import phase_order, phase_parents, run_epic

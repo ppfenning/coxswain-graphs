@@ -43,7 +43,7 @@ from typing import Any
 from graphs._contract import ContractViolation, proposal, require, require_cartridge
 from runner.protocol import NodeRunner
 
-__all__ = ["run", "GRAPH_NAME"]
+__all__ = ["GRAPH_NAME", "run"]
 
 GRAPH_NAME = "retro-propose"
 

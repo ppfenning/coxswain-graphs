@@ -1,0 +1,8 @@
+# Local mirror of the CI lint job: `pre-commit install` once, then ruff runs on
+# each commit with the same rules pyproject.toml / ruff.toml declares.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.6
+    hooks:
+      - id: ruff
+        args: [--fix]

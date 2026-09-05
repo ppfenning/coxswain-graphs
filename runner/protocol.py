@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["NodeRunner", "NodeResult", "RunnerError", "BudgetStop"]
+__all__ = ["BudgetStop", "NodeResult", "NodeRunner", "RunnerError"]
 
 
 class RunnerError(Exception):

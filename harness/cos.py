@@ -46,6 +46,7 @@ from typing import Any
 from core.intake import consume as consume_intake_item
 from core.intake import read_queue
 from core.ledger import read as read_ledger
+
 from graphs._spec import GraphSpec
 from harness.invoke import Invocation, invoke_graphs
 

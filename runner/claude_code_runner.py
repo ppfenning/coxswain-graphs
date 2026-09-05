@@ -39,7 +39,7 @@ from typing import Any
 
 from runner.protocol import BudgetStop, NodeResult, RunnerError
 
-__all__ = ["ClaudeCodeRunner", "TIER_EFFORT", "DEFAULT_TIER"]
+__all__ = ["DEFAULT_TIER", "TIER_EFFORT", "ClaudeCodeRunner"]
 
 DEFAULT_TIER = "standard"
 
@@ -339,7 +339,7 @@ class ClaudeCodeRunner:
             lines.append(
                 f"Always use ABSOLUTE paths under {where} — a relative path resolves against a "
                 "directory that is not the repository, and every failed read is a wasted turn. "
-                "Read by range: the map gives line numbers, so open the 40–80 lines around the "
+                "Read by range: the map gives line numbers, so open the 40-80 lines around the "
                 "symbol you need (Read's offset and limit), and never read a file longer than 300 "
                 "lines whole. Each turn re-sends everything already read, so a whole-file read of "
                 "a large module taxes every turn that follows it."

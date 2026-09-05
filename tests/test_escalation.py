@@ -22,8 +22,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from core import ledger
+
 from harness import split_by_policy
 from harness.escalate import escalate_self_modification, governance_hits, touched_paths
 
