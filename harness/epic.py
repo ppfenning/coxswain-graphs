@@ -77,6 +77,12 @@ _DRAFT_KINDS = frozenset({"draft_pr_create", "self_modification"})
 # the bound only stops a pathological diff from swamping the phase prompt.
 PATCH_FOR_VALIDATION_CHARS = 120_000
 
+# Two recorded attempts and a third run is refused rather than tried again.
+# A refusal past this point is not itself an attempt, so it must not grow the
+# count it is enforcing — see `_run_phase`, which quarantines these tasks with
+# a plain `quarantined.append` rather than `_quarantine_task`.
+ATTEMPT_CAP = 2
+
 
 def _git(*args: str, cwd: Path | None = None) -> tuple[bool, str]:
     """Run one git command and report what happened, never what was intended."""
@@ -537,6 +543,15 @@ def _quarantine_task(
     return {"id": task, "phase": phase, "grain": "task", "reason": reason}
 
 
+def _attempt_cap_reason(attempts: Sequence[Mapping[str, Any]]) -> str:
+    """The refusal's reason, naming every earlier run so a person has the history."""
+    history = "; ".join(f"{a.get('run')}: {a.get('reason')}" for a in attempts)
+    return (
+        f"attempt cap: {len(attempts)} earlier run(s) quarantined this task — {history}. "
+        "Refusing a third run; a person decides."
+    )
+
+
 def _run_phase(
     ctx: _Ctx,
     *,
@@ -600,7 +615,21 @@ def _run_phase(
             suggested_action=f"rebase {branch} onto {base_ref}",
         )
 
-    ready = workstore.ready_tasks(items, phase=phase)
+    all_ready = workstore.ready_tasks(items, phase=phase)
+
+    # A third run of the same task is refused outright rather than tried
+    # again — quarantined here, plainly, never through `_quarantine_task`,
+    # because a refusal is not an attempt and must not grow the count it is
+    # enforcing.
+    attempts_by_id = {str(item["id"]): item.get("attempts") or [] for item in all_ready}
+    for task_id, attempts in attempts_by_id.items():
+        if len(attempts) < ATTEMPT_CAP:
+            continue
+        reason = _attempt_cap_reason(attempts)
+        quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason})
+        print(f"  attempt cap: {task_id} refused ({len(attempts)} attempt(s) recorded)")
+    ready = [item for item in all_ready if len(attempts_by_id[str(item["id"])]) < ATTEMPT_CAP]
+
     by_id = {str(item["id"]): item for item in items}
     results: list[dict[str, Any]] = []
 

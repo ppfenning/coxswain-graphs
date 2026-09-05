@@ -706,6 +706,70 @@ def test_a_quarantined_task_records_an_attempt_on_its_own_work_item(repo, cart, 
         assert attempt["ts"]
 
 
+def test_a_task_at_the_attempt_cap_is_refused_and_its_sibling_still_lands(repo, cart, tmp_path) -> None:
+    """Two recorded attempts and a third run is refused outright, for a person to decide."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n"
+        "attempts:\n"
+        "  - {run: epic-0, phase: p1-foundations, reason: 'first refusal', ts: '2026-01-01T00:00:00+00:00'}\n"
+        "  - {run: epic-1, phase: p1-foundations, reason: 'second refusal', ts: '2026-01-02T00:00:00+00:00'}\n"
+        "---\n\nread the vendor schema\n"
+    )
+    (wi / "p1-foundations" / "t2-bench.md").write_text(
+        "---\nid: t2-bench\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: bench harness\n---\n\ntime the join\n"
+    )
+    work = workstore.read_initiative(wi)
+
+    runner = Runner({"t2-bench": new_file_patch("t2-bench.txt")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-cap")
+
+    assert not any(call["role"] in ("plan", "build") and "t1-probe" in call["prompt"] for call in runner.calls)
+
+    quarantined = {q["id"]: q for q in result["quarantined"] if q["grain"] == "task"}
+    assert set(quarantined) == {"t1-probe"}
+    reason = quarantined["t1-probe"]["reason"]
+    assert "attempt cap" in reason
+    assert "first refusal" in reason
+    assert "second refusal" in reason
+
+    assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
+    assert "epic/demo-initiative/p1-foundations--t1-probe" not in branches(repo)
+
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    assert len(item["attempts"]) == 2
+
+
+def test_a_task_with_one_recorded_attempt_still_runs(repo, cart, tmp_path) -> None:
+    """One attempt is short of the cap, so the task runs like any other."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n"
+        "attempts:\n"
+        "  - {run: epic-0, phase: p1-foundations, reason: 'first refusal', ts: '2026-01-01T00:00:00+00:00'}\n"
+        "---\n\nread the vendor schema\n"
+    )
+    work = workstore.read_initiative(wi)
+
+    runner = Runner({"t1-probe": new_file_patch("t1-probe.txt")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-one")
+
+    assert any(call["role"] == "build" and "t1-probe" in call["prompt"] for call in runner.calls)
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+    assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t1-probe", "epic/demo-initiative/p1-foundations")
+
+
 def test_a_refused_build_is_never_applied_and_never_shown_to_a_validator(repo, cart, tmp_path) -> None:
     """The saving, and the correctness, are the same change.
 
