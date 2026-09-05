@@ -158,3 +158,95 @@ def test_the_validators_see_the_patch_itself(cart) -> None:
     chunk_prompts = [c["prompt"] for c in runner.calls if c["role"] == "validate_chunk"]
     assert chunk_prompts and all("PATCH_MARKER_LINE" in p for p in chunk_prompts)
     assert all(PLANTED not in c["prompt"] for c in runner.calls), "the summary stays out"
+
+
+# ── a placeholder is not a verdict ──────────────────────────────────────────
+
+# Run 17's chunk verdict, verbatim in the fields that matter. `route status`
+# had passed charter review, survived the adversary at arbitration, and been
+# called goal-met by the phase validator. Then this arrived as the final
+# structured output, after two turns and no reads, and quarantined the task.
+PLACEHOLDER = {
+    "satisfied": False,
+    "gaps": [
+        "Need to verify status_rows' actual output keys match what render_status "
+        "reads before crediting the requirement — pending file read."
+    ],
+    "reasoning": "Placeholder pending verification via file reads; will follow up with tool calls before finalizing.",
+}
+
+# A real refusal that happens to be ABOUT a placeholder in the code. The
+# detector must not touch this: it is a finding, and the most valuable thing a
+# chunk validator says.
+REAL_REFUSAL_ABOUT_A_PLACEHOLDER = {
+    "satisfied": False,
+    "gaps": ["the request handler body is still a placeholder that raises NotImplementedError"],
+    "reasoning": "the patch leaves a placeholder where the parser should be, so the task is not done",
+}
+
+
+def test_a_placeholder_verdict_is_asked_again_rather_than_believed(cart) -> None:
+    result, runner = run(cart, {"validate_chunk": [PLACEHOLDER, CHUNK_OK], "validate_phase": PHASE_MET})
+
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 3, "two tasks, and the first one asked twice"
+
+    # The retry is the same question, plus the plain statement that it is the last.
+    assert "There is no later" in chunk_calls[1]["prompt"]
+    assert chunk_calls[1]["tier"] == chunk_calls[0]["tier"], "a retry is not a cheaper ask"
+
+    # And the answer that counts is the one that is actually a verdict.
+    assert all(v["satisfied"] for v in result["chunk_verdicts"])
+
+
+def test_a_node_that_placeholders_twice_stops_instead_of_blaming_the_task(cart) -> None:
+    """A chunk validator that will not answer refuses about itself, not the task.
+
+    The epic driver invokes this graph once for the whole phase. Raising here
+    would lose the sibling task's verdict to one task's placeholder — before
+    this graph retried, the same event quarantined one task, and a retry must
+    never make the failure larger than that.
+    """
+    result, runner = run(
+        cart,
+        {"validate_chunk": [PLACEHOLDER, PLACEHOLDER, CHUNK_OK], "validate_phase": PHASE_MET},
+    )
+
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 3, "two placeholders for one task, one real answer for the other"
+    assert sum(1 for c in chunk_calls if "t1-probe" in c["prompt"]) == 2
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t2-bench"]["satisfied"] is True, "a sibling's verdict survives another task's fault"
+    assert by_task["t1-probe"]["satisfied"] is False
+    assert "harness fault" in " ".join(by_task["t1-probe"]["gaps"])
+
+
+def test_a_refusal_about_a_placeholder_in_the_code_is_a_verdict(cart) -> None:
+    """The markers describe the author's own process, never the code under it."""
+    result, runner = run(
+        cart,
+        {"validate_chunk": REAL_REFUSAL_ABOUT_A_PLACEHOLDER, "validate_phase": PHASE_MET},
+    )
+    assert len([c for c in runner.calls if c["role"] == "validate_chunk"]) == 2, "asked once per task"
+    assert not any(v["satisfied"] for v in result["chunk_verdicts"])
+
+
+def test_the_phase_verdict_is_held_to_the_same_rule(cart) -> None:
+    stalling = {**PHASE_UNMET, "reasoning": "pending verification of the merge order; will follow up"}
+    result, runner = run(cart, {"validate_chunk": CHUNK_OK, "validate_phase": [stalling, PHASE_MET]})
+    assert len([c for c in runner.calls if c["role"] == "validate_phase"]) == 2
+    assert result["phase_verdict"]["goal_met"] is True
+
+
+def test_a_placeholdering_phase_verdict_still_raises(cart) -> None:
+    """There is nothing narrower to fall back to for the phase verdict itself.
+
+    Unlike the chunk case, a phase with no verdict is exactly what the record
+    should say happened.
+    """
+    stalling = {**PHASE_UNMET, "reasoning": "provisional verdict; will verify after reading the files"}
+    with pytest.raises(ContractViolation) as exc:
+        run(cart, {"validate_chunk": CHUNK_OK, "validate_phase": stalling})
+    assert "placeholder rather than a verdict" in str(exc.value)
+    assert "p1-foundations" in str(exc.value)
