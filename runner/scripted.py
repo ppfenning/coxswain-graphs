@@ -51,4 +51,11 @@ class ScriptedRunner:
                 + (f" (call {len(self.calls)})" if role in self._responses else "")
                 + "; scripting every node a graph runs is how a test notices the graph changed shape"
             )
-        return NodeResult(queued.pop(0) if len(queued) > 1 else queued[0])
+        # An entry may be an exception instance rather than a response, so a test
+        # can script a role that fails on a given call — a budget stop on a
+        # retry, say. Once it is the only entry left it repeats on every further
+        # call of that role, same as any other single-item entry repeats.
+        answer = queued.pop(0) if len(queued) > 1 else queued[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        return NodeResult(answer)

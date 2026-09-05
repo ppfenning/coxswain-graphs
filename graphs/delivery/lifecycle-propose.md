@@ -149,6 +149,7 @@ It is bounded three separate ways, and each stop is recorded by name:
 | `no_progress` | successive patches are ≥ 0.98 similar (`difflib.SequenceMatcher`) | Re-submitting the same diff is not a fix; it is shopping for a verdict, and eventually one reviewer says yes. The near-identical patch is never reviewed. |
 | `objection_standing` | a retry's adversary raises a claim already standing (matched case-insensitively, stripped) | Re-litigating an objection is not progress. A retry that instead ends in `approve` means the reviewers, shown the standing objections, judged them fallen. |
 | `attempts_exhausted` | `fix_attempts` additional attempts (default 2) produced no approval | A cap that can be argued with is not a cap. |
+| `budget` | a retry build's `RunnerError` carries `error_max_budget_usd` | The attempt is spent but returned no patch. `build` and `review` keep describing the last patch actually reviewed rather than lose it to an exception. |
 
 The similarity check is `difflib` — pure, no disk, no clock — so it stays inside
 the graph rather than becoming another thing the shell has to do.

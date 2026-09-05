@@ -17,8 +17,8 @@ one, so a stale patch quarantines with git's own diagnosis rather than
 slipping through.
 
 What makes a result reusable is deliberately narrow and read off the record,
-never inferred: the graph emits proposals only on an approved verdict, and a
-patch has to exist to be applied.
+never inferred: the graph emits a `draft_pr_create` proposal only on an
+approved verdict, and a patch has to exist to be applied.
 """
 
 from __future__ import annotations
@@ -37,11 +37,14 @@ def result_path(runs_dir: Path | str, run_id: str, phase: str, task: str) -> Pat
 
 
 def reusable(result: Mapping[str, Any] | None) -> bool:
-    """Pure: an approved lifecycle result with a patch to apply."""
+    """Pure: an approved lifecycle result — a `draft_pr_create` proposal — with a patch to apply."""
     if not isinstance(result, Mapping):
         return False
     patch = str((result.get("build") or {}).get("patch") or "")
-    return bool(result.get("proposals")) and bool(patch.strip()) and not result.get("stopped")
+    approved = any(
+        isinstance(p, Mapping) and p.get("kind") == "draft_pr_create" for p in result.get("proposals") or []
+    )
+    return approved and bool(patch.strip()) and not (result.get("fix_loop") or {}).get("stopped")
 
 
 def save_result(result: Mapping[str, Any], *, runs_dir: Path | str, run_id: str, phase: str, task: str) -> Path:

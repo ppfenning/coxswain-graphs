@@ -15,7 +15,17 @@ def test_anything_short_of_that_is_not() -> None:
     assert not reusable(None)
     assert not reusable({**APPROVED, "proposals": []}), "no proposals means the verdict was not approve"
     assert not reusable({**APPROVED, "build": {"patch": "   "}}), "nothing to apply"
-    assert not reusable({**APPROVED, "stopped": "attempts_exhausted"})
+    assert not reusable({**APPROVED, "fix_loop": {"stopped": "attempts_exhausted"}})
+
+
+def test_a_proposal_that_is_not_draft_pr_create_is_not_approval() -> None:
+    """`scope_epic` appends an `item_create` proposal regardless of verdict; that is not approval."""
+    assert not reusable({**APPROVED, "proposals": [{"kind": "item_create"}]})
+
+
+def test_a_budget_stopped_result_is_not_reusable_even_with_an_approved_proposal() -> None:
+    """A kept patch is still not a resumable one: `fix_loop.stopped` means the loop never reached approve."""
+    assert not reusable({**APPROVED, "fix_loop": {"attempts": 2, "stopped": "budget"}})
 
 
 def test_results_round_trip_beside_the_manifest(tmp_path) -> None:

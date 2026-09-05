@@ -12,6 +12,7 @@ import pytest
 from graphs.delivery import lifecycle_propose
 from graphs._contract import ContractViolation, review_tier
 from runner import ScriptedRunner
+from runner.protocol import RunnerError
 
 REVIEW_TIER_CONFIG = {
     "tier0_patterns": ["docs_only", "rename_only", "config_bump", "param_tweak"],
@@ -293,3 +294,36 @@ def test_an_under_evidenced_handoff_costs_one_attempt_not_the_run(cart, plan_res
     # No second opinion was invented out of the shuttle's objection.
     assert result["adversary"] is None and result["arbitration"] is None
     assert "review_charter" not in [c["role"] for c in scripted.calls]
+
+
+# ── a retry that hits the build node's dollar ceiling ───────────────────────
+
+REVISE = {"verdict": "revise",
+          "findings": [{"charter_principle": "x", "detail": "needs a test", "file": "src/a.py"}],
+          "rationale": "needs a test"}
+BUDGET_STOP = RunnerError("node 'build' failed in claude: {\"subtype\": \"error_max_budget_usd\"}")
+
+
+def test_a_budget_stop_on_a_retry_keeps_the_last_reviewed_build(cart, plan_response, build_response) -> None:
+    """The exception is swallowed; the record keeps the build that was reviewed."""
+    result, scripted = run(
+        cart, plan_response, build_response,
+        extra={"review_charter": REVISE, "build": [build_response, BUDGET_STOP]},
+    )
+    assert result["fix_loop"] == {"attempts": 2, "stopped": "budget"}
+    assert result["build"]["patch"] == build_response["patch"]
+    assert result["review"]["verdict"] == "revise"
+    assert result["proposals"] == []
+
+
+def test_a_non_budget_runner_error_on_a_retry_still_propagates(cart, plan_response, build_response) -> None:
+    """Only the dollar ceiling is swallowed. Any other failure is still a failure."""
+    other = RunnerError("node 'build' failed in claude: {\"subtype\": \"error_something_else\"}")
+    with pytest.raises(RunnerError):
+        run(cart, plan_response, build_response, extra={"review_charter": REVISE, "build": [build_response, other]})
+
+
+def test_a_budget_stop_on_the_first_build_still_propagates(cart, plan_response) -> None:
+    """There is no earlier build to keep, so the honest behaviour is to raise."""
+    with pytest.raises(RunnerError):
+        run(cart, plan_response, build_response=BUDGET_STOP)

@@ -64,7 +64,7 @@ from graphs._contract import (
     require_cartridge,
     review_tier,
 )
-from runner.protocol import NodeRunner
+from runner.protocol import NodeRunner, RunnerError
 
 __all__ = ["run", "GRAPH_NAME"]
 
@@ -308,6 +308,11 @@ def _claims(adversary: Mapping[str, Any] | None) -> set[str]:
         for objection in adversary.get("objections") or []
         if isinstance(objection, Mapping) and str(objection.get("claim") or "").strip()
     }
+
+
+def _is_budget_stop(exc: Exception) -> bool:
+    """Whether a `RunnerError` is the CLI's dollar-ceiling stop, not some other failure."""
+    return "error_max_budget_usd" in str(exc).lower()
 
 
 def _critique(
@@ -857,27 +862,38 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         standing |= _claims(adversary)
         critique = _critique(review, adversary, arbitration)
 
-        retry = runner.run(
-            role="build",
-            tier="standard",
-            thread=str(ticket),
-            schema=BUILD_SCHEMA,
-            context=context,
-            prompt=(
-                "This change was sent back. Start from the previous patch — apply it "
-                "first, then change only what the critique requires — and return a new "
-                "unified diff of the whole change.\n\n"
-                f"Ticket: {ticket_text}\nPlan: {plan}\n\n"
-                f"Previous patch (apply this first; do not redo the work it already did):\n"
-                f"{build.get('patch')}\n\n"
-                f"Standing critique:\n{critique}\n\n"
-                "Every objection above must actually fall — a patch that leaves one "
-                "of them standing is not a fix, and saying it is addressed is not the "
-                "same as addressing it. Return the patch only — it is applied by the "
-                "shell into a worktree, never by you. Include the deterministic "
-                "commands you ran and their output."
-            ),
-        )
+        try:
+            retry = runner.run(
+                role="build",
+                tier="standard",
+                thread=str(ticket),
+                schema=BUILD_SCHEMA,
+                context=context,
+                prompt=(
+                    "This change was sent back. Start from the previous patch — apply it "
+                    "first, then change only what the critique requires — and return a new "
+                    "unified diff of the whole change.\n\n"
+                    f"Ticket: {ticket_text}\nPlan: {plan}\n\n"
+                    f"Previous patch (apply this first; do not redo the work it already did):\n"
+                    f"{build.get('patch')}\n\n"
+                    f"Standing critique:\n{critique}\n\n"
+                    "Every objection above must actually fall — a patch that leaves one "
+                    "of them standing is not a fix, and saying it is addressed is not the "
+                    "same as addressing it. Return the patch only — it is applied by the "
+                    "shell into a worktree, never by you. Include the deterministic "
+                    "commands you ran and their output."
+                ),
+            )
+        except RunnerError as exc:
+            if not _is_budget_stop(exc):
+                raise
+            # The retry spent the budget without returning a patch. `build` and
+            # `review` still describe the last patch actually reviewed — that is
+            # the thing worth keeping, not an exception that loses it along with
+            # everything the run already earned.
+            attempts += 1
+            stopped = "budget"
+            break
         attempts += 1
 
         # No progress. Comparing the two patches is cheap, deterministic and

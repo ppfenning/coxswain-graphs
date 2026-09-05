@@ -296,6 +296,20 @@ required with no fallback, and the run is replayable. A driver calling the runne
 directly would have put the two judgments the phase boundary rests on outside
 every rule the rest of the system is held to.
 
+A budget stop (`error_max_budget_usd`) is a shape signal, not a ceiling to
+raise: the answer is to split the task into one file and one behaviour, on
+the order of two hundred lines, not to buy the build a bigger number. When a
+`lifecycle-propose` fix-loop retry hits it, the loop keeps the last reviewed
+build on the record rather than lose it to the exception, and marks
+`fix_loop.stopped == "budget"`. That record is not resumed automatically —
+a budget-stopped result's patch is kept on the record for whoever picks the
+task up next, but `harness/resume.py`'s `reusable` requires an approved
+`draft_pr_create` proposal and no `fix_loop.stopped`, and a budget-stopped
+result has neither, so the task still runs again from scratch on the next
+pass rather than being resumed as though it were approved. What it buys is
+the quarantine reason and the saved patch being visible to whoever picks the
+task up, in place of a run that recorded nothing at all.
+
 ## What the implementation deviates on
 
 Four places where the shipped driver is narrower or differently shaped than the
