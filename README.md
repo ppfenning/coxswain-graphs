@@ -89,6 +89,8 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 | `retro-propose` | ops | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite |
 | `coxswain` | ops | one `dispatch` node over a driver-assembled docket. Selects; the harness invokes |
 
+Each graph's diagram is generated from its own docstring by `python -m harness.graphdoc`; the committed pages live under [`docs/graphs/`](docs/graphs/index.md).
+
 ## A phased build, with no tracker
 
 ```bash
