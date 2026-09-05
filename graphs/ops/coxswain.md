@@ -1,4 +1,4 @@
-# chief-of-staff — specification
+# coxswain — specification
 
 Deferred from v0 as "a graph whose nodes dispatch other graphs" (see
 README.md). It turns out to be one node, because the hard part was never the
@@ -31,7 +31,7 @@ see "Invocation is the harness's" below.
 
 ## Dispatch is judgment; invocation is consequences
 
-Two different kinds of thing were fused in the phrase "chief-of-staff
+Two different kinds of thing were fused in the phrase "coxswain
 dispatch," and separating them is the whole design:
 
 - **Deciding what to run next is judgment.** It weighs a registry, a queue, a
@@ -48,12 +48,12 @@ dispatch," and separating them is the whole design:
   constructed args and invokes them via `harness.invoke.invoke_graphs`
   (`run_cos`), under **one run id** derived from the parent. That is the same
   nested-invocation primitive `harness/phase.py` already runs a whole phase
-  through — `phase`, chief-of-staff, and the bounded fix loop are its three
+  through — `phase`, coxswain, and the bounded fix loop are its three
   named consumers, and this is the second one to arrive.
 
 Because the dispatched graphs run under the parent run id, their proposals
 flow into the **same** policy/gate/ledger path as anything else. A
-chief-of-staff run's proposals are its children's proposals, assembled by the
+coxswain run's proposals are its children's proposals, assembled by the
 driver in invocation-id order — never wall-clock order, for the reason
 `harness/invoke.py` already gives: two runs over the same selections must
 produce the same record no matter who finished first.
@@ -85,7 +85,7 @@ that needs doing right now," and the docket, the schema, and the driver all
 say so plainly rather than manufacturing something to run.
 
 **Requires** the optional `dispatch` role. A team that has not bound it is
-told so, rather than silently getting a chief of staff that does nothing.
+told so, rather than silently getting a coxswain that does nothing.
 
-**Status:** implemented in [`chief_of_staff.py`](chief_of_staff.py) (the
+**Status:** implemented in [`coxswain.py`](coxswain.py) (the
 graph) and `harness/cos.py` (the driver).

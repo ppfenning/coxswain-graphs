@@ -131,7 +131,7 @@ staying small, enforced at the seam where it actually matters.
 | `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared state vs actual. |
 | `phase-validate` | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver. |
 | `retro-propose` | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite. |
-| `chief-of-staff` | one `dispatch` node over a driver-assembled docket. Selects; the driver invokes. |
+| `coxswain` | one `dispatch` node over a driver-assembled docket. Selects; the driver invokes. |
 
 All seven are specified in `graphs/` and implemented.
 
@@ -141,7 +141,7 @@ to the I/O edge that already owns every side effect. Results are ordered by task
 id before anything is recorded, so wall-clock order never reaches the ledger.
 The same ruling, made once in `harness/invoke.py`, governs everything that
 blocks on futures: the phase driver, the epic driver (`harness/epic.py`), and
-the chief-of-staff driver (`harness/cos.py`). None of them carries a `SPEC`,
+the coxswain driver (`harness/cos.py`). None of them carries a `SPEC`,
 and every child run records under the parent's run id.
 
 ## None of this needs a tracker

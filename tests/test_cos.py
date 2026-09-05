@@ -1,6 +1,6 @@
-"""chief-of-staff: the graph decides, `harness/cos.py` builds the docket and acts.
+"""coxswain: the graph decides, `harness/cos.py` builds the docket and acts.
 
-Two things are under test here, deliberately in one file: the `chief_of_staff`
+Two things are under test here, deliberately in one file: the `coxswain`
 graph's own refusals (an unrunnable or unknown selection, an incoherent
 idle-with-selections answer), and the driver's two functions — `assemble_docket`
 reading the intake queue and the ledger into a runnability picture, `run_cos`
@@ -14,7 +14,7 @@ import pytest
 from core.ledger import append as ledger_append
 from graphs._contract import ContractViolation
 from graphs._spec import GraphSpec
-from graphs.ops import chief_of_staff
+from graphs.ops import coxswain
 from harness import cli, cos
 from runner import ScriptedRunner
 
@@ -58,7 +58,7 @@ def cos_args(cart, docket=DOCKET, **overrides) -> dict:
 
 def test_a_runnable_selection_is_accepted(cart) -> None:
     response = {"selections": [{"graph": "retro", "why": "the ledger has rows"}], "idle": False, "reasoning": "run retro"}
-    result = chief_of_staff.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
+    result = coxswain.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
     assert result["selections"] == response["selections"]
     assert result["idle"] is False
     assert result["proposals"] == [], "the cos graph proposes nothing itself"
@@ -67,25 +67,25 @@ def test_a_runnable_selection_is_accepted(cart) -> None:
 def test_selecting_an_unrunnable_registry_entry_is_refused_by_the_graph(cart) -> None:
     response = {"selections": [{"graph": "decompose", "why": "there's an idea"}], "idle": False, "reasoning": "r"}
     with pytest.raises(ContractViolation, match="not runnable"):
-        chief_of_staff.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
+        coxswain.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
 
 
 def test_selecting_a_graph_the_docket_never_named_is_refused(cart) -> None:
     response = {"selections": [{"graph": "ghost", "why": "x"}], "idle": False, "reasoning": "r"}
     with pytest.raises(ContractViolation, match="does not name"):
-        chief_of_staff.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
+        coxswain.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
 
 
 def test_idle_true_with_selections_present_is_refused_as_incoherent(cart) -> None:
     response = {"selections": [{"graph": "retro", "why": "x"}], "idle": True, "reasoning": "r"}
     with pytest.raises(ContractViolation, match="incoherent"):
-        chief_of_staff.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
+        coxswain.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
 
 
 def test_an_empty_docket_can_legitimately_come_back_idle(cart) -> None:
     empty_docket = {"registry": [], "intake": [], "ready_tasks": [], "ledger": {"rows": 0, "agreement": None}}
     response = {"selections": [], "idle": True, "reasoning": "nothing on the docket needs doing"}
-    result = chief_of_staff.run(cos_args(cart, docket=empty_docket), ScriptedRunner({"dispatch": response}))
+    result = coxswain.run(cos_args(cart, docket=empty_docket), ScriptedRunner({"dispatch": response}))
     assert result == {
         "run_id": "r",
         "date": "2026-08-31",
@@ -98,24 +98,24 @@ def test_an_empty_docket_can_legitimately_come_back_idle(cart) -> None:
 
 def test_dispatch_runs_at_standard_tier(cart) -> None:
     scripted = ScriptedRunner({"dispatch": {"selections": [], "idle": True, "reasoning": "r"}})
-    chief_of_staff.run(cos_args(cart), scripted)
+    coxswain.run(cos_args(cart), scripted)
     assert scripted.calls[0]["role"] == "dispatch"
     assert scripted.calls[0]["tier"] == "standard"
 
 
 def test_requires_a_docket(cart) -> None:
     with pytest.raises(ContractViolation, match="args.docket is required"):
-        chief_of_staff.run({"run_id": "r", "date": "d", "cartridge": cart}, ScriptedRunner({}))
+        coxswain.run({"run_id": "r", "date": "d", "cartridge": cart}, ScriptedRunner({}))
 
 
 def test_a_team_without_the_dispatch_role_is_told_so(cartridge) -> None:
     with pytest.raises(ContractViolation, match="needs the optional role 'dispatch'"):
-        chief_of_staff.run(cos_args(cartridge), ScriptedRunner({}))
+        coxswain.run(cos_args(cartridge), ScriptedRunner({}))
 
 
 def test_refuses_without_a_cartridge() -> None:
     with pytest.raises(ContractViolation, match="cartridge"):
-        chief_of_staff.run({"run_id": "r", "date": "d", "docket": DOCKET}, ScriptedRunner({}))
+        coxswain.run({"run_id": "r", "date": "d", "docket": DOCKET}, ScriptedRunner({}))
 
 
 # ------------------------------------------------------------ assemble_docket
@@ -292,7 +292,7 @@ def test_an_idle_decision_invokes_nothing(cart) -> None:
 def test_run_cos_runs_the_cos_graph_itself_when_no_result_is_given(cart) -> None:
     empty_docket = {"registry": [], "intake": [], "ready_tasks": [], "ledger": {"rows": 0, "agreement": None}}
     runner = ScriptedRunner({"dispatch": {"selections": [], "idle": True, "reasoning": "quiet day"}})
-    specs = {"cos": chief_of_staff.SPEC}
+    specs = {"cos": coxswain.SPEC}
 
     result = cos.run_cos(
         docket=empty_docket, specs=specs, runner=runner, cartridge=cart, run_id="parent", date="d", max_parallel=1
@@ -581,7 +581,7 @@ def test_the_cos_cli_arm_resolves_runs_dir_off_the_existing_global_flag() -> Non
     # sharing one string. Parsing "cos" here proves `args.runs_dir` resolves
     # for the cos arm with no AttributeError, not just that the name is
     # present somewhere in the source.
-    parser = cli._build_parser({"cos": chief_of_staff.SPEC})
+    parser = cli._build_parser({"cos": coxswain.SPEC})
     args = parser.parse_args(["cos", "--team", "acme"])
     assert args.runs_dir is not None
 
@@ -591,7 +591,7 @@ def test_the_cos_arm_wires_runs_dir_and_the_cartridge_into_the_docket_call() -> 
     # whether or not the cos arm ever passes that value on. This exercises
     # the actual kwargs the arm hands `assemble_docket`, so it goes red if
     # the wire from `--runs-dir` (or the cartridge) to the docket ever breaks.
-    parser = cli._build_parser({"cos": chief_of_staff.SPEC})
+    parser = cli._build_parser({"cos": coxswain.SPEC})
     args = parser.parse_args(["cos", "--team", "acme", "--runs-dir", "/tmp/some-runs"])
     cart = {"intake": [{"source": "queue_dir", "path": "/tmp/intake"}]}
 

@@ -1,8 +1,8 @@
-"""The chief-of-staff driver: assembles the docket, runs dispatch, invokes what it picked.
+"""The coxswain driver: assembles the docket, runs dispatch, invokes what it picked.
 
 NOT a graph, and it must never acquire a `SPEC` — the same rule
 `harness/invoke.py` states for itself, and for the same reason.
-`graphs/ops/chief_of_staff.py` is the graph: one node, the `dispatch` role,
+`graphs/ops/coxswain.py` is the graph: one node, the `dispatch` role,
 judgment over a docket it is handed. This module is the other half — reading
 enough of the system to build that docket, and then acting on whatever the
 graph decided, through the nested-invocation primitive `harness/invoke.py`
@@ -60,7 +60,7 @@ class CosError(Exception):
     same shape of problem one layer down — a selection the graph already
     approved as runnable, but that names a graph `run_cos` does not yet know
     how to build invocation args for. Extending `_KNOWN_GRAPHS` (and the
-    branch in `run_cos` below) is how a new graph joins chief-of-staff
+    branch in `run_cos` below) is how a new graph joins coxswain
     dispatch for real, not just in the registry listing.
     """
 

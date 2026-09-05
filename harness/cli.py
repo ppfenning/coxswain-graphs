@@ -419,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
             "totals": {"ready": len(ready), "completed": len(results), "failed": len(failures)},
         }
     elif args.graph == "cos" and not getattr(args, "docket", None):
-        # The chief-of-staff driver path. With --docket the cos graph runs alone
+        # The coxswain driver path. With --docket the cos graph runs alone
         # through the generic arm below — judgment only, nothing invoked. Without
         # it, the driver assembles the docket from what is actually readable
         # (intake queue, ledger, registry), runs the dispatch graph, and invokes
@@ -450,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
                 alerts=alerts,
             )
         except (ContractViolation, RunnerError, CosError) as exc:
-            print(f"chief-of-staff failed: {exc}", file=sys.stderr)
+            print(f"coxswain failed: {exc}", file=sys.stderr)
             return 1
         for failure in cos_out["failures"]:
             print(f"dispatched run failed: {failure}", file=sys.stderr)
@@ -462,13 +462,13 @@ def main(argv: list[str] | None = None) -> int:
             picked = "nothing (at capacity)"
         else:
             picked = "nothing (idle)"
-        print(f"chief-of-staff dispatched: {picked}")
+        print(f"coxswain dispatched: {picked}")
         if deferred:
             reasons = "; ".join(f"{d['graph']} ({d['reason']})" for d in deferred)
-            print(f"chief-of-staff deferred: {reasons}")
+            print(f"coxswain deferred: {reasons}")
         if cos_out["consumed"]:
             print(f"intake consumed: {', '.join(cos_out['consumed'])}")
-        graph_name = "chief-of-staff(dispatch)"
+        graph_name = "coxswain(dispatch)"
         result = {
             "run_id": run_id,
             "date": args.date,

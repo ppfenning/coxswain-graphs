@@ -245,7 +245,7 @@ same policy, gate and ledger as everything else rather than into a side channel.
 It shipped as `harness/invoke.py`, and `run_phase` is now a thin wrapper over it.
 
 It is shared with two other pieces of deferred work: the bounded fix loop in
-`lifecycle-propose`, and the chief-of-staff dispatcher. Building it once was the
+`lifecycle-propose`, and the coxswain dispatcher. Building it once was the
 point. What this spec needed from it, specifically:
 
 - invoke a named graph from the registry with constructed args

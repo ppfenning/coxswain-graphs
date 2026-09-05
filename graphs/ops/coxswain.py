@@ -1,4 +1,4 @@
-"""chief-of-staff — dispatch is a graph; invocation is the harness's.
+"""coxswain — dispatch is a graph; invocation is the harness's.
 
     dispatch
 
@@ -41,7 +41,7 @@ from runner.protocol import NodeRunner
 
 __all__ = ["run", "GRAPH_NAME"]
 
-GRAPH_NAME = "chief-of-staff"
+GRAPH_NAME = "coxswain"
 
 DISPATCH_SCHEMA = {
     "type": "object",
@@ -83,7 +83,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     if "dispatch" not in bound:
         raise ContractViolation(
             "this graph needs the optional role 'dispatch' bound in the cartridge; "
-            "a team that has not bound it cannot run chief-of-staff dispatch"
+            "a team that has not bound it cannot run coxswain dispatch"
         )
 
     registry = list(docket.get("registry") or [])
@@ -152,7 +152,7 @@ SPEC = GraphSpec(
     name="cos",  # registry key and CLI subcommand stay `cos` this release; other repos launch `shell.py cos`
     graph_name=GRAPH_NAME,
     run=run,
-    summary="chief-of-staff dispatch: judgment over a docket the driver assembled",
+    summary="coxswain dispatch: judgment over a docket the driver assembled",
     needs=(
         Need(
             "docket",

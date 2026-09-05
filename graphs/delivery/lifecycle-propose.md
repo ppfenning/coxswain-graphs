@@ -177,7 +177,7 @@ arbitration live in this graph; verification became the harness's check arm
 (`--repo` applies the patch in a real worktree and runs `landing_areas.checks`,
 attaching machine evidence before the gate); retro is its own graph
 (`graphs/ops/retro-propose.md`); and intake is a queue directory the
-chief-of-staff driver drains (`graphs/ops/chief-of-staff.md`). The ticket still
+coxswain driver drains (`graphs/ops/coxswain.md`). The ticket still
 arrives as an argument — a graph that read a queue could not be replayed.
 Staging a draft PR is *emitted* as a `draft_pr_create` proposal and never
 executed by this graph.

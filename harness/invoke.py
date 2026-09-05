@@ -9,7 +9,7 @@ rather than in `graphs/`, where `test_portability.py` would hold it to purity
 rules it cannot satisfy and the honest fix would be to weaken the test.
 
 One primitive, three consumers. `run_phase` is the first (it is now a thin
-wrapper over this); the epic-swarm driver, the chief-of-staff dispatcher, and
+wrapper over this); the epic-swarm driver, the coxswain dispatcher, and
 the bounded fix loop are the ones still to arrive. Building it once is the
 point, so the API stays general — an id, a registry name, some args — and
 small.

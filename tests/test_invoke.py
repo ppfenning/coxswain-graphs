@@ -1,7 +1,7 @@
 """Nested invocation: graphs invoking graphs, under one run id and one order.
 
 The primitive `run_phase` now sits on, and that the swarm driver, the
-chief-of-staff dispatcher and the bounded fix loop will sit on next. Three
+coxswain dispatcher and the bounded fix loop will sit on next. Three
 things can go wrong here and none of them are loud: the fan-out quietly
 serialises, wall-clock order leaks into the record, or a malformed invocation
 set half-runs before anyone finds out. These check all three, plus the line

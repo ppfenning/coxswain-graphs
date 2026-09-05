@@ -18,7 +18,7 @@ graphs/    the programs. pure functions of (args, runner)
   delivery/   work that produces work: initiative-decompose, lifecycle-propose,
               phase-validate (the epic driver's validators)
   ops/        keeping a running system honest: triage-propose, epic-reconcile,
-              retro-propose, chief-of-staff
+              retro-propose, coxswain
 runner/    node execution: the protocol, a scripted runner, the live one
 shell.py   two-line compatibility shim; `python shell.py ...` still works
 docs/      the contract every graph must satisfy
@@ -87,7 +87,7 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 | `epic-reconcile` | ops | compare (set arithmetic) → reconcile → emit. Declared state vs actual |
 | `phase-validate` | delivery | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver |
 | `retro-propose` | ops | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite |
-| `chief-of-staff` | ops | one `dispatch` node over a driver-assembled docket. Selects; the harness invokes |
+| `coxswain` | ops | one `dispatch` node over a driver-assembled docket. Selects; the harness invokes |
 
 ## A phased build, with no tracker
 
@@ -209,10 +209,10 @@ for the working rule and
 for where the ideas came from.
 
 Everything deferred from v0 has since landed: the intake queue (a directory
-the chief-of-staff drains, `agent-cartridges/core/intake.py`), the bounded fix
+the coxswain drains, `agent-cartridges/core/intake.py`), the bounded fix
 loop (in `lifecycle-propose`, with its attempt count carried to the ledger),
 retro (`retro-propose`, which proposes only what it can cite), and the
-chief-of-staff dispatcher — a one-node graph that selects from the registry,
+coxswain dispatcher — a one-node graph that selects from the registry,
 with a driver (`harness/cos.py`) that invokes the selection through the same
 nested-invocation primitive the epic driver fans out with. What remains
 deferred is named where it is deferred: comfort level 2 (`pr_ready_flip`
@@ -258,7 +258,7 @@ measured — and unbuyable where the system would be grading itself.
 every graph. The machinery moved into `harness/` with a public API, graphs now
 register via `SPEC` instead of being enumerated, and the graphs themselves are
 namespaced by function. The rename is not cosmetic: "graph harness" used to
-conflate the program with the runtime, and the split is what a chief-of-staff
+conflate the program with the runtime, and the split is what a coxswain
 graph — a graph whose nodes dispatch other graphs — needs to exist without
 being a special case.
 
