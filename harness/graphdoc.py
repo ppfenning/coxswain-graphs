@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 
 from harness.registry import GraphSpec, discover
 
-__all__ = ["Spec", "for_graph", "mermaid", "page", "main"]
+__all__ = ["Spec", "for_graph", "main", "mermaid", "page"]
 
 
 @dataclass(frozen=True)
@@ -79,7 +80,7 @@ def mermaid(spec: Spec) -> str:
     lines.extend(
         f'    {node_id}["{name}<br/>step · {i + 1}"]' for i, (node_id, name) in enumerate(zip(ids, nodes))
     )
-    lines.extend(f"    {a} --> {b}" for a, b in zip(ids, ids[1:]))
+    lines.extend(f"    {a} --> {b}" for a, b in itertools.pairwise(ids))
     if ids:
         lines.append(f"    style {ids[0]} fill:#f96,stroke:#333,stroke-width:2px")
     return "\n".join(lines)

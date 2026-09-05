@@ -38,7 +38,7 @@ def test_a_well_formed_patch_is_passed_through_unchanged(tmp_path: Path) -> None
 def test_an_empty_patch_is_allowed_and_writes_nothing(tmp_path: Path) -> None:
     ok, _ = apply_patch("", tmp_path)
     assert ok
-    assert list(p for p in tmp_path.iterdir() if p.name != ".git") == []
+    assert [p for p in tmp_path.iterdir() if p.name != ".git"] == []
 
 
 def test_a_hunk_header_that_overcounts_by_one_still_applies(tmp_path: Path) -> None:

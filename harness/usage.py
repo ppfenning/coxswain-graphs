@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-__all__ = ["summarize", "record_usage"]
+__all__ = ["record_usage", "summarize"]
 
 
 def summarize(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -26,7 +26,7 @@ def summarize(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
     by_model: dict[str, dict[str, Any]] = {}
     for call in calls:
-        row = by_model.setdefault(str(call.get("model")), {"calls": 0, "cost_usd": 0.0, "input_total": 0, **{f: 0 for f in fields}})
+        row = by_model.setdefault(str(call.get("model")), {"calls": 0, "cost_usd": 0.0, "input_total": 0, **dict.fromkeys(fields, 0)})
         row["calls"] += 1
         row["cost_usd"] = round(row["cost_usd"] + float(call.get("cost_usd") or 0.0), 4)
         row["input_total"] += total(call)

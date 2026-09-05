@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-__all__ = ["result_path", "reusable", "save_result", "load_result"]
+__all__ = ["load_result", "result_path", "reusable", "save_result"]
 
 
 def result_path(runs_dir: Path | str, run_id: str, phase: str, task: str) -> Path:

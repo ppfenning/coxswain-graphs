@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from graphs.delivery import lifecycle_propose
 from graphs._contract import ContractViolation, review_tier
+from graphs.delivery import lifecycle_propose
 from runner import ScriptedRunner
 from runner.protocol import BudgetStop, RunnerError
 

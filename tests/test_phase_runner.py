@@ -10,9 +10,6 @@ from __future__ import annotations
 
 import threading
 import time
-
-import pytest
-
 from functools import partial
 
 from graphs.delivery import lifecycle_propose

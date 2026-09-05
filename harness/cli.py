@@ -17,17 +17,19 @@ import os
 import sys
 import uuid
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from datetime import date as date_type
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from core import ledger, workstore
 from core.cartridge import CartridgeError
 from core.manifest import build_manifest, record_run
+
 from graphs._contract import ContractViolation
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, run_checks
+from harness.digest import build_digest
 from harness.escalate import escalate_self_modification
 from harness.gate import apply_decisions, auto_apply, gate
 from harness.phase import run_phase
@@ -35,7 +37,6 @@ from harness.registry import GraphSpec, discover
 from harness.resolve import resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
 from harness.usage import record_usage
-from harness.digest import build_digest
 from harness.worktree import apply_patch, create_worktree
 from runner.protocol import RunnerError
 
@@ -227,7 +228,7 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
             "the apply arms write under (default: this repository)"
         ),
     )
-    parser.add_argument("--date", default=date_type.today().isoformat())
+    parser.add_argument("--date", default=date_type.today().isoformat())  # noqa: DTZ011 — the operator's local date is the intended default
     parser.add_argument("--run-id", default=None)
     return parser
 
@@ -609,7 +610,7 @@ def main(argv: list[str] | None = None) -> int:
             if not ok:
                 print(f"  {detail}", file=sys.stderr)
 
-    ts = datetime.now(timezone.utc).isoformat()
+    ts = datetime.now(UTC).isoformat()
     manifest = build_manifest(
         run_id=run_id,
         ts=ts,

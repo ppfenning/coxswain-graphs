@@ -20,7 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["Need", "GraphSpec"]
+__all__ = ["GraphSpec", "Need"]
 
 
 @dataclass(frozen=True)

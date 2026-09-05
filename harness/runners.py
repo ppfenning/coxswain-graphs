@@ -46,9 +46,9 @@ def build_runner(
 
     profile = load_provider_profile(provider_profile)
     if profile.get("runner") == "claude-code":
-        from runner.claude_code_runner import ClaudeCodeRunner
-
         import os
+
+        from runner.claude_code_runner import ClaudeCodeRunner
 
         return ClaudeCodeRunner(
             profile,

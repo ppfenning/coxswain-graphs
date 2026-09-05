@@ -67,9 +67,9 @@ from graphs._contract import (
     require_cartridge,
     review_tier,
 )
-from runner.protocol import BudgetStop, NodeRunner, RunnerError
+from runner.protocol import BudgetStop, NodeRunner
 
-__all__ = ["run", "GRAPH_NAME"]
+__all__ = ["GRAPH_NAME", "run"]
 
 GRAPH_NAME = "lifecycle-propose"
 

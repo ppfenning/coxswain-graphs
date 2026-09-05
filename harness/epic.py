@@ -37,27 +37,29 @@ merged in by `_Ctx.checks`.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from core import workstore
 from core.manifest import build_manifest, gate_diff, record_run
 from core.workstore import WorkStoreError, record_attempt
+
 from graphs._contract import proposal
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, repo_checks, run_checks
+from harness.digest import build_digest
 from harness.escalate import escalate_self_modification
 from harness.gate import auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
-from harness.worktree import apply_patch, create_worktree
-from harness.digest import build_digest
 from harness.resume import load_result, reusable, save_result
+from harness.worktree import apply_patch, create_worktree
 
-__all__ = ["run_epic", "phase_parents", "phase_order"]
+__all__ = ["phase_order", "phase_parents", "run_epic"]
 
 LIFECYCLE = "lifecycle"
 VALIDATE = "validate"
@@ -587,10 +589,8 @@ def _quarantine_task(
     """
     path = (by_id.get(task) or {}).get("path")
     if path:
-        try:
-            record_attempt(path, run=ctx.run_id, phase=phase, reason=reason, ts=datetime.now(timezone.utc).isoformat())
-        except (WorkStoreError, OSError):
-            pass
+        with contextlib.suppress(WorkStoreError, OSError):
+            record_attempt(path, run=ctx.run_id, phase=phase, reason=reason, ts=datetime.now(UTC).isoformat())
     return {"id": task, "phase": phase, "grain": "task", "reason": reason}
 
 
@@ -1012,7 +1012,7 @@ def _run_phase(
     }
     manifest = build_manifest(
         run_id=f"{ctx.run_id}:{phase}",
-        ts=datetime.now(timezone.utc).isoformat(),
+        ts=datetime.now(UTC).isoformat(),
         principal=PRINCIPAL,
         cartridge=ctx.cartridge,
         provider_profile=ctx.provider_profile,
