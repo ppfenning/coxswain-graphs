@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from runner.protocol import NodeResult, RunnerError
+from runner.protocol import BudgetStop, NodeResult, RunnerError
 
 __all__ = ["ClaudeCodeRunner", "TIER_EFFORT", "DEFAULT_TIER"]
 
@@ -505,7 +505,16 @@ class ClaudeCodeRunner:
             # the whole diagnosis of a build failure once; never again.
             detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
             if attempt == 2 or not _is_transient(payload):
-                raise RunnerError(f"node '{role}' failed in claude: {json.dumps(detail)[:800]}")
+                message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
+                if payload.get("subtype") == "error_max_budget_usd":
+                    raise BudgetStop(
+                        role=role,
+                        thread=thread,
+                        session=state["session"] if thread else None,
+                        spent_usd=float(payload.get("total_cost_usd") or 0.0),
+                        detail=message,
+                    )
+                raise RunnerError(message)
 
             # Keep the failed attempt's trace. The retry writes to the same
             # filename, and a transient error that leaves no record behind is

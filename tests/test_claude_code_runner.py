@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from runner import RunnerError
+from runner.protocol import BudgetStop
 from runner.claude_code_runner import ClaudeCodeRunner
 from runner.scripted import ScriptedRunner
 
@@ -610,6 +611,7 @@ REFUSED = {
     "subtype": "error_max_budget_usd",
     "result": "the session reached its budget ceiling",
     "num_turns": 24,
+    "total_cost_usd": 0.97,
 }
 OK = {"type": "result", "is_error": False, "structured_output": {"ok": True}, "total_cost_usd": 0.02, "num_turns": 3}
 
@@ -693,6 +695,42 @@ def test_an_error_about_the_work_is_not_retried(sequenced_claude, tmp_path) -> N
     with pytest.raises(RunnerError, match="error_max_budget_usd"):
         runner.run(role="build", schema=SCHEMA, prompt="build it")
     assert calls() == 1
+
+
+def test_a_budget_stop_on_a_thread_carries_the_session_and_spend(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence(REFUSED)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    with pytest.raises(BudgetStop) as exc_info:
+        runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    argv = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[0])
+    stop = exc_info.value
+    assert stop.role == "build"
+    assert stop.session == argv[argv.index("--session-id") + 1]
+    assert stop.spent_usd == 0.97
+    assert isinstance(stop, RunnerError)
+
+
+def test_a_budget_stop_without_a_thread_has_no_session(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(REFUSED)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    with pytest.raises(BudgetStop) as exc_info:
+        runner.run(role="build", schema=SCHEMA, prompt="build it")
+    assert exc_info.value.session is None
+
+
+def test_a_non_budget_error_is_a_runner_error_not_a_budget_stop(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(SAFEGUARD)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    with pytest.raises(RunnerError) as exc_info:
+        runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")
+    assert not isinstance(exc_info.value, BudgetStop)
 
 
 def test_the_failed_attempt_keeps_its_trace(sequenced_claude, tmp_path) -> None:

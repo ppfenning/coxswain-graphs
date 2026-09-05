@@ -23,11 +23,37 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["NodeRunner", "NodeResult", "RunnerError"]
+__all__ = ["NodeRunner", "NodeResult", "RunnerError", "BudgetStop"]
 
 
 class RunnerError(Exception):
     """A node could not be run, or came back with something unusable."""
+
+
+class BudgetStop(RunnerError):
+    """The CLI stopped a node on `error_max_budget_usd`, not a real failure.
+
+    The session named here still exists on disk with its whole context; a
+    later phase resumes it rather than starting the node over.
+    """
+
+    def __init__(
+        self,
+        *,
+        role: str,
+        thread: str | None,
+        session: str | None,
+        spent_usd: float,
+        detail: str,
+        partial_patch: str = "",
+    ) -> None:
+        self.role = role
+        self.thread = thread
+        self.session = session
+        self.spent_usd = spent_usd
+        self.partial_patch = partial_patch
+        self.detail = detail
+        super().__init__(detail)
 
 
 class NodeResult(dict):
