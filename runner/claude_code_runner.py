@@ -77,6 +77,20 @@ _PATCH_ROLES = frozenset({"build"})
 
 _DIFF_CMD = "git add -A && git diff --cached"
 
+
+def _capture_diff(scratch: Path) -> str:
+    """The scratch's half-written change, or "" — never a raise.
+
+    A `BudgetStop` on a threaded role leaves the scratch behind for the next
+    phase to resume into; this is what lets the stopped node hand over what it
+    had already built rather than just an apology.
+    """
+    try:
+        proc = subprocess.run(_DIFF_CMD, shell=True, capture_output=True, text=True, cwd=scratch)
+    except OSError:
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
 # Errors that are about the CALL, not about the work. The provider's own
 # safeguard classifier occasionally flags an ordinary node message — an
 # arbitration prompt quoting two reviewers reads, to a classifier, like an
@@ -347,7 +361,7 @@ class ClaudeCodeRunner:
         lines.append("</workspace>")
         return "\n".join(lines)
 
-    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None) -> list[str]:
+    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None, spent_usd: float = 0.0) -> list[str]:
         argv = [
             self.claude_bin,
             "-p",
@@ -369,7 +383,10 @@ class ClaudeCodeRunner:
         if budget is None:
             budget = self.budget_usd.get(tier)
         if budget is not None:
-            argv += ["--max-budget-usd", f"{budget:.4f}"]
+            # Resuming a stopped session may see the ceiling as covering the
+            # whole session's spend rather than this invocation's, so the
+            # fresh slice must cover at least the ceiling either way.
+            argv += ["--max-budget-usd", f"{spent_usd + budget:.4f}"]
         if system:
             argv += ["--system-prompt", system]
         for extra in (self.repo_dir, scratch):
@@ -425,13 +442,14 @@ class ClaudeCodeRunner:
     def _invoke(
         self, *, role: str, tier: str, model: str, tools: Sequence[str], schema: Mapping[str, Any], prompt: str,
         packs: Sequence[str], scratch: Path | None, patches: bool, session: Sequence[str], budget_usd: float | None = None,
+        spent_usd: float = 0.0,
     ) -> subprocess.CompletedProcess[str]:
         system = "\n\n".join(
             part for part in (self._read_context(packs), self._workspace(scratch, patches=patches), self.extra_system) if part
         )
         argv = self._argv(
             model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role,
-            session=session, budget_usd=budget_usd,
+            session=session, budget_usd=budget_usd, spent_usd=spent_usd,
         )
         try:
             return subprocess.run(
@@ -477,6 +495,7 @@ class ClaudeCodeRunner:
                 proc = self._invoke(
                     role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
+                    spent_usd=state.get("spent_usd", 0.0),
                 )
             else:
                 with self._scratch(role) as scratch:
@@ -499,6 +518,9 @@ class ClaudeCodeRunner:
                     # session behind for a `--resume` to find, so the retry
                     # must repeat the exact flags the failed attempt used.
                     state["calls"] += 1
+                    # A successful call clears any recorded stop, so a later
+                    # unrelated call on this thread is not inflated by it.
+                    state["spent_usd"] = 0.0
                 break
 
             # Name everything the CLI said about it. A bare `None` result was
@@ -507,12 +529,22 @@ class ClaudeCodeRunner:
             if attempt == 2 or not _is_transient(payload):
                 message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
                 if payload.get("subtype") == "error_max_budget_usd":
+                    spent = float(payload.get("total_cost_usd") or 0.0)
+                    partial_patch = ""
+                    if thread:
+                        # Leave `state` exactly as it was — same scratch, same
+                        # `calls` — so a later `run(..., thread=same)` resumes
+                        # this session instead of starting the node over.
+                        state["spent_usd"] = spent
+                        if state.get("scratch"):
+                            partial_patch = _capture_diff(state["scratch"])
                     raise BudgetStop(
                         role=role,
                         thread=thread,
                         session=state["session"] if thread else None,
-                        spent_usd=float(payload.get("total_cost_usd") or 0.0),
+                        spent_usd=spent,
                         detail=message,
+                        partial_patch=partial_patch,
                     )
                 raise RunnerError(message)
 

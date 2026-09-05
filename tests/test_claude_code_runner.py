@@ -723,6 +723,106 @@ def test_a_budget_stop_without_a_thread_has_no_session(sequenced_claude, tmp_pat
     assert exc_info.value.session is None
 
 
+def test_a_threaded_budget_stop_keeps_the_thread_for_a_resume(sequenced_claude, tmp_path, repo) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence(OK, REFUSED, OK)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    with pytest.raises(BudgetStop):
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+
+    assert "T" in runner._threads, "the stopped session is not discarded"
+    assert runner._threads["T"]["calls"] == 1, "the failed call never advanced the counter"
+    assert runner._threads["T"]["spent_usd"] == 0.97
+    assert Path(runner._threads["T"]["scratch"]).is_dir(), "the half-written tree is kept"
+
+    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T")
+    calls_argv = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+    sid = calls_argv[0][calls_argv[0].index("--session-id") + 1]
+    third = calls_argv[2]
+    assert third[third.index("--resume") + 1] == sid, "the next call resumes the same session"
+
+
+def test_a_resumed_thread_sends_spent_plus_the_ceiling(sequenced_claude, tmp_path, repo) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence(OK, REFUSED, OK)
+    profile = {**PROFILE, "budget_usd": {"standard": 1.0}}
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    with pytest.raises(BudgetStop):
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T")
+
+    third = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[2])
+    assert third[third.index("--max-budget-usd") + 1] == "1.9700", "0.97 spent plus the 1.00 ceiling"
+
+
+def test_an_explicit_budget_on_the_resume_is_added_to_spent_too(sequenced_claude, tmp_path, repo) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence(OK, REFUSED, OK)
+    profile = {**PROFILE, "budget_usd": {"standard": 1.0}}
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    with pytest.raises(BudgetStop):
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T", budget_usd=2.5)
+
+    third = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[2])
+    assert third[third.index("--max-budget-usd") + 1] == "3.4700", "0.97 spent plus the 2.50 override"
+
+
+def test_a_successful_resume_clears_the_recorded_spend(sequenced_claude, tmp_path, repo) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence(OK, REFUSED, OK, OK)
+    profile = {**PROFILE, "budget_usd": {"standard": 1.0}}
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    with pytest.raises(BudgetStop):
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="again", thread="T")
+
+    fourth = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[3])
+    assert fourth[fourth.index("--max-budget-usd") + 1] == "1.0000", "the reset spend leaves the plain ceiling"
+
+
+def test_a_threaded_budget_stop_carries_the_scratch_as_a_partial_patch(sequenced_claude, tmp_path, repo) -> None:
+    script, set_sequence, _ = sequenced_claude
+    script.write_text(
+        script.read_text().replace("#!/bin/sh\n", "#!/bin/sh\nprintf 'half a change\\n' > half-written.txt\n"),
+        encoding="utf-8",
+    )
+    set_sequence(REFUSED)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+
+    with pytest.raises(BudgetStop) as exc_info:
+        runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    assert "half-written.txt" in exc_info.value.partial_patch
+    assert "+half a change" in exc_info.value.partial_patch
+
+
+def test_a_threadless_budget_stop_drops_the_scratch_and_has_no_partial_patch(sequenced_claude, tmp_path, repo) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence(REFUSED)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+
+    with pytest.raises(BudgetStop) as exc_info:
+        runner.run(role="build", schema=SCHEMA, prompt="build it")
+    argv = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[0])
+    scratch = next(d for d in _add_dirs(argv) if "agent-graphs-build-" in d)
+    assert not Path(scratch).exists(), "a threadless scratch is dropped as today"
+    assert exc_info.value.partial_patch == ""
+
+
 def test_a_non_budget_error_is_a_runner_error_not_a_budget_stop(sequenced_claude, tmp_path) -> None:
     script, set_sequence, _ = sequenced_claude
     set_sequence(SAFEGUARD)
