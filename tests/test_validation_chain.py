@@ -347,3 +347,117 @@ def test_a_budget_stop_on_the_first_build_still_propagates(cart, plan_response) 
     """There is no earlier build to keep, so the honest behaviour is to raise."""
     with pytest.raises(RunnerError):
         run(cart, plan_response, build_response=BUDGET_STOP)
+
+
+# ── gating the plan competition on tier ─────────────────────────────────────
+
+PLAN_ALT = {"steps": ["a different route"], "files_expected": ["src/b.py"], "out_of_scope": ["src/a.py"]}
+CHOOSE_FIRST = {"chosen": "first", "reasoning": "a names the file the test imports", "price": "b unwritten"}
+ATTACK_PROCEED = {"verdict": "proceed", "objections": [], "strongest_objection": "none that survive"}
+
+
+def test_below_the_gate_the_competition_and_the_attack_do_not_run(cart, plan_response, build_response) -> None:
+    """A docs-only task with min_tier 1 buys neither seat, however many are bound."""
+    bind(cart, "plan_alternative", "plan_arbitrate", "plan_adversary")
+    cart["policy"]["plan_competition"] = {"min_tier": 1}
+    result, scripted = run(
+        cart, plan_response, build_response,
+        extra={"plan_alternative": PLAN_ALT, "plan_arbitrate": CHOOSE_FIRST, "plan_adversary": ATTACK_PROCEED},
+        patterns=["docs_only"],
+    )
+    called = [c["role"] for c in scripted.calls]
+    assert "plan_alternative" not in called
+    assert "plan_arbitrate" not in called
+    assert "plan_adversary" not in called
+    assert result["plan_gate"] == {"tier": 0, "min_tier": 1, "competition": False, "attack": False, "ran": False}
+    evidence = result["proposals"][0]["evidence"]
+    assert {"check": "plan gate", "output": "tier 0 vs min 1: competition skipped"} in evidence
+
+
+def test_a_dangerous_surface_clears_the_gate_and_both_seats_run(cart, plan_response, build_response) -> None:
+    bind(cart, "plan_alternative", "plan_arbitrate", "plan_adversary")
+    cart["policy"]["plan_competition"] = {"min_tier": 1}
+    result, scripted = run(
+        cart, plan_response, build_response,
+        extra={"plan_alternative": PLAN_ALT, "plan_arbitrate": CHOOSE_FIRST, "plan_adversary": ATTACK_PROCEED},
+        patterns=["docs_only"], surfaces=["schema"],
+    )
+    called = [c["role"] for c in scripted.calls]
+    assert "plan_alternative" in called
+    assert "plan_arbitrate" in called
+    assert "plan_adversary" in called
+    assert result["plan_gate"] == {"tier": 2, "min_tier": 1, "competition": True, "attack": True, "ran": True}
+    evidence = result["proposals"][0]["evidence"]
+    assert all(row["check"] != "plan gate" for row in evidence)
+
+
+def test_a_floor_of_zero_lets_a_docs_only_task_through(cart, plan_response, build_response) -> None:
+    bind(cart, "plan_alternative", "plan_arbitrate", "plan_adversary")
+    cart["policy"]["plan_competition"] = {"min_tier": 0}
+    result, scripted = run(
+        cart, plan_response, build_response,
+        extra={"plan_alternative": PLAN_ALT, "plan_arbitrate": CHOOSE_FIRST, "plan_adversary": ATTACK_PROCEED},
+        patterns=["docs_only"],
+    )
+    called = [c["role"] for c in scripted.calls]
+    assert "plan_alternative" in called
+    assert "plan_arbitrate" in called
+    assert "plan_adversary" in called
+    assert result["plan_gate"] == {"tier": 0, "min_tier": 0, "competition": True, "attack": True, "ran": True}
+
+
+def test_unbound_roles_carry_no_gate_row_and_make_no_call(cart, plan_response, build_response) -> None:
+    """No gated seat is bound at all, so the gate never had anything to skip."""
+    cart["policy"]["plan_competition"] = {"min_tier": 1}
+    result, scripted = run(cart, plan_response, build_response, patterns=["docs_only"])
+    called = [c["role"] for c in scripted.calls]
+    assert "plan_alternative" not in called
+    assert "plan_arbitrate" not in called
+    assert "plan_adversary" not in called
+    assert result["plan_gate"]["ran"] is False
+    evidence = result["proposals"][0]["evidence"]
+    assert all(row["check"] != "plan gate" for row in evidence)
+
+
+def test_a_size_based_tier0_shortcut_does_not_leak_into_the_pre_build_gate(
+    cart, plan_response, build_response
+) -> None:
+    """`review_tier`'s size shortcut reads an empty pre-build change_facts as
+    zero changed lines, which would clear `tier0_max_changed_lines` for every
+    task. The pre-build gate must not inherit that branch."""
+    cart["policy"]["review_tier"]["tier0_max_changed_lines"] = 50
+    bind(cart, "plan_alternative", "plan_arbitrate", "plan_adversary")
+    cart["policy"]["plan_competition"] = {"min_tier": 1}
+    result, scripted = run(
+        cart, plan_response, build_response,
+        extra={"plan_alternative": PLAN_ALT, "plan_arbitrate": CHOOSE_FIRST, "plan_adversary": ATTACK_PROCEED},
+    )
+    called = [c["role"] for c in scripted.calls]
+    assert "plan_alternative" in called
+    assert "plan_arbitrate" in called
+    assert "plan_adversary" in called
+    assert result["plan_gate"] == {"tier": 1, "min_tier": 1, "competition": True, "attack": True, "ran": True}
+
+
+def test_a_cartridge_with_only_the_attacker_bound_is_told_the_attack_was_skipped_not_a_competition(cart, plan_response, build_response) -> None:
+    """A team that never configured a competition must not read that one was skipped."""
+    bind(cart, "plan_adversary")
+    cart["policy"]["plan_competition"] = {"min_tier": 1}
+    result, scripted = run(
+        cart, plan_response, build_response,
+        extra={"plan_adversary": ATTACK_PROCEED},
+        patterns=["docs_only"],
+    )
+    assert "plan_adversary" not in [c["role"] for c in scripted.calls]
+    assert result["plan_gate"] == {"tier": 0, "min_tier": 1, "competition": False, "attack": False, "ran": False}
+    evidence = result["proposals"][0]["evidence"]
+    assert {"check": "plan gate", "output": "tier 0 vs min 1: plan attack skipped"} in evidence
+    assert not any(e.get("output", "").endswith("competition skipped") for e in evidence)
+
+
+def test_an_attacker_only_cartridge_above_the_gate_reports_the_attack_ran(cart, plan_response, build_response) -> None:
+    bind(cart, "plan_adversary")
+    cart["policy"]["plan_competition"] = {"min_tier": 1}
+    result, scripted = run(cart, plan_response, build_response, extra={"plan_adversary": ATTACK_PROCEED}, surfaces=["schema"])
+    assert "plan_adversary" in [c["role"] for c in scripted.calls]
+    assert result["plan_gate"] == {"tier": 2, "min_tier": 1, "competition": False, "attack": True, "ran": True}

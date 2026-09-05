@@ -20,7 +20,10 @@ An objection the adversary sustains buys one revision, and the revision goes
 back to whoever wrote the plan — the first planner on its thread, the second
 on its own, or the arbiter when the plan is a merge of both. A planner is
 never handed another planner's plan and told it is its own. Every one of
-these roles is optional; unbound means absent.
+these roles is optional; unbound means absent. Even bound, the competition and
+the attack run only when the tier read off the task's surfaces and patterns
+reaches `policy.plan_competition.min_tier` — a docs-only task does not buy a
+second planner just because a team happens to have one bound.
 
 Three convictions shape the back half of this graph.
 
@@ -428,6 +431,53 @@ def _plan_competition(
     return winner, record, author
 
 
+def _plan_tier(cartridge: Mapping[str, Any], *, surfaces: list[str], patterns: list[str]) -> int:
+    """The tier a task reads as before anyone has built anything.
+
+    Deliberately not a call into `review_tier`: a plan has no diff yet, so
+    change_facts would have to be passed in empty, and `review_tier`'s size
+    branches read an empty dict as zero changed lines in zero modules — which
+    satisfies `tier0_max_changed_lines` and `tier1_max_changed_lines` for
+    every task. A cartridge that sets `tier0_max_changed_lines` (one already
+    does, for live epics) would then read every task without a tier2 surface
+    as tier 0 before a line of code exists, silently disabling the
+    competition under any floor above 0. This reads only the two policy keys
+    a pre-build task can actually speak to — the dangerous surfaces and the
+    trivial patterns — and never reaches a size branch at all.
+
+    Note for the next reader: this graph never imports `core`, the same way
+    it never imports `shell` or `harness` — only the harness imports the
+    substrate, which is what lets CI collect this file with agent-cartridges
+    absent.
+    """
+    config = (cartridge.get("policy") or {}).get("review_tier") or {}
+    dangerous = set(config.get("tier2_surfaces") or [])
+    if dangerous & set(surfaces):
+        return 2
+    trivial = set(config.get("tier0_patterns") or [])
+    if patterns and set(patterns) <= trivial:
+        return 0
+    return 1
+
+
+def _plan_gate(
+    cartridge: Mapping[str, Any], bound: Mapping[str, Any], surfaces: list[str], patterns: list[str]
+) -> tuple[int, int, bool, bool, bool]:
+    """Whether the competition and the attack are worth their price on this task.
+
+    Returns the tier, the configured floor, whether the competition PAIR is
+    bound, whether the plan attacker is bound, and whether the floor is
+    cleared. The two seats are reported separately on purpose: a cartridge that
+    binds only the attacker never configured a competition, and must not be
+    told one was skipped. The floor comparison is made exactly once, here.
+    """
+    tier = _plan_tier(cartridge, surfaces=surfaces, patterns=patterns)
+    min_tier = int(((cartridge.get("policy") or {}).get("plan_competition") or {}).get("min_tier", 0))
+    competition_bound = "plan_alternative" in bound and "plan_arbitrate" in bound
+    attack_bound = "plan_adversary" in bound
+    return tier, min_tier, competition_bound, attack_bound, tier >= min_tier
+
+
 def _plan_attack(
     runner: NodeRunner,
     *,
@@ -764,6 +814,16 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         )
 
     bound = cartridge.get("skills") or {}
+    surfaces = list(args.get("surfaces") or [])
+    patterns = list(args.get("patterns") or [])
+    gate_tier, gate_min, competition_bound, attack_bound, compete = _plan_gate(cartridge, bound, surfaces, patterns)
+    plan_gate = {
+        "tier": gate_tier,
+        "min_tier": gate_min,
+        "competition": competition_bound and compete,
+        "attack": attack_bound and compete,
+        "ran": (competition_bound or attack_bound) and compete,
+    }
 
     # The first planner keeps the ticket's own thread; build joins it later.
     author = _Author("plan", "standard", str(ticket))
@@ -783,7 +843,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # The competition needs both halves: an alternative nobody judges is a
     # plan nobody builds, and an arbiter with one plan has nothing to decide.
     competition: dict[str, Any] | None = None
-    if "plan_alternative" in bound and "plan_arbitrate" in bound:
+    if "plan_alternative" in bound and "plan_arbitrate" in bound and compete:
         chosen_plan, competition, author = _plan_competition(
             runner, context=context, ticket=ticket_text, date=date, plan=first_plan, first=author
         )
@@ -792,7 +852,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 
     # A revision goes to whoever wrote the chosen plan, on that seat's thread.
     plan_attack: dict[str, Any] | None = None
-    if "plan_adversary" in bound:
+    if "plan_adversary" in bound and compete:
         plan, plan_attack = _plan_attack(
             runner, context=context, ticket=ticket_text, author=author, plan=chosen_plan
         )
@@ -820,8 +880,6 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     )
 
     facts = _change_facts(build)
-    surfaces = list(args.get("surfaces") or [])
-    patterns = list(args.get("patterns") or [])
     tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
 
     handoff: dict[str, Any] | None = None
@@ -956,6 +1014,23 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 target=str(ticket),
                 evidence=[
                     {"check": "review tier", "output": str(tier)},
+                    # Only when a gated seat is bound but the tier never cleared
+                    # the floor: a row that always reads "ran" is a row nobody
+                    # reads, and a row present whether or not a seat is bound
+                    # would claim a skip that was never even offered.
+                    # One row per seat that was bound and skipped, named for what
+                    # it is: a cartridge with only the attacker bound never had
+                    # a competition to skip.
+                    *(
+                        [{"check": "plan gate", "output": f"tier {gate_tier} vs min {gate_min}: competition skipped"}]
+                        if competition_bound and not compete
+                        else []
+                    ),
+                    *(
+                        [{"check": "plan gate", "output": f"tier {gate_tier} vs min {gate_min}: plan attack skipped"}]
+                        if attack_bound and not compete
+                        else []
+                    ),
                     # Only when a competition or an attack ran: a row that
                     # always reads "no competition" is a row nobody reads.
                     *(
@@ -1020,6 +1095,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "plan": dict(plan),
         "plan_competition": competition,
         "plan_attack": plan_attack,
+        "plan_gate": plan_gate,
         "build": dict(build),
         "review": dict(review),
         "change_facts": facts,

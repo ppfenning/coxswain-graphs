@@ -25,7 +25,7 @@ def test_runs_end_to_end_and_returns_the_documented_shape(
     result = lifecycle_propose.run(args(cartridge), runner(plan_response, build_response, review_response))
     assert set(result) == {
         "run_id", "date", "ticket", "scope", "review_tier", "handoff", "adversary",
-        "arbitration", "plan", "plan_competition", "plan_attack", "build", "review",
+        "arbitration", "plan", "plan_competition", "plan_attack", "plan_gate", "build", "review",
         "change_facts", "fix_loop", "proposals",
     }
 
