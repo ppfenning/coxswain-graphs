@@ -52,6 +52,7 @@ class NodeRunner(Protocol):
         prompt: str,
         context: Sequence[str] = (),
         thread: str | None = None,
+        budget_usd: float | None = None,
     ) -> NodeResult:
         """Execute one node.
 
@@ -66,5 +67,8 @@ class NodeRunner(Protocol):
         instance, and withholds it from review, which must never inherit the
         builder's reasoning. A runner may ignore it entirely; the scripted
         runner does, which is why the graphs stay replayable.
+
+        `budget_usd` is a per-call dollar ceiling that overrides the role or
+        tier one when given.
         """
         ...

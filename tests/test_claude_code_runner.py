@@ -17,6 +17,7 @@ import pytest
 
 from runner import RunnerError
 from runner.claude_code_runner import ClaudeCodeRunner
+from runner.scripted import ScriptedRunner
 
 PROFILE = {
     "profile": "fake-claude-code",
@@ -399,6 +400,22 @@ def test_no_budget_means_no_ceiling(fake_claude, tmp_path) -> None:
     assert "--max-budget-usd" not in recorded(fake_claude)["argv"]
 
 
+def test_a_call_level_budget_overrides_the_role_ceiling(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner(
+        {**PROFILE, "budget_usd": {"standard": 0.35}, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path
+    )
+    runner.run(role="build", schema=SCHEMA, prompt="go", budget_usd=2.5)
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "2.5000"
+
+
+def test_the_scripted_runner_records_the_budget_override() -> None:
+    runner = ScriptedRunner({"plan": {"ok": True}})
+    runner.run(role="plan", tier="standard", schema=SCHEMA, prompt="go", budget_usd=1.25)
+    assert runner.calls[0]["budget_usd"] == 1.25
+
+
 def test_a_profile_may_reassign_a_roles_tier(fake_claude, tmp_path) -> None:
     script, _, _ = fake_claude
     runner = ClaudeCodeRunner({**PROFILE, "tier_overrides": {"scope_epic": "cheap"}}, claude_bin=str(script), cwd=tmp_path)
@@ -713,6 +730,18 @@ def test_a_transient_failure_on_a_thread_retries_the_same_session_id(sequenced_c
     third = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()][2]
     assert "--resume" in third and "--session-id" not in third, \
         "the counter only advanced once a call actually succeeded"
+
+
+def test_a_retry_resends_the_same_budget_override(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence(SAFEGUARD, OK)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    runner.run(role="arbitrate", schema=SCHEMA, prompt="decide", budget_usd=2.5)
+    calls = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+    assert len(calls) == 2
+    assert all(argv[argv.index("--max-budget-usd") + 1] == "2.5000" for argv in calls)
 
 
 # ── the sandbox boundary is told to the node, not discovered by hitting it ──

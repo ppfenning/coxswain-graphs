@@ -347,7 +347,7 @@ class ClaudeCodeRunner:
         lines.append("</workspace>")
         return "\n".join(lines)
 
-    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = ()) -> list[str]:
+    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None) -> list[str]:
         argv = [
             self.claude_bin,
             "-p",
@@ -363,7 +363,9 @@ class ClaudeCodeRunner:
             json.dumps(dict(schema)),
             *_ISOLATION,
         ]
-        budget = self.role_budget_usd.get(role) if role is not None else None
+        budget = budget_usd
+        if budget is None:
+            budget = self.role_budget_usd.get(role) if role is not None else None
         if budget is None:
             budget = self.budget_usd.get(tier)
         if budget is not None:
@@ -422,12 +424,15 @@ class ClaudeCodeRunner:
 
     def _invoke(
         self, *, role: str, tier: str, model: str, tools: Sequence[str], schema: Mapping[str, Any], prompt: str,
-        packs: Sequence[str], scratch: Path | None, patches: bool, session: Sequence[str],
+        packs: Sequence[str], scratch: Path | None, patches: bool, session: Sequence[str], budget_usd: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         system = "\n\n".join(
             part for part in (self._read_context(packs), self._workspace(scratch, patches=patches), self.extra_system) if part
         )
-        argv = self._argv(model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role, session=session)
+        argv = self._argv(
+            model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role,
+            session=session, budget_usd=budget_usd,
+        )
         try:
             return subprocess.run(
                 argv,
@@ -453,6 +458,7 @@ class ClaudeCodeRunner:
         prompt: str,
         context: Sequence[str] = (),
         thread: str | None = None,
+        budget_usd: float | None = None,
     ) -> NodeResult:
         tier = self.tier_overrides.get(role, tier)
         model = self._model_for(tier)
@@ -470,13 +476,13 @@ class ClaudeCodeRunner:
                 session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
                 proc = self._invoke(
                     role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
-                    scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session,
+                    scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
                 )
             else:
                 with self._scratch(role) as scratch:
                     proc = self._invoke(
                         role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
-                        scratch=scratch, patches=True, session=(),
+                        scratch=scratch, patches=True, session=(), budget_usd=budget_usd,
                     )
 
             stdout = (proc.stdout or "").strip()

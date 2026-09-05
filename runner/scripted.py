@@ -42,8 +42,11 @@ class ScriptedRunner:
         prompt: str,
         context: Sequence[str] = (),
         thread: str | None = None,
+        budget_usd: float | None = None,
     ) -> NodeResult:
-        self.calls.append({"role": role, "tier": tier, "prompt": prompt, "context": list(context), "thread": thread})
+        self.calls.append(
+            {"role": role, "tier": tier, "prompt": prompt, "context": list(context), "thread": thread, "budget_usd": budget_usd}
+        )
         queued = self._responses.get(role)
         if not queued:
             raise RunnerError(
