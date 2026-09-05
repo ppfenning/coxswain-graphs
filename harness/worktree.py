@@ -5,7 +5,51 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-__all__ = ["apply_patch", "create_worktree"]
+__all__ = ["apply_patch", "create_worktree", "normalise_patch"]
+
+_TRAILING_MARKERS = ("</patch>", "</diff>", "</code>", "```")
+_MIDDLE_TAGS = ("</patch>", "</diff>", "<patch>", "<diff>")
+
+
+def normalise_patch(text: str) -> tuple[str, str | None]:
+    """Strip one trailing markup marker a structured-output builder can leak.
+
+    A build node's patch field is prose to whatever produced it, and prose
+    sometimes arrives wrapped in the tags or fences the model used to talk
+    about it — a closing `</patch>` glued to the last content line, or a
+    stray ``` fence. `git apply` does not know that convention and fails on
+    it, or worse, applies it and leaves the tag in the file. This strips
+    exactly one such marker from the end, then refuses rather than guesses
+    if markup is still present anywhere else: a tag mid-patch means the
+    whole shape is suspect, not just its last line.
+    """
+    if not text:
+        return text, None
+    rstripped = text.rstrip("\n")
+    marker = next((m for m in _TRAILING_MARKERS if rstripped.endswith(m)), None)
+    # The wrong belief this trades on: that a trailing fence or tag is always
+    # leaked markup and never content a hunk actually meant to add. It is
+    # stripped unconditionally on that belief, same shape as the doctor
+    # incident this exists for — the cost of the trade is a hunk whose true
+    # last line ends the same way, which this cannot tell from a leak.
+    body = rstripped[: -len(marker)].rstrip(" \t\n") if marker else rstripped
+    if marker and not body:
+        # A fence or tag with nothing under it is not an empty change, it is a
+        # builder that returned markup instead of a patch; letting it through
+        # would take the --allow-empty path and record "applied" over an
+        # unchanged tree.
+        return text, "builder output was markup only: no patch under the marker"
+    cleaned = body + "\n" if body else ""
+    for lineno, line in enumerate(cleaned.splitlines(), start=1):
+        # Column zero, not substring: every diff line carries a `+`, `-`, or
+        # space prefix, and every header starts with a diff keyword, so only
+        # an actual tag or fence line — never a hunk that mentions one as
+        # content — starts at column zero with `<` or a backtick fence.
+        is_tag = line.startswith("<") and line.rstrip() in _MIDDLE_TAGS
+        is_fence = line.startswith("```") and (line.rstrip() == "```" or line.startswith("```diff"))
+        if is_tag or is_fence:
+            return text, f"builder output contained markup at line {lineno}: {line}"
+    return cleaned, None
 
 
 def apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
@@ -17,6 +61,9 @@ def apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
     anywhere near a real checkout: an agent that owns a worktree can be wrong
     destructively without costing anything.
     """
+    cleaned, refusal = normalise_patch(patch)
+    if refusal is not None:
+        return False, refusal
     worktree.mkdir(parents=True, exist_ok=True)
     if not (worktree / ".git").exists():
         subprocess.run(["git", "init", "-q"], cwd=worktree, capture_output=True, text=True)
@@ -28,7 +75,7 @@ def apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
     # because git recomputes the count from the hunk body instead of
     # trusting the header. It does not relax context matching, so a hunk
     # whose content does not fit the file still fails with git's own message.
-    normalised = patch if patch.endswith("\n") or not patch else patch + "\n"
+    normalised = cleaned if cleaned.endswith("\n") or not cleaned else cleaned + "\n"
     result = subprocess.run(
         ["git", "apply", "--verbose", "--allow-empty", "--recount", "-"],
         input=normalised,

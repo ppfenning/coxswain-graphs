@@ -812,7 +812,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         prompt=(
             f"Carry out this plan and return the change as a unified diff.\n\n"
             f"Ticket: {ticket_text}\nPlan: {plan}\n\nReturn the patch only — it is applied "
-            "by the shell into a worktree, never by you. Include the deterministic "
+            "by the shell into a worktree, never by you. No tags, no fences, no trailing "
+            "markup of any kind — the text is fed to `git apply` verbatim and a stray "
+            "`</patch>` fails the checks. Include the deterministic "
             "commands you ran and their output."
         ),
     )
@@ -880,7 +882,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     "Every objection above must actually fall — a patch that leaves one "
                     "of them standing is not a fix, and saying it is addressed is not the "
                     "same as addressing it. Return the patch only — it is applied by the "
-                    "shell into a worktree, never by you. Include the deterministic "
+                    "shell into a worktree, never by you. No tags, no fences, no trailing "
+                    "markup of any kind — the text is fed to `git apply` verbatim and a "
+                    "stray `</patch>` fails the checks. Include the deterministic "
                     "commands you ran and their output."
                 ),
             )

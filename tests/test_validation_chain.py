@@ -274,6 +274,26 @@ def test_the_builder_is_sent_back_the_handoff_s_own_words(cart, plan_response, b
     assert "attach the check output" in retry
 
 
+def test_both_build_prompts_forbid_trailing_markup(cart, plan_response, build_response) -> None:
+    """A patch is fed to `git apply` verbatim; a stray `</patch>` fails the checks."""
+    bind(cart, "handoff")
+    second = {**build_response, "patch": build_response["patch"] + "+evidence\n"}
+    _, scripted = run(
+        cart, plan_response, [build_response, second],
+        extra={
+            "handoff": [
+                {"complete": False, "blocking": False, "missing": ["output of the cleanliness check"],
+                 "brief": "attach the check output"},
+                {"complete": True, "blocking": False, "missing": [], "brief": "ok"},
+            ]
+        },
+    )
+    prompts = [c["prompt"] for c in scripted.calls if c["role"] == "build"]
+    assert len(prompts) == 2
+    assert "no trailing markup" in prompts[0]
+    assert "no trailing markup" in prompts[1]
+
+
 def test_an_under_evidenced_handoff_costs_one_attempt_not_the_run(cart, plan_response, build_response) -> None:
     """It buys a build attempt out of the same bounded budget as any revise.
 
