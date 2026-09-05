@@ -121,10 +121,13 @@ class AnthropicRunner:
         prompt: str,
         context: Sequence[str] = (),
         thread: str | None = None,
+        budget_usd: float | None = None,
     ) -> NodeResult:
         # `thread` is accepted for the protocol and ignored: each call here is
         # one stateless Messages request. Carrying history would be this
         # runner's own feature, and nothing in it is needed for correctness.
+        # `budget_usd` is accepted for the protocol and ignored the same way:
+        # the Messages API has no per-call spend ceiling to hand it to.
         model = self._model_for(tier)
         # The bound skill body leads the system prompt: it is the role's craft,
         # and the context packs are the team's rules it applies them under.

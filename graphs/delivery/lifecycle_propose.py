@@ -762,6 +762,15 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # the prompt is the difference between a 10-turn plan and a 24-turn one.
     ticket_text = _ticket_text(ticket, args.get("ticket_title"), args.get("ticket_body"))
 
+    # A per-call dollar ceiling for the build role. The harness has no
+    # "float" kind (`Need` offers str, int, json_file, jsonl_file,
+    # text_or_path — see graphs/_spec.py), so a CLI-supplied value arrives as
+    # a raw string; the epic driver hands one straight off parsed YAML as a
+    # float already. Coerced once, here, rather than trusted at each site
+    # that passes it to the runner.
+    raw_build_budget_usd = args.get("build_budget_usd")
+    build_budget_usd = None if raw_build_budget_usd is None else float(raw_build_budget_usd)
+
     context = list(cartridge.get("context") or [])
     proposals: list[dict[str, Any]] = []
 
@@ -869,6 +878,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         thread=str(ticket),
         schema=BUILD_SCHEMA,
         context=context,
+        budget_usd=build_budget_usd,
         prompt=(
             f"Carry out this plan and return the change as a unified diff.\n\n"
             f"Ticket: {ticket_text}\nPlan: {plan}\n\nReturn the patch only — it is applied "
@@ -929,6 +939,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 thread=str(ticket),
                 schema=BUILD_SCHEMA,
                 context=context,
+                budget_usd=build_budget_usd,
                 prompt=(
                     "This change was sent back. Start from the previous patch — apply it "
                     "first, then change only what the critique requires — and return a new "
@@ -1065,6 +1076,15 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                         else []
                     ),
                     {"check": "changed lines", "output": str(facts["changed_lines"])},
+                    # Only when the caller overrode the build budget: a row
+                    # that always reads the default budget is a row nobody
+                    # reads, and present whether or not an override was given
+                    # would claim an override that never happened.
+                    *(
+                        [{"check": "build budget", "output": f"override ${build_budget_usd} per build call"}]
+                        if build_budget_usd is not None
+                        else []
+                    ),
                     # Normalised into the evidence shape rather than spread raw:
                     # a commands_run entry is keyed `command`, and everything
                     # downstream — the gate, the manifest — reads `check`.
@@ -1115,5 +1135,9 @@ SPEC = GraphSpec(
         Need("ticket", flag="--ticket", help="the ticket to work"),
         Need("fix_attempts", flag="--fix-attempts", kind="int", required=False,
              help="additional build attempts after the first (default 2); 0 disables the fix loop"),
+        Need("build_budget_usd", flag="--build-budget-usd", required=False,
+             help="a per-call dollar ceiling for the build role, overriding the default "
+                  "(a plain number; there is no float kind, so it arrives as a string "
+                  "and this graph coerces it)"),
     ),
 )

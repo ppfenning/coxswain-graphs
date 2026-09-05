@@ -294,6 +294,42 @@ def test_both_build_prompts_forbid_trailing_markup(cart, plan_response, build_re
     assert "no trailing markup" in prompts[1]
 
 
+def test_a_build_budget_override_reaches_both_the_first_build_and_a_retry(cart, plan_response, build_response) -> None:
+    bind(cart, "handoff")
+    second = {**build_response, "patch": build_response["patch"] + "+evidence\n"}
+    result, scripted = run(
+        cart, plan_response, [build_response, second],
+        extra={
+            "handoff": [
+                {"complete": False, "blocking": False, "missing": ["output of the cleanliness check"],
+                 "brief": "attach the check output"},
+                {"complete": True, "blocking": False, "missing": [], "brief": "ok"},
+            ]
+        },
+        build_budget_usd=2.5,
+    )
+    builds = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(builds) == 2
+    assert builds[0]["budget_usd"] == 2.5
+    assert builds[1]["budget_usd"] == 2.5
+    evidence = result["proposals"][0]["evidence"]
+    assert {"check": "build budget", "output": "override $2.5 per build call"} in evidence
+
+
+def test_a_cli_style_budget_string_is_coerced_to_a_float(cart, plan_response, build_response) -> None:
+    """The harness has no float `Need` kind; a flag value arrives as a raw string."""
+    _, scripted = run(cart, plan_response, build_response, build_budget_usd="2.5")
+    build_call = next(c for c in scripted.calls if c["role"] == "build")
+    assert build_call["budget_usd"] == 2.5
+
+
+def test_no_build_budget_override_leaves_no_evidence_row(cart, plan_response, build_response) -> None:
+    result, scripted = run(cart, plan_response, build_response)
+    assert scripted.calls[[c["role"] for c in scripted.calls].index("build")]["budget_usd"] is None
+    evidence = result["proposals"][0]["evidence"]
+    assert all(row["check"] != "build budget" for row in evidence)
+
+
 def test_an_under_evidenced_handoff_costs_one_attempt_not_the_run(cart, plan_response, build_response) -> None:
     """It buys a build attempt out of the same bounded budget as any revise.
 

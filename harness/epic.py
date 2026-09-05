@@ -680,6 +680,32 @@ def _run_phase(
                 to_run.append(task)
     record["reused_tasks"] = [str(r.get("ticket")) for r in reused]
 
+    # A task whose item asks for a build budget above the cartridge's cap
+    # never reaches the model at all — refused outright, plainly, the same
+    # way the attempt cap above is: never through `_quarantine_task`, because
+    # this is not an attempt either and must not grow the count that gates it.
+    cap = (ctx.cartridge.get("policy") or {}).get("build_budget_usd_max")
+    # Item order, not set iteration order: a set's order comes from the
+    # string hash seed, which is process environment, not a declared input,
+    # so two runs over the same items could otherwise record and print the
+    # refusals in a different order each time.
+    over_budget = [
+        task for task in to_run
+        if task.get("budget_usd") is not None and cap is not None and task["budget_usd"] > cap
+    ]
+    for task in over_budget:
+        task_id = str(task["id"])
+        quarantined.append({
+            "id": task_id, "phase": phase, "grain": "task",
+            "reason": (
+                f"budget_usd {task['budget_usd']} exceeds the cartridge cap "
+                f"build_budget_usd_max {cap} (a per build call ceiling)"
+            ),
+        })
+        print(f"  build budget: {task_id} refused (budget_usd {task['budget_usd']} > cap {cap})")
+    over_budget_ids = {str(task["id"]) for task in over_budget}
+    runnable = [task for task in to_run if str(task["id"]) not in over_budget_ids]
+
     # A task the driver quarantined before carries its reasons — and, when one
     # was saved, its last patch — into the ticket body, so the planner and the
     # builder both see what already failed and why, next to the critique.
@@ -687,11 +713,11 @@ def _run_phase(
     patches_for_attempt: dict[str, str | None] = {
         str(task["id"]): ((load_result(ctx.runs_dir, task["attempts"][-1]["run"], phase, str(task["id"])) or {})
                            .get("build") or {}).get("patch")
-        for task in to_run
+        for task in runnable
         if task.get("attempts")
     }
 
-    if to_run:
+    if runnable:
         results, _, failures = invoke_graphs(
             [
                 Invocation(
@@ -711,9 +737,10 @@ def _run_phase(
                         "surfaces": list(task.get("surfaces") or []),
                         "patterns": list(task.get("patterns") or []),
                         **({"fix_attempts": ctx.fix_attempts} if ctx.fix_attempts is not None else {}),
+                        **({"build_budget_usd": task["budget_usd"]} if task.get("budget_usd") is not None else {}),
                     },
                 )
-                for task in to_run
+                for task in runnable
             ],
             specs=ctx.specs,
             runner=ctx.runner,

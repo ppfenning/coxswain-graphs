@@ -186,9 +186,9 @@ class Runner:
     def _subject(self, prompt: str, candidates) -> str | None:
         return next((c for c in candidates if c in prompt), None)
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
         with self.lock:
-            self.calls.append({"role": role, "tier": tier, "prompt": prompt})
+            self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
 
         if role == "plan":
             return {"steps": ["do it"], "files_expected": ["x.txt"], "out_of_scope": []}
@@ -424,6 +424,27 @@ def test_a_failing_repo_declared_check_quarantines_naming_it(repo, cart, tmp_pat
     assert "configured checks failed" in reason and "false" in reason
 
 
+def test_a_build_budget_under_the_cap_reaches_the_build_call(repo, cart, tmp_path) -> None:
+    cart["policy"]["build_budget_usd_max"] = 3.0
+    work = initiative(two_phases=False)
+    next(i for i in work["items"] if i["id"] == "t1-probe")["budget_usd"] = 2.0
+    result, runner = drive(repo, cart, tmp_path, work=work)
+    build_calls = [c for c in runner.calls if c["role"] == "build" and "t1-probe" in c["prompt"]]
+    assert build_calls and build_calls[0]["budget_usd"] == 2.0
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+
+
+def test_a_build_budget_over_the_cap_is_quarantined_and_the_sibling_still_lands(repo, cart, tmp_path) -> None:
+    cart["policy"]["build_budget_usd_max"] = 3.0
+    work = initiative(two_phases=False)
+    next(i for i in work["items"] if i["id"] == "t1-probe")["budget_usd"] = 5.0
+    result, runner = drive(repo, cart, tmp_path, work=work)
+    reason = next(q["reason"] for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert "budget_usd 5.0 exceeds the cartridge cap build_budget_usd_max 3.0" in reason
+    assert not any(c["role"] == "build" and "t1-probe" in c["prompt"] for c in runner.calls)
+    assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
+
+
 def test_a_repo_without_the_file_gets_only_the_cartridges_checks(repo, cart) -> None:
     from harness.epic import _Ctx
 
@@ -524,12 +545,12 @@ def test_no_rebase_is_proposed_when_the_stack_is_still_on_its_base(repo, cart, t
 class Revising(Runner):
     """Reviews everything as `revise`, so the fix loop is the only thing running."""
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
         if role == "review_charter":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
             return {"verdict": "revise", "findings": [], "rationale": "not yet"}
-        return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context)
+        return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, budget_usd=budget_usd)
 
 
 def builds_per_task(runner) -> dict[str, int]:
@@ -645,12 +666,12 @@ class RefusedRunner(Runner):
         super().__init__(patches, **kw)
         self.refused = refused
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
         if role == "review_charter" and self.refused in prompt:
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
             return dict(REVISE)
-        return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread)
+        return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd)
 
 
 def test_a_build_the_fix_loop_refused_is_quarantined_with_the_loop_s_own_reason(repo, cart, tmp_path) -> None:
