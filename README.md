@@ -44,6 +44,12 @@ interactive; add `--assume r` (or `a`) to answer it non-interactively. Drop
 the provider profile decides which model each tier means, and names the env
 var holding the key.
 
+This repository, `agent-cartridges`, and `agent-tools` are set up together.
+The clone order, the environments, the logins, the provider profile, and the
+verify step are written once, in
+[`agent-tools/docs/getting-started.md`](https://github.com/ppfenning/agent-tools/blob/main/docs/getting-started.md),
+which walks through all three from a clean machine.
+
 ## The shape of a graph
 
 A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
