@@ -4,12 +4,14 @@ name: ci
 # the bill down: docs-only pushes do not trigger a run, a superseded run is
 # cancelled rather than finishing, and pip is cached. The suite itself takes
 # well under a second — the runner startup and the installs were the whole cost.
+# Pull requests always run regardless of which paths changed, docs-only
+# included, because the branch ruleset requires the `test` check before
+# merge and a skipped run can never satisfy it.
 on:
   push:
     branches: [main]
     paths-ignore: ['**.md', '.gitignore', 'LICENSE']
   pull_request:
-    paths-ignore: ['**.md', '.gitignore', 'LICENSE']
   workflow_dispatch:
 
 concurrency:
