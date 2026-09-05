@@ -84,6 +84,37 @@ PATCH_FOR_VALIDATION_CHARS = 120_000
 ATTEMPT_CAP = 2
 
 
+def _carry_forward(body: str, attempts: list[dict[str, Any]], patch: str | None, *, limit: int) -> str:
+    """Append a task's own quarantine history to its ticket body, as a reference.
+
+    Pure: no file, no clock. With no attempts the body is untouched — most
+    tasks have none. Otherwise the planner and the builder both see why the
+    last try was quarantined, and — when a patch was actually saved — what it
+    looked like, offered as a reference and never as an approved change.
+    """
+    if not attempts:
+        return body
+    header = (
+        "",
+        "## Previous attempts (recorded by the harness)",
+        *(f"- {a.get('run')} ({a.get('phase')}): {a.get('reason')}" for a in attempts),
+    )
+    reference = (
+        (
+            "",
+            "Reference patch from the last attempt (NOT approved — the reasons above are "
+            "why; apply what still fits, address every reason, and re-read the critique "
+            "before trusting any line of it):",
+            "```diff",
+            patch[:limit] if len(patch) <= limit else f"{patch[:limit]}\n... truncated",
+            "```",
+        )
+        if patch and patch.strip()
+        else ()
+    )
+    return "\n".join((body, *header, *reference))
+
+
 def _git(*args: str, cwd: Path | None = None) -> tuple[bool, str]:
     """Run one git command and report what happened, never what was intended."""
     proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
@@ -649,6 +680,17 @@ def _run_phase(
                 to_run.append(task)
     record["reused_tasks"] = [str(r.get("ticket")) for r in reused]
 
+    # A task the driver quarantined before carries its reasons — and, when one
+    # was saved, its last patch — into the ticket body, so the planner and the
+    # builder both see what already failed and why, next to the critique.
+    # Offered as a reference; nothing here approves it.
+    patches_for_attempt: dict[str, str | None] = {
+        str(task["id"]): ((load_result(ctx.runs_dir, task["attempts"][-1]["run"], phase, str(task["id"])) or {})
+                           .get("build") or {}).get("patch")
+        for task in to_run
+        if task.get("attempts")
+    }
+
     if to_run:
         results, _, failures = invoke_graphs(
             [
@@ -659,7 +701,12 @@ def _run_phase(
                         "date": ctx.date,
                         "ticket": task["id"],
                         "ticket_title": task.get("title") or "",
-                        "ticket_body": task.get("body") or "",
+                        "ticket_body": _carry_forward(
+                            task.get("body") or "",
+                            list(task.get("attempts") or []),
+                            patches_for_attempt.get(str(task["id"])),
+                            limit=PATCH_FOR_VALIDATION_CHARS,
+                        ),
                         "cartridge": ctx.cartridge,
                         "surfaces": list(task.get("surfaces") or []),
                         "patterns": list(task.get("patterns") or []),

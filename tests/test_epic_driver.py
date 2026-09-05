@@ -24,6 +24,7 @@ from core import ledger, workstore
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
 from harness.epic import phase_order, phase_parents, run_epic
+from harness.resume import save_result
 from runner.protocol import RunnerError
 
 SHA = "sha-fixture"
@@ -704,6 +705,69 @@ def test_a_quarantined_task_records_an_attempt_on_its_own_work_item(repo, cart, 
         assert attempt["phase"] == "p1-foundations"
         assert attempt["reason"] == entry["reason"]
         assert attempt["ts"]
+
+    # The round trip that matters: re-reading the store (not a hand-built dict)
+    # after the write, so the second run's task dicts are whatever
+    # `read_initiative` actually produces, attempts included.
+    work2 = workstore.read_initiative(wi)
+    runner2 = Runner({"t1-probe": new_file_patch("t1-probe.txt"), "t2-bench": new_file_patch("t2-bench.txt")})
+    drive(repo, cart, tmp_path, runner=runner2, work=work2, run_id="epic-attempt-2")
+
+    for task in ("t1-probe", "t2-bench"):
+        prompt = next(c["prompt"] for c in runner2.calls if c["role"] == "plan" and task in c["prompt"])
+        assert quarantined[task]["reason"] in prompt
+
+
+# ── the previous attempt's reasons and patch, carried into the ticket body ──
+
+
+def test_a_recorded_attempt_carries_its_reason_and_last_patch_into_both_prompts(repo, cart, tmp_path) -> None:
+    """What worked by hand seven times: the reference implementation and the objections, in the body."""
+    work = initiative()
+    work["items"][0]["attempts"] = [
+        {"run": "epic-0", "phase": "p1-foundations", "reason": "checks failed: state 1 failed", "ts": "t"}
+    ]
+    save_result(
+        {"ticket": "t1-probe", "build": {"patch": new_file_patch("t1-probe-old.txt", "distinctive-marker")}},
+        runs_dir=tmp_path / "runs", run_id="epic-0", phase="p1-foundations", task="t1-probe",
+    )
+
+    result, runner = drive(repo, cart, tmp_path, work=work)
+
+    for role in ("plan", "build"):
+        prompt = next(c["prompt"] for c in runner.calls if c["role"] == role and "t1-probe" in c["prompt"])
+        assert "checks failed: state 1 failed" in prompt
+        assert "distinctive-marker" in prompt
+        assert "NOT approved" in prompt
+
+    # The sibling with no attempts carries nothing.
+    sibling = next(c["prompt"] for c in runner.calls if c["role"] == "plan" and "t2-bench" in c["prompt"])
+    assert "## Previous attempts" not in sibling
+    assert "```diff" not in sibling
+
+
+def test_a_recorded_attempt_with_no_saved_result_still_carries_its_reason(repo, cart, tmp_path) -> None:
+    """A run that never got as far as a build has nothing to load — the reason still rides along."""
+    work = initiative()
+    work["items"][0]["attempts"] = [
+        {"run": "epic-missing", "phase": "p1-foundations", "reason": "the fix loop gave up: no_progress", "ts": "t"}
+    ]
+
+    result, runner = drive(repo, cart, tmp_path, work=work)
+
+    for role in ("plan", "build"):
+        prompt = next(c["prompt"] for c in runner.calls if c["role"] == role and "t1-probe" in c["prompt"])
+        assert "the fix loop gave up: no_progress" in prompt
+        assert "```diff" not in prompt
+
+
+def test_a_task_with_no_attempts_is_planned_exactly_as_before(repo, cart, tmp_path) -> None:
+    """No history to carry, so the body reaching the planner is unchanged."""
+    result, runner = drive(repo, cart, tmp_path)
+
+    prompt = next(c["prompt"] for c in runner.calls if c["role"] == "plan" and "t1-probe" in c["prompt"])
+    assert "## Previous attempts" not in prompt
+    assert "read the vendor schema" in prompt
 
 
 def test_a_task_at_the_attempt_cap_is_refused_and_its_sibling_still_lands(repo, cart, tmp_path) -> None:
