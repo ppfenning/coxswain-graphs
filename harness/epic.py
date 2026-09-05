@@ -42,6 +42,7 @@ from typing import Any
 
 from core import workstore
 from core.manifest import build_manifest, gate_diff, record_run
+from core.workstore import WorkStoreError, record_attempt
 from graphs._contract import proposal
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, run_checks
@@ -494,6 +495,31 @@ def run_epic(
     }
 
 
+def _quarantine_task(
+    ctx: _Ctx,
+    by_id: Mapping[str, dict[str, Any]],
+    *,
+    phase: str,
+    task: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Build a task's quarantine entry AND leave a record on its own work item.
+
+    The phase record is the run's memory; the item file is the task's own, so
+    the next run — which may not even resume this one — still sees why the
+    last attempt didn't land. A task built with no file behind it (as tests
+    do) or a store that refuses the write loses the item-side memory, never
+    the quarantine entry itself.
+    """
+    path = (by_id.get(task) or {}).get("path")
+    if path:
+        try:
+            record_attempt(path, run=ctx.run_id, phase=phase, reason=reason, ts=datetime.now(timezone.utc).isoformat())
+        except (WorkStoreError, OSError):
+            pass
+    return {"id": task, "phase": phase, "grain": "task", "reason": reason}
+
+
 def _run_phase(
     ctx: _Ctx,
     *,
@@ -558,6 +584,7 @@ def _run_phase(
         )
 
     ready = workstore.ready_tasks(items, phase=phase)
+    by_id = {str(item["id"]): item for item in items}
     results: list[dict[str, Any]] = []
 
     # Resume: a task whose earlier run already produced an approved patch is
@@ -604,7 +631,7 @@ def _run_phase(
         # policy `invoke_graphs` names continue-and-quarantine.
         for failure in failures:
             quarantined.append(
-                {"id": failure.split(":", 1)[0], "phase": phase, "grain": "task", "reason": failure}
+                _quarantine_task(ctx, by_id, phase=phase, task=failure.split(":", 1)[0], reason=failure)
             )
     # Every result — fresh or reused — is saved under THIS run, so the next
     # resume has one place to look and the record of what ran is complete.
@@ -612,7 +639,6 @@ def _run_phase(
     for result in results:
         save_result(result, runs_dir=ctx.runs_dir, run_id=ctx.run_id, phase=phase, task=str(result.get("ticket")))
 
-    by_id = {str(item["id"]): item for item in items}
     built: dict[str, dict[str, Any]] = {}
     surviving: list[str] = []
     escalated: set[str] = set()
@@ -639,7 +665,7 @@ def _run_phase(
                     "status": "quarantined",
                 }
             )
-            quarantined.append({"id": task, "phase": phase, "grain": "task", "reason": refused})
+            quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=refused))
             continue
 
         build = _build_task(ctx, phase=phase, task=task, result=result)
@@ -681,9 +707,7 @@ def _run_phase(
             }
         )
         if build.get("quarantine"):
-            quarantined.append(
-                {"id": task, "phase": phase, "grain": "task", "reason": build["quarantine"]}
-            )
+            quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=build["quarantine"]))
             continue
         surviving.append(task)
 
@@ -745,7 +769,7 @@ def _run_phase(
             surviving.remove(task)
             gaps = ", ".join(chunk.get("gaps") or []) or str(chunk.get("reasoning", ""))
             quarantined.append(
-                {"id": task, "phase": phase, "grain": "task", "reason": f"validate_chunk unsatisfied: {gaps}"}
+                _quarantine_task(ctx, by_id, phase=phase, task=task, reason=f"validate_chunk unsatisfied: {gaps}")
             )
             for task_record in record["task_records"]:
                 if task_record["id"] == task:

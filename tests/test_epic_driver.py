@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from core import ledger
+from core import ledger, workstore
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
 from harness.epic import phase_order, phase_parents, run_epic
@@ -611,6 +611,44 @@ def test_a_build_the_fix_loop_refused_is_quarantined_with_the_loop_s_own_reason(
     assert "no_progress" in reason, reason
     assert "validate_chunk" not in reason, reason
     assert "'revise'" in reason, reason
+
+
+def test_a_quarantined_task_records_an_attempt_on_its_own_work_item(repo, cart, tmp_path) -> None:
+    """The item file, not just the phase record, remembers the quarantine."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    (wi / "p1-foundations" / "t2-bench.md").write_text(
+        "---\nid: t2-bench\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: bench harness\n---\n\ntime the join\n"
+    )
+    work = workstore.read_initiative(wi)
+
+    # No patch scripted for t2-bench, so its build raises and it is quarantined
+    # by the `invoke_graphs` failure loop — a different call site from t1-probe's
+    # fix-loop refusal, and both tasks are file-backed so both writes are live.
+    runner = RefusedRunner({"t1-probe": new_file_patch("t1-probe.txt")}, refused="t1-probe")
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-attempt")
+
+    quarantined = {q["id"]: q for q in result["quarantined"] if q["grain"] == "task"}
+    assert set(quarantined) == {"t1-probe", "t2-bench"}
+
+    for task in ("t1-probe", "t2-bench"):
+        entry = quarantined[task]
+        assert set(entry) == {"id", "phase", "grain", "reason"}
+        item = workstore.read_item(wi / "p1-foundations" / f"{task}.md")
+        assert len(item["attempts"]) == 1
+        attempt = item["attempts"][0]
+        assert attempt["run"] == "epic-attempt"
+        assert attempt["phase"] == "p1-foundations"
+        assert attempt["reason"] == entry["reason"]
+        assert attempt["ts"]
 
 
 def test_a_refused_build_is_never_applied_and_never_shown_to_a_validator(repo, cart, tmp_path) -> None:
