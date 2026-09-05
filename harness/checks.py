@@ -7,7 +7,8 @@ same argument one step further: whether the tests pass is not something a
 review node gets to assert either. This module runs the cartridge's configured
 commands against the applied patch and turns their exit codes and output into
 evidence rows — measured, never self-reported, and attached to the proposal
-before the gate sees it.
+before the gate sees it. `repo_checks` parses a repository's own root
+`.agent-checks` file into the same `{name, cmd}` shape `run_checks` expects.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-__all__ = ["run_checks", "checks_evidence", "all_passed"]
+__all__ = ["run_checks", "checks_evidence", "all_passed", "repo_checks"]
 
 # Tokens like "12 passed", "2 failed", "1 error"/"errors", "3 skipped". Generic
 # on purpose: it reads whatever a test runner prints rather than special-casing
@@ -35,6 +36,23 @@ def _parse_counts(output: str) -> dict[str, int]:
         key = "error" if word.lower() == "errors" else word.lower()
         counts[key] = counts.get(key, 0) + int(number)
     return counts
+
+
+def repo_checks(text: str) -> list[dict]:
+    """Parse a `.agent-checks` file: one shell command per line, pure.
+
+    Blank lines and lines starting with `#` are ignored. Each surviving line,
+    stripped, becomes an entry whose `name` is its first whitespace-separated
+    word and whose `cmd` is the stripped line itself. A duplicate `cmd` keeps
+    only its first occurrence; order is otherwise preserved. Odd input
+    (`None`, or anything that is not a string) yields `[]` rather than raising
+    — a malformed file is a check that did not run, not a crash.
+    """
+    if not isinstance(text, str):
+        return []
+    lines = (stripped for stripped in (line.strip() for line in text.splitlines()) if stripped and not stripped.startswith("#"))
+    unique = dict.fromkeys(lines)  # first occurrence wins, order preserved
+    return [{"name": line.split(None, 1)[0], "cmd": line} for line in unique]
 
 
 def run_checks(

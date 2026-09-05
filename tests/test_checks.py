@@ -20,7 +20,7 @@ import textwrap
 
 import pytest
 
-from harness.checks import all_passed, checks_evidence, run_checks
+from harness.checks import all_passed, checks_evidence, repo_checks, run_checks
 from harness.worktree import apply_patch, create_worktree
 
 
@@ -243,3 +243,36 @@ def test_checks_run_against_the_applied_state_not_the_pre_patch_one(tmp_path) ->
     [result] = run_checks(worktree, checks)
     assert result["passed"] is True
     assert result["counts"] == {"passed": 1}
+
+
+def test_repo_checks_ignores_comments_and_blanks_and_keeps_order():
+    text = textwrap.dedent(
+        """
+        # a leading comment
+        pytest -q
+
+        ruff check .
+        # a trailing comment
+        """
+    )
+    assert repo_checks(text) == [
+        {"name": "pytest", "cmd": "pytest -q"},
+        {"name": "ruff", "cmd": "ruff check ."},
+    ]
+
+
+def test_repo_checks_collapses_a_duplicate_cmd_to_its_first_occurrence():
+    text = "pytest -q\nruff check .\npytest -q\n"
+    assert repo_checks(text) == [
+        {"name": "pytest", "cmd": "pytest -q"},
+        {"name": "ruff", "cmd": "ruff check ."},
+    ]
+
+
+def test_repo_checks_names_are_the_first_word():
+    assert repo_checks("mypy src/ --strict") == [{"name": "mypy", "cmd": "mypy src/ --strict"}]
+
+
+def test_repo_checks_never_raises_on_odd_input():
+    assert repo_checks("") == []
+    assert repo_checks(None) == []
