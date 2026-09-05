@@ -23,10 +23,14 @@ def apply_patch(patch: str, worktree: Path) -> tuple[bool, str]:
     # A diff that arrives through a JSON field can lose its final newline,
     # and git rejects such a patch as corrupt at its last line even though
     # every hunk is intact. Restoring the newline changes no hunk; it only
-    # lets git read the one it already has.
+    # lets git read the one it already has. --recount covers the sibling
+    # case: a hunk header whose line count is off by one still applies,
+    # because git recomputes the count from the hunk body instead of
+    # trusting the header. It does not relax context matching, so a hunk
+    # whose content does not fit the file still fails with git's own message.
     normalised = patch if patch.endswith("\n") or not patch else patch + "\n"
     result = subprocess.run(
-        ["git", "apply", "--verbose", "--allow-empty", "-"],
+        ["git", "apply", "--verbose", "--allow-empty", "--recount", "-"],
         input=normalised,
         cwd=worktree,
         capture_output=True,

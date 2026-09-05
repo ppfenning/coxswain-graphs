@@ -39,3 +39,53 @@ def test_an_empty_patch_is_allowed_and_writes_nothing(tmp_path: Path) -> None:
     ok, _ = apply_patch("", tmp_path)
     assert ok
     assert list(p for p in tmp_path.iterdir() if p.name != ".git") == []
+
+
+def test_a_hunk_header_that_overcounts_by_one_still_applies(tmp_path: Path) -> None:
+    """error: corrupt patch at <stdin>:256 twice cost an approved run its patch.
+
+    Built from a one-line modification, the shape of the incident: the final
+    hunk of a real diff overcounted, not a file-creation hunk with no context
+    to match against.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "f.txt").write_text("one\ntwo\nthree\n")
+    diff = (
+        "diff --git a/f.txt b/f.txt\n"
+        "--- a/f.txt\n"
+        "+++ b/f.txt\n"
+        "@@ -1,3 +1,3 @@\n"
+        " one\n"
+        "-two\n"
+        "+TWO\n"
+        " three\n"
+    )
+    doctored = diff.replace("@@ -1,3 +1,3 @@", "@@ -1,3 +1,4 @@")
+    assert doctored != diff
+    ok, detail = apply_patch(doctored, tmp_path)
+    assert ok, detail
+    assert (tmp_path / "f.txt").read_text() == "one\nTWO\nthree\n"
+
+
+def test_a_mismatched_context_line_still_fails_and_names_it(tmp_path: Path) -> None:
+    """A miscounted header does not buy a mismatched hunk a pass: --recount
+
+    only recomputes the header, it does not touch context matching.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "f.txt").write_text("one\ntwo\n")
+    diff = (
+        "diff --git a/f.txt b/f.txt\n"
+        "--- a/f.txt\n"
+        "+++ b/f.txt\n"
+        "@@ -1,2 +1,2 @@\n"
+        " wrong\n"
+        "-two\n"
+        "+three\n"
+    )
+    doctored = diff.replace("@@ -1,2 +1,2 @@", "@@ -1,3 +1,3 @@")
+    assert doctored != diff
+    ok, detail = apply_patch(doctored, tmp_path)
+    assert not ok
+    assert "f.txt" in detail
+    assert "does not apply" in detail
