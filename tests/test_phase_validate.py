@@ -313,7 +313,31 @@ def test_a_placeholdering_phase_verdict_still_raises(cart) -> None:
     assert "p1-foundations" in str(exc.value)
 
 
-# ── needs_evidence: a typed ask, fulfilled once ─────────────────────────────
+# ── evidence_requests: normalising the ask ──────────────────────────────────
+
+
+def test_evidence_requests_keeps_a_typed_object_as_is() -> None:
+    kept, dropped = phase_validate.evidence_requests(
+        [{"path": "core/manifest.py", "why": "confirm the sha assignment"}]
+    )
+    assert kept == [{"path": "core/manifest.py", "why": "confirm the sha assignment"}]
+    assert dropped == []
+
+
+def test_evidence_requests_reads_a_bare_string_as_a_path() -> None:
+    kept, dropped = phase_validate.evidence_requests(["core/manifest.py"])
+    assert kept == [{"path": "core/manifest.py"}]
+    assert dropped == []
+
+
+def test_evidence_requests_drops_an_entry_with_no_usable_path() -> None:
+    entry = {"why": "confirm overlay_sha comes from the same resolved-cartridge mapping"}
+    kept, dropped = phase_validate.evidence_requests([entry])
+    assert kept == []
+    assert dropped == [entry]
+
+
+# ── needs_evidence: a typed ask, fulfilled once, and never refused by the harness itself ────
 
 CHUNK_NEEDS_EVIDENCE = {
     "satisfied": False,
@@ -343,8 +367,21 @@ SECOND_STILL_ASKS = {
     "needs_evidence": ["migrations/0008_more.sql"],
 }
 
+SECOND_RULES_WITHOUT_THE_FILE = {
+    "satisfied": True,
+    "gaps": [],
+    "reasoning": "ruled on the patch alone since the file could not be supplied",
+}
 
-def test_needs_evidence_asks_once_more_with_the_file_in_context(cart, tmp_path) -> None:
+SECOND_REFUSES_ON_ITS_OWN_GAP = {
+    "satisfied": False,
+    "gaps": ["the join still drops rows with a null vendor_id"],
+    "reasoning": "the patch alone shows a real gap, evidence or not",
+}
+
+
+def test_needs_evidence_asks_once_more_with_the_file_in_the_prompt(cart, tmp_path) -> None:
+    """The follow-up carries the file's text in `prompt`, never in `context` — context entries are read as files."""
     target = tmp_path / "migrations" / "0007_add_col.sql"
     target.parent.mkdir(parents=True)
     target.write_text("ALTER TABLE vendor ADD COLUMN drift_flag boolean;\n")
@@ -356,7 +393,8 @@ def test_needs_evidence_asks_once_more_with_the_file_in_context(cart, tmp_path) 
     )
     chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
     assert len(chunk_calls) == 3, "two tasks; one of them asks a follow-up"
-    follow_up = " ".join(chunk_calls[1]["context"])
+    assert chunk_calls[1]["context"] == [], "the follow-up never smuggles prose into context"
+    follow_up = chunk_calls[1]["prompt"]
     assert "Evidence you asked for" in follow_up
     assert "ALTER TABLE vendor ADD COLUMN drift_flag boolean;" in follow_up
 
@@ -365,21 +403,42 @@ def test_needs_evidence_asks_once_more_with_the_file_in_context(cart, tmp_path) 
     assert by_task["t1-probe"]["satisfied"] is True, "the second verdict is final, as returned"
 
 
-def test_a_path_outside_the_worktree_is_refused_with_no_second_call(cart, tmp_path) -> None:
+def test_an_unreadable_needs_evidence_with_a_satisfied_second_verdict_finishes_clean(cart, tmp_path) -> None:
+    """A path the harness cannot read still gets a follow-up; it never becomes a refusal by itself."""
     result, runner = run(
         cart,
-        {"validate_chunk": CHUNK_NEEDS_EVIDENCE_OUTSIDE, "validate_phase": PHASE_MET},
+        {"validate_chunk": [CHUNK_NEEDS_EVIDENCE_OUTSIDE, SECOND_RULES_WITHOUT_THE_FILE], "validate_phase": PHASE_MET},
         worktree=tmp_path,
     )
     chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
-    assert len(chunk_calls) == 2, "one ask per task; a refusal buys no follow-up"
+    assert len(chunk_calls) == 3, "the unreadable path still buys a follow-up, not a harness-made refusal"
+    assert chunk_calls[1]["context"] == [], "the follow-up never smuggles prose into context"
+    follow_up = chunk_calls[1]["prompt"]
+    assert "../secrets.env" in follow_up and "outside the worktree" in follow_up
 
     by_task = {v["task"]: v for v in result["chunk_verdicts"]}
-    assert "evidence_supplied" not in by_task["t1-probe"]
-    assert "outside the worktree" in " ".join(by_task["t1-probe"]["gaps"])
+    assert by_task["t1-probe"] == {
+        "task": "t1-probe",
+        "satisfied": True,
+        "gaps": [],
+        "reasoning": "ruled on the patch alone since the file could not be supplied",
+        "evidence_supplied": [],
+        "evidence_unread": ["../secrets.env (outside the worktree)"],
+    }
 
 
-def test_more_than_five_requested_paths_are_truncated_to_five_and_the_rest_are_reported(cart, tmp_path) -> None:
+def test_an_unreadable_needs_evidence_with_a_refusing_second_verdict_keeps_only_its_own_gap(cart, tmp_path) -> None:
+    result, runner = run(
+        cart,
+        {"validate_chunk": [CHUNK_NEEDS_EVIDENCE_OUTSIDE, SECOND_REFUSES_ON_ITS_OWN_GAP], "validate_phase": PHASE_MET},
+        worktree=tmp_path,
+    )
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t1-probe"]["satisfied"] is False
+    assert by_task["t1-probe"]["gaps"] == ["the join still drops rows with a null vendor_id"]
+
+
+def test_more_than_five_requested_paths_are_truncated_to_five_and_named_to_the_validator(cart, tmp_path) -> None:
     names = [f"f{i}.txt" for i in range(7)]
     for name in names:
         (tmp_path / name).write_text(f"contents of {name}\n")
@@ -394,12 +453,14 @@ def test_more_than_five_requested_paths_are_truncated_to_five_and_the_rest_are_r
         {"validate_chunk": [needs_seven, CHUNK_OK], "validate_phase": PHASE_MET},
         worktree=tmp_path,
     )
-    follow_up = " ".join([c for c in runner.calls if c["role"] == "validate_chunk"][1]["context"])
+    second_call = [c for c in runner.calls if c["role"] == "validate_chunk"][1]
+    assert second_call["context"] == [], "the follow-up never smuggles prose into context"
+    follow_up = second_call["prompt"]
     assert sum(1 for name in names if f"contents of {name}" in follow_up) == 5
+    assert "f5.txt" in follow_up and "f6.txt" in follow_up and "cap" in follow_up
 
-    gaps = " ".join(next(v for v in result["chunk_verdicts"] if v["task"] == "t1-probe")["gaps"])
-    assert "f5.txt" in gaps and "f6.txt" in gaps, "the two dropped names are named, not silently gone"
-    assert "cap" in gaps
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t1-probe"]["gaps"] == [], "the overflow is named to the validator, not baked into the outcome"
 
 
 def test_a_second_needs_evidence_is_not_chased(cart, tmp_path) -> None:
@@ -409,7 +470,7 @@ def test_a_second_needs_evidence_is_not_chased(cart, tmp_path) -> None:
 
     result, runner = run(
         cart,
-        {"validate_chunk": [CHUNK_NEEDS_EVIDENCE, SECOND_STILL_ASKS], "validate_phase": PHASE_MET},
+        {"validate_chunk": [CHUNK_NEEDS_EVIDENCE, SECOND_STILL_ASKS, CHUNK_OK], "validate_phase": PHASE_MET},
         worktree=tmp_path,
     )
     chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
@@ -435,28 +496,32 @@ def test_a_satisfied_verdict_never_gets_a_second_call_even_with_needs_evidence(c
     assert len(chunk_calls) == 2, "one ask per task; satisfied needs no follow-up"
 
 
-def test_no_worktree_on_the_task_refuses_without_touching_a_reader(cart) -> None:
-    """The graph itself opens nothing; with no worktree there is nothing to ask a reader for."""
-    result, runner = run(cart, {"validate_chunk": CHUNK_NEEDS_EVIDENCE, "validate_phase": PHASE_MET})
+def test_no_worktree_on_the_task_still_gets_a_second_ask_naming_the_gap(cart) -> None:
+    """The graph itself opens nothing; with no worktree it still asks again, in the prompt, naming why."""
+    result, runner = run(cart, {"validate_chunk": [CHUNK_NEEDS_EVIDENCE, CHUNK_OK], "validate_phase": PHASE_MET})
     chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
-    assert len(chunk_calls) == 2, "one ask per task; no worktree buys no follow-up"
+    assert len(chunk_calls) == 3, "one ask per task; a request the harness cannot resolve still buys a follow-up"
+    assert chunk_calls[1]["context"] == [], "the follow-up never smuggles prose into context"
+    assert "no worktree was supplied" in chunk_calls[1]["prompt"]
 
     by_task = {v["task"]: v for v in result["chunk_verdicts"]}
-    assert "evidence_supplied" not in by_task["t1-probe"]
-    assert "no worktree was supplied" in " ".join(by_task["t1-probe"]["gaps"])
+    assert by_task["t1-probe"]["evidence_supplied"] == []
+    assert by_task["t1-probe"]["evidence_unread"] == ["migrations/0007_add_col.sql (no worktree was supplied)"]
 
 
-def test_a_worktree_with_no_reader_is_refused_not_guessed(cart, tmp_path) -> None:
-    """A worktree names where to look; without a reader the graph still reads nothing itself."""
+def test_a_worktree_with_no_reader_still_gets_a_second_ask(cart, tmp_path) -> None:
+    """A worktree names where to look; without a reader the graph still reads nothing itself, and still asks again."""
     result, runner = run(
         cart,
-        {"validate_chunk": CHUNK_NEEDS_EVIDENCE, "validate_phase": PHASE_MET},
+        {"validate_chunk": [CHUNK_NEEDS_EVIDENCE, CHUNK_OK], "validate_phase": PHASE_MET},
         worktree=tmp_path,
         reader=None,
     )
     chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
-    assert len(chunk_calls) == 2, "one ask per task; no reader buys no follow-up"
+    assert len(chunk_calls) == 3, "one ask per task; no reader still buys a follow-up"
+    assert chunk_calls[1]["context"] == [], "the follow-up never smuggles prose into context"
+    assert "no evidence reader was supplied" in chunk_calls[1]["prompt"]
 
     by_task = {v["task"]: v for v in result["chunk_verdicts"]}
-    assert "evidence_supplied" not in by_task["t1-probe"]
-    assert "no evidence reader was supplied" in " ".join(by_task["t1-probe"]["gaps"])
+    assert by_task["t1-probe"]["evidence_supplied"] == []
+    assert by_task["t1-probe"]["evidence_unread"] == ["migrations/0007_add_col.sql (no evidence reader was supplied)"]
