@@ -96,6 +96,31 @@ def test_an_empty_docket_can_legitimately_come_back_idle(cart) -> None:
     }
 
 
+def test_the_prompt_shows_the_usage_verdict_and_its_one_line_reason(cart) -> None:
+    docket = {**DOCKET, "free_slots": 0, "usage": {"verdict": "stop", "reason": "today's budget is spent"}}
+    response = {"selections": [], "idle": True, "reasoning": "usage window says stop"}
+    runner = ScriptedRunner({"dispatch": response})
+
+    coxswain.run(cos_args(cart, docket=docket), runner)
+
+    prompt = runner.calls[0]["prompt"]
+    assert "verdict=stop" in prompt
+    assert "today's budget is spent" in prompt
+
+
+def test_the_prompt_renders_a_missing_reason_as_blank_not_the_word_none(cart) -> None:
+    # DOCKET carries no `usage` key at all, so the fallback reads unmeasured
+    # with no reason — the prompt must not print the literal word 'None'.
+    response = {"selections": [], "idle": True, "reasoning": "r"}
+    runner = ScriptedRunner({"dispatch": response})
+
+    coxswain.run(cos_args(cart, docket=DOCKET), runner)
+
+    prompt = runner.calls[0]["prompt"]
+    assert "verdict=unmeasured" in prompt
+    assert "reason=None" not in prompt
+
+
 def test_dispatch_runs_at_standard_tier(cart) -> None:
     scripted = ScriptedRunner({"dispatch": {"selections": [], "idle": True, "reasoning": "r"}})
     coxswain.run(cos_args(cart), scripted)
@@ -485,6 +510,97 @@ def test_assemble_docket_ignores_everything_in_runs_dir_that_is_not_a_live_pidfi
     assert docket["free_slots"] == docket["max_in_flight"] == 3
 
 
+def test_assemble_docket_without_usage_says_unmeasured_and_behaves_as_today() -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+    )
+    assert docket["usage"] == {"verdict": "unmeasured"}
+    assert docket["free_slots"] == docket["max_in_flight"] == 3
+
+
+def test_assemble_docket_with_a_go_verdict_leaves_the_slots_alone() -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+        usage={
+            "verdict": "go",
+            "headroom_usd": 12.5,
+            "tier_ceiling": "deep",
+            "effort_ceiling": "high",
+            "reason": "plenty of headroom left",
+        },
+    )
+    assert docket["usage"] == {
+        "verdict": "go",
+        "headroom_usd": 12.5,
+        "tier_ceiling": "deep",
+        "effort_ceiling": "high",
+        "reason": "plenty of headroom left",
+    }
+    assert docket["free_slots"] == docket["max_in_flight"] == 3
+
+
+def test_assemble_docket_with_a_stop_verdict_zeroes_the_slots_and_carries_the_reason() -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+        usage={
+            "verdict": "stop",
+            "headroom_usd": 0.0,
+            "tier_ceiling": "cheap",
+            "effort_ceiling": "low",
+            "reason": "today's budget is spent",
+        },
+    )
+    assert docket["free_slots"] == 0
+    assert docket["usage"] == {
+        "verdict": "stop",
+        "headroom_usd": 0.0,
+        "tier_ceiling": "cheap",
+        "effort_ceiling": "low",
+        "reason": "today's budget is spent",
+    }
+
+
+def test_assemble_docket_folds_the_verdicts_case_before_matching_stop() -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+        usage={"verdict": "Stop", "reason": "today's budget is spent"},
+    )
+    assert docket["usage"]["verdict"] == "stop"
+    assert docket["free_slots"] == 0
+
+
+def test_assemble_docket_treats_a_verdictless_usage_payload_as_unmeasured() -> None:
+    # A payload from the cross-repository tool that is missing its own verdict
+    # (or misspells it) must not silently read as measured with a wall of
+    # `None`s standing in for a real assessment.
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+        usage={"headroom_usd": 5.0},
+    )
+    assert docket["usage"] == {"verdict": "unmeasured"}
+    assert docket["free_slots"] == docket["max_in_flight"] == 3
+
+
 def test_run_cos_invokes_only_the_free_slots_and_defers_the_rest(cart) -> None:
     retro_spec, retro_calls = _stub_spec("retro", "retro-propose")
     triage_spec, triage_calls = _stub_spec("triage", "triage-propose")
@@ -541,6 +657,65 @@ def test_run_cos_with_zero_free_slots_invokes_nothing(cart) -> None:
     assert retro_calls == []
     assert result["results"] == []
     assert result["deferred"] == [{"graph": "retro", "reason": "at capacity: 1 in flight of 1"}]
+
+
+def test_run_cos_with_a_stop_usage_verdict_defers_with_the_usage_reason_not_a_manufactured_capacity(cart) -> None:
+    retro_spec, retro_calls = _stub_spec("retro", "retro-propose")
+    specs = {"retro": retro_spec}
+
+    docket = {
+        **DOCKET,
+        "in_flight": [],
+        "max_in_flight": 3,
+        "free_slots": 0,
+        "usage": {"verdict": "stop", "reason": "today's budget is spent"},
+    }
+    cos_result = {"selections": [{"graph": "retro", "why": "a"}], "idle": False, "reasoning": "r"}
+
+    result = cos.run_cos(
+        docket=docket,
+        specs=specs,
+        runner=None,
+        cartridge=cart,
+        run_id="parent",
+        date="d",
+        max_parallel=1,
+        cos_result=cos_result,
+    )
+
+    assert retro_calls == []
+    assert result["deferred"] == [
+        {"graph": "retro", "reason": "usage window stopped dispatch: today's budget is spent"}
+    ]
+
+
+def test_run_cos_enforces_a_stop_verdict_even_on_a_docket_with_no_free_slots_key(cart) -> None:
+    # DOCKET (module-level fixture) carries no in_flight/max_in_flight/free_slots
+    # at all, the same shape `test_a_docket_missing_free_slots_...` below covers
+    # for the ordinary capacity fallback. A `usage` verdict of `stop` must win
+    # over that fallback too, not just over an explicit `free_slots` the docket
+    # happened to carry.
+    retro_spec, retro_calls = _stub_spec("retro", "retro-propose")
+    specs = {"retro": retro_spec}
+
+    docket = {**DOCKET, "usage": {"verdict": "stop", "reason": "today's budget is spent"}}
+    cos_result = {"selections": [{"graph": "retro", "why": "a"}], "idle": False, "reasoning": "r"}
+
+    result = cos.run_cos(
+        docket=docket,
+        specs=specs,
+        runner=None,
+        cartridge=cart,
+        run_id="parent",
+        date="d",
+        max_parallel=1,
+        cos_result=cos_result,
+    )
+
+    assert retro_calls == []
+    assert result["deferred"] == [
+        {"graph": "retro", "reason": "usage window stopped dispatch: today's budget is spent"}
+    ]
 
 
 def test_a_docket_missing_free_slots_falls_back_to_the_cartridges_bound_not_uncapped(cart) -> None:

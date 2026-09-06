@@ -117,6 +117,43 @@ def _free_slots(max_in_flight: int, in_flight: Sequence[Mapping[str, Any]]) -> i
     return max(0, max_in_flight - alive)
 
 
+def _usage_block(usage: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The docket's view of the usage window gatherer's Assessment.
+
+    No usage at all, or a payload whose own verdict is missing or not one of
+    'stop'/'go' (case-folded), reads as 'unmeasured' — never as a half-built
+    dict of `None`s that could pass for something actually measured.
+    """
+    verdict = str((usage or {}).get("verdict") or "").strip().lower()
+    if verdict not in {"stop", "go"}:
+        return {"verdict": "unmeasured"}
+    return {
+        "verdict": verdict,
+        "headroom_usd": usage.get("headroom_usd"),
+        "tier_ceiling": usage.get("tier_ceiling"),
+        "effort_ceiling": usage.get("effort_ceiling"),
+        "reason": usage.get("reason"),
+    }
+
+
+def _usage_stops(usage_block: Mapping[str, Any]) -> bool:
+    """Whether the usage window's verdict is the one that means dispatch nothing at all.
+
+    The single place either caller who needs to know asks — `assemble_docket`
+    computing the docket's own `free_slots`, `run_cos` enforcing the same rule
+    against a docket it did not necessarily build itself — so the two can
+    never drift onto two different spellings of 'stop'.
+    """
+    return usage_block.get("verdict") == "stop"
+
+
+def _gated_free_slots(
+    max_in_flight: int, in_flight: Sequence[Mapping[str, Any]], usage_block: Mapping[str, Any]
+) -> int:
+    """`_free_slots`, floored to zero the instant the usage window says stop."""
+    return 0 if _usage_stops(usage_block) else _free_slots(max_in_flight, in_flight)
+
+
 def assemble_docket(
     *,
     specs: Mapping[str, GraphSpec],
@@ -125,6 +162,7 @@ def assemble_docket(
     alerts_present: bool,
     cartridge: Mapping[str, Any] | None = None,
     runs_dir: Path | str | None = None,
+    usage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read what is on hand, and mark each registered graph runnable or not.
 
@@ -148,6 +186,14 @@ def assemble_docket(
     say how many of `policy.dispatch.max_in_flight` (default 3, off the
     cartridge) are actually free. Without `runs_dir` there is nothing to
     glob, so `in_flight` is empty and every slot reads free.
+
+    `usage`, when given, is the usage window gatherer's Assessment (the JSON
+    `cox usage assess --json` prints, from the separate `coxswain-tools`
+    repository) — a `stop` verdict zeroes `free_slots` outright, on top of
+    whatever `in_flight` already occupied, and the docket carries the block
+    verbatim as `usage` so a caller can say why. Omitted, or shaped without a
+    recognised verdict, it reads as `{"verdict": "unmeasured"}` and changes
+    nothing about today's slot arithmetic.
     """
     intake_items = read_queue(intake_root) if intake_root is not None else []
     ledger_rows = read_ledger(ledger_path) if ledger_path is not None else ()
@@ -161,7 +207,8 @@ def assemble_docket(
         if runs_dir is not None
         else []
     )
-    free_slots = _free_slots(max_in_flight, in_flight)
+    usage_block = _usage_block(usage)
+    free_slots = _gated_free_slots(max_in_flight, in_flight, usage_block)
 
     clean = sum(1 for row in ledger_rows if row.get("outcome") == "clean")
     reversal = sum(1 for row in ledger_rows if row.get("outcome") == "reversal")
@@ -190,6 +237,7 @@ def assemble_docket(
         "in_flight": in_flight,
         "max_in_flight": max_in_flight,
         "free_slots": free_slots,
+        "usage": usage_block,
     }
 
 
@@ -224,8 +272,10 @@ def run_cos(
 
     Only the docket's `free_slots` selections, in the order given, are
     invoked — returned as `invoked`, alongside `selections` in full — and the
-    rest come back as `deferred`, each with a reason naming how many runs are
-    already in flight against the bound. This is a floor under the dispatch
+    rest come back as `deferred`, each with a reason naming why: how many
+    runs are already in flight against the bound, or, when the docket's
+    `usage` verdict is `stop`, the usage window's own one-line reason rather
+    than a manufactured capacity count. This is a floor under the dispatch
     skill's own "fill only the free slots" rule, not a substitute for it. A
     caller reporting what ran reads `invoked` rather than re-deriving it from
     `selections` and `deferred`, which would just be this same slice done
@@ -246,24 +296,35 @@ def run_cos(
     # dispatch uncapped. It falls back to the cartridge's own bound with
     # nothing presumed already running, the same floor `assemble_docket`
     # would compute given an empty `runs_dir`; the cap never disappears just
-    # because the docket that carried it did.
+    # because the docket that carried it did. A `usage` verdict of `stop`
+    # overrides that fallback (and any `free_slots` the docket did carry) the
+    # same way `assemble_docket` gates its own — the rule is `_usage_stops`,
+    # shared rather than re-spelled here, so the two can never disagree about
+    # what 'stop' means.
+    usage_block = docket.get("usage") or {}
     in_flight = docket.get("in_flight")
     max_in_flight = (
         docket.get("max_in_flight") if docket.get("max_in_flight") is not None else _max_in_flight(cartridge)
     )
     free_slots = (
-        docket.get("free_slots")
-        if docket.get("free_slots") is not None
-        else _free_slots(max_in_flight, in_flight or [])
+        0
+        if _usage_stops(usage_block)
+        else (
+            docket.get("free_slots")
+            if docket.get("free_slots") is not None
+            else _free_slots(max_in_flight, in_flight or [])
+        )
     )
 
     allowed = selections[:free_slots]
     held_back = selections[free_slots:]
     alive_count = sum(1 for row in (in_flight or []) if row.get("alive"))
-    deferred = [
-        {"graph": str(selection.get("graph")), "reason": f"at capacity: {alive_count} in flight of {max_in_flight}"}
-        for selection in held_back
-    ]
+    deferral_reason = (
+        f"usage window stopped dispatch: {usage_block.get('reason')}"
+        if _usage_stops(usage_block)
+        else f"at capacity: {alive_count} in flight of {max_in_flight}"
+    )
+    deferred = [{"graph": str(selection.get("graph")), "reason": deferral_reason} for selection in held_back]
 
     invocations: list[Invocation] = []
     decompose_queue = list(intake_items)
