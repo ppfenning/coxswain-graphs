@@ -19,7 +19,18 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-__all__ = ["all_passed", "checks_evidence", "repo_checks", "run_checks"]
+__all__ = [
+    "HARNESS_FAULT_PREFIX",
+    "all_passed",
+    "check_outcome",
+    "checks_evidence",
+    "is_harness_fault",
+    "quarantine_reason",
+    "repo_checks",
+    "run_checks",
+]
+
+HARNESS_FAULT_PREFIX = "harness fault:"
 
 # Tokens like "12 passed", "2 failed", "1 error"/"errors", "3 skipped". Generic
 # on purpose: it reads whatever a test runner prints rather than special-casing
@@ -27,6 +38,8 @@ __all__ = ["all_passed", "checks_evidence", "repo_checks", "run_checks"]
 _COUNT_RE = re.compile(r"(\d+)\s+(passed|failed|error|errors|skipped)\b", re.IGNORECASE)
 
 _TAIL_CHARS = 2000
+_TAIL_LINES = 20
+_TRUNCATION_MARKER = f"... [truncated to last {_TAIL_LINES} lines]"
 
 
 def _parse_counts(output: str) -> dict[str, int]:
@@ -36,6 +49,19 @@ def _parse_counts(output: str) -> dict[str, int]:
         key = "error" if word.lower() == "errors" else word.lower()
         counts[key] = counts.get(key, 0) + int(number)
     return counts
+
+
+def _tail_lines(text: str, n: int = _TAIL_LINES) -> str:
+    lines = text.splitlines()
+    if len(lines) <= n:
+        return text
+    return "\n".join([_TRUNCATION_MARKER, *lines[-n:]])
+
+
+def check_outcome(returncode: int | None, error: str | None) -> str:
+    if error is not None:
+        return "unrunnable"
+    return "passed" if returncode == 0 else "failed"
 
 
 def repo_checks(text: str) -> list[dict]:
@@ -94,9 +120,26 @@ def run_checks(
                     "name": name,
                     "cmd": cmd,
                     "passed": False,
+                    "outcome": "failed",
+                    "error": None,
                     "exit_code": None,
                     "counts": _parse_counts(partial),
                     "output_tail": (partial + f"\n[timed out after {timeout}s]")[-_TAIL_CHARS:],
+                }
+            )
+            continue
+        except (FileNotFoundError, OSError) as exc:
+            error = str(exc)
+            results.append(
+                {
+                    "name": name,
+                    "cmd": cmd,
+                    "passed": False,
+                    "outcome": check_outcome(None, error),
+                    "error": error,
+                    "exit_code": None,
+                    "counts": {},
+                    "output_tail": "",
                 }
             )
             continue
@@ -107,6 +150,8 @@ def run_checks(
                 "name": name,
                 "cmd": cmd,
                 "passed": proc.returncode == 0,
+                "outcome": check_outcome(proc.returncode, None),
+                "error": None,
                 "exit_code": proc.returncode,
                 "counts": _parse_counts(combined),
                 "output_tail": combined[-_TAIL_CHARS:],
@@ -129,14 +174,28 @@ def checks_evidence(results: Sequence[Mapping[str, Any]]) -> list[dict[str, str]
         counted = ", ".join(f"{v} {k}" for k, v in counts.items())
         verdict = "pass" if result.get("passed") else "FAIL"
         detail = f"{counted} " if counted else ""
-        rows.append(
-            {
-                "check": f"checks:{result['name']}",
-                "output": f"{verdict} — {detail}(exit {result.get('exit_code')})",
-            }
-        )
+        summary = f"{verdict} — {detail}(exit {result.get('exit_code')})"
+        tail = f"\ncmd: {result.get('cmd')}\n{_tail_lines(result.get('output_tail') or '')}"
+        carries_tail = not result.get("passed") and result.get("outcome") != "unrunnable"
+        output = summary + tail if carries_tail else summary
+        rows.append({"check": f"checks:{result['name']}", "output": output})
     return rows
 
 
 def all_passed(results: Sequence[Mapping[str, Any]]) -> bool:
     return all(r.get("passed") for r in results)
+
+
+def is_harness_fault(reason: str) -> bool:
+    return reason.startswith(HARNESS_FAULT_PREFIX)
+
+
+def quarantine_reason(results: Sequence[Mapping[str, Any]]) -> str | None:
+    if all_passed(results):
+        return None
+    real_failures = [r for r in results if not r.get("passed") and r.get("outcome") != "unrunnable"]
+    if not real_failures:
+        unrunnable = next(r for r in results if r.get("outcome") == "unrunnable")
+        return f"{HARNESS_FAULT_PREFIX} check '{unrunnable['name']}' could not run: {unrunnable.get('error')}"
+    failed = ", ".join(r["name"] for r in results if not r.get("passed"))
+    return f"configured checks failed: {failed} — see evidence"

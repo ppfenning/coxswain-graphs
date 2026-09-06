@@ -20,7 +20,15 @@ import textwrap
 
 import pytest
 
-from harness.checks import all_passed, checks_evidence, repo_checks, run_checks
+from harness.checks import (
+    all_passed,
+    check_outcome,
+    checks_evidence,
+    is_harness_fault,
+    quarantine_reason,
+    repo_checks,
+    run_checks,
+)
 from harness.worktree import apply_patch, create_worktree
 
 
@@ -71,6 +79,7 @@ def test_run_checks_passing_cmd_reports_counts_and_passed(tmp_path) -> None:
     assert result["exit_code"] == 0
     assert result["counts"] == {"passed": 3}
     assert result["name"] == "tests"
+    assert result["outcome"] == "passed"
 
 
 def test_run_checks_failing_cmd_reports_both_counts_and_failure(tmp_path) -> None:
@@ -85,6 +94,17 @@ def test_run_checks_failing_cmd_reports_both_counts_and_failure(tmp_path) -> Non
     assert result["passed"] is False
     assert result["exit_code"] == 1
     assert result["counts"] == {"failed": 1, "passed": 2}
+    assert result["outcome"] == "failed"
+
+
+def test_run_checks_unrunnable_cmd_is_a_harness_fault_not_a_failure(tmp_path) -> None:
+    missing = tmp_path / "no-such-worktree"
+    checks = [{"name": "ghost", "cmd": "true"}]
+    [result] = run_checks(missing, checks)
+    assert result["outcome"] == check_outcome(result["exit_code"], result["error"])
+    assert result["outcome"] == "unrunnable"
+    assert result["exit_code"] is None
+    assert "no-such-worktree" in result["error"]
 
 
 def test_run_checks_no_counts_in_output_is_empty_not_invented(tmp_path) -> None:
@@ -123,6 +143,23 @@ def test_run_checks_output_tail_is_bounded(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# check_outcome
+# ---------------------------------------------------------------------------
+
+
+def test_check_outcome_is_passed_on_a_zero_return_with_no_error() -> None:
+    assert check_outcome(0, None) == "passed"
+
+
+def test_check_outcome_is_failed_on_a_nonzero_return_with_no_error() -> None:
+    assert check_outcome(1, None) == "failed"
+
+
+def test_check_outcome_is_unrunnable_when_an_error_is_present() -> None:
+    assert check_outcome(None, "No such file or directory") == "unrunnable"
+
+
+# ---------------------------------------------------------------------------
 # checks_evidence
 # ---------------------------------------------------------------------------
 
@@ -151,10 +188,107 @@ def test_checks_evidence_exit_code_present_even_with_no_counts() -> None:
     assert "exit 0" in row["output"]
 
 
+def test_checks_evidence_failure_carries_the_command_and_output_tail() -> None:
+    results = [
+        {
+            "name": "tests",
+            "cmd": "pytest -q",
+            "passed": False,
+            "outcome": "failed",
+            "exit_code": 1,
+            "counts": {"failed": 1},
+            "output_tail": "AssertionError: boom",
+        }
+    ]
+    [row] = checks_evidence(results)
+    assert "cmd: pytest -q" in row["output"]
+    assert "AssertionError: boom" in row["output"]
+
+
+def test_checks_evidence_truncates_a_long_tail_with_a_marker() -> None:
+    lines = [f"line {i}" for i in range(25)]
+    results = [
+        {
+            "name": "tests",
+            "cmd": "pytest -q",
+            "passed": False,
+            "outcome": "failed",
+            "exit_code": 1,
+            "counts": {},
+            "output_tail": "\n".join(lines),
+        }
+    ]
+    [row] = checks_evidence(results)
+    assert "[truncated" in row["output"]
+    assert "line 0" not in row["output"]
+    assert "line 24" in row["output"]
+
+
+def test_checks_evidence_unrunnable_carries_no_command_or_tail() -> None:
+    results = [
+        {
+            "name": "ghost",
+            "cmd": "true",
+            "passed": False,
+            "outcome": "unrunnable",
+            "error": "No such file or directory",
+            "exit_code": None,
+            "counts": {},
+            "output_tail": "",
+        }
+    ]
+    [row] = checks_evidence(results)
+    assert "cmd:" not in row["output"]
+
+
 def test_all_passed() -> None:
     assert all_passed([{"passed": True}, {"passed": True}]) is True
     assert all_passed([{"passed": True}, {"passed": False}]) is False
     assert all_passed([]) is True
+
+
+# ---------------------------------------------------------------------------
+# quarantine_reason
+# ---------------------------------------------------------------------------
+
+
+def test_quarantine_reason_is_none_when_everything_passed() -> None:
+    assert quarantine_reason([{"passed": True, "outcome": "passed"}]) is None
+
+
+def test_quarantine_reason_is_the_harness_fault_wording_for_an_unrunnable_check() -> None:
+    results = [{"name": "ghost", "passed": False, "outcome": "unrunnable", "error": "No such file or directory"}]
+    reason = quarantine_reason(results)
+    assert reason == "harness fault: check 'ghost' could not run: No such file or directory"
+
+
+def test_quarantine_reason_is_the_ordinary_wording_plus_see_evidence_for_a_real_failure() -> None:
+    results = [{"name": "tests", "passed": False, "outcome": "failed"}]
+    assert quarantine_reason(results) == "configured checks failed: tests — see evidence"
+
+
+def test_quarantine_reason_does_not_hide_a_real_failure_behind_an_unrunnable_one() -> None:
+    results = [
+        {"name": "tests", "passed": False, "outcome": "failed"},
+        {"name": "lint", "passed": False, "outcome": "unrunnable", "error": "No such file or directory"},
+    ]
+    reason = quarantine_reason(results)
+    assert reason == "configured checks failed: tests, lint — see evidence"
+    assert not is_harness_fault(reason)
+
+
+# ---------------------------------------------------------------------------
+# is_harness_fault
+# ---------------------------------------------------------------------------
+
+
+def test_is_harness_fault_matches_the_prefix_quarantine_reason_emits() -> None:
+    reason = quarantine_reason([{"name": "ghost", "passed": False, "outcome": "unrunnable", "error": "boom"}])
+    assert is_harness_fault(reason)
+
+
+def test_is_harness_fault_is_false_for_the_ordinary_wording() -> None:
+    assert not is_harness_fault("configured checks failed: tests — see evidence")
 
 
 # ---------------------------------------------------------------------------

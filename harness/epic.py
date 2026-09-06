@@ -51,7 +51,7 @@ from core.workstore import WorkStoreError, record_attempt
 
 from graphs._contract import proposal
 from harness.autonomy import split_by_policy
-from harness.checks import all_passed, checks_evidence, repo_checks, run_checks
+from harness.checks import checks_evidence, is_harness_fault, quarantine_reason, repo_checks, run_checks
 from harness.digest import build_digest
 from harness.escalate import escalate_self_modification
 from harness.gate import auto_apply, gate
@@ -372,9 +372,9 @@ def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) 
         results = run_checks(worktree, ctx.checks)
         record["checks"] = results
         record["evidence"].extend(checks_evidence(results))
-        if not all_passed(results):
-            failed = ", ".join(r["name"] for r in results if not r.get("passed"))
-            record["quarantine"] = f"configured checks failed: {failed}"
+        reason = quarantine_reason(results)
+        if reason:
+            record["quarantine"] = reason
     return record
 
 
@@ -847,7 +847,15 @@ def _run_phase(
             }
         )
         if build.get("quarantine"):
-            quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=build["quarantine"]))
+            reason = build["quarantine"]
+            # A harness fault is not an attempt: the build was never actually
+            # tried, so recording one here would burn the same two-strike cap
+            # a real failure does. Mirrors the attempt-cap refusal above,
+            # which quarantines without ever calling `_quarantine_task`.
+            if is_harness_fault(reason):
+                quarantined.append({"id": task, "phase": phase, "grain": "task", "reason": reason})
+            else:
+                quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=reason))
             continue
         surviving.append(task)
 
