@@ -68,9 +68,10 @@ from graphs._contract import (
     require_cartridge,
     review_tier,
 )
+from graphs.delivery.phase_validate import _PLACEHOLDER_MARKERS
 from runner.protocol import BudgetStop, NodeRunner
 
-__all__ = ["GRAPH_NAME", "run"]
+__all__ = ["GRAPH_NAME", "review_is_placeholder", "run"]
 
 GRAPH_NAME = "lifecycle-propose"
 
@@ -854,7 +855,111 @@ def _handoff_critique(
         None,
         None,
         "revise",
+        False,
+        False,
     )
+
+
+def review_is_placeholder(answer: Mapping[str, Any]) -> bool:
+    """Pure: does this review answer describe itself instead of judging the change?
+
+    Reads REVIEW_SCHEMA's findings/rationale and ADVERSARY_SCHEMA's
+    objections/strongest_objection by the same rule, so the charter and
+    adversary reviewers share one check. True when every finding's detail IS
+    (not merely contains) one of phase_validate's markers or the bare word
+    "placeholder" — a substring search would also catch a real finding ABOUT
+    placeholder code, which is the one thing this must never flag. True when
+    `rationale` itself is empty, "{}", or only whitespace — REVIEW_SCHEMA
+    requires it, so its absence is never legitimate; the check is scoped to
+    that field alone, because ADVERSARY_SCHEMA has no `rationale` and an
+    adversary that approves with nothing left to object to is not a
+    placeholder. True when there are no findings or objections at all and the
+    verdict is 'revise' with nothing said either — a revise with nothing
+    behind it, on either schema.
+    """
+    def text(item: Mapping[str, Any]) -> str:
+        return str(item.get("detail") or item.get("why_wrong") or item.get("claim") or "").strip().lower()
+
+    items = list(answer.get("findings") or answer.get("objections") or [])
+    summary = str(answer.get("rationale") or answer.get("strongest_objection") or "").strip()
+    empty_summary = summary in ("", "{}")
+    all_placeholders = bool(items) and all(text(item) == "placeholder" or text(item) in _PLACEHOLDER_MARKERS for item in items)
+    empty_rationale = "rationale" in answer and str(answer.get("rationale") or "").strip() in ("", "{}")
+    empty_revise = not items and answer.get("verdict") == "revise" and empty_summary
+    return all_placeholders or empty_rationale or empty_revise
+
+
+def _reviewer_answer(
+    runner: NodeRunner,
+    *,
+    role: str,
+    schema: Mapping[str, Any],
+    context: list[str],
+    prompt: str,
+) -> tuple[dict[str, Any], bool]:
+    """One reviewer's answer, and one retry if it is a placeholder instead.
+
+    Same shape as phase_validate._verdict: same role and prompt on retry, plus
+    one sentence saying the previous answer did not count. Retried once and
+    never more — a reviewer that will not answer twice abstains, and it is the
+    caller's to decide what an abstention costs.
+    """
+    first = dict(runner.run(role=role, tier="deep", schema=schema, context=context, prompt=prompt))
+    if not review_is_placeholder(first):
+        return first, False
+    second = dict(
+        runner.run(
+            role=role,
+            tier="deep",
+            schema=schema,
+            context=context,
+            prompt=(
+                f"{prompt}\n\n"
+                "Your previous answer named what you would check instead of checking it — "
+                "a placeholder, not a verdict. Answer for real this time."
+            ),
+        )
+    )
+    return second, review_is_placeholder(second)
+
+
+def _review_harness_fault() -> dict[str, Any]:
+    """Pure: the review a double abstention becomes, never the placeholder verbatim.
+
+    Built from REVIEW_SCHEMA's own keys. Handing the raw placeholder answer
+    on as `review` would let its "placeholder" finding read, downstream, as a
+    real one — the exact confusion this change exists to stop.
+    """
+    return {
+        "verdict": "revise",
+        "findings": [
+            {
+                "charter_principle": "harness fault",
+                "detail": "both reviewers returned a placeholder twice and produced no judgment",
+                "file": "",
+            }
+        ],
+        "rationale": "harness fault: review placeholders",
+    }
+
+
+def _abstained_review() -> dict[str, Any]:
+    """Pure: the charter reviewer's slot in the record once it has abstained.
+
+    Its own words never reach `_critique` or a later build prompt — only the
+    fact of the abstention does. Forwarding the raw second answer would put
+    the 2026-09-05 text back in front of a builder under a different name.
+    """
+    return {"verdict": "revise", "findings": [], "rationale": "review_charter did not produce a judgment after a second attempt"}
+
+
+def _abstained_adversary() -> dict[str, Any]:
+    """Pure: the adversary's slot in the record once it has abstained, same rule."""
+    return {
+        "verdict": "revise",
+        "objections": [],
+        "strongest_objection": "review_adversary did not produce a judgment after a second attempt",
+    }
 
 
 def _review_round(
@@ -867,17 +972,22 @@ def _review_round(
     facts: Mapping[str, Any],
     handoff: Mapping[str, Any] | None,
     tier: int,
-) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None, str]:
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None, str, bool, bool]:
     """One full round of review, and the verdict it reaches.
 
     Factored out because a retry is reviewed under EXACTLY the same rules as the
     first try — same tier arithmetic, same optional roles, same arbitration
     trigger. A fix loop with a cheaper second pass would be a way of grinding a
     change past its reviewers, which is the thing this loop must not become.
+
+    The fifth element is true when either reviewer placeholdered twice; the
+    sixth is true only when BOTH did, which the caller quarantines rather than
+    sends back to build — a reviewer that abstains is not a verdict to rebuild
+    against.
     """
-    review = runner.run(
+    review, charter_abstained = _reviewer_answer(
+        runner,
         role="review_charter",
-        tier="deep",
         schema=REVIEW_SCHEMA,
         context=context,
         prompt=(
@@ -892,23 +1002,76 @@ def _review_round(
 
     # Tier 0 is the cheapest review, never the absence of one.
     adversary: dict[str, Any] | None = None
+    adversary_abstained = False
     if tier >= 1 and "review_adversary" in bound:
-        adversary = dict(
-            runner.run(
-                role="review_adversary",
-                tier="deep",
-                schema=ADVERSARY_SCHEMA,
-                context=context,
-                prompt=(
-                    "Your job is to disagree. Find what this change gets wrong, and "
-                    "what the first reviewer accepted too easily.\n\n"
-                    f"Task: {ticket}\nChange facts: {facts}\n"
-                    f"First reviewer said: {review.get('verdict')} — {review.get('rationale')}\n"
-                    f"Patch:\n{build.get('patch')}\n\n"
-                    "State your strongest objection plainly, even if you end up approving."
-                ),
-            )
+        adversary, adversary_abstained = _reviewer_answer(
+            runner,
+            role="review_adversary",
+            schema=ADVERSARY_SCHEMA,
+            context=context,
+            prompt=(
+                "Your job is to disagree. Find what this change gets wrong, and "
+                "what the first reviewer accepted too easily.\n\n"
+                f"Task: {ticket}\nChange facts: {facts}\n"
+                f"First reviewer said: {review.get('verdict')} — {review.get('rationale')}\n"
+                f"Patch:\n{build.get('patch')}\n\n"
+                "State your strongest objection plainly, even if you end up approving."
+            ),
         )
+
+    # An abstained reviewer is dropped from the record and the critique alike —
+    # its raw second answer never reaches a builder — and the survivor's
+    # verdict decides, through arbitration when the team has bound one, so a
+    # tier that would have demanded a third read still gets one. Neither
+    # survives, and there is nothing to decide with — the caller quarantines
+    # that.
+    charter_usable, adversary_usable = not charter_abstained, adversary is not None and not adversary_abstained
+    if not charter_usable and not adversary_usable:
+        return _review_harness_fault(), adversary, None, "revise", True, True
+    if not charter_usable:
+        sole_arbitration = None
+        if "arbitrate" in bound:
+            sole_arbitration = dict(
+                runner.run(
+                    role="arbitrate",
+                    tier="deep",
+                    schema=ARBITRATE_SCHEMA,
+                    context=context,
+                    prompt=(
+                        "One reviewer has looked at this change; the other did not produce a "
+                        "judgment after a second attempt and has abstained. Decide.\n\n"
+                        f"Task: {ticket}\nReview tier: {tier}\n"
+                        "Charter reviewer: abstained, no judgment\n"
+                        f"Adversary: {adversary.get('verdict')} — {adversary.get('strongest_objection')}\n"
+                        f"Change facts: {facts}\n\n"
+                        "Say who you sided with and why. 'neither' is allowed."
+                    ),
+                )
+            )
+        sole_verdict = str(sole_arbitration.get("verdict")) if sole_arbitration is not None else str(adversary.get("verdict"))
+        return _abstained_review(), adversary, sole_arbitration, sole_verdict, True, False
+    if not adversary_usable and adversary is not None:
+        sole_arbitration = None
+        if "arbitrate" in bound:
+            sole_arbitration = dict(
+                runner.run(
+                    role="arbitrate",
+                    tier="deep",
+                    schema=ARBITRATE_SCHEMA,
+                    context=context,
+                    prompt=(
+                        "One reviewer has looked at this change; the other did not produce a "
+                        "judgment after a second attempt and has abstained. Decide.\n\n"
+                        f"Task: {ticket}\nReview tier: {tier}\n"
+                        f"Charter reviewer: {review.get('verdict')} — {review.get('rationale')}\n"
+                        "Adversary: abstained, no judgment\n"
+                        f"Change facts: {facts}\n\n"
+                        "Say who you sided with and why. 'neither' is allowed."
+                    ),
+                )
+            )
+        sole_verdict = str(sole_arbitration.get("verdict")) if sole_arbitration is not None else str(review.get("verdict"))
+        return dict(review), _abstained_adversary(), sole_arbitration, sole_verdict, True, False
 
     # Arbitration on disagreement, and unconditionally at tier 2 — where the
     # cost of being wrong is high enough that agreement between two reviewers
@@ -944,7 +1107,7 @@ def _review_round(
     else:
         verdict = str(review.get("verdict"))
 
-    return dict(review), adversary, arbitration, verdict
+    return dict(review), adversary, arbitration, verdict, False, False
 
 
 def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
@@ -1118,9 +1281,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # with. Paying two reviewers to read a change the shuttle already said is
     # under-evidenced would buy an opinion about the wrong thing.
     if handoff is not None and not handoff.get("complete"):
-        review, adversary, arbitration, verdict = _handoff_critique(handoff)
+        review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _handoff_critique(handoff)
     else:
-        review, adversary, arbitration, verdict = _review_round(
+        review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _review_round(
             runner,
             context=context,
             bound=bound,
@@ -1130,6 +1293,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             handoff=handoff,
             tier=tier,
         )
+    # Carried across every round: an abstention two rounds ago is still an
+    # abstention, even once a later round comes back clean.
+    any_review_placeholder = review_placeholder
 
     # The bounded fix loop. A change sent back goes back to the builder with the
     # critique attached — but the loop is bounded in three separate ways, because
@@ -1138,10 +1304,12 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     fix_attempts = args.get("fix_attempts")
     fix_attempts = DEFAULT_FIX_ATTEMPTS if fix_attempts is None else int(fix_attempts)
     attempts = 1
-    stopped: str | None = None
+    # Both reviewers abstaining is a harness fault, not a task to rebuild
+    # against — the loop never gets a chance to start.
+    stopped: str | None = "harness fault: review placeholders" if review_quarantine else None
     standing: set[str] = set()
 
-    while verdict != "approve" and attempts <= fix_attempts:
+    while verdict != "approve" and attempts <= fix_attempts and not review_quarantine:
         # Every claim raised so far, not merely the last round's. Re-raising an
         # objection from two rounds ago is no more progress than re-raising the
         # one from the last.
@@ -1210,10 +1378,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             # attempt if the cap allows one, and never a review round bought
             # for a change the shuttle has already refused to hand over.
             if not handoff.get("complete"):
-                review, adversary, arbitration, verdict = _handoff_critique(handoff)
+                review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _handoff_critique(handoff)
+                any_review_placeholder = any_review_placeholder or review_placeholder
                 continue
         tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
-        review, adversary, arbitration, verdict = _review_round(
+        review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _review_round(
             runner,
             context=context,
             bound=bound,
@@ -1223,6 +1392,10 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             handoff=handoff,
             tier=tier,
         )
+        any_review_placeholder = any_review_placeholder or review_placeholder
+        if review_quarantine:
+            stopped = "harness fault: review placeholders"
+            break
 
         # An approval here is not a technicality. The reviewers saw the standing
         # objections in the patch they were given and approved anyway, which is
@@ -1346,6 +1519,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "stopped": stopped,
             "continuations": continuations,
             **({"continuation_refused": continuation_refused} if continuation_refused is not None else {}),
+            **({"review_placeholder": True} if any_review_placeholder else {}),
         },
         "proposals": proposals,
     }
