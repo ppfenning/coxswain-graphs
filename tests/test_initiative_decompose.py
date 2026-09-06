@@ -47,7 +47,7 @@ def decompose(cart, decomposition=DECOMPOSITION, challenge=None):
 
 def test_emits_one_proposal_per_task(cart) -> None:
     result = decompose(cart)
-    assert [p["target"] for p in result["proposals"]] == ["t1", "t2", "t3"]
+    assert [p["target"] for p in result["proposals"]] == ["t1", "t2", "t3", "initiative"]
     assert all(p["kind"] == "item_create" for p in result["proposals"])
 
 
@@ -63,6 +63,42 @@ def test_a_proposal_says_what_blocks_it(cart) -> None:
     result = decompose(cart)
     unblocked = next(p for p in result["proposals"] if p["target"] == "t1")
     assert any("can start immediately" in e["output"] for e in unblocked["evidence"])
+
+
+# ── the schema requests what the code reads ────────────────────────────────
+
+
+def test_the_schema_actually_requests_a_goal_per_phase() -> None:
+    phase_schema = initiative_decompose.DECOMPOSE_SCHEMA["properties"]["phases"]["items"]
+    assert phase_schema["required"] == ["id", "goal"]
+
+
+# ── initiative.md ────────────────────────────────────────────────────────────
+
+
+def test_initiative_text_carries_phase_goals_in_order() -> None:
+    idea = {"id": "regatta", "title": "Route sync", "budget_usd": 500, "why": "because races drift"}
+    text = initiative_decompose.initiative_text(
+        idea, ["p1", "p2"], {"p1": "foundations", "p2": "cutover"}, "coxswain-graphs"
+    )
+    assert "PHASE GOALS, each judged against ITS OWN line:\n- p1: foundations\n- p2: cutover" in text
+
+
+def test_emit_writes_initiative_md_as_one_more_proposal(cart) -> None:
+    result = decompose(cart)
+    initiative = next(p for p in result["proposals"] if p["target"] == "initiative")
+    assert "PHASE GOALS" in initiative["suggested_action"]
+
+
+# ── ids scoped to an initiative ─────────────────────────────────────────────
+
+
+def test_task_ids_and_files_are_prefixed_with_the_initiative_id(cart) -> None:
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "initiative_id": "regatta"},
+        ScriptedRunner({"decompose": DECOMPOSITION}),
+    )
+    assert [t["id"] for t in result["tasks"]] == ["regatta-t1", "regatta-t2", "regatta-t3"]
 
 
 # ── the adversary on the DAG ───────────────────────────────────────────────
@@ -119,6 +155,23 @@ def test_the_adversary_cannot_stall_a_task_on_itself(cart) -> None:
 def test_the_challenge_is_attached_as_evidence(cart) -> None:
     result = decompose(cart, challenge=ACCEPTED)
     assert any(e["check"] == "adversary on the DAG" for e in result["proposals"][0]["evidence"])
+
+
+def test_adversary_edges_are_applied_even_when_args_carry_assume(cart) -> None:
+    """A struck edge is absent from the filed tasks no matter what `assume` says."""
+    challenge = {
+        "spurious_edges": [{"task": "t2", "needs": "t1", "why_not_real": "no schema dependency"}],
+        "missing_edges": [],
+        "verdict": "revise",
+        "summary": "one edge was imagined",
+    }
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "assume": "a"},
+        ScriptedRunner({"decompose": DECOMPOSITION, "review_adversary": challenge}),
+    )
+    filed = next(t for t in result["tasks"] if t["id"] == "t2")
+    assert "t1" not in filed["needs"]
 
 
 def test_without_an_adversary_the_edges_stand_unchallenged(cart) -> None:
