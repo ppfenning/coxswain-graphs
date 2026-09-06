@@ -1,7 +1,7 @@
-# agent-graphs
+# coxswain-graphs
 
 Portable agent graphs, and the **harness** that runs them against the
-[`agent-cartridges`](https://github.com/ppfenning/agent-cartridges) substrate.
+[`coxswain-cartridges`](https://github.com/ppfenning/coxswain-cartridges) substrate.
 
 Four nouns, one seam each:
 
@@ -9,7 +9,7 @@ Four nouns, one seam each:
 |---|---|---|
 | **Harness** | consequences: side effects, policy, the gate, the ledger | `harness/` |
 | **Graph** | sequence — what runs, in what order, at what tier. Writes nothing | `graphs/` |
-| **Cartridge** | who a run works for: role → skill, where writes land | `agent-cartridges` |
+| **Cartridge** | who a run works for: role → skill, where writes land | `coxswain-cartridges` |
 | **Runner** | execution: canned dicts in tests, the Messages API live | `runner/` |
 
 ```
@@ -28,26 +28,26 @@ tests/     the portability check, and the graphs' own behaviour. run it in CI.
 ## Running one
 
 ```bash
-git clone https://github.com/ppfenning/agent-cartridges ../agent-cartridges
-pip install -e ".[dev]" && pip install -e ../agent-cartridges
+git clone https://github.com/ppfenning/coxswain-cartridges ../coxswain-cartridges
+pip install -e ".[dev]" && pip install -e ../coxswain-cartridges
 
 python shell.py triage --team local \
   --alerts fixtures/alerts.json \
-  --skills-root ../agent-cartridges/skills-plugins \
+  --skills-root ../coxswain-cartridges/skills-plugins \
   --scripted fixtures/triage-run.json      # offline: canned nodes, no key
 ```
 
 The `local` cartridge and the skills it binds ship together in
-`agent-cartridges`, so that command resolves from a clean clone. The gate is
+`coxswain-cartridges`, so that command resolves from a clean clone. The gate is
 interactive; add `--assume r` (or `a`) to answer it non-interactively. Drop
 `--scripted` and add `pip install -e ".[live]"` to run against the real API;
 the provider profile decides which model each tier means, and names the env
 var holding the key.
 
-This repository, `agent-cartridges`, and `agent-tools` are set up together.
+This repository, `coxswain-cartridges`, and `coxswain-tools` are set up together.
 The clone order, the environments, the logins, the provider profile, and the
 verify step are written once, in
-[`agent-tools/docs/getting-started.md`](https://github.com/ppfenning/agent-tools/blob/main/docs/getting-started.md),
+[`coxswain-tools/docs/getting-started.md`](https://github.com/ppfenning/coxswain-tools/blob/main/docs/getting-started.md),
 which walks through all three from a clean machine.
 
 ## The shape of a graph
@@ -95,11 +95,11 @@ Each graph's diagram is generated from its own docstring by `python -m harness.g
 
 ```bash
 python shell.py decompose --team local --idea "go arrow-native across the reader path" \
-  --skills-root ../agent-cartridges/skills-plugins \
+  --skills-root ../coxswain-cartridges/skills-plugins \
   --scripted fixtures/decompose-run.json --assume r
 
 python shell.py phase --team local --initiative fixtures/work/example-initiative \
-  --skills-root ../agent-cartridges/skills-plugins \
+  --skills-root ../coxswain-cartridges/skills-plugins \
   --scripted fixtures/phase-run.json --assume r --max-parallel 4
 ```
 
@@ -163,7 +163,7 @@ Five convictions hold this together:
   cartridges, skills, `core/policy.py`, `core/ledger.py`, `harness/`, the
   ledger file — is escalated to `self_modification` (`ramp: never`) from its
   paths alone, whatever kind the graph claimed. And the ledger itself lives
-  OUTSIDE the working tree (`$XDG_STATE_HOME/agent-graphs/`), because a trust
+  OUTSIDE the working tree (`$XDG_STATE_HOME/coxswain-graphs/`), because a trust
   record you can reach through the thing it governs is not a record.
 
 There is no ticketing platform anywhere in this. `cartridges/local/` binds every
@@ -205,13 +205,13 @@ The graphs and the harness are written and tested. They were written **fresh
 from the specifications in `graphs/*/**.md` and the contract in `docs/`** —
 nothing was ported from the implementations that exist from prior employment.
 See
-[`agent-cartridges/docs/CLEAN-ROOM.md`](https://github.com/ppfenning/agent-cartridges/blob/main/docs/CLEAN-ROOM.md)
+[`coxswain-cartridges/docs/CLEAN-ROOM.md`](https://github.com/ppfenning/coxswain-cartridges/blob/main/docs/CLEAN-ROOM.md)
 for the working rule and
-[`PROVENANCE.md`](https://github.com/ppfenning/agent-cartridges/blob/main/docs/PROVENANCE.md)
+[`PROVENANCE.md`](https://github.com/ppfenning/coxswain-cartridges/blob/main/docs/PROVENANCE.md)
 for where the ideas came from.
 
 Everything deferred from v0 has since landed: the intake queue (a directory
-the coxswain drains, `agent-cartridges/core/intake.py`), the bounded fix
+the coxswain drains, `coxswain-cartridges/core/intake.py`), the bounded fix
 loop (in `lifecycle-propose`, with its attempt count carried to the ledger),
 retro (`retro-propose`, which proposes only what it can cite), and the
 coxswain dispatcher — a one-node graph that selects from the registry,
@@ -268,8 +268,8 @@ being a special case.
 
 | Repo | Owns |
 |---|---|
-| [`agent-cartridges`](https://github.com/ppfenning/agent-cartridges) | Substrate: cartridge merge, policy, manifest, ledger — and the reference `local-skills` plugin |
-| **`agent-graphs`** | Harness (the runtime) + graphs (the programs) |
+| [`coxswain-cartridges`](https://github.com/ppfenning/coxswain-cartridges) | Substrate: cartridge merge, policy, manifest, ledger — and the reference `local-skills` plugin |
+| **`coxswain-graphs`** | Harness (the runtime) + graphs (the programs) |
 | a skills plugin | Craft: the skill bodies a cartridge binds roles to — `local-skills` ships with the substrate; teams point `--skills-root` at their own |
 
 ## License
