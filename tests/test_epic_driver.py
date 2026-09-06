@@ -23,7 +23,7 @@ from core import ledger, workstore
 
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
-from harness.epic import phase_order, phase_parents, run_epic
+from harness.epic import branch_action, phase_order, phase_parents, run_epic
 from harness.resume import save_result
 from runner.protocol import RunnerError
 
@@ -507,29 +507,17 @@ def test_a_governance_patch_cannot_earn_its_merge(repo, cart, tmp_path) -> None:
     assert {row["outcome"] for row in rows} == {"skipped"}, "approved, never executed — neither win nor reversal"
 
 
-# ── re-entrancy and the stack rebase ────────────────────────────────────────
+# ── the branch-action decision, on literals ─────────────────────────────────
 
 
-def test_a_moved_parent_head_proposes_and_executes_a_stack_rebase(repo, cart, tmp_path) -> None:
-    work = initiative(two_phases=False)
-    first, _ = drive(repo, cart, tmp_path, work=work, run_id="epic-1")
-    assert first["phases"][0]["status"] == "complete"
-    before = git("rev-parse", "epic/demo-initiative/p1-foundations", cwd=repo)
+def test_branch_action_recreates_or_blocks_only_a_stale_reused_branch() -> None:
+    assert branch_action(reused=False, head_moved=True, has_own_commits=True) == "proceed"
+    assert branch_action(reused=True, head_moved=False, has_own_commits=True) == "proceed"
+    assert branch_action(reused=True, head_moved=True, has_own_commits=False) == "recreate"
+    assert branch_action(reused=True, head_moved=True, has_own_commits=True) == "block"
 
-    # The ground moves under the stack: somebody lands something on main.
-    (repo / "moved.md").write_text("moved\n", encoding="utf-8")
-    git("add", "-A", cwd=repo)
-    git("commit", "-qm", "advance main", cwd=repo)
-    assert not is_ancestor(repo, "main", "epic/demo-initiative/p1-foundations")
 
-    done = initiative(two_phases=False, done=("t1-probe", "t2-bench"))
-    second, _ = drive(repo, cart, tmp_path, work=done, run_id="epic-2")
-
-    rebases = [p for p in second["proposals"] if p["kind"] == "stack_rebase"]
-    assert len(rebases) == 1 and rebases[0]["target"] == "epic/demo-initiative/p1-foundations"
-    assert second["totals"]["stacks_rebased"] == 1
-    assert is_ancestor(repo, "main", "epic/demo-initiative/p1-foundations")
-    assert git("rev-parse", "epic/demo-initiative/p1-foundations", cwd=repo) != before
+# ── re-entrancy: recreate, block, and the stack rebase ──────────────────────
 
 
 def test_no_rebase_is_proposed_when_the_stack_is_still_on_its_base(repo, cart, tmp_path) -> None:
@@ -540,6 +528,52 @@ def test_no_rebase_is_proposed_when_the_stack_is_still_on_its_base(repo, cart, t
     assert [p for p in second["proposals"] if p["kind"] == "stack_rebase"] == []
     assert second["totals"]["stacks_rebased"] == 0
     assert second["phases"][0]["status"] == "complete"
+
+
+def test_a_stale_empty_reused_branch_is_recreated_before_any_task_builds(repo, cart, tmp_path) -> None:
+    """Refused day one leaves the branch equal to its base — nothing of its own to lose."""
+    work = initiative(two_phases=False)
+    first, _ = drive(repo, cart, tmp_path, work=work, run_id="epic-1", assume="r")
+    assert first["phases"][0]["status"] == "partial"
+    assert git("rev-parse", "epic/demo-initiative/p1-foundations", cwd=repo) == git("rev-parse", "main", cwd=repo)
+
+    (repo / "moved.md").write_text("moved\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "advance main", cwd=repo)
+    assert not is_ancestor(repo, "main", "epic/demo-initiative/p1-foundations")
+
+    second, _ = drive(repo, cart, tmp_path, work=work, run_id="epic-2")
+    assert second["phases"][0]["status"] == "complete"
+    assert is_ancestor(repo, "main", "epic/demo-initiative/p1-foundations")
+    assert [p for p in second["proposals"] if p["kind"] == "stack_rebase"] == []
+
+
+def test_a_stale_reused_branch_with_its_own_commits_blocks_rather_than_building(repo, cart, tmp_path) -> None:
+    work = initiative(two_phases=False)
+    first, _ = drive(repo, cart, tmp_path, work=work, run_id="epic-1")
+    assert first["phases"][0]["status"] == "complete"
+    before = git("rev-parse", "epic/demo-initiative/p1-foundations", cwd=repo)
+
+    (repo / "moved.md").write_text("moved\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "advance main", cwd=repo)
+
+    second, runner = drive(repo, cart, tmp_path, work=work, run_id="epic-2")
+    assert second["phases"][0]["status"] == "blocked"
+    reason = second["phases"][0]["reason"]
+    assert "epic/demo-initiative/p1-foundations" in reason and "main" in reason
+    assert not any(c["role"] == "build" for c in runner.calls)
+    assert git("rev-parse", "epic/demo-initiative/p1-foundations", cwd=repo) == before
+
+    # The gate has something to decide on: the same kind of proposal the
+    # quiet path files, not a phase quarantined with nothing to act on.
+    rebases = [p for p in second["proposals"] if p["kind"] == "stack_rebase"]
+    assert len(rebases) == 1 and rebases[0]["target"] == "epic/demo-initiative/p1-foundations"
+
+    # The branch is released, not wedged: a third run can open it again.
+    third, _ = drive(repo, cart, tmp_path, work=work, run_id="epic-3")
+    assert third["phases"][0]["status"] == "blocked"
+    assert "rebase it through the gate" in third["phases"][0]["reason"]
 
 
 class Revising(Runner):
