@@ -950,6 +950,7 @@ def _reviewer_answer(
     runner: NodeRunner,
     *,
     role: str,
+    model_tier: str,
     schema: Mapping[str, Any],
     context: list[str],
     prompt: str,
@@ -961,13 +962,13 @@ def _reviewer_answer(
     never more — a reviewer that will not answer twice abstains, and it is the
     caller's to decide what an abstention costs.
     """
-    first = dict(runner.run(role=role, tier="deep", schema=schema, context=context, prompt=prompt))
+    first = dict(runner.run(role=role, tier=model_tier, schema=schema, context=context, prompt=prompt))
     if not review_is_placeholder(first):
         return first, False
     second = dict(
         runner.run(
             role=role,
-            tier="deep",
+            tier=model_tier,
             schema=schema,
             context=context,
             prompt=(
@@ -1042,9 +1043,12 @@ def _review_round(
     sends back to build — a reviewer that abstains is not a verdict to rebuild
     against.
     """
+    # The model tier for reviews is decided here; the profile's `tiers` mapping
+    # turns "standard" into a model.
     review, charter_abstained = _reviewer_answer(
         runner,
         role="review_charter",
+        model_tier="standard",
         schema=REVIEW_SCHEMA,
         context=context,
         prompt=(
@@ -1064,6 +1068,7 @@ def _review_round(
         adversary, adversary_abstained = _reviewer_answer(
             runner,
             role="review_adversary",
+            model_tier="standard",
             schema=ADVERSARY_SCHEMA,
             context=context,
             prompt=(
