@@ -23,7 +23,7 @@ from core import ledger, workstore
 
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
-from harness.epic import branch_action, phase_order, phase_parents, run_epic
+from harness.epic import branch_action, phase_order, phase_parents, run_epic, task_outcome
 from harness.resume import save_result
 from runner.protocol import RunnerError
 
@@ -379,6 +379,58 @@ def test_the_failing_checks_evidence_reaches_the_record(repo, cart, tmp_path) ->
     result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
     failed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
     assert any(row["check"] == "checks:state" and "FAIL" in row["output"] for row in failed["evidence"])
+
+
+# ── outcome and the exit line: an approved build that does not land ─────────
+
+
+def test_task_outcome_names_all_four_cases() -> None:
+    assert task_outcome("approve", None, None, True) == "landed"
+    assert task_outcome("approve", None, "configured checks failed: state — see evidence", False) == "approved_not_landed"
+    assert task_outcome(None, "approve", "harness fault: check 'state' could not run: boom", False) == "harness_fault"
+    assert task_outcome("revise", None, None, False) == "rejected"
+
+
+def test_an_approved_and_quarantined_task_names_itself_in_the_exit_summary(repo, cart, tmp_path) -> None:
+    runner = Runner(
+        {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")},
+        verdicts={"p1-foundations": GOAL_UNMET},
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    failed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert failed["outcome"] == "approved_not_landed"
+    assert "checks failed" in failed["reason"]
+    assert result["totals"]["approved_not_landed"] == 1
+    assert f"approved but not landed: t1-probe — cox runs recover epic-1 t1-probe --repo {repo}" in result["exit_summary"]
+
+
+def test_the_cli_exit_line_names_an_approved_and_unlanded_task(monkeypatch, tmp_path, capsys) -> None:
+    from harness import cli
+
+    monkeypatch.setattr(cli, "resolve_cartridge", lambda *a, **k: ({"skills": {}}, {}))
+    monkeypatch.setattr(cli, "build_runner", lambda **k: object())
+    monkeypatch.setattr(workstore, "read_initiative", lambda path: {"id": "demo", "phases": [], "items": []})
+    monkeypatch.setattr(
+        "harness.epic.run_epic",
+        lambda **k: {
+            "totals": {"approved_not_landed": 1},
+            "quarantined": [],
+            "exit_summary": ["approved but not landed: t1-probe — cox runs recover epic-1 t1-probe --repo /repo"],
+        },
+    )
+
+    exit_code = cli.main(
+        [
+            "epic", "--team", "acme", "--unverified-skills",
+            "--initiative", str(tmp_path / "initiative"), "--repo", "/repo",
+            "--run-id", "epic-1", "--runs-dir", str(tmp_path / "runs"),
+        ]
+    )
+
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert "approved but not landed: t1-probe — cox runs recover epic-1 t1-probe --repo /repo" in err
 
 
 # ── repo-declared checks, from a root `.agent-checks` file ──────────────────
