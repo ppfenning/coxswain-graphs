@@ -91,6 +91,11 @@ def _capture_diff(scratch: Path) -> str:
         return ""
     return proc.stdout if proc.returncode == 0 else ""
 
+
+def reconcile_patch(reported: str, computed: str) -> tuple[str, str | None]:
+    """The scratch's own diff over the model's account of it, or a named failure."""
+    return (computed, None) if computed else ("", "patch_empty")
+
 # Errors that are about the CALL, not about the work. The provider's own
 # safeguard classifier occasionally flags an ordinary node message — an
 # arbitration prompt quoting two reviewers reads, to a classifier, like an
@@ -493,6 +498,7 @@ class ClaudeCodeRunner:
         # the call rather than about the work. A retry loop on a model error is
         # how a budget disappears; one retry is how a transient classifier
         # misfire stops costing a finished task its run.
+        computed_patch, has_scratch = "", False
         for attempt in (1, 2):
             if thread:
                 state = self._thread(thread, role)
@@ -502,12 +508,18 @@ class ClaudeCodeRunner:
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
                     spent_usd=state.get("spent_usd", 0.0),
                 )
+                if role in _PATCH_ROLES and state.get("scratch"):
+                    has_scratch = True
+                    computed_patch = _capture_diff(state["scratch"])
             else:
                 with self._scratch(role) as scratch:
                     proc = self._invoke(
                         role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                         scratch=scratch, patches=True, session=(), budget_usd=budget_usd,
                     )
+                    if role in _PATCH_ROLES and scratch:
+                        has_scratch = True
+                        computed_patch = _capture_diff(scratch)
 
             stdout = (proc.stdout or "").strip()
             if not stdout:
@@ -598,4 +610,9 @@ class ClaudeCodeRunner:
                 **({"trace": payload["trace"]} if payload.get("trace") else {}),
             }
         )
+        if role in _PATCH_ROLES and has_scratch:
+            patch, reason = reconcile_patch(str(data.get("patch") or ""), computed_patch)
+            if reason:
+                raise RunnerError(f"node '{role}' {reason}: the scratch tree has no changes to show for it")
+            return NodeResult({**data, "patch": patch})
         return NodeResult(data)
