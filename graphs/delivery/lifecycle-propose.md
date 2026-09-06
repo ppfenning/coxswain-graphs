@@ -14,7 +14,7 @@ that only reads other nodes):
 | `plan_arbitrate` | `plan_arbitrate` | deep | none (**optional**; picks a plan or merges, names the price) |
 | `plan_adversary` | `plan_adversary` | deep | none (**optional**; attacks the chosen plan's claims; one revision at most) |
 | `build` | `build` | standard | its own worktree only |
-| `review` | `review_charter` | deep | none |
+| `review` | `review_charter` | standard | none |
 | `emit` | — | — | proposals as data |
 
 `scope` runs first and only if the team bound `scope_epic` — unbound means absent,
@@ -41,8 +41,8 @@ flowchart TB
         BUILD["build<br/>role: build, standard"]
         FACTS["change_facts<br/>counted from the patch,<br/>never asked of the model"]
         HANDOFF{"handoff<br/>does build's output contain<br/>what review needs?"}
-        REVIEW["review<br/>role: review_charter, deep"]
-        ADV["adversary<br/>role: review_adversary, deep"]
+        REVIEW["review<br/>role: review_charter, standard"]
+        ADV["adversary<br/>role: review_adversary, standard"]
         ARB["arbitrate<br/>role: arbitrate, deep"]
         EMIT["emit"]
         STOP(["graph stops"])

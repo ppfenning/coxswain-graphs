@@ -48,7 +48,7 @@ def test_nodes_ask_for_roles_and_tiers_never_skills_or_models(
     assert [(c["role"], c["tier"]) for c in scripted.calls] == [
         ("plan", "standard"),
         ("build", "standard"),
-        ("review_charter", "deep"),
+        ("review_charter", "standard"),
     ]
 
 
@@ -164,6 +164,31 @@ def adversarial(cartridge) -> dict:
     """Bind the adversary, so a round can actually raise an objection."""
     cartridge["skills"]["review_adversary"] = "acme-skills:review_adversary"
     return cartridge
+
+
+def adjudicated(cartridge) -> dict:
+    """Bind the adversary and the arbiter, so disagreement gets decided."""
+    cartridge["skills"]["review_adversary"] = "acme-skills:review_adversary"
+    cartridge["skills"]["arbitrate"] = "acme-skills:arbitrate"
+    return cartridge
+
+
+ARBITRATION_SIDES_ADVERSARY = {"verdict": "revise", "sided_with": "adversary", "reasoning": "the objection holds"}
+
+
+def test_reviewers_run_at_standard_and_arbitration_stays_deep(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(
+        plan_response, build_response, review_response,
+        review_adversary=ADV_OBJECTS, arbitrate=ARBITRATION_SIDES_ADVERSARY,
+    )
+    lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+    assert [(c["role"], c["tier"]) for c in scripted.calls if c["role"] != "plan" and c["role"] != "build"] == [
+        ("review_charter", "standard"),
+        ("review_adversary", "standard"),
+        ("arbitrate", "deep"),
+    ]
 
 
 def rebuilt(build_response, patch) -> dict:
