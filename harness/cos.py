@@ -50,7 +50,7 @@ from core.ledger import read as read_ledger
 from graphs._spec import GraphSpec
 from harness.invoke import Invocation, invoke_graphs
 
-__all__ = ["CosError", "assemble_docket", "run_cos"]
+__all__ = ["CosError", "assemble_docket", "dispatch_line", "run_cos"]
 
 
 class CosError(Exception):
@@ -115,6 +115,13 @@ def _free_slots(max_in_flight: int, in_flight: Sequence[Mapping[str, Any]]) -> i
     """How much of the bound is not already occupied by something alive. Plain data in, an int out."""
     alive = sum(1 for row in in_flight if row.get("alive"))
     return max(0, max_in_flight - alive)
+
+
+def dispatch_line(selection: Mapping[str, Any], outcome: Mapping[str, Any]) -> str:
+    graph = str(selection.get("graph"))
+    item = selection.get("item", graph)
+    reason = outcome.get("reason")
+    return f"dispatched {graph} for {item}" if reason is None else f"dispatched {graph} for {item} — failed: {reason}"
 
 
 def _usage_block(usage: Mapping[str, Any] | None) -> dict[str, Any]:

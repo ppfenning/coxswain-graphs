@@ -38,6 +38,23 @@ def cart(cartridge) -> dict:
     return cartridge
 
 
+def test_a_successful_dispatch_names_the_graph_and_the_item():
+    line = cos.dispatch_line({"graph": "decompose", "item": "queue/001-idea.md"}, {})
+    assert line == "dispatched decompose for queue/001-idea.md"
+
+
+def test_a_failed_dispatch_also_carries_the_reason():
+    line = cos.dispatch_line(
+        {"graph": "decompose", "item": "queue/001-idea.md"}, {"reason": "error_max_budget_usd"}
+    )
+    assert line == "dispatched decompose for queue/001-idea.md — failed: error_max_budget_usd"
+
+
+def test_a_selection_with_no_item_falls_back_to_the_graph_name():
+    line = cos.dispatch_line({"graph": "retro"}, {})
+    assert line == "dispatched retro for retro"
+
+
 DOCKET = {
     "registry": [
         {"name": "retro", "summary": "reads the ledger back", "runnable": True, "reason": ""},
