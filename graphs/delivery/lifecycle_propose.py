@@ -283,6 +283,48 @@ NO_PROGRESS_RATIO = 0.98
 CONTINUATIONS_MAX = 2
 
 
+def is_test_path(path: str) -> bool:
+    """A file whose changes are evidence for a change, not the change itself."""
+    name = path.rsplit("/", 1)[-1]
+    return (
+        path.startswith("tests/")
+        or (name.startswith("test_") and name.endswith(".py"))
+        or name.endswith("_test.py")
+        or name == "conftest.py"
+    )
+
+
+_DIFF_PREFIXES = ("a/", "b/", "c/", "i/", "w/", "o/")
+_DIFF_GIT_RE = re.compile(r"^diff --git \S+ (\S+)$", re.MULTILINE)
+
+
+def _diff_path(token: str) -> str:
+    return token[2:] if token[:2] in _DIFF_PREFIXES else token
+
+
+def _file_chunks(patch: str) -> list[tuple[str, str]]:
+    """One `(path, chunk)` per `diff --git` header, path taken from its `b/` (or `i/`) side."""
+    headers = list(_DIFF_GIT_RE.finditer(patch))
+    ends = [h.start() for h in headers[1:]] + [len(patch)]
+    return [(_diff_path(header.group(1)), patch[header.end():end]) for header, end in zip(headers, ends)]
+
+
+def _changed_in(chunk: str) -> int:
+    return sum(
+        1
+        for line in chunk.splitlines()
+        if (line.startswith("+") and not line.startswith("+++")) or (line.startswith("-") and not line.startswith("---"))
+    )
+
+
+def _lines_by_kind(patch: str) -> tuple[int, int]:
+    """Added-plus-removed lines per file in the patch, split source from test."""
+    chunks = _file_chunks(patch) or [("", patch)]
+    source_lines = sum(_changed_in(chunk) for path, chunk in chunks if not is_test_path(path))
+    test_lines = sum(_changed_in(chunk) for path, chunk in chunks if is_test_path(path))
+    return source_lines, test_lines
+
+
 def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
     """Deterministic facts about the change, for the reviewer and the gate.
 
@@ -295,19 +337,22 @@ def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
     added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
     removed = sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))
     files = list(build.get("files_touched") or [])
+    source_lines, test_lines = _lines_by_kind(patch)
     return {
         "files_touched": files,
         "module_count": len({f.rsplit("/", 1)[0] for f in files}),
         "added_lines": added,
         "removed_lines": removed,
         "changed_lines": added + removed,
+        "source_lines": source_lines,
+        "test_lines": test_lines,
     }
 
 
 def measured_facts(build: Mapping[str, Any], change_facts: Mapping[str, Any]) -> dict[str, str]:
     """The facts the harness itself established, keyed for `prune_missing` to cite.
 
-    Every path the build touched, the three line counts, and the tail of every
+    Every path the build touched, the five line counts, and the tail of every
     `pytest` command it ran — all of it already measured, none of it asked of a
     model. A `missing` item that names one of these is asking for a number the
     graph is already holding.
@@ -315,7 +360,7 @@ def measured_facts(build: Mapping[str, Any], change_facts: Mapping[str, Any]) ->
     facts: dict[str, str] = {}
     for path in change_facts.get("files_touched") or []:
         facts[f"file:{path}"] = f"touched: {path}"
-    for key in ("added_lines", "removed_lines", "changed_lines"):
+    for key in ("added_lines", "removed_lines", "changed_lines", "source_lines", "test_lines"):
         facts[key] = f"{key.replace('_', ' ')}: {change_facts.get(key)}"
     for index, entry in enumerate(build.get("commands_run") or []):
         command = str(entry.get("command") or "") if isinstance(entry, Mapping) else ""
@@ -373,18 +418,22 @@ def prune_missing(missing: list[str], facts: dict[str, str]) -> tuple[list[str],
 _SIZE_TARGET_RE = re.compile(r"~\s*(\d+)\s*lines", re.IGNORECASE)
 
 
-def _size_deviation(ticket_text: str, changed_lines: int) -> str | None:
-    """A size overrun against the ticket's own `~N lines` target, when it named one.
-
-    Not a `missing` item: the target and the count are both already known, so
-    there is nothing left for another build attempt to discover. It is a
-    disclosed fact about the change, not a gap in the evidence for it.
-    """
+def _size_deviation(ticket_text: str, source_lines: int, test_lines: int) -> str | None:
+    """Overrun of `source_lines` against the ticket's `~N lines` target; test lines are reported, not counted."""
     match = _SIZE_TARGET_RE.search(ticket_text)
     if not match:
         return None
     target = int(match.group(1))
-    return f"deviation: {changed_lines} lines against ~{target}" if changed_lines > target else None
+    if source_lines <= target:
+        return None
+    return f"deviation: {source_lines} source lines against ~{target} (tests {test_lines} lines, not counted)"
+
+
+def _test_ratio_deviation(source_lines: int, test_lines: int) -> str | None:
+    """A disclosed deviation, never a refusal, when tests dwarf the source they cover."""
+    if source_lines <= 0 or test_lines <= 3 * source_lines:
+        return None
+    return f"deviation: tests are {test_lines / source_lines:.1f}x the source"
 
 
 def _claims(adversary: Mapping[str, Any] | None) -> set[str]:
@@ -781,7 +830,9 @@ def _handoff(
                 f"Task: {ticket}\nPlan: {plan}\nSummary: {build.get('summary')}\n"
                 f"Files: {build.get('files_touched')}\nChange facts: {facts}\n"
                 "The facts listed under Change facts are already measured by the "
-                "harness; do not list any of them as missing.\n"
+                "harness; do not list any of them as missing. Any size target in "
+                "the ticket binds source lines only — test lines are reported "
+                "here, never a missing item.\n"
                 f"Commands run (with their real output): {build.get('commands_run')}\n"
                 f"Patch ({len(patch)} chars, {'complete' if len(patch) <= PATCH_PREVIEW_CHARS else 'head shown'}):\n"
                 f"{patch[:PATCH_PREVIEW_CHARS]}\n\n"
@@ -810,10 +861,16 @@ def _handoff(
     if not kept:
         handoff["complete"] = True
         handoff["blocking"] = False
-    deviation = _size_deviation(str(ticket), int(facts.get("changed_lines") or 0))
-    if deviation:
+    source_lines = int(facts.get("source_lines") or 0)
+    test_lines = int(facts.get("test_lines") or 0)
+    deviations = [
+        d
+        for d in (_size_deviation(str(ticket), source_lines, test_lines), _test_ratio_deviation(source_lines, test_lines))
+        if d
+    ]
+    if deviations:
         brief = str(handoff.get("brief") or "")
-        handoff["brief"] = f"{brief}\n{deviation}" if brief else deviation
+        handoff["brief"] = "\n".join([brief, *deviations]) if brief else "\n".join(deviations)
     # No patch is an absent artifact as a matter of fact, whatever the node
     # said; with a patch in hand, only the node knows whether an INPUT was
     # missing, so its flag decides.
