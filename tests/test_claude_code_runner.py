@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from runner import RunnerError
-from runner.claude_code_runner import ClaudeCodeRunner, next_spent
+from runner.claude_code_runner import ClaudeCodeRunner, next_spent, reconcile_patch
 from runner.protocol import BudgetStop
 from runner.scripted import ScriptedRunner
 
@@ -40,8 +40,10 @@ def fake_claude(tmp_path: Path):
     output = tmp_path / "output.json"
     helper = tmp_path / "record.py"
     helper.write_text(
-        "import json, sys\n"
-        f"json.dump({{'argv': sys.argv[1:], 'stdin': sys.stdin.read()}}, open({str(record)!r}, 'w'))\n",
+        "import json, sys, pathlib\n"
+        f"json.dump({{'argv': sys.argv[1:], 'stdin': sys.stdin.read()}}, open({str(record)!r}, 'w'))\n"
+        "if pathlib.Path('.git').exists():\n"
+        "    pathlib.Path('built.txt').write_text('edited\\n')\n",
         encoding="utf-8",
     )
     script = tmp_path / "claude"
@@ -348,6 +350,53 @@ def test_two_builders_never_share_a_scratch(fake_claude, tmp_path, repo) -> None
     assert seen[0] != seen[1], "parallel tasks in one phase must not edit the same tree"
 
 
+# ── the patch is computed from the scratch, not recalled ────────────────────
+
+
+def test_reconcile_patch_prefers_the_scratchs_diff_over_a_differing_report() -> None:
+    assert reconcile_patch("diff --git a/x\n-a\n+b\n", "diff --git a/y\n-c\n+d\n") == ("diff --git a/y\n-c\n+d\n", None)
+
+
+def test_reconcile_patch_is_patch_empty_when_the_scratch_has_nothing_but_the_model_reported_something() -> None:
+    assert reconcile_patch("diff --git a/x\n-a\n+b\n", "") == ("", "patch_empty")
+
+
+def test_reconcile_patch_is_patch_empty_when_both_are_empty() -> None:
+    assert reconcile_patch("", "") == ("", "patch_empty")
+
+
+def test_reconcile_patch_passes_through_an_identical_report() -> None:
+    assert reconcile_patch("same\n", "same\n") == ("same\n", None)
+
+
+def test_a_successful_build_returns_the_scratchs_diff_not_the_models(fake_claude, tmp_path, repo) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": False, "total_cost_usd": 0.01, "num_turns": 1,
+                "structured_output": {"summary": "did the thing", "files_touched": ["f.txt"],
+                                      "commands_run": [], "patch": "diff --git a/test.txt\n-a\n+b\n"}})
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    out = runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert "built.txt" in out["patch"] and "test.txt" not in out["patch"]
+    assert out["summary"] == "did the thing" and out["files_touched"] == ["f.txt"]
+
+
+def test_a_build_that_edited_nothing_is_refused_as_patch_empty(tmp_path, repo) -> None:
+    """A bare `cat` of the canned output: no `.git` write, so the scratch stays clean."""
+    output = tmp_path / "output.json"
+    output.write_text(
+        json.dumps({"is_error": False, "total_cost_usd": 0.01, "num_turns": 1,
+                    "structured_output": {"patch": "diff --git a/test.txt\n-a\n+b\n"}}),
+        encoding="utf-8",
+    )
+    script = tmp_path / "claude"
+    script.write_text(f"#!/bin/sh\ncat {output}\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+    with pytest.raises(RunnerError, match="patch_empty"):
+        runner.run(role="build", schema=SCHEMA, prompt="go")
+
+
 def test_a_reading_role_gets_no_scratch(fake_claude, tmp_path, repo) -> None:
     runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
     runner.run(role="review_charter", schema=SCHEMA, prompt="go")
@@ -634,6 +683,8 @@ def sequenced_claude(tmp_path: Path):
         "import json, pathlib\n"
         f"c = pathlib.Path({str(counter)!r}); n = int(c.read_text() or 0) if c.exists() else 0\n"
         "c.write_text(str(n + 1))\n"
+        "if pathlib.Path('.git').exists():\n"
+        "    pathlib.Path('built.txt').write_text('edited\\n')\n"
         f"outs = json.load(open({str(outputs)!r}))\n"
         "print(json.dumps(outs[min(n, len(outs) - 1)]))\n",
         encoding="utf-8",
