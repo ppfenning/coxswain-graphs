@@ -49,8 +49,22 @@ VALIDATE_CHUNK_SCHEMA = {
         "satisfied": {"type": "boolean"},
         "gaps": {"type": "array", "items": {"type": "string"}},
         "reasoning": {"type": "string"},
-        # Optional: relative paths the validator would need to read to rule.
-        "needs_evidence": {"type": "array", "items": {"type": "string"}},
+        # Optional: files the validator would need to read to rule. A bare
+        # string is the one-release-old form, read as {"path": <string>}.
+        "needs_evidence": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {"type": "string"},
+                    {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}, "why": {"type": "string"}},
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+        },
     },
     "required": ["satisfied", "gaps", "reasoning"],
     "additionalProperties": False,
@@ -201,6 +215,46 @@ def _harness_fault_verdict(second: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _as_request(item: Any) -> dict[str, str] | None:
+    if isinstance(item, str) and item:
+        return {"path": item}
+    if isinstance(item, Mapping) and isinstance(item.get("path"), str) and item.get("path"):
+        why = item.get("why")
+        return {"path": item["path"], "why": why} if isinstance(why, str) and why else {"path": item["path"]}
+    return None
+
+
+def evidence_requests(raw: Sequence[Any]) -> tuple[list[dict[str, str]], list[Any]]:
+    """Pure: `needs_evidence` entries as `{"path", "why"?}`, and those with no usable path."""
+    parsed = [(_as_request(item), item) for item in raw]
+    return (
+        [request for request, _ in parsed if request is not None],
+        [item for request, item in parsed if request is None],
+    )
+
+
+def _second_chunk_prompt(
+    base: str, read_pairs: Sequence[tuple[str, str]], unread: Sequence[tuple[str, str]]
+) -> str:
+    """Pure: the same prompt, with what was read and what could not be, said in it — never in `context`."""
+    evidence = "\n\n".join(f"--- {path} ---\n{text}" for path, text in read_pairs)
+    named = "; ".join(f"{path} ({reason})" for path, reason in unread)
+    return "\n\n".join(
+        [
+            base,
+            *([f"Evidence you asked for:\n{evidence}"] if read_pairs else []),
+            *(
+                [
+                    f"the evidence you asked for could not be read: {named}; rule on "
+                    "the patch and facts in front of you, or say plainly that you cannot."
+                ]
+                if unread
+                else []
+            ),
+        ]
+    )
+
+
 _MAX_EVIDENCE_FILES = 5
 
 # What the harness injects to fetch a named file's text; `None` means it could
@@ -260,8 +314,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     chunk_verdicts: list[dict[str, Any]] = []
     if "validate_chunk" in bound:
         # The reader is the injected edge: `harness/epic.py` supplies the one
-        # that actually opens a file. Absent here, every needs_evidence
-        # request is refused rather than guessed at.
+        # that actually opens a file. Absent here, no needs_evidence request
+        # can be read, and the validator is told so and asked again — never
+        # refused by the harness on that account alone.
         reader: EvidenceReader | None = args.get("reader")
         for task in tasks:
             chunk_prompt = (
@@ -272,7 +327,10 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 "account of the work. Name every gap you find; an empty list "
                 "means you found none, not that you did not look.\n\n"
                 "If you cannot rule without reading a file the diff does not "
-                "show, list it in needs_evidence instead of guessing."
+                "show, list it in needs_evidence as {\"path\": ..., \"why\": ...}: "
+                "path must be exactly a repository-relative file path as it "
+                "would appear in `git ls-files`, and the reason belongs in "
+                "why, never in path."
             )
             raw_verdict, stalled = _verdict(
                 runner,
@@ -287,19 +345,18 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             # fault. Narrow the failure back to the task it belongs to.
             first_verdict = _harness_fault_verdict(raw_verdict) if stalled else raw_verdict
             requested = [] if stalled else list(first_verdict.get("needs_evidence") or [])
+            kept, dropped = evidence_requests(requested)
 
             # A typed, one-shot ask, independent of the placeholder retry
             # above: what comes back second is final, routed through the same
             # `_verdict` guard so a placeholder answer here is not believed
             # either. Not chased further, even if it asks again.
-            base_verdict = first_verdict
-            evidence_supplied: list[str] | None = None
-            refusal_gaps: list[str] = []
-            if first_verdict.get("satisfied") is False and requested:
-                accepted, refused = _partition_evidence(task.get("worktree"), requested)
+            if first_verdict.get("satisfied") is False and (kept or dropped):
+                accepted, refused = _partition_evidence(task.get("worktree"), [item["path"] for item in kept])
                 reads = [(rel, reader(task.get("worktree"), rel) if reader is not None else None) for rel in accepted]
                 read_pairs = [(rel, text) for rel, text in reads if text is not None]
                 unread = [
+                    *((str(item), "could not be resolved to a path") for item in dropped),
                     *refused,
                     *(
                         (rel, "could not be read" if reader is not None else "no evidence reader was supplied")
@@ -307,28 +364,32 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                         if text is None
                     ),
                 ]
-                if read_pairs:
-                    evidence_block = "\n\n".join(f"--- {path} ---\n{text}" for path, text in read_pairs)
-                    second_raw, second_stalled = _verdict(
-                        runner,
-                        role="validate_chunk",
-                        tier="standard",
-                        schema=VALIDATE_CHUNK_SCHEMA,
-                        context=[*context, f"Evidence you asked for:\n{evidence_block}"],
-                        prompt=chunk_prompt,
-                    )
-                    base_verdict = _harness_fault_verdict(second_raw) if second_stalled else second_raw
-                    evidence_supplied = [path for path, _ in read_pairs]
-                refusal_gaps = [f"needs_evidence named '{path}', {reason}; refused" for path, reason in unread]
+                second_raw, second_stalled = _verdict(
+                    runner,
+                    role="validate_chunk",
+                    tier="standard",
+                    schema=VALIDATE_CHUNK_SCHEMA,
+                    context=context,
+                    prompt=_second_chunk_prompt(chunk_prompt, read_pairs, unread),
+                )
+                base_verdict = _harness_fault_verdict(second_raw) if second_stalled else second_raw
+                evidence_supplied: list[str] | None = [path for path, _ in read_pairs]
+                evidence_unread = [f"{path} ({reason})" for path, reason in unread]
+            else:
+                base_verdict = first_verdict
+                evidence_supplied = None
+                evidence_unread = []
 
             entry = {
                 "task": str(task.get("id")),
                 "satisfied": bool(base_verdict.get("satisfied")),
-                "gaps": [*(base_verdict.get("gaps") or []), *refusal_gaps],
+                "gaps": list(base_verdict.get("gaps") or []),
                 "reasoning": str(base_verdict.get("reasoning", "")),
             }
             if evidence_supplied is not None:
                 entry["evidence_supplied"] = evidence_supplied
+            if evidence_unread:
+                entry["evidence_unread"] = evidence_unread
             chunk_verdicts.append(entry)
 
     phase_verdict, phase_stalled = _verdict(
