@@ -94,3 +94,46 @@ after being wrong twice.
 - **Generality.** Triage has runbook entries; `lifecycle-propose` has none, or
   has something else. Worth resisting the urge to generalise the field before a
   second graph actually needs it.
+
+## The project overlay layer
+
+**Status:** implemented (2026-09-06). A fourth cartridge layer, read from the
+TARGET repository rather than from `agent-cartridges` itself:
+`<repo>/.agent/cartridge.yaml`. It has no `extends` — it is the last word, not
+another link in the chain — and it merges LAST, on top of whatever the
+profile's team cartridge already resolved to. Absent, the resolved cartridge
+is byte-identical to a run without one.
+
+Only four keys are read out of it:
+
+- `context` — concatenates onto the context list, as every layer does.
+- `policy.review_tier` — tighten only. An overlay may add a tier2 surface or
+  lower a size threshold; it may not raise one or remove a surface the team
+  already set.
+- `landing_areas.checks` — the run's checks. This subsumes `.agent-checks`:
+  that file is a shorthand that populates this key only when the overlay
+  itself does not set it.
+- `description`.
+
+Every other top-level key is refused. `skills`, `cast`, `write_kinds`,
+`extends`, and anything else the overlay declares raises `CartridgeError`
+naming the offending key — an overlay tightens a team's policy, it does not
+hand the target repository a second cast or a second set of write kinds.
+
+The overlay's own text is folded into `cartridge_sha`, so a run under an
+overlay and a run without one are provably different runs. The resolved
+cartridge also carries `overlay_sha`: the sha256 of the overlay text when
+`<repo>/.agent/cartridge.yaml` was present, `None` when it was not.
+
+`agent-graphs` writes `overlay_sha` beside `cartridge_sha` wherever it builds
+a per-run record from the resolved cartridge itself: today that is the
+entry-level observation `_observe_trap_failures` files when a `doc_update`
+trap did not hold (`harness/cli.py`). The phase manifest that `build_manifest`
+and `record_run` produce for every run does not yet carry `overlay_sha` — that
+function lives in `agent-cartridges`, and its current signature neither
+accepts the field as an argument nor reads it off the `cartridge` mapping it
+is already handed, confirmed by calling it directly with an `overlay_sha`-
+bearing cartridge and reading back its keys. Passing `cartridge` unchanged
+picks up `overlay_sha` automatically once `build_manifest` reads it the way it
+already reads `cartridge_sha`; landing that read is a change to
+`agent-cartridges`, not to `agent-graphs`.

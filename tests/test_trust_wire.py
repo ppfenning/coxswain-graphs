@@ -240,7 +240,17 @@ def test_a_trap_that_did_not_hold_is_recorded_against_the_entry(cart, tmp_path) 
     assert row["risk"] == "low", "risk is read off the taxonomy, never invented"
     assert row["principal"] == GRAPH, "the principal is the graph, never a person"
     assert (row["cartridge_sha"], row["provider_profile"]) == (SHA, PROFILE)
+    assert row["overlay_sha"] is None, "no overlay in the fixture cartridge, so the field reads back None"
     assert row["ts"] == "2026-08-31T00:00:00Z", "the manifest's clock, not a second one"
+
+
+def test_an_overlay_shas_cartridge_carries_it_into_the_row(cart, tmp_path) -> None:
+    path = tmp_path / "l.jsonl"
+    cart["overlay_sha"] = "overlay-sha-fixture"
+    observe(triage_result(trap_held=False), cart, path)
+
+    (row,) = ledger.read(path)
+    assert row["overlay_sha"] == "overlay-sha-fixture"
 
 
 def test_a_trap_that_held_records_nothing(cart, tmp_path) -> None:
