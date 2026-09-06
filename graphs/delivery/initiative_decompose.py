@@ -19,13 +19,13 @@ the work store is written by an apply arm after a human said yes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
 from runner.protocol import NodeRunner
 
-__all__ = ["GRAPH_NAME", "run"]
+__all__ = ["GRAPH_NAME", "initiative_text", "run"]
 
 GRAPH_NAME = "initiative-decompose"
 
@@ -98,6 +98,22 @@ EDGE_CHALLENGE_SCHEMA = {
     "required": ["spurious_edges", "missing_edges", "verdict", "summary"],
     "additionalProperties": False,
 }
+
+
+def initiative_text(idea: Mapping[str, Any], phases: Sequence[str], goals: Mapping[str, str], repo: str) -> str:
+    """The `initiative.md` shape every hand-written initiative in the workspace carries."""
+    goal_lines = "\n".join(f"- {phase_id}: {goals.get(phase_id, '')}" for phase_id in phases)
+    return (
+        "---\n"
+        f"id: {idea.get('id')}\n"
+        f"title: {idea.get('title')}\n"
+        f"repo: {repo}\n"
+        f"budget_usd: {idea.get('budget_usd')}\n"
+        "---\n\n"
+        f"{idea.get('why', '')}\n\n"
+        "PHASE GOALS, each judged against ITS OWN line:\n"
+        f"{goal_lines}\n"
+    )
 
 
 def _apply_challenge(tasks: list[dict[str, Any]], challenge: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -177,9 +193,17 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         )
     )
 
+    initiative_id = args.get("initiative_id")
+
     tasks = [dict(t, needs=list(t.get("needs") or []), surfaces=list(t.get("surfaces") or [])) for t in decomposition.get("tasks") or []]
     if not tasks:
         raise ContractViolation("decompose returned no tasks; there is nothing to propose")
+
+    if initiative_id:
+        tasks = [
+            dict(t, id=f"{initiative_id}-{t['id']}", needs=[f"{initiative_id}-{n}" for n in t["needs"]])
+            for t in tasks
+        ]
 
     challenge: dict[str, Any] | None = None
     if "review_adversary" in bound:
@@ -216,6 +240,12 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     )
     landing = landing_for(cartridge, "planned")
 
+    phase_order = [str(p.get("id")) for p in decomposition.get("phases") or []]
+    goals = {str(p.get("id")): str(p.get("goal") or "") for p in decomposition.get("phases") or []}
+    idea_doc = {"id": initiative_id or run_id, "title": str(idea), "budget_usd": args.get("budget_usd"), "why": str(idea)}
+    initiative_body = initiative_text(idea_doc, phase_order, goals, str(args.get("repo") or ""))
+    initiative_where = "/".join(part for part in (landing, initiative_id) if part)
+
     proposals = [
         proposal(
             cartridge,
@@ -226,7 +256,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 {"check": "depends on", "output": ", ".join(task["needs"]) or "nothing — can start immediately"},
                 {"check": "surfaces", "output": ", ".join(task.get("surfaces") or []) or "none declared"},
                 *(
-                    [{"check": "adversary on the DAG", "output": str(challenge.get("summary"))}]
+                    [{"check": "adversary on the DAG", "output": "adversary edges applied: " + str(challenge.get("summary"))}]
                     if challenge
                     else []
                 ),
@@ -237,9 +267,18 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             # inventing the title and guessing the initiative — the first live
             # run proved exactly that. `initiative_id` is optional: absent, the
             # store root's name is the initiative, as `read_initiative` reads it.
-            suggested_action=_item_action(task, landing=landing, initiative_id=args.get("initiative_id")),
+            suggested_action=_item_action(task, landing=landing, initiative_id=initiative_id),
         )
         for task in sorted(tasks, key=lambda t: str(t["id"]))
+    ] + [
+        proposal(
+            cartridge,
+            kind="item_create",
+            target="initiative",
+            evidence=[{"check": "phases", "output": ", ".join(phase_order) or "none"}],
+            rationale=str(decomposition.get("rationale") or ""),
+            suggested_action=f"create {initiative_where}/initiative.md with body =\n{initiative_body}",
+        )
     ]
 
     unblocked = [t["id"] for t in tasks if not t["needs"]]
@@ -290,5 +329,9 @@ SPEC = GraphSpec(
              help="the initiative, as prose or a path to a file holding it"),
         Need("initiative_id", flag="--initiative-id", required=False,
              help="directory name for the initiative under the work store (default: the store root itself)"),
+        Need("repo", flag="--target-repo", required=False,
+             help="the repository the initiative targets, for initiative.md's frontmatter"),
+        Need("budget_usd", flag="--budget-usd", required=False,
+             help="the initiative's budget in dollars, for initiative.md's frontmatter"),
     ),
 )
