@@ -61,6 +61,61 @@ def test_change_facts_are_counted_from_the_patch_not_asked_of_the_model(
     assert facts["changed_lines"] == 3
 
 
+TWO_HUNK_PATCH = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n"
+    "+++ b/src/a.py\n"
+    "@@ -1,2 +1,2 @@\n"
+    "-old\n"
+    "+new\n"
+    " context\n"
+    "@@ -10,1 +10,2 @@\n"
+    " keep\n"
+    "+added\n"
+)
+
+CUT_MID_HUNK_PATCH = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n"
+    "+++ b/src/a.py\n"
+    "@@ -1,2 +1,2 @@\n"
+    "-old\n"
+    "+new\n"
+    " context\n"
+    "@@ -10,1 +10,2 @@\n"
+    " keep\n"
+)
+
+BARE_HUNK_PATCH = "@@ -1,1 +1,1 @@\n line\n"
+
+
+def test_patch_parses_accepts_a_complete_two_hunk_patch() -> None:
+    assert lifecycle_propose.patch_parses(TWO_HUNK_PATCH) is None
+
+
+def test_patch_parses_names_the_file_and_hunk_cut_short() -> None:
+    reason = lifecycle_propose.patch_parses(CUT_MID_HUNK_PATCH)
+    assert reason == "the patch was cut off at src/a.py hunk 2; emit the complete patch"
+
+
+def test_patch_parses_accepts_a_bare_hunk_list_with_no_diff_header() -> None:
+    assert lifecycle_propose.patch_parses(BARE_HUNK_PATCH) is None
+
+
+def test_a_truncated_patch_is_retried_once_and_a_second_truncation_is_recorded(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    truncated = {**build_response, "patch": CUT_MID_HUNK_PATCH}
+    scripted = runner(plan_response, [truncated, truncated], review_response)
+    result = lifecycle_propose.run(args(cartridge), scripted)
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 2
+    assert "src/a.py hunk 2" in build_calls[1]["prompt"]
+    assert result["change_facts"]["patch_ok"] is False
+    assert result["fix_loop"]["stopped"] == "patch_truncated"
+    assert result["proposals"] == []
+
+
 def test_approved_review_emits_a_draft_pr_proposal_and_applies_nothing(
     cartridge, plan_response, build_response, review_response
 ) -> None:

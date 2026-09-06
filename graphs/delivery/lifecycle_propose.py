@@ -325,6 +325,38 @@ def _lines_by_kind(patch: str) -> tuple[int, int]:
     return source_lines, test_lines
 
 
+_HUNK_RE = re.compile(r"^@@ -\d+,(\d+) \+\d+,(\d+) @@")
+
+
+def patch_parses(patch: str) -> str | None:
+    """None when every hunk header's counts match its body and the text ends with a newline."""
+    if not patch.strip():
+        return None
+    name, hunk_index = "the patch", 0
+    for path, chunk in _file_chunks(patch) or [("", patch)]:
+        name = path or "the patch"
+        lines = chunk.splitlines()
+        hunk_index = 0
+        for i, line in enumerate(lines):
+            match = _HUNK_RE.match(line)
+            if not match:
+                continue
+            hunk_index += 1
+            old_count, new_count = int(match.group(1)), int(match.group(2))
+            body: list[str] = []
+            for later in lines[i + 1 :]:
+                if later.startswith("@@"):
+                    break
+                body.append(later)
+            seen_old = sum(1 for l in body if not l.startswith("+"))
+            seen_new = sum(1 for l in body if not l.startswith("-"))
+            if seen_old != old_count or seen_new != new_count:
+                return f"the patch was cut off at {name} hunk {hunk_index}; emit the complete patch"
+    if not patch.endswith("\n"):
+        return f"the patch was cut off at {name} hunk {hunk_index}; emit the complete patch"
+    return None
+
+
 def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
     """Deterministic facts about the change, for the reviewer and the gate.
 
@@ -346,6 +378,7 @@ def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
         "changed_lines": added + removed,
         "source_lines": source_lines,
         "test_lines": test_lines,
+        "patch_ok": patch_parses(patch) is None,
     }
 
 
@@ -1001,6 +1034,15 @@ def _review_harness_fault() -> dict[str, Any]:
     }
 
 
+def _patch_truncated_review(reason: str) -> dict[str, Any]:
+    """Pure: the review slot for a patch still truncated after its one retry."""
+    return {
+        "verdict": "revise",
+        "findings": [{"charter_principle": "harness fault", "detail": reason, "file": ""}],
+        "rationale": "patch_truncated",
+    }
+
+
 def _abstained_review() -> dict[str, Any]:
     """Pure: the charter reviewer's slot in the record once it has abstained.
 
@@ -1330,19 +1372,63 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             ) from stop
         build = resumed
 
+    # A patch that does not parse is asked again once, with the reason
+    # attached, and never chased further: the second answer is final.
+    truncation = patch_parses(build.get("patch") or "")
+    if truncation is not None:
+        try:
+            build = runner.run(
+                role="build",
+                tier="standard",
+                thread=str(ticket),
+                schema=BUILD_SCHEMA,
+                context=context,
+                budget_usd=build_budget_usd,
+                prompt=(
+                    f"Carry out this plan and return the change as a unified diff.\n\n"
+                    f"Ticket: {ticket_text}\nPlan: {plan}\n\nReturn the patch only — it is applied "
+                    "by the shell into a worktree, never by you. No tags, no fences, no trailing "
+                    "markup of any kind — the text is fed to `git apply` verbatim and a stray "
+                    "`</patch>` fails the checks. Include the deterministic "
+                    f"commands you ran and their output. {truncation}"
+                ),
+            )
+        except BudgetStop as exc:
+            resumed, continuations, reason, stop = _resume_build(
+                runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
+                surfaces=surfaces, stop=exc, continuations=continuations,
+            )
+            if resumed is None:
+                raise BudgetStop(
+                    role=stop.role,
+                    thread=stop.thread,
+                    session=stop.session,
+                    spent_usd=stop.spent_usd,
+                    partial_patch=stop.partial_patch,
+                    detail=f"{stop.detail} — continuation refused: {reason}",
+                ) from stop
+            build = resumed
+        truncation = patch_parses(build.get("patch") or "")
+    patch_truncated = truncation is not None
+
     facts = _change_facts(build)
     tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
 
     handoff: dict[str, Any] | None = None
-    if "handoff" in bound:
+    if not patch_truncated and "handoff" in bound:
         handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts, ticket_id=ticket)
 
     # A non-blocking refusal costs a build attempt, not the run. Review is
     # skipped — there is nothing yet worth a deep-tier opinion — and the
     # handoff's own list of what is missing is what the builder is sent back
     # with. Paying two reviewers to read a change the shuttle already said is
-    # under-evidenced would buy an opinion about the wrong thing.
-    if handoff is not None and not handoff.get("complete"):
+    # under-evidenced would buy an opinion about the wrong thing. A patch still
+    # truncated after its one retry never buys a review either — there is
+    # nothing yet that applies.
+    if patch_truncated:
+        review, adversary, arbitration = _patch_truncated_review(truncation), None, None
+        verdict, review_placeholder, review_quarantine = "revise", False, False
+    elif handoff is not None and not handoff.get("complete"):
         review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _handoff_critique(handoff)
     else:
         review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _review_round(
@@ -1367,11 +1453,16 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     fix_attempts = DEFAULT_FIX_ATTEMPTS if fix_attempts is None else int(fix_attempts)
     attempts = 1
     # Both reviewers abstaining is a harness fault, not a task to rebuild
-    # against — the loop never gets a chance to start.
-    stopped: str | None = "harness fault: review placeholders" if review_quarantine else None
+    # against — the loop never gets a chance to start. A patch truncated twice
+    # is the same shape: nothing to send back and revise.
+    stopped: str | None = (
+        "patch_truncated" if patch_truncated
+        else "harness fault: review placeholders" if review_quarantine
+        else None
+    )
     standing: set[str] = set()
 
-    while verdict != "approve" and attempts <= fix_attempts and not review_quarantine:
+    while verdict != "approve" and attempts <= fix_attempts and not review_quarantine and not patch_truncated:
         # Every claim raised so far, not merely the last round's. Re-raising an
         # objection from two rounds ago is no more progress than re-raising the
         # one from the last.
