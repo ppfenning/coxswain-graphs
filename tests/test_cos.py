@@ -309,6 +309,77 @@ def test_consumes_only_after_a_successful_decompose_never_a_failed_one(tmp_path,
     assert not (intake_root / "consumed").exists() or list((intake_root / "consumed").iterdir()) == []
 
 
+def test_a_successful_invocation_is_recorded_with_its_item_and_graph(tmp_path, cart) -> None:
+    decompose_spec, _ = _stub_spec("decompose", "initiative-decompose")
+    specs = {"decompose": decompose_spec}
+
+    intake_root = tmp_path / "intake"
+    intake_root.mkdir()
+    (intake_root / "001-idea.md").write_text("body", encoding="utf-8")
+
+    cos_result = {"selections": [{"graph": "decompose", "why": "x"}], "idle": False, "reasoning": "r"}
+
+    result = cos.run_cos(
+        docket=DOCKET,
+        specs=specs,
+        runner=None,
+        cartridge=cart,
+        run_id="parent",
+        date="d",
+        max_parallel=1,
+        intake_root=intake_root,
+        cos_result=cos_result,
+    )
+
+    item = str(intake_root / "001-idea.md")
+    assert result["invoked"] == [
+        {"graph": "decompose", "why": "x", "item": item, "line": f"dispatched decompose for {item}"}
+    ]
+
+
+def test_a_failed_invocation_is_recorded_with_its_item_and_reason(tmp_path, cart) -> None:
+    decompose_spec, _ = _stub_spec("decompose", "initiative-decompose", fail=True)
+    specs = {"decompose": decompose_spec}
+
+    intake_root = tmp_path / "intake"
+    intake_root.mkdir()
+    (intake_root / "001-idea.md").write_text("body", encoding="utf-8")
+
+    cos_result = {"selections": [{"graph": "decompose", "why": "x"}], "idle": False, "reasoning": "r"}
+
+    result = cos.run_cos(
+        docket=DOCKET,
+        specs=specs,
+        runner=None,
+        cartridge=cart,
+        run_id="parent",
+        date="d",
+        max_parallel=1,
+        intake_root=intake_root,
+        cos_result=cos_result,
+    )
+
+    item = str(intake_root / "001-idea.md")
+    assert result["invoked"] == [
+        {
+            "graph": "decompose",
+            "why": "x",
+            "item": item,
+            "reason": "decompose refused",
+            "line": f"dispatched decompose for {item} — failed: decompose refused",
+        }
+    ]
+
+
+def test_dispatch_line_accepts_the_two_shapes_run_cos_now_calls_it_with() -> None:
+    entry = {"graph": "decompose", "item": "queue/001-idea.md"}
+    assert cos.dispatch_line(entry, {"reason": None}) == "dispatched decompose for queue/001-idea.md"
+    assert (
+        cos.dispatch_line(entry, {"reason": "decompose refused"})
+        == "dispatched decompose for queue/001-idea.md — failed: decompose refused"
+    )
+
+
 def test_an_idle_decision_invokes_nothing(cart) -> None:
     result = cos.run_cos(
         docket=DOCKET,
