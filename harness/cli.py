@@ -22,6 +22,7 @@ from datetime import date as date_type
 from pathlib import Path
 from typing import Any
 
+import yaml
 from core import ledger, workstore
 from core.cartridge import CartridgeError
 from core.manifest import build_manifest, record_run
@@ -34,7 +35,7 @@ from harness.escalate import escalate_self_modification
 from harness.gate import apply_decisions, auto_apply, gate
 from harness.phase import run_phase
 from harness.registry import GraphSpec, discover
-from harness.resolve import resolve_cartridge, role_skill_bodies
+from harness.resolve import overlay_path, resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
 from harness.usage import record_usage
 from harness.worktree import apply_patch, create_worktree
@@ -287,6 +288,13 @@ def _cos_docket_args(*, cartridge: Mapping[str, Any], args: argparse.Namespace) 
     }
 
 
+def _read_overlay(repo: str | None) -> Any | None:
+    """Parsed `<repo>/.agent/cartridge.yaml`, or None when repo or the file is absent."""
+    if not repo or not Path(overlay_path(repo)).is_file():
+        return None
+    return yaml.safe_load(Path(overlay_path(repo)).read_text(encoding="utf-8"))
+
+
 def main(argv: list[str] | None = None) -> int:
     specs = discover()
     parser = _build_parser(specs)
@@ -295,12 +303,15 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skills_root and not args.unverified_skills:
         parser.error("pass --skills-root at least once, or --unverified-skills to skip the check explicitly")
 
+    overlay = _read_overlay(args.repo)
+
     try:
         cartridge, skill_index = resolve_cartridge(
             args.team,
             cartridges_dir=args.cartridges_dir,
             skills_root=args.skills_root,
             unverified_skills=args.unverified_skills,
+            overlay=overlay,
         )
     except CartridgeError as exc:
         print(str(exc), file=sys.stderr)
