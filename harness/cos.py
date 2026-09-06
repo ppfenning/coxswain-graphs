@@ -370,6 +370,20 @@ def run_cos(
     )
 
     failed_ids = {failure.split(":", 1)[0] for failure in failures}
+    failure_reasons = {failure.split(":", 1)[0]: failure.split(":", 1)[1].strip() for failure in failures}
+    decompose_paths = {invocation_id: item["path"] for invocation_id, item in decompose_by_invocation}
+
+    invoked = []
+    for index, selection in enumerate(allowed):
+        graph = str(selection.get("graph"))
+        invocation_id = f"{graph}-{index}"
+        item = decompose_paths.get(invocation_id, selection.get("item", graph))
+        reason = failure_reasons.get(invocation_id)
+        entry = {**selection, "graph": graph, "item": item}
+        if invocation_id in failed_ids:
+            entry["reason"] = reason
+        entry["line"] = dispatch_line(entry, {"reason": reason})
+        invoked.append(entry)
 
     consumed: list[str] = []
     for invocation_id, item in decompose_by_invocation:
@@ -384,7 +398,7 @@ def run_cos(
 
     return {
         "selections": selections,
-        "invoked": allowed,
+        "invoked": invoked,
         "results": results,
         "proposals": proposals,
         "failures": failures,
