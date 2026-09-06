@@ -54,6 +54,7 @@ Deferred (see graphs/lifecycle-propose.md): intake queue, verification, retro.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from difflib import SequenceMatcher
 from typing import Any, NamedTuple
@@ -300,6 +301,89 @@ def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
         "removed_lines": removed,
         "changed_lines": added + removed,
     }
+
+
+def measured_facts(build: Mapping[str, Any], change_facts: Mapping[str, Any]) -> dict[str, str]:
+    """The facts the harness itself established, keyed for `prune_missing` to cite.
+
+    Every path the build touched, the three line counts, and the tail of every
+    `pytest` command it ran — all of it already measured, none of it asked of a
+    model. A `missing` item that names one of these is asking for a number the
+    graph is already holding.
+    """
+    facts: dict[str, str] = {}
+    for path in change_facts.get("files_touched") or []:
+        facts[f"file:{path}"] = f"touched: {path}"
+    for key in ("added_lines", "removed_lines", "changed_lines"):
+        facts[key] = f"{key.replace('_', ' ')}: {change_facts.get(key)}"
+    for index, entry in enumerate(build.get("commands_run") or []):
+        command = str(entry.get("command") or "") if isinstance(entry, Mapping) else ""
+        if not command.startswith("pytest"):
+            continue
+        output = str(entry.get("output") or "") if isinstance(entry, Mapping) else ""
+        tail = "\n".join(output.strip().splitlines()[-3:])
+        facts[f"pytest:{index}"] = f"{command} -> {tail}"
+    return facts
+
+
+# The model's own words for "I already have this"; matched case-insensitively
+# against a `missing` item, then against the fact-key substring that answers
+# it. A complaint typed differently still names the same absent thing.
+_DISCHARGE_PHRASES = {
+    "files touched": "file",
+    "git diff": "file",
+    "diff shown": "file",
+    "line count": "lines",
+    "lines": "lines",
+    "size": "lines",
+    "budget": "lines",
+    "pytest": "pytest",
+    "test output": "pytest",
+    "suite": "pytest",
+    "passed": "pytest",
+}
+
+
+def prune_missing(missing: list[str], facts: dict[str, str]) -> tuple[list[str], list[str]]:
+    """Split a model's `missing` list into what still stands and what the
+    harness already answered.
+
+    A complaint that names a fact the harness already measured is discharged,
+    paired with the fact that answers it — a reader sees the harness answered
+    it rather than a build attempt spent closing a gap that was never open.
+    """
+    kept: list[str] = []
+    discharged: list[str] = []
+    for item in missing:
+        # Word-bounded: a phrase must appear as itself, not as a run of
+        # letters inside a longer word — "cleanliness" is not "lines".
+        substring = next(
+            (sub for phrase, sub in _DISCHARGE_PHRASES.items() if re.search(rf"\b{re.escape(phrase)}\b", item, re.IGNORECASE)),
+            None,
+        )
+        fact = next((value for key, value in facts.items() if substring and substring in key), None)
+        if fact is not None:
+            discharged.append(f"{item} -> {fact}")
+        else:
+            kept.append(item)
+    return kept, discharged
+
+
+_SIZE_TARGET_RE = re.compile(r"~\s*(\d+)\s*lines", re.IGNORECASE)
+
+
+def _size_deviation(ticket_text: str, changed_lines: int) -> str | None:
+    """A size overrun against the ticket's own `~N lines` target, when it named one.
+
+    Not a `missing` item: the target and the count are both already known, so
+    there is nothing left for another build attempt to discover. It is a
+    disclosed fact about the change, not a gap in the evidence for it.
+    """
+    match = _SIZE_TARGET_RE.search(ticket_text)
+    if not match:
+        return None
+    target = int(match.group(1))
+    return f"deviation: {changed_lines} lines against ~{target}" if changed_lines > target else None
 
 
 def _claims(adversary: Mapping[str, Any] | None) -> set[str]:
@@ -695,6 +779,8 @@ def _handoff(
                 "build produced actually contain what a reviewer needs?\n\n"
                 f"Task: {ticket}\nPlan: {plan}\nSummary: {build.get('summary')}\n"
                 f"Files: {build.get('files_touched')}\nChange facts: {facts}\n"
+                "The facts listed under Change facts are already measured by the "
+                "harness; do not list any of them as missing.\n"
                 f"Commands run (with their real output): {build.get('commands_run')}\n"
                 f"Patch ({len(patch)} chars, {'complete' if len(patch) <= PATCH_PREVIEW_CHARS else 'head shown'}):\n"
                 f"{patch[:PATCH_PREVIEW_CHARS]}\n\n"
@@ -713,6 +799,20 @@ def _handoff(
             ),
         )
     )
+    # Anything the model flagged as missing that the harness already measured
+    # is discharged here, not argued with the model: the fact is not absent,
+    # it is sitting in `facts` unread. If discharging clears the list, the
+    # handoff was complete all along.
+    kept, discharged = prune_missing(list(handoff.get("missing") or []), measured_facts(build, facts))
+    handoff["missing"] = kept
+    handoff["discharged"] = discharged
+    if not kept:
+        handoff["complete"] = True
+        handoff["blocking"] = False
+    deviation = _size_deviation(str(ticket), int(facts.get("changed_lines") or 0))
+    if deviation:
+        brief = str(handoff.get("brief") or "")
+        handoff["brief"] = f"{brief}\n{deviation}" if brief else deviation
     # No patch is an absent artifact as a matter of fact, whatever the node
     # said; with a patch in hand, only the node knows whether an INPUT was
     # missing, so its flag decides.
