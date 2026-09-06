@@ -25,7 +25,7 @@ from typing import Any
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
 from runner.protocol import NodeRunner
 
-__all__ = ["GRAPH_NAME", "run", "initiative_text"]
+__all__ = ["GRAPH_NAME", "initiative_text", "run"]
 
 GRAPH_NAME = "initiative-decompose"
 
