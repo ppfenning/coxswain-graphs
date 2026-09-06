@@ -132,6 +132,7 @@ staying small, enforced at the seam where it actually matters.
 | `phase-validate` | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver. |
 | `retro-propose` | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite. |
 | `coxswain` | one `dispatch` node over a driver-assembled docket. Selects; the driver invokes. |
+| `review-diff` | review_charter → review_adversary → verify_evidence → [arbitrate]. Reviews an arbitrary diff, outside any build's own run. |
 
 All seven are specified in `graphs/` and implemented.
 

@@ -88,6 +88,7 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 | `phase-validate` | delivery | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver |
 | `retro-propose` | ops | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite |
 | `coxswain` | ops | one `dispatch` node over a driver-assembled docket. Selects; the harness invokes |
+| `review-diff` | delivery | review_charter → review_adversary → verify_evidence → [arbitrate]. Verdict and findings out, nothing written or pushed |
 
 Each graph's diagram is generated from its own docstring by `python -m harness.graphdoc`; the committed pages live under [`docs/graphs/`](docs/graphs/index.md).
 
