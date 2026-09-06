@@ -102,6 +102,11 @@ _PLACEHOLDER_MARKERS = (
     "will verify",
     "before finalizing",
     "provisional verdict",
+    "need to verify",
+    "would need to read",
+    "cannot confirm from the evidence provided",
+    "placeholder, will",
+    # not "needs to verify" or "will redo": both read naturally inside a real finding about the code
 )
 
 
