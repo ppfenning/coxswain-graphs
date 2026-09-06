@@ -597,3 +597,110 @@ def test_a_merge_without_a_plan_stops_the_graph_instead_of_building_the_first_pl
     with pytest.raises(ContractViolation, match="claimed 'merged'"):
         lifecycle_propose.run(args(competitive(cartridge)), scripted)
     assert roles(scripted, "build") == [], "no plan was built under the false claim"
+
+
+# ── a review is not a verdict when it only names what it would check ───────
+
+# The literal charter-reviewer answer that burned two build attempts: a
+# finding whose detail is the bare word "placeholder" and a rationale that is
+# just the empty object a schema-shaped stub produces.
+INCIDENT_LITERAL = {
+    "verdict": "revise",
+    "findings": [{"detail": "placeholder", "charter_principle": "handoff evidence", "file": ""}],
+    "rationale": "{}",
+}
+
+
+def test_review_is_placeholder_catches_the_literal_incident() -> None:
+    assert lifecycle_propose.review_is_placeholder(INCIDENT_LITERAL) is True
+
+
+def test_review_is_placeholder_leaves_a_real_revise_alone() -> None:
+    assert lifecycle_propose.review_is_placeholder(REVISE) is False
+
+
+def test_review_is_placeholder_leaves_an_empty_findings_approve_alone() -> None:
+    approve = {"verdict": "approve", "findings": [], "rationale": "matches the charter"}
+    assert lifecycle_propose.review_is_placeholder(approve) is False
+
+
+def test_review_is_placeholder_leaves_a_real_finding_about_placeholder_code_alone() -> None:
+    """A finding is a match only when its detail IS the marker, never when it merely contains one."""
+    real_finding = {
+        "verdict": "revise",
+        "findings": [{"detail": "the patch leaves a placeholder function with no test", "charter_principle": "tests", "file": "a.py"}],
+        "rationale": "the handler is unimplemented",
+    }
+    assert lifecycle_propose.review_is_placeholder(real_finding) is False
+
+
+def test_review_is_placeholder_leaves_an_adversary_approve_with_nothing_to_object_to_alone() -> None:
+    """ADVERSARY_SCHEMA has no `rationale`; an empty `strongest_objection` on an
+    approve is a clean approval, not a placeholder."""
+    approve = {"verdict": "approve", "objections": [], "strongest_objection": ""}
+    assert lifecycle_propose.review_is_placeholder(approve) is False
+
+
+def test_an_abstained_reviewers_placeholder_never_reaches_the_next_build_prompt(
+    cartridge, plan_response, build_response
+) -> None:
+    """The failure mode itself: an abstained review must not resurface in the fix loop.
+
+    The charter reviewer placeholders twice every round; the adversary sends
+    the change back once and then approves. The retry build prompt — built
+    from the sanitized stand-in, not the raw second answer — must carry
+    neither the word nor the empty-object rationale the incident was made of.
+    """
+    scripted = ScriptedRunner(
+        {
+            "plan": plan_response,
+            "build": [build_response, rebuilt(build_response, PATCH_ANSWERED)],
+            "review_charter": [INCIDENT_LITERAL, INCIDENT_LITERAL],
+            "review_adversary": [ADV_OBJECTS, ADV_APPROVES],
+        }
+    )
+    result = lifecycle_propose.run(args(adversarial(cartridge)), scripted)
+
+    retry_prompt = roles(scripted, "build")[1]["prompt"]
+    assert "placeholder" not in retry_prompt.lower()
+    assert "{}" not in retry_prompt
+    assert [p["kind"] for p in result["proposals"]] == ["draft_pr_create"]
+
+
+def test_a_reviewer_that_placeholders_twice_abstains_and_the_other_decides_alone(
+    cartridge, plan_response, build_response
+) -> None:
+    scripted = ScriptedRunner(
+        {
+            "plan": plan_response,
+            "build": build_response,
+            "review_charter": [INCIDENT_LITERAL, INCIDENT_LITERAL],
+            "review_adversary": ADV_APPROVES,
+        }
+    )
+    result = lifecycle_propose.run(args(adversarial(cartridge)), scripted)
+
+    assert len(roles(scripted, "review_charter")) == 2, "asked again once, then abstained"
+    assert len(roles(scripted, "arbitrate")) == 0, "one reviewer abstained; nothing to arbitrate between"
+    assert result["arbitration"] is None
+    assert result["fix_loop"]["review_placeholder"] is True
+    assert [p["kind"] for p in result["proposals"]] == ["draft_pr_create"], "the adversary's approval stands alone"
+
+
+def test_both_reviewers_placeholdering_quarantines_rather_than_rebuilds(
+    cartridge, plan_response, build_response
+) -> None:
+    scripted = ScriptedRunner(
+        {
+            "plan": plan_response,
+            "build": build_response,
+            "review_charter": [INCIDENT_LITERAL, INCIDENT_LITERAL],
+            "review_adversary": [INCIDENT_LITERAL, INCIDENT_LITERAL],
+        }
+    )
+    result = lifecycle_propose.run(args(adversarial(cartridge)), scripted)
+
+    assert len(roles(scripted, "build")) == 1, "quarantined, not sent back for another attempt"
+    assert result["fix_loop"]["stopped"] == "harness fault: review placeholders"
+    assert result["fix_loop"]["review_placeholder"] is True
+    assert result["proposals"] == []

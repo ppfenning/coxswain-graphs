@@ -245,6 +245,44 @@ def test_a_node_that_placeholders_twice_stops_instead_of_blaming_the_task(cart) 
     assert "harness fault" in " ".join(by_task["t1-probe"]["gaps"])
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "need to verify",
+        "would need to read",
+        "cannot confirm from the evidence provided",
+        "placeholder, will",
+    ],
+)
+def test_each_new_marker_is_asked_again_rather_than_believed(cart, marker) -> None:
+    stalling = {"satisfied": False, "gaps": [], "reasoning": f"{marker} the migration before ruling on this."}
+    result, runner = run(cart, {"validate_chunk": [stalling, CHUNK_OK], "validate_phase": PHASE_MET})
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 3, "two tasks, and the first one asked twice"
+    assert all(v["satisfied"] for v in result["chunk_verdicts"])
+
+
+@pytest.mark.parametrize("phrase", ["needs to verify", "will redo"])
+def test_a_real_gap_using_third_person_verify_or_redo_is_not_a_placeholder(cart, phrase) -> None:
+    """These two read naturally inside a genuine finding, so they are not markers.
+
+    Left out of `_PLACEHOLDER_MARKERS`, unlike first-person 'need to verify':
+    a gap that repeats one of these twice is still a real gap, not a harness
+    fault, and must not quarantine the task.
+    """
+    real_gap = {
+        "satisfied": False,
+        "gaps": [f"the loader {phrase} the row count before the write"],
+        "reasoning": "the migration is missing a check",
+    }
+    result, runner = run(cart, {"validate_chunk": [real_gap, real_gap], "validate_phase": PHASE_MET})
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 2, "asked once per task; the repeated gap was never a placeholder"
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert not by_task["t1-probe"]["satisfied"]
+    assert phrase in " ".join(by_task["t1-probe"]["gaps"]), "the real gap survives, not a harness-fault stand-in"
+
+
 def test_a_refusal_about_a_placeholder_in_the_code_is_a_verdict(cart) -> None:
     """The markers describe the author's own process, never the code under it."""
     result, runner = run(
