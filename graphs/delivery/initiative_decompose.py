@@ -329,7 +329,7 @@ SPEC = GraphSpec(
              help="the initiative, as prose or a path to a file holding it"),
         Need("initiative_id", flag="--initiative-id", required=False,
              help="directory name for the initiative under the work store (default: the store root itself)"),
-        Need("repo", flag="--repo", required=False,
+        Need("repo", flag="--target-repo", required=False,
              help="the repository the initiative targets, for initiative.md's frontmatter"),
         Need("budget_usd", flag="--budget-usd", required=False,
              help="the initiative's budget in dollars, for initiative.md's frontmatter"),
