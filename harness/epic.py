@@ -59,7 +59,7 @@ from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
 from harness.worktree import apply_patch, create_worktree
 
-__all__ = ["phase_order", "phase_parents", "run_epic"]
+__all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
 
 LIFECYCLE = "lifecycle"
 VALIDATE = "validate"
@@ -299,6 +299,18 @@ def _parent_head_moved(ctx: _Ctx, phase: str, base_ref: str) -> bool:
     """
     ok, _ = _git("-C", str(ctx.repo), "merge-base", "--is-ancestor", base_ref, ctx.phase_branch(phase))
     return not ok
+
+
+def branch_action(reused: bool, head_moved: bool, has_own_commits: bool) -> str:
+    """Block only a stale branch that has something of its own to lose; recreate the rest."""
+    if not (reused and head_moved):
+        return "proceed"
+    return "block" if has_own_commits else "recreate"
+
+
+def _phase_branch_own_commits(ctx: _Ctx, phase: str, base_ref: str) -> bool:
+    ok, out = _git("-C", str(ctx.repo), "rev-list", "--count", f"{base_ref}..{ctx.phase_branch(phase)}")
+    return ok and int(out or "0") > 0
 
 
 def _rebase(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str]:
@@ -634,6 +646,54 @@ def _run_phase(
         quarantined.append({"id": phase, "phase": phase, "grain": "phase", "reason": record["reason"]})
         return record
     record["reused_branch"] = reused
+
+    # Decided before a single task builds: a reused branch behind its base is
+    # either recreated (nothing of its own to lose) or blocked (something is).
+    head_moved = reused and _parent_head_moved(ctx, phase, base_ref)
+    has_own_commits = head_moved and _phase_branch_own_commits(ctx, phase, base_ref)
+    action = branch_action(reused, head_moved, has_own_commits)
+
+    if action == "block":
+        # The proposal the quiet path below would have built for the same
+        # staleness — filed here, unchanged, so the gate has it to decide on.
+        record["batch"].append(
+            proposal(
+                ctx.cartridge,
+                kind="stack_rebase",
+                target=branch,
+                evidence=[
+                    {"check": "merge-base --is-ancestor", "output": f"{base_ref} is NOT an ancestor of {branch}"},
+                    {"check": "stacked on", "output": f"{branch} was branched from {base_ref}, whose head has moved"},
+                ],
+                rationale=(
+                    f"'{base_ref}' moved since '{branch}' was created, so this phase — and "
+                    "everything stacked above it — is sitting on ground that is no longer there"
+                ),
+                suggested_action=f"rebase {branch} onto {base_ref}",
+            )
+        )
+        record["status"] = "blocked"
+        record["reason"] = (
+            f"phase branch {branch} is behind {base_ref} and carries its own commits; its tasks "
+            "would build against a base missing landed work — rebase it through the gate"
+        )
+        quarantined.append({"id": phase, "phase": phase, "grain": "phase", "reason": record["reason"]})
+        # Release it, or the next run cannot open this branch at all.
+        _git("-C", str(ctx.phase_worktree(phase)), "checkout", "--detach", "-q")
+        return record
+
+    if action == "recreate":
+        _git("-C", str(ctx.phase_worktree(phase)), "checkout", "--detach", "-q")
+        _git("-C", str(ctx.repo), "worktree", "remove", "--force", str(ctx.phase_worktree(phase)))
+        _git("-C", str(ctx.repo), "branch", "-D", branch)
+        ok, detail, reused = _open_phase_worktree(ctx, phase, base_ref)
+        if not ok:
+            record["status"] = "blocked"
+            record["reason"] = f"the phase worktree could not be recreated: {detail}"
+            quarantined.append({"id": phase, "phase": phase, "grain": "phase", "reason": record["reason"]})
+            return record
+        record["reused_branch"] = reused
+        record["recreated"] = f"phase branch {branch} recreated from {base_ref} (it carried nothing of its own)"
 
     # A runner whose nodes can read the world reads THIS phase's branch — not
     # whatever the repository happens to have checked out. Phase N+1 stacks on
