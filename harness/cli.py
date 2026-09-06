@@ -385,6 +385,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  quarantined {entry.get('grain')}: {entry.get('id')} — {entry.get('reason')}", file=sys.stderr)
         print(f"  manifests: {args.runs_dir} (one per phase, under {run_id}:<phase>)")
         print(f"  ledger   : {args.ledger}")
+        for line in result.get("exit_summary") or []:
+            print(f"  {line}", file=sys.stderr)
         record_usage(runner, runs_dir=args.runs_dir, run_id=run_id)
         return 0
 

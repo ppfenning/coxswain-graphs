@@ -423,6 +423,22 @@ def _unapproved(result: Mapping[str, Any]) -> str | None:
     )
 
 
+def task_outcome(
+    review_verdict: str | None,
+    arbitration_verdict: str | None,
+    quarantine_reason: str | None,
+    landed: bool,
+) -> str:
+    """One of `landed`, `approved_not_landed`, `rejected`, `harness_fault`."""
+    if landed:
+        return "landed"
+    if quarantine_reason is not None and is_harness_fault(quarantine_reason):
+        return "harness_fault"
+    if review_verdict == "approve" or arbitration_verdict == "approve":
+        return "approved_not_landed"
+    return "rejected"
+
+
 # ── the driver ──────────────────────────────────────────────────────────────
 
 
@@ -565,6 +581,7 @@ def run_epic(
         if record["status"] == "complete":
             complete.add(phase)
 
+    approved_not_landed = [t for t in tasks if t.get("outcome") == "approved_not_landed"]
     return {
         "run_id": run_id,
         "date": date,
@@ -573,11 +590,16 @@ def run_epic(
         "tasks": tasks,
         "quarantined": quarantined,
         "proposals": proposals,
+        "exit_summary": [
+            f"approved but not landed: {t['id']} — cox runs recover {run_id} {t['id']} --repo {repo}"
+            for t in approved_not_landed
+        ],
         "totals": {
             "phases_complete": sum(1 for p in phases if p["status"] == "complete"),
             "phases_partial": sum(1 for p in phases if p["status"] == "partial"),
             "phases_blocked": sum(1 for p in phases if p["status"] == "blocked"),
             "tasks_quarantined": sum(1 for q in quarantined if q.get("grain") == "task"),
+            "approved_not_landed": len(approved_not_landed),
             "stacks_rebased": stacks_rebased,
         },
     }
@@ -1042,6 +1064,14 @@ def _run_phase(
         task_record["merged"] = bool(state.merged.get(task))
         if state.merged.get(task) is False and not task_record.get("quarantine"):
             task_record["status"] = "quarantined"
+        verdicts = (built.get(task) or {}).get("result") or {}
+        task_record["outcome"] = task_outcome(
+            str((verdicts.get("review") or {}).get("verdict") or "") or None,
+            str((verdicts.get("arbitration") or {}).get("verdict") or "") or None,
+            task_record.get("quarantine"),
+            task_record["merged"],
+        )
+        task_record["reason"] = task_record.get("quarantine")
 
     # An executed `state_move` is reflected in the driver's own copy of the work
     # so the next phase's tasks can become ready inside this run.
