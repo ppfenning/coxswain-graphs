@@ -145,13 +145,15 @@ def run_checks(
             continue
 
         combined = (proc.stdout or "") + (proc.stderr or "")
+        not_found = proc.returncode == 127
+        error = f"command not found: {cmd}" if not_found else None
         results.append(
             {
                 "name": name,
                 "cmd": cmd,
                 "passed": proc.returncode == 0,
-                "outcome": check_outcome(proc.returncode, None),
-                "error": None,
+                "outcome": check_outcome(proc.returncode, error),
+                "error": error,
                 "exit_code": proc.returncode,
                 "counts": _parse_counts(combined),
                 "output_tail": combined[-_TAIL_CHARS:],
@@ -175,8 +177,14 @@ def checks_evidence(results: Sequence[Mapping[str, Any]]) -> list[dict[str, str]
         verdict = "pass" if result.get("passed") else "FAIL"
         detail = f"{counted} " if counted else ""
         summary = f"{verdict} — {detail}(exit {result.get('exit_code')})"
-        tail = f"\ncmd: {result.get('cmd')}\n{_tail_lines(result.get('output_tail') or '')}"
-        carries_tail = not result.get("passed") and result.get("outcome") != "unrunnable"
+        captured = result.get("output_tail") or ""
+        if result.get("outcome") == "unrunnable":
+            error_text = result.get("error") or ""
+            body = f"{error_text}\n{captured}" if captured else error_text
+        else:
+            body = captured
+        tail = f"\ncmd: {result.get('cmd')}\n{_tail_lines(body)}"
+        carries_tail = not result.get("passed")
         output = summary + tail if carries_tail else summary
         rows.append({"check": f"checks:{result['name']}", "output": output})
     return rows

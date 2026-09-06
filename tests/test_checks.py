@@ -107,6 +107,30 @@ def test_run_checks_unrunnable_cmd_is_a_harness_fault_not_a_failure(tmp_path) ->
     assert "no-such-worktree" in result["error"]
 
 
+def test_run_checks_missing_binary_is_unrunnable_naming_the_command(tmp_path) -> None:
+    checks = [{"name": "tests", "cmd": "no-such-binary-xyz -q"}]
+    [result] = run_checks(tmp_path, checks)
+    assert result["outcome"] == "unrunnable"
+    assert "no-such-binary-xyz -q" in result["error"]
+
+
+def test_missing_binary_evidence_carries_the_command_and_error(tmp_path) -> None:
+    checks = [{"name": "tests", "cmd": "no-such-binary-xyz -q"}]
+    results = run_checks(tmp_path, checks)
+    [row] = checks_evidence(results)
+    assert "no-such-binary-xyz -q" in row["output"]
+    assert "command not found" in row["output"]
+
+
+def test_missing_binary_evidence_also_carries_the_shells_own_words(tmp_path) -> None:
+    """The synthesized error names the command; the shell's own text must still survive beside it."""
+    checks = [{"name": "tests", "cmd": "no-such-binary-xyz -q"}]
+    results = run_checks(tmp_path, checks)
+    assert results[0]["output_tail"].strip()
+    [row] = checks_evidence(results)
+    assert results[0]["output_tail"].strip() in row["output"]
+
+
 def test_run_checks_no_counts_in_output_is_empty_not_invented(tmp_path) -> None:
     """A check whose output names no pass/fail tokens gets an EMPTY counts dict,
     never a guessed one — the whole point of counting from reality."""
@@ -224,7 +248,7 @@ def test_checks_evidence_truncates_a_long_tail_with_a_marker() -> None:
     assert "line 24" in row["output"]
 
 
-def test_checks_evidence_unrunnable_carries_no_command_or_tail() -> None:
+def test_checks_evidence_unrunnable_carries_the_command_and_error() -> None:
     results = [
         {
             "name": "ghost",
@@ -238,7 +262,26 @@ def test_checks_evidence_unrunnable_carries_no_command_or_tail() -> None:
         }
     ]
     [row] = checks_evidence(results)
-    assert "cmd:" not in row["output"]
+    assert "cmd: true" in row["output"]
+    assert "No such file or directory" in row["output"]
+
+
+def test_checks_evidence_unrunnable_appends_captured_output_beside_the_error() -> None:
+    results = [
+        {
+            "name": "tests",
+            "cmd": "no-such-binary -q",
+            "passed": False,
+            "outcome": "unrunnable",
+            "error": "command not found: no-such-binary -q",
+            "exit_code": 127,
+            "counts": {},
+            "output_tail": "/bin/sh: 1: no-such-binary: not found",
+        }
+    ]
+    [row] = checks_evidence(results)
+    assert "command not found: no-such-binary -q" in row["output"]
+    assert "/bin/sh: 1: no-such-binary: not found" in row["output"]
 
 
 def test_all_passed() -> None:
