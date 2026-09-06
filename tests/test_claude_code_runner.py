@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from runner import RunnerError
-from runner.claude_code_runner import ClaudeCodeRunner
+from runner.claude_code_runner import ClaudeCodeRunner, next_spent
 from runner.protocol import BudgetStop
 from runner.scripted import ScriptedRunner
 
@@ -777,7 +777,15 @@ def test_an_explicit_budget_on_the_resume_is_added_to_spent_too(sequenced_claude
     assert third[third.index("--max-budget-usd") + 1] == "3.4700", "0.97 spent plus the 2.50 override"
 
 
-def test_a_successful_resume_clears_the_recorded_spend(sequenced_claude, tmp_path, repo) -> None:
+def test_next_spent_accumulates_across_successes() -> None:
+    assert next_spent(next_spent(0.0, 0.02, stopped=False), 0.03, stopped=False) == 0.05
+
+
+def test_next_spent_on_a_stop_replaces_rather_than_adds() -> None:
+    assert next_spent(0.5, 0.97, stopped=True) == 0.97
+
+
+def test_a_successful_resume_keeps_accumulating_spend(sequenced_claude, tmp_path, repo) -> None:
     script, set_sequence, _ = sequenced_claude
     argv_log = tmp_path / "argvs.jsonl"
     set_sequence(OK, REFUSED, OK, OK)
@@ -791,7 +799,8 @@ def test_a_successful_resume_clears_the_recorded_spend(sequenced_claude, tmp_pat
     runner.run(role="build", schema=SCHEMA, prompt="again", thread="T")
 
     fourth = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[3])
-    assert fourth[fourth.index("--max-budget-usd") + 1] == "1.0000", "the reset spend leaves the plain ceiling"
+    assert fourth[fourth.index("--max-budget-usd") + 1] == "1.9900", \
+        "0.97 stop replaces call 1's 0.02, call 3's 0.02 success adds to reach 0.99, plus the 1.00 ceiling"
 
 
 def test_a_threaded_budget_stop_carries_the_scratch_as_a_partial_patch(sequenced_claude, tmp_path, repo) -> None:
@@ -865,6 +874,7 @@ def test_a_transient_failure_on_a_thread_retries_the_same_session_id(sequenced_c
 
     set_sequence(OK)
     runner.run(role="build", schema=SCHEMA, prompt="again", thread="T")
+    assert runner._threads["T"]["spent_usd"] == 0.04, "the failed attempt left the total untouched, only two successes counted"
     third = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()][2]
     assert "--resume" in third and "--session-id" not in third, \
         "the counter only advanced once a call actually succeeded"

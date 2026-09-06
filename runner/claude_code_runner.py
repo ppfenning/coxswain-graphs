@@ -116,6 +116,11 @@ def _is_transient(payload: Mapping[str, Any]) -> bool:
     return any(marker in said for marker in _TRANSIENT_ERRORS)
 
 
+def next_spent(previous: float, reported_usd: float, stopped: bool) -> float:
+    """A stop's `total_cost_usd` is the session's, replacing; a success's is this call's, adding."""
+    return reported_usd if stopped else previous + reported_usd
+
+
 class ClaudeCodeRunner:
     """Runs nodes as headless Claude Code sessions with structured output."""
 
@@ -518,9 +523,12 @@ class ClaudeCodeRunner:
                     # session behind for a `--resume` to find, so the retry
                     # must repeat the exact flags the failed attempt used.
                     state["calls"] += 1
-                    # A successful call clears any recorded stop, so a later
-                    # unrelated call on this thread is not inflated by it.
-                    state["spent_usd"] = 0.0
+                    # A success's `total_cost_usd` is this call's own spend, not the
+                    # session's: three resumed builds on one ticket reported 1.56, 0.67,
+                    # 0.86 — falling then rising, which a cumulative figure cannot do.
+                    state["spent_usd"] = next_spent(
+                        state.get("spent_usd", 0.0), float(payload.get("total_cost_usd") or 0.0), stopped=False
+                    )
                 break
 
             # Name everything the CLI said about it. A bare `None` result was
@@ -535,7 +543,7 @@ class ClaudeCodeRunner:
                         # Leave `state` exactly as it was — same scratch, same
                         # `calls` — so a later `run(..., thread=same)` resumes
                         # this session instead of starting the node over.
-                        state["spent_usd"] = spent
+                        state["spent_usd"] = next_spent(state.get("spent_usd", 0.0), spent, stopped=True)
                         if state.get("scratch"):
                             partial_patch = _capture_diff(state["scratch"])
                     raise BudgetStop(
