@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -10,7 +11,11 @@ from typing import Any
 from core.cartridge import load
 from core.skills import index_from_roots
 
-__all__ = ["resolve_cartridge", "role_skill_bodies"]
+__all__ = ["overlay_path", "resolve_cartridge", "role_skill_bodies"]
+
+
+def overlay_path(repo: str) -> str:
+    return os.path.join(repo, ".agent", "cartridge.yaml")
 
 
 class _Unverified(dict):
@@ -26,6 +31,7 @@ def resolve_cartridge(
     cartridges_dir: Path | str,
     skills_root: Sequence[str | Path],
     unverified_skills: bool = False,
+    overlay: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Mapping[str, Sequence[Any]]]:
     """Resolve the team's cartridge, and return the skill index used to do it.
 
@@ -38,7 +44,7 @@ def resolve_cartridge(
     if unverified_skills:
         print("warning: skill bindings NOT verified (--unverified-skills)", file=sys.stderr)
         index = _Unverified()
-    return load(team, cartridges_dir, skill_index=index), index
+    return load(team, cartridges_dir, skill_index=index, overlay=overlay), index
 
 
 def role_skill_bodies(
