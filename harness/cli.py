@@ -135,6 +135,7 @@ def _observe_trap_failures(
                 "risk": risk,
                 "subject": entry,
                 "cartridge_sha": cartridge.get("cartridge_sha"),
+                "overlay_sha": cartridge.get("overlay_sha"),
                 "provider_profile": provider_profile,
             },
             ledger_path,
