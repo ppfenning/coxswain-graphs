@@ -226,3 +226,118 @@ def test_a_proposal_names_the_bound_landing_not_the_abstract_one(cart) -> None:
     assert "title=" in action and "needs=[" in action
     empty = next(p["suggested_action"] for p in result["proposals"] if "needs=[]" in p["suggested_action"])
     assert "none" not in empty, "an empty list prints as [], never as a word the arm would copy"
+
+
+# ── surfaces resolve to real paths ──────────────────────────────────────────
+
+
+def test_surface_problem_of_no_unresolved_surfaces_is_none() -> None:
+    assert initiative_decompose.surface_problem([]) is None
+
+
+def test_surface_problem_of_one_unresolved_surface_names_it() -> None:
+    assert initiative_decompose.surface_problem(["x"]) == "unbuildable: surfaces are prose — x"
+
+
+def test_surface_problem_is_one_line_per_unresolved_surface_not_comma_joined() -> None:
+    problem = initiative_decompose.surface_problem(["t1: foo", "t1: bar"])
+    assert problem == "unbuildable: surfaces are prose — t1: foo\nunbuildable: surfaces are prose — t1: bar"
+
+
+def test_apply_surface_resolutions_does_not_mutate_its_argument() -> None:
+    tasks = [{"id": "t1", "surfaces": ["schema"]}]
+    tree = [{"repo": "graphs", "path": "graphs/schema.py"}]
+    original = tasks[0]
+
+    resolved = initiative_decompose._apply_surface_resolutions(tasks, tree)
+
+    assert tasks[0] is original
+    assert tasks[0]["surfaces"] == ["schema"]
+    assert resolved[0]["surfaces"] == ["graphs/schema.py"]
+
+
+def test_a_tree_with_unresolved_surfaces_and_no_adversary_quarantines_the_run(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["foo", "bar"]}],
+    }
+    runner = ScriptedRunner({"decompose": decomposition})
+    with pytest.raises(ContractViolation, match="unbuildable") as exc:
+        initiative_decompose.run(
+            {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": [{"repo": "g", "path": "g/other.py"}]},
+            runner,
+        )
+    message = str(exc.value)
+    assert "t1: foo" in message
+    assert "t1: bar" in message
+    assert message.count("\n") == 1, "one line per unresolved surface, not one comma-joined clause per task"
+
+
+def test_the_adversary_gets_an_unbuildable_challenge_naming_task_and_prose(cart) -> None:
+    tree = [{"repo": "graphs", "path": "graphs/schema.py"}]
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["widget-thing"]}],
+    }
+    correction = {
+        "corrections": [{"task": "t1", "surface": "widget-thing", "replacement": "schema.py"}],
+        "summary": "resolved",
+    }
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": decomposition, "review_adversary": [ACCEPTED, correction]})
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": tree}, runner
+    )
+    unbuildable_call = runner.calls[-1]
+    assert unbuildable_call["role"] == "review_adversary"
+    assert "t1: widget-thing" in unbuildable_call["prompt"]
+    assert result["tasks"][0]["surfaces"] == ["graphs/schema.py"]
+
+
+def test_a_second_unresolved_set_after_the_adversarys_attempt_quarantines_the_run(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["widget-thing"]}],
+    }
+    bad_correction = {
+        "corrections": [{"task": "t1", "surface": "widget-thing", "replacement": "still-prose"}],
+        "summary": "tried",
+    }
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": decomposition, "review_adversary": [ACCEPTED, bad_correction]})
+    with pytest.raises(ContractViolation, match="unbuildable"):
+        initiative_decompose.run(
+            {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": [{"repo": "g", "path": "g/other.py"}]},
+            runner,
+        )
+
+
+def test_a_task_whose_surfaces_span_two_repos_is_split_one_per_repo(cart) -> None:
+    tree = [
+        {"repo": "graphs-repo", "path": "graphs/schema.py"},
+        {"repo": "harness-repo", "path": "harness/epic.py"},
+    ]
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [
+            {"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["schema.py", "epic.py"]},
+            {"id": "t2", "phase": "p1", "title": "b", "body": "b", "needs": ["t1"], "surfaces": []},
+        ],
+    }
+    runner = ScriptedRunner({"decompose": decomposition})
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": tree}, runner
+    )
+    ids = sorted(t["id"] for t in result["tasks"])
+    assert ids == ["t1--graphs-repo", "t1--harness-repo", "t2"]
+    graphs_task = next(t for t in result["tasks"] if t["id"] == "t1--graphs-repo")
+    assert graphs_task["surfaces"] == ["graphs/schema.py"]
+    t2 = next(t for t in result["tasks"] if t["id"] == "t2")
+    assert sorted(t2["needs"]) == ["t1--graphs-repo", "t1--harness-repo"]
+
+
+def test_without_a_tree_surfaces_stay_as_declared(cart) -> None:
+    """No tree means nothing to resolve against; the old behaviour is unchanged."""
+    result = decompose(cart)
+    t1 = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert t1["surfaces"] == ["schema"]
