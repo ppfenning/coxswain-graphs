@@ -25,7 +25,7 @@ from typing import Any
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
 from runner.protocol import NodeRunner
 
-__all__ = ["GRAPH_NAME", "initiative_text", "run"]
+__all__ = ["GRAPH_NAME", "initiative_text", "resolve_surfaces", "run", "surface_problem"]
 
 GRAPH_NAME = "initiative-decompose"
 
@@ -99,6 +99,28 @@ EDGE_CHALLENGE_SCHEMA = {
     "additionalProperties": False,
 }
 
+UNBUILDABLE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "corrections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string"},
+                    "surface": {"type": "string"},
+                    "replacement": {"type": "string"},
+                },
+                "required": ["task", "surface", "replacement"],
+                "additionalProperties": False,
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["corrections", "summary"],
+    "additionalProperties": False,
+}
+
 
 def initiative_text(idea: Mapping[str, Any], phases: Sequence[str], goals: Mapping[str, str], repo: str) -> str:
     """The `initiative.md` shape every hand-written initiative in the workspace carries."""
@@ -114,6 +136,98 @@ def initiative_text(idea: Mapping[str, Any], phases: Sequence[str], goals: Mappi
         "PHASE GOALS, each judged against ITS OWN line:\n"
         f"{goal_lines}\n"
     )
+
+
+def resolve_surfaces(surfaces: Sequence[str], tree: Sequence[Mapping[str, Any]]) -> tuple[list[str], list[str]]:
+    """Match each prose surface against a real path in tree. (resolved paths, unresolved prose).
+
+    Same name and signature as `core.workstore.resolve_surfaces` so a later
+    `from core.workstore import resolve_surfaces, surface_problem` is a one-line
+    swap — but a graph never imports `core` itself, so this stays the real
+    implementation here, not a stand-in.
+    """
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    for surface in surfaces:
+        hit = next((str(row.get("path")) for row in tree if surface == row.get("path") or surface in str(row.get("path"))), None)
+        (resolved if hit else unresolved).append(hit or surface)
+    return resolved, unresolved
+
+
+def surface_problem(unresolved: Sequence[str]) -> str | None:
+    """One line per unresolved surface; `None` when there is nothing unbuildable."""
+    if not unresolved:
+        return None
+    return "\n".join(f"unbuildable: surfaces are prose — {item}" for item in unresolved)
+
+
+def _apply_surface_resolutions(tasks: list[dict[str, Any]], tree: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """New task dicts; each task's surfaces resolved against tree. The caller's tasks are untouched.
+
+    Anything that does not resolve keeps its prose rather than being dropped —
+    an unresolved surface is a defect for `run` to act on, never one this
+    function silently discards.
+    """
+    new_tasks = []
+    for task in tasks:
+        resolved, unresolved = resolve_surfaces(task.get("surfaces") or [], tree)
+        new_tasks.append(dict(task, surfaces=resolved + unresolved))
+    return new_tasks
+
+
+def _unresolved_pairs(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[str, Any]]) -> list[str]:
+    """`"task: prose"` for every surface still unresolved against tree, one per line-to-be."""
+    return [
+        f"{task['id']}: {surface}"
+        for task in tasks
+        for surface in resolve_surfaces(task.get("surfaces") or [], tree)[1]
+    ]
+
+
+def _apply_corrections(tasks: list[dict[str, Any]], corrections: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """New task dicts; a corrected surface replaces the prose the adversary named, nothing else."""
+    by_task: dict[str, dict[str, str]] = {}
+    for c in corrections:
+        by_task.setdefault(str(c.get("task")), {})[str(c.get("surface"))] = str(c.get("replacement"))
+    return [
+        dict(t, surfaces=[by_task.get(str(t["id"]), {}).get(s, s) for s in t.get("surfaces") or []])
+        for t in tasks
+    ]
+
+
+def _split_cross_repo(tasks: list[dict[str, Any]], tree: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """One task per repo when a task's resolved surfaces span more than one tree in the stack.
+
+    A task that never touches more than one repo passes through unchanged. A
+    task that was split is replaced everywhere it was named in `needs`, by
+    every part it became — a downstream task waited on the whole thing, and
+    now the whole thing is more than one task.
+    """
+    repo_of = {str(row.get("path")): str(row.get("repo")) for row in tree}
+    parts: dict[str, list[str]] = {}
+    split: list[dict[str, Any]] = []
+    for task in tasks:
+        repos = sorted({repo_of[s] for s in task.get("surfaces") or [] if s in repo_of})
+        if len(repos) <= 1:
+            parts[str(task["id"])] = [str(task["id"])]
+            split.append(task)
+            continue
+        new_ids = [f"{task['id']}--{repo}" for repo in repos]
+        parts[str(task["id"])] = new_ids
+        split.extend(
+            dict(task, id=new_id, surfaces=[s for s in task["surfaces"] if repo_of.get(s) == repo])
+            for repo, new_id in zip(repos, new_ids, strict=True)
+        )
+    return [dict(t, needs=[n for need in t["needs"] for n in parts.get(need, [need])]) for t in split]
+
+
+def _stack_repo_count(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[str, Any]]) -> int:
+    """The number of repos the stack actually touches, read off the tree rather than guessed."""
+    if not tree:
+        return 1
+    repo_of = {str(row.get("path")): str(row.get("repo")) for row in tree}
+    repos = {repo_of[s] for t in tasks for s in t.get("surfaces") or [] if s in repo_of}
+    return len(repos) or 1
 
 
 def _apply_challenge(tasks: list[dict[str, Any]], challenge: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -232,11 +346,38 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "ever become ready: " + "; ".join(cycles)
         )
 
+    tree = list(args.get("tree") or [])
+    if tree:
+        problems = _unresolved_pairs(tasks, tree)
+        if problems:
+            # An unresolved surface is a decompose defect, never a task to
+            # discard: nothing is proposed until every surface names a real
+            # path, or the run is quarantined for a human to look at.
+            if "review_adversary" not in bound:
+                raise ContractViolation(surface_problem(problems))
+            unbuildable = dict(
+                runner.run(
+                    role="review_adversary",
+                    tier="deep",
+                    schema=UNBUILDABLE_SCHEMA,
+                    context=context,
+                    prompt=(
+                        "These task surfaces are prose, not real paths in the tree. Resolve "
+                        "each to the actual path it means.\n\n" + (surface_problem(problems) or "")
+                    ),
+                )
+            )
+            tasks = _apply_corrections(tasks, unbuildable.get("corrections") or [])
+            problems = _unresolved_pairs(tasks, tree)
+            if problems:
+                raise ContractViolation(surface_problem(problems))
+        tasks = _split_cross_repo(_apply_surface_resolutions(tasks, tree), tree)
+
     shape = epic_shape(
         cartridge,
         phases=len({t["phase"] for t in tasks}),
         tickets=len(tasks),
-        repos=len({s for t in tasks for s in t.get("surfaces") or []} & {"cross_repo"}) + 1,
+        repos=_stack_repo_count(tasks, tree),
     )
     landing = landing_for(cartridge, "planned")
 
@@ -333,5 +474,8 @@ SPEC = GraphSpec(
              help="the repository the initiative targets, for initiative.md's frontmatter"),
         Need("budget_usd", flag="--budget-usd", required=False,
              help="the initiative's budget in dollars, for initiative.md's frontmatter"),
+        Need("tree", flag="--tree", kind="jsonl_file", required=False,
+             help="rows of {repo, path} across the target repo(s); resolves task surfaces to "
+                  "real paths and derives the stack (default: surfaces are not resolved)"),
     ),
 )
