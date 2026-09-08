@@ -30,6 +30,7 @@ def cart(cartridge) -> dict:
     cartridge["skills"]["decompose"] = "acme-skills:decompose"
     cartridge["work_routing"] = {"states": {"active": "work", "planned": "work", "future": "backlog"}}
     cartridge["write_kinds"]["item_create"] = {"risk": "low", "ramp": "deferred"}
+    cartridge["write_kinds"]["state_move"] = {"risk": "low", "ramp": "deferred"}
     return cartridge
 
 
@@ -84,10 +85,48 @@ def test_initiative_text_carries_phase_goals_in_order() -> None:
     assert "PHASE GOALS, each judged against ITS OWN line:\n- p1: foundations\n- p2: cutover" in text
 
 
+def test_initiative_text_carries_the_intake_link_when_given_one() -> None:
+    idea = {"id": "regatta", "title": "Route sync", "budget_usd": 500, "why": "because races drift"}
+    text = initiative_decompose.initiative_text(
+        idea, ["p1"], {"p1": "foundations"}, "coxswain-graphs", intake="intake/regatta.md"
+    )
+    assert "intake: intake/regatta.md" in text
+
+
+def test_initiative_text_omits_intake_when_none_given() -> None:
+    idea = {"id": "regatta", "title": "Route sync", "budget_usd": 500, "why": "because races drift"}
+    text = initiative_decompose.initiative_text(idea, ["p1"], {"p1": "foundations"}, "coxswain-graphs")
+    assert "intake:" not in text
+
+
 def test_emit_writes_initiative_md_as_one_more_proposal(cart) -> None:
     result = decompose(cart)
     initiative = next(p for p in result["proposals"] if p["target"] == "initiative")
     assert "PHASE GOALS" in initiative["suggested_action"]
+    assert "intake" not in initiative["suggested_action"]
+
+
+def test_emit_proposes_linking_the_intake_file_as_its_own_write(cart) -> None:
+    result = initiative_decompose.run(
+        {
+            "run_id": "r",
+            "date": "2026-08-30",
+            "cartridge": cart,
+            "idea": "go arrow-native",
+            "intake_path": "intake/regatta.md",
+        },
+        ScriptedRunner({"decompose": DECOMPOSITION}),
+    )
+    link = next(p for p in result["proposals"] if p["target"] == "intake/regatta.md")
+    assert link["kind"] == "state_move"
+    assert "cox route file --from-intake intake/regatta.md" in link["suggested_action"]
+    assert "initiative: r" in link["suggested_action"]
+    assert "intake/done/regatta.md" in link["suggested_action"]
+
+
+def test_emit_proposes_no_intake_link_without_a_source(cart) -> None:
+    result = decompose(cart)
+    assert not any(p["kind"] == "state_move" for p in result["proposals"])
 
 
 # ── ids scoped to an initiative ─────────────────────────────────────────────

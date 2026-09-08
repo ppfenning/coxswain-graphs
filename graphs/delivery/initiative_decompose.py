@@ -122,15 +122,19 @@ UNBUILDABLE_SCHEMA = {
 }
 
 
-def initiative_text(idea: Mapping[str, Any], phases: Sequence[str], goals: Mapping[str, str], repo: str) -> str:
+def initiative_text(
+    idea: Mapping[str, Any], phases: Sequence[str], goals: Mapping[str, str], repo: str, *, intake: str | None = None
+) -> str:
     """The `initiative.md` shape every hand-written initiative in the workspace carries."""
     goal_lines = "\n".join(f"- {phase_id}: {goals.get(phase_id, '')}" for phase_id in phases)
+    intake_line = f"intake: {intake}\n" if intake else ""
     return (
         "---\n"
         f"id: {idea.get('id')}\n"
         f"title: {idea.get('title')}\n"
         f"repo: {repo}\n"
         f"budget_usd: {idea.get('budget_usd')}\n"
+        f"{intake_line}"
         "---\n\n"
         f"{idea.get('why', '')}\n\n"
         "PHASE GOALS, each judged against ITS OWN line:\n"
@@ -384,7 +388,8 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     phase_order = [str(p.get("id")) for p in decomposition.get("phases") or []]
     goals = {str(p.get("id")): str(p.get("goal") or "") for p in decomposition.get("phases") or []}
     idea_doc = {"id": initiative_id or run_id, "title": str(idea), "budget_usd": args.get("budget_usd"), "why": str(idea)}
-    initiative_body = initiative_text(idea_doc, phase_order, goals, str(args.get("repo") or ""))
+    intake_path = args.get("intake_path")
+    initiative_body = initiative_text(idea_doc, phase_order, goals, str(args.get("repo") or ""), intake=intake_path)
     initiative_where = "/".join(part for part in (landing, initiative_id) if part)
 
     proposals = [
@@ -420,7 +425,24 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             rationale=str(decomposition.get("rationale") or ""),
             suggested_action=f"create {initiative_where}/initiative.md with body =\n{initiative_body}",
         )
-    ]
+    ] + (
+        [
+            proposal(
+                cartridge,
+                kind="state_move",
+                target=intake_path,
+                evidence=[{"check": "initiative", "output": f"{initiative_where}/initiative.md"}],
+                rationale="the initiative now exists; the intake file it came from retires out of the queue",
+                suggested_action=(
+                    f"call `cox route file --from-intake {intake_path}` if that CLI is present; otherwise "
+                    f"set {intake_path}'s frontmatter to `initiative: {initiative_id or run_id}` and move it "
+                    f"to `intake/done/{intake_path.rsplit('/', 1)[-1]}`"
+                ),
+            )
+        ]
+        if intake_path
+        else []
+    )
 
     unblocked = [t["id"] for t in tasks if not t["needs"]]
     return {
@@ -477,5 +499,8 @@ SPEC = GraphSpec(
         Need("tree", flag="--tree", kind="jsonl_file", required=False,
              help="rows of {repo, path} across the target repo(s); resolves task surfaces to "
                   "real paths and derives the stack (default: surfaces are not resolved)"),
+        Need("intake_path", flag="--from-intake", required=False,
+             help="path to the intake file this idea came from, when it did; links initiative.md "
+                  "and the intake file both ways"),
     ),
 )
