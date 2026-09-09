@@ -19,7 +19,7 @@ shell = ["agent-cartridges"]
 # The live runner. Everything else — graphs, tests, the scripted runner — works
 # without it, which is the point: CI never needs a key.
 live = ["anthropic>=0.40"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff"]
 
 [tool.setuptools.packages.find]
 include = ["graphs*", "runner*", "harness*"]
