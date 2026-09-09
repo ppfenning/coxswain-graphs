@@ -308,9 +308,11 @@ def branch_action(reused: bool, head_moved: bool, has_own_commits: bool) -> str:
     return "block" if has_own_commits else "recreate"
 
 
-def _phase_branch_own_commits(ctx: _Ctx, phase: str, base_ref: str) -> bool:
-    ok, out = _git("-C", str(ctx.repo), "rev-list", "--count", f"{base_ref}..{ctx.phase_branch(phase)}")
-    return ok and int(out or "0") > 0
+def _phase_branch_diff_adds_lines(ctx: _Ctx, phase: str, base_ref: str) -> bool:
+    """Does the branch's diff against `base_ref` add anything, or would recreating it lose nothing?"""
+    ok, out = _git("-C", str(ctx.repo), "diff", "--numstat", f"{base_ref}..{ctx.phase_branch(phase)}")
+    added = sum(int(line.split("\t")[0]) for line in out.splitlines() if line.split("\t")[0].isdigit())
+    return ok and added > 0
 
 
 def _rebase(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str]:
@@ -694,7 +696,7 @@ def _run_phase(
     # Decided before a single task builds: a reused branch behind its base is
     # either recreated (nothing of its own to lose) or blocked (something is).
     head_moved = reused and _parent_head_moved(ctx, phase, base_ref)
-    has_own_commits = head_moved and _phase_branch_own_commits(ctx, phase, base_ref)
+    has_own_commits = head_moved and _phase_branch_diff_adds_lines(ctx, phase, base_ref)
     action = branch_action(reused, head_moved, has_own_commits)
 
     if action == "block":
@@ -771,7 +773,9 @@ def _run_phase(
             suggested_action=f"rebase {branch} onto {base_ref}",
         )
 
-    all_ready = workstore.ready_tasks(items, phase=phase)
+    # A dropped task is terminal like a done one: it never gets rebuilt or
+    # re-reviewed, and never blocks the phase behind it.
+    all_ready = [item for item in workstore.ready_tasks(items, phase=phase) if item.get("state") != "dropped"]
 
     # A third run of the same task is refused outright rather than tried
     # again — quarantined here, plainly, never through `_quarantine_task`,
@@ -1184,7 +1188,7 @@ def _phase_status(
     so the phase is partial no matter how good the work was.
     """
     if not ready and not quarantined and all(
-        item.get("state") == "done" for item in items if item.get("phase") == phase
+        item.get("state") in ("done", "dropped") for item in items if item.get("phase") == phase
     ):
         return "complete", "every task in the phase was already done"
     if not validated:
