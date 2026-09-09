@@ -5,7 +5,50 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from harness.worktree import apply_patch, normalise_patch
+from harness.worktree import apply_patch, keep_worktree, normalise_patch, remove_worktree
+
+
+def _worktree_paths(repo: Path) -> list[str]:
+    out = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return [line.removeprefix("worktree ") for line in out.splitlines() if line.startswith("worktree ")]
+
+
+def _repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "f.txt").write_text("x\n")
+    subprocess.run(["git", "-c", "user.email=t@invalid", "-c", "user.name=t", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@invalid", "-c", "user.name=t", "commit", "-qm", "base"], cwd=repo, check=True)
+    worktree = tmp_path / "worktrees" / "run-1" / "p1"
+    worktree.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "feature", str(worktree)],
+        check=True, capture_output=True, text=True,
+    )
+    return repo, worktree
+
+
+def test_remove_worktree_deletes_the_directory_and_clears_the_registration(tmp_path: Path) -> None:
+    repo, worktree = _repo_with_worktree(tmp_path)
+    ok, detail = remove_worktree(repo, worktree)
+    assert ok, detail
+    assert not worktree.exists()
+    assert str(worktree) not in _worktree_paths(repo)
+
+
+def test_keep_worktree_moves_the_directory_under_kept_run_and_clears_the_registration(tmp_path: Path) -> None:
+    repo, worktree = _repo_with_worktree(tmp_path)
+    worktree_root = tmp_path / "worktrees"
+    ok, detail = keep_worktree(repo, worktree, worktree_root, "run-1")
+    assert ok, detail
+    assert not worktree.exists()
+    kept = worktree_root / "_kept" / "run-1" / "p1"
+    assert (kept / "f.txt").read_text() == "x\n"
+    assert str(worktree) not in _worktree_paths(repo)
 
 
 def _diff_for(worktree: Path, name: str, text: str) -> str:
