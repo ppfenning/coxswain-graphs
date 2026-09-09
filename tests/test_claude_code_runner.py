@@ -544,6 +544,68 @@ def test_without_a_trace_dir_nothing_changes(fake_claude, tmp_path) -> None:
     assert "trace" not in runner.calls[-1]
 
 
+# ── the per-call ledger ──────────────────────────────────────────────────────
+
+
+def _ledger_lines(tmp_path: Path, run_id: str) -> list[dict]:
+    return [json.loads(line) for line in (tmp_path / f"{run_id}.calls.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+def test_a_successful_call_appends_one_line_to_the_calls_ledger(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 1
+    assert rows[0]["ok"] is True and "error" not in rows[0]
+    assert rows[0]["role"] == runner.calls[-1]["role"] and rows[0]["cost_usd"] == runner.calls[-1]["cost_usd"]
+
+
+def test_a_runner_error_still_appends_a_line_before_raising(fake_claude, tmp_path) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": True, "result": "Not logged in · Please run /login"})
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+    with pytest.raises(RunnerError, match="Not logged in"):
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 1
+    assert rows[0]["ok"] is False and "Not logged in" in rows[0]["error"]
+
+
+def test_a_non_object_answer_still_appends_a_line_before_raising(fake_claude, tmp_path) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": False, "structured_output": [1, 2, 3]})
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+    with pytest.raises(RunnerError, match="expected an object"):
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 1
+    assert rows[0]["ok"] is False and "expected an object" in rows[0]["error"]
+
+
+def test_prose_with_no_structured_output_still_appends_a_line_before_raising(fake_claude, tmp_path) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": False, "structured_output": None, "result": "I could not decide."})
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+    with pytest.raises(RunnerError, match="not JSON"):
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 1
+    assert rows[0]["ok"] is False and "not JSON" in rows[0]["error"]
+
+
+def test_two_calls_append_two_lines_not_one_overwritten_line(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    runner.run(role="plan", schema=SCHEMA, prompt="again")
+    assert len(_ledger_lines(tmp_path, "r1")) == 2
+
+
+def test_without_runs_dir_or_run_id_nothing_is_written(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    assert not list(tmp_path.glob("*.calls.jsonl"))
+
+
 def test_nodes_are_told_to_use_absolute_paths_and_ranged_reads(fake_claude, tmp_path, repo) -> None:
     runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
     runner.run(role="review_charter", schema=SCHEMA, prompt="go")
@@ -834,6 +896,66 @@ def test_next_spent_accumulates_across_successes() -> None:
 
 def test_next_spent_on_a_stop_replaces_rather_than_adds() -> None:
     assert next_spent(0.5, 0.97, stopped=True) == 0.97
+
+
+# ── the ledger sees every billed attempt, not just the one that returns ─────
+
+
+def test_a_transient_retry_ledgers_the_failed_attempt_before_the_success(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(SAFEGUARD, OK)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+
+    assert dict(runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")) == {"ok": True}
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 2, "the retried attempt was billed too and must not vanish from the ledger"
+    assert rows[0]["ok"] is False and "safeguards flagged" in rows[0]["error"]
+    assert rows[1]["ok"] is True and "error" not in rows[1]
+
+
+def test_a_transient_retry_with_tracing_ledgers_the_renamed_trace_not_the_reused_one(sequenced_claude, tmp_path) -> None:
+    """The retry reuses the failed attempt's filename, so its ledger row must not still point there."""
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(SAFEGUARD, OK)
+    runner = ClaudeCodeRunner(
+        PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", trace_dir=tmp_path / "trace",
+    )
+
+    runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 2
+    assert rows[0]["trace"] != rows[1]["trace"], "one path must not be claimed by two rows"
+    assert rows[0]["trace"].endswith("arbitrate-1.error.jsonl")
+    assert rows[1]["trace"].endswith("arbitrate-1.jsonl")
+
+
+def test_a_budget_stop_still_ledgers_the_attempt_it_spent(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(REFUSED)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+
+    with pytest.raises(BudgetStop):
+        runner.run(role="build", schema=SCHEMA, prompt="build it")
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 1
+    assert rows[0]["ok"] is False and "error_max_budget_usd" in rows[0]["error"]
+
+
+def test_a_patch_empty_refusal_is_not_ledgered_as_a_success(tmp_path, repo) -> None:
+    output = tmp_path / "output.json"
+    output.write_text(
+        json.dumps({"is_error": False, "total_cost_usd": 0.01, "num_turns": 1, "structured_output": {"patch": ""}}),
+        encoding="utf-8",
+    )
+    script = tmp_path / "claude"
+    script.write_text(f"#!/bin/sh\ncat {output}\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo, runs_dir=tmp_path, run_id="r1")
+    with pytest.raises(RunnerError, match="patch_empty"):
+        runner.run(role="build", schema=SCHEMA, prompt="go")
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 1
+    assert rows[0]["ok"] is False and "patch_empty" in rows[0]["error"]
 
 
 def test_a_successful_resume_keeps_accumulating_spend(sequenced_claude, tmp_path, repo) -> None:
