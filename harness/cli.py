@@ -328,6 +328,14 @@ def main(argv: list[str] | None = None) -> int:
 
     run_id = args.run_id or f"{args.graph}-{args.date}-{uuid.uuid4().hex[:8]}"
 
+    # A runner that keeps a per-call ledger needs to know where and under what
+    # name — without these two, its ledger has nothing to write to and
+    # `record_usage`'s read of it has nothing to read.
+    if hasattr(runner, "runs_dir"):
+        runner.runs_dir = Path(args.runs_dir)
+    if hasattr(runner, "run_id"):
+        runner.run_id = run_id
+
     # A runner whose nodes can read the world gets a tool-computed map of it
     # first, so no node pays turns to draw one. The epic driver refreshes it per
     # phase; this is the single-graph case.
@@ -337,6 +345,29 @@ def main(argv: list[str] | None = None) -> int:
         checks = (cartridge.get("landing_areas") or {}).get("checks") or []
         runner.check_commands = [str(c.get("cmd")) for c in checks if isinstance(c, dict) and c.get("cmd")]
 
+    try:
+        return _run_graph(specs=specs, parser=parser, args=args, cartridge=cartridge, runner=runner, run_id=run_id)
+    finally:
+        # Every exit below — success, a caught exception's `return 1`, or
+        # anything left to raise past this point — leaves `usage.json` matching
+        # whatever the per-call ledger holds, not only the happy path. `close`
+        # runs AFTER, the order the single-graph path always had: a runner that
+        # frees what it was counting in `close` must still be readable here.
+        record_usage(runner, runs_dir=args.runs_dir, run_id=run_id)
+        close = getattr(runner, "close", None)
+        if callable(close):
+            close()
+
+
+def _run_graph(
+    *,
+    specs: dict[str, GraphSpec],
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    cartridge: Mapping[str, Any],
+    runner: Any,
+    run_id: str,
+) -> int:
     if args.graph == "epic":
         # The whole initiative. The driver gates and records PER PHASE — phase
         # N+1's base depends on which merges the gate let into phase N's branch,
@@ -387,7 +418,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  ledger   : {args.ledger}")
         for line in result.get("exit_summary") or []:
             print(f"  {line}", file=sys.stderr)
-        record_usage(runner, runs_dir=args.runs_dir, run_id=run_id)
         return 0
 
     if args.graph == "phase":
@@ -653,8 +683,4 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nrecorded {run_id}: {len(auto_applied)} auto-applied, {len(diffs)} gated decision(s), {len(proposals)} proposal(s)")
     print(f"  manifest: {Path(args.runs_dir) / (run_id + '.json')}")
     print(f"  ledger  : {args.ledger}")
-    record_usage(runner, runs_dir=args.runs_dir, run_id=run_id)
-    close = getattr(runner, "close", None)
-    if callable(close):
-        close()
     return 0

@@ -42,9 +42,31 @@ def summarize(calls: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _read_ledger(path: Path) -> list[dict[str, Any]]:
+    """Every line of the per-call ledger that parses as a JSON object; a bad line is skipped, not fatal."""
+    if not path.exists():
+        return []
+    rows = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
 def record_usage(runner: Any, *, runs_dir: Path | str, run_id: str) -> dict[str, Any] | None:
-    """Write `<runs_dir>/<run_id>.usage.json` from `runner.calls`, if it has any. Returns the summary."""
-    calls = getattr(runner, "calls", None)
+    """Write `<runs_dir>/<run_id>.usage.json` from the per-call ledger, unioned with `runner.calls` by
+    `(role, trace)` with the ledger winning a shared key. Returns the summary."""
+    ledger_calls = _read_ledger(Path(runs_dir) / f"{run_id}.calls.jsonl")
+    seen = {(row.get("role"), row.get("trace")) for row in ledger_calls}
+    extra = [c for c in (getattr(runner, "calls", None) or []) if (c.get("role"), c.get("trace")) not in seen]
+    calls = ledger_calls + extra
     if not calls:
         return None
     summary = summarize(calls)
