@@ -34,7 +34,7 @@ import tempfile
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -230,7 +230,7 @@ class ClaudeCodeRunner:
         if not self.runs_dir or not self.run_id:
             return
         self.runs_dir.mkdir(parents=True, exist_ok=True)
-        row = {**call, "ts": datetime.now(timezone.utc).isoformat(), "ok": ok}
+        row = {**call, "ts": datetime.now(UTC).isoformat(), "ok": ok}
         if error is not None:
             row["error"] = error
         path = self.runs_dir / f"{self.run_id}.calls.jsonl"
