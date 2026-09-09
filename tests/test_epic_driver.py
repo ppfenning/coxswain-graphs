@@ -355,6 +355,8 @@ def test_a_failing_check_quarantines_that_task_and_the_sibling_still_merges(repo
     quarantined = result["quarantined"]
     assert [q["id"] for q in quarantined] == ["t1-probe"]
     assert "checks failed" in quarantined[0]["reason"]
+    assert quarantined[0]["kind"] == "no_work"
+    assert "patch_kept" not in quarantined[0]
     assert result["totals"]["tasks_quarantined"] == 1
 
     # The sibling's work is untouched by its neighbour's failure.
@@ -526,10 +528,50 @@ def test_an_unsatisfied_chunk_verdict_quarantines_before_the_gate(repo, cart, tm
 
     assert [q["id"] for q in result["quarantined"]] == ["t1-probe"]
     assert "validate_chunk unsatisfied" in result["quarantined"][0]["reason"]
+    assert result["quarantined"][0]["kind"] == "unverified"
+    assert result["quarantined"][0]["patch_kept"] is True
     # No merge was even proposed for it: a task the validator says did not do
     # what it said is not a task whose merge should be up for a decision.
     assert not any("t1-probe" in p["target"] for p in result["proposals"] if p["kind"] == "merge_stack")
     assert "epic/demo-initiative/p1-foundations--t1-probe" not in branches(repo)
+
+
+def test_an_unverified_quarantine_keeps_the_patch_and_records_it_kept(repo, cart, tmp_path) -> None:
+    """`validate_chunk` unsatisfied is `unverified`: the patch stays, on both records."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    work = workstore.read_initiative(wi)
+
+    runner = Runner({"t1-probe": new_file_patch("t1-probe.txt")}, chunk={"t1-probe": CHUNK_BAD})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-unverified")
+
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["kind"] == "unverified"
+    assert entry["patch_kept"] is True
+
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    attempt = item["attempts"][0]
+    assert attempt["kind"] == "unverified"
+    assert attempt["patch_kept"] is True
+
+
+def test_a_worktree_that_cannot_be_opened_fails_the_phase_not_a_task(repo, cart, tmp_path, monkeypatch) -> None:
+    """`infra` is the caller's own branch: no task-grain entry, the phase itself is marked."""
+    monkeypatch.setattr("harness.epic._open_phase_worktree", lambda ctx, phase, base_ref: (False, "boom", False))
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
+
+    p1 = result["phases"][0]
+    assert p1["status"] == "blocked"
+    assert p1["phase_failed_to_start"] == p1["reason"]
+    assert "boom" in p1["phase_failed_to_start"]
+    assert not any(q["grain"] == "task" for q in result["quarantined"])
 
 
 # ── governance ──────────────────────────────────────────────────────────────
@@ -769,6 +811,7 @@ def test_a_build_the_fix_loop_refused_is_quarantined_with_the_loop_s_own_reason(
     quarantined = [q for q in result["quarantined"] if q["grain"] == "task"]
     assert [q["id"] for q in quarantined] == ["t1-probe"]
     reason = quarantined[0]["reason"]
+    assert quarantined[0]["kind"] == "refused"
 
     # The loop's diagnosis, not a validator's restatement of a stale verdict.
     assert "no_progress" in reason, reason
@@ -802,15 +845,20 @@ def test_a_quarantined_task_records_an_attempt_on_its_own_work_item(repo, cart, 
     quarantined = {q["id"]: q for q in result["quarantined"] if q["grain"] == "task"}
     assert set(quarantined) == {"t1-probe", "t2-bench"}
 
+    # t1-probe: the fix loop's own refusal. t2-bench: no build was ever
+    # scripted for it, so `invoke_graphs` reports it as a swarm failure.
+    expected_kind = {"t1-probe": "refused", "t2-bench": "no_work"}
     for task in ("t1-probe", "t2-bench"):
         entry = quarantined[task]
-        assert set(entry) == {"id", "phase", "grain", "reason"}
+        assert set(entry) == {"id", "phase", "grain", "reason", "kind"}
+        assert entry["kind"] == expected_kind[task]
         item = workstore.read_item(wi / "p1-foundations" / f"{task}.md")
         assert len(item["attempts"]) == 1
         attempt = item["attempts"][0]
         assert attempt["run"] == "epic-attempt"
         assert attempt["phase"] == "p1-foundations"
         assert attempt["reason"] == entry["reason"]
+        assert attempt["kind"] == expected_kind[task]
         assert attempt["ts"]
 
     # The round trip that matters: re-reading the store (not a hand-built dict)
@@ -909,10 +957,15 @@ def test_a_task_at_the_attempt_cap_is_refused_and_its_sibling_still_lands(repo, 
     assert "attempt cap" in reason
     assert "first refusal" in reason
     assert "second refusal" in reason
+    # Attempt cap is "nothing produced", not a reviewer's rejection of a
+    # patch — docs/design/observed-record.md §3 puts it under `no_work`.
+    assert quarantined["t1-probe"]["kind"] == "no_work"
 
     assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
     assert "epic/demo-initiative/p1-foundations--t1-probe" not in branches(repo)
 
+    # A refusal past the cap is not itself an attempt: the item still shows
+    # only the two earlier ones, neither of which grew a third entry.
     item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
     assert len(item["attempts"]) == 2
 
