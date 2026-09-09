@@ -43,7 +43,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from core import workstore
 from core.manifest import build_manifest, gate_diff, record_run
@@ -612,6 +612,7 @@ def _quarantine_task(
     phase: str,
     task: str,
     reason: str,
+    kind: Literal["refused", "no_work", "unverified", "infra"],
 ) -> dict[str, Any]:
     """Build a task's quarantine entry AND leave a record on its own work item.
 
@@ -620,12 +621,32 @@ def _quarantine_task(
     last attempt didn't land. A task built with no file behind it (as tests
     do) or a store that refuses the write loses the item-side memory, never
     the quarantine entry itself.
+
+    `kind` is the closed set from docs/design/observed-record.md §3. `infra`
+    is never passed here: nothing ran for the task at all, so that case is
+    the caller's own branch at the `_open_phase_worktree` failure site, which
+    marks the phase `phase_failed_to_start` and never reaches this function.
+    `unverified` is an approved patch the validator would not sign off, so it
+    is kept rather than discarded — `patch_kept: True` on both the entry and
+    the attempt.
     """
+    patch_kept = kind == "unverified"
+    entry: dict[str, Any] = {"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": kind}
+    if patch_kept:
+        entry["patch_kept"] = True
     path = (by_id.get(task) or {}).get("path")
     if path:
         with contextlib.suppress(WorkStoreError, OSError):
-            record_attempt(path, run=ctx.run_id, phase=phase, reason=reason, ts=datetime.now(UTC).isoformat())
-    return {"id": task, "phase": phase, "grain": "task", "reason": reason}
+            record_attempt(
+                path,
+                run=ctx.run_id,
+                phase=phase,
+                reason=reason,
+                kind=kind,
+                ts=datetime.now(UTC).isoformat(),
+                **({"patch_kept": True} if patch_kept else {}),
+            )
+    return entry
 
 
 def _attempt_cap_reason(attempts: Sequence[Mapping[str, Any]]) -> str:
@@ -665,6 +686,7 @@ def _run_phase(
     if not ok:
         record["status"] = "blocked"
         record["reason"] = f"the phase worktree could not be created: {detail}"
+        record["phase_failed_to_start"] = record["reason"]
         quarantined.append({"id": phase, "phase": phase, "grain": "phase", "reason": record["reason"]})
         return record
     record["reused_branch"] = reused
@@ -712,6 +734,7 @@ def _run_phase(
         if not ok:
             record["status"] = "blocked"
             record["reason"] = f"the phase worktree could not be recreated: {detail}"
+            record["phase_failed_to_start"] = record["reason"]
             quarantined.append({"id": phase, "phase": phase, "grain": "phase", "reason": record["reason"]})
             return record
         record["reused_branch"] = reused
@@ -759,7 +782,7 @@ def _run_phase(
         if len(attempts) < ATTEMPT_CAP:
             continue
         reason = _attempt_cap_reason(attempts)
-        quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason})
+        quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
         print(f"  attempt cap: {task_id} refused ({len(attempts)} attempt(s) recorded)")
     ready = [item for item in all_ready if len(attempts_by_id[str(item["id"])]) < ATTEMPT_CAP]
 
@@ -798,7 +821,7 @@ def _run_phase(
     for task in over_budget:
         task_id = str(task["id"])
         quarantined.append({
-            "id": task_id, "phase": phase, "grain": "task",
+            "id": task_id, "phase": phase, "grain": "task", "kind": "no_work",
             "reason": (
                 f"budget_usd {task['budget_usd']} exceeds the cartridge cap "
                 f"build_budget_usd_max {cap} (a per build call ceiling)"
@@ -853,7 +876,9 @@ def _run_phase(
         # policy `invoke_graphs` names continue-and-quarantine.
         for failure in failures:
             quarantined.append(
-                _quarantine_task(ctx, by_id, phase=phase, task=failure.split(":", 1)[0], reason=failure)
+                _quarantine_task(
+                    ctx, by_id, phase=phase, task=failure.split(":", 1)[0], reason=failure, kind="no_work"
+                )
             )
     # Every result — fresh or reused — is saved under THIS run, so the next
     # resume has one place to look and the record of what ran is complete.
@@ -887,7 +912,7 @@ def _run_phase(
                     "status": "quarantined",
                 }
             )
-            quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=refused))
+            quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=refused, kind="refused"))
             continue
 
         build = _build_task(ctx, phase=phase, task=task, result=result)
@@ -935,9 +960,11 @@ def _run_phase(
             # a real failure does. Mirrors the attempt-cap refusal above,
             # which quarantines without ever calling `_quarantine_task`.
             if is_harness_fault(reason):
-                quarantined.append({"id": task, "phase": phase, "grain": "task", "reason": reason})
+                quarantined.append({"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
             else:
-                quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=reason))
+                quarantined.append(
+                    _quarantine_task(ctx, by_id, phase=phase, task=task, reason=reason, kind="no_work")
+                )
             continue
         surviving.append(task)
 
@@ -1008,7 +1035,10 @@ def _run_phase(
             surviving.remove(task)
             gaps = ", ".join(chunk.get("gaps") or []) or str(chunk.get("reasoning", ""))
             quarantined.append(
-                _quarantine_task(ctx, by_id, phase=phase, task=task, reason=f"validate_chunk unsatisfied: {gaps}")
+                _quarantine_task(
+                    ctx, by_id, phase=phase, task=task,
+                    reason=f"validate_chunk unsatisfied: {gaps}", kind="unverified",
+                )
             )
             for task_record in record["task_records"]:
                 if task_record["id"] == task:
