@@ -34,6 +34,7 @@ import tempfile
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +127,32 @@ def next_spent(previous: float, reported_usd: float, stopped: bool) -> float:
     return reported_usd if stopped else previous + reported_usd
 
 
+def _call_fields(role: str, tier: str, model: str, tools: Sequence[str], payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The one shape a call is recorded in — success or failure alike."""
+    usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
+    return {
+        "role": role,
+        "tier": tier,
+        "model": model,
+        "tools": list(tools),
+        "cost_usd": payload.get("total_cost_usd"),
+        "turns": payload.get("num_turns"),
+        "duration_ms": payload.get("duration_ms"),
+        # Split, not summed: a cache read costs a tenth of a fresh token,
+        # and "4.6M input" meant nothing until the price revealed that most
+        # of it was cached. Now the record says so itself.
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
+        "cache_creation_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+        "input_total": sum(
+            int(usage.get(k) or 0)
+            for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        ),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        **({"trace": payload["trace"]} if payload.get("trace") else {}),
+    }
+
+
 class ClaudeCodeRunner:
     """Runs nodes as headless Claude Code sessions with structured output."""
 
@@ -140,6 +167,8 @@ class ClaudeCodeRunner:
         timeout: int = 1800,
         extra_system: str = "",
         trace_dir: Path | str | None = None,
+        runs_dir: Path | str | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.profile = dict(profile)
         self.tiers = dict(self.profile.get("tiers") or {})
@@ -169,6 +198,12 @@ class ClaudeCodeRunner:
         # AGENT_GRAPHS_TRACE_DIR or by the harness. Without it a 44-turn build
         # is a number; with it, it is a list of what each turn did.
         self.trace_dir: Path | None = Path(trace_dir).expanduser() if trace_dir else None
+        # Where the per-call ledger lives: `<runs_dir>/<run_id>.calls.jsonl`, one
+        # line per call, appended as it returns — success or `RunnerError` alike.
+        # Learned the way trace_dir is, so a run that dies mid-node still leaves
+        # a record of what it spent instead of only what a survivor remembers.
+        self.runs_dir: Path | None = Path(runs_dir).expanduser() if runs_dir else None
+        self.run_id: str | None = run_id
         # The project's own check commands, verbatim from the cartridge, set by
         # the harness. Traced builds spent a third of their turns discovering
         # how to run the tests — the wrong interpreter, `which pytest`,
@@ -189,6 +224,18 @@ class ClaudeCodeRunner:
         # One row per node: what it cost and how many turns it took. Read by
         # whoever wants to know what a run spent; never by a graph.
         self.calls: list[dict[str, Any]] = []
+
+    def _append_call_ledger(self, call: Mapping[str, Any], *, ok: bool, error: str | None = None) -> None:
+        """One JSON line per call, written as it returns — never a rewrite, never buffered."""
+        if not self.runs_dir or not self.run_id:
+            return
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        row = {**call, "ts": datetime.now(timezone.utc).isoformat(), "ok": ok}
+        if error is not None:
+            row["error"] = error
+        path = self.runs_dir / f"{self.run_id}.calls.jsonl"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
 
     # ── resolution ──────────────────────────────────────────────────────────
 
@@ -546,8 +593,12 @@ class ClaudeCodeRunner:
             # Name everything the CLI said about it. A bare `None` result was
             # the whole diagnosis of a build failure once; never again.
             detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
+            message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
             if attempt == 2 or not _is_transient(payload):
-                message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
+                # Every failed attempt that ends the node is billed, whether it
+                # stops the budget or raises outright — ledgered here, once,
+                # before either exit, with the trace path the CLI just reported.
+                self._append_call_ledger(_call_fields(role, tier, model, tools, payload), ok=False, error=message)
                 if payload.get("subtype") == "error_max_budget_usd":
                     spent = float(payload.get("total_cost_usd") or 0.0)
                     partial_patch = ""
@@ -570,11 +621,19 @@ class ClaudeCodeRunner:
 
             # Keep the failed attempt's trace. The retry writes to the same
             # filename, and a transient error that leaves no record behind is
-            # one nobody can measure the frequency of later.
+            # one nobody can measure the frequency of later. Renamed BEFORE the
+            # ledger line is written, so the failed row names the file that
+            # still holds its trace rather than the one the retry is about to
+            # reuse — the ledger and the trace file agree on one path each.
+            traced_payload = payload
             if payload.get("trace"):
-                failed = Path(payload["trace"])
-                failed.replace(failed.with_suffix(".error.jsonl"))
+                failed = Path(payload["trace"]).replace(Path(payload["trace"]).with_suffix(".error.jsonl"))
+                traced_payload = {**payload, "trace": str(failed)}
+            self._append_call_ledger(_call_fields(role, tier, model, tools, traced_payload), ok=False, error=message)
 
+        # Built before either raise below, so a malformed answer is ledgered
+        # too — the run spent the call whether or not it parsed.
+        call = _call_fields(role, tier, model, tools, payload)
         data = payload.get("structured_output")
         if data is None:
             # An older build, or a session that answered in prose: the result
@@ -582,37 +641,21 @@ class ClaudeCodeRunner:
             try:
                 data = json.loads(str(payload.get("result") or ""))
             except json.JSONDecodeError as exc:
-                raise RunnerError(f"node '{role}' returned no structured output and its text is not JSON: {exc}") from exc
+                message = f"node '{role}' returned no structured output and its text is not JSON: {exc}"
+                self._append_call_ledger(call, ok=False, error=message)
+                raise RunnerError(message) from exc
         if not isinstance(data, dict):
-            raise RunnerError(f"node '{role}' returned {type(data).__name__}, expected an object")
+            message = f"node '{role}' returned {type(data).__name__}, expected an object"
+            self._append_call_ledger(call, ok=False, error=message)
+            raise RunnerError(message)
 
-        usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
-        self.calls.append(
-            {
-                "role": role,
-                "tier": tier,
-                "model": model,
-                "tools": list(tools),
-                "cost_usd": payload.get("total_cost_usd"),
-                "turns": payload.get("num_turns"),
-                "duration_ms": payload.get("duration_ms"),
-                # Split, not summed: a cache read costs a tenth of a fresh token,
-                # and "4.6M input" meant nothing until the price revealed that most
-                # of it was cached. Now the record says so itself.
-                "input_tokens": int(usage.get("input_tokens") or 0),
-                "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
-                "cache_creation_tokens": int(usage.get("cache_creation_input_tokens") or 0),
-                "input_total": sum(
-                    int(usage.get(k) or 0)
-                    for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-                ),
-                "output_tokens": int(usage.get("output_tokens") or 0),
-                **({"trace": payload["trace"]} if payload.get("trace") else {}),
-            }
-        )
+        self.calls.append(call)
         if role in _PATCH_ROLES and has_scratch:
             patch, reason = reconcile_patch(str(data.get("patch") or ""), computed_patch)
             if reason:
-                raise RunnerError(f"node '{role}' {reason}: the scratch tree has no changes to show for it")
-            return NodeResult({**data, "patch": patch})
+                message = f"node '{role}' {reason}: the scratch tree has no changes to show for it"
+                self._append_call_ledger(call, ok=False, error=message)
+                raise RunnerError(message)
+            data = {**data, "patch": patch}
+        self._append_call_ledger(call, ok=True)
         return NodeResult(data)
