@@ -24,6 +24,8 @@ __all__ = [
     "all_passed",
     "check_outcome",
     "checks_evidence",
+    "collected_ids",
+    "coverage_floor_holds",
     "is_harness_fault",
     "quarantine_reason",
     "repo_checks",
@@ -56,6 +58,20 @@ def _tail_lines(text: str, n: int = _TAIL_LINES) -> str:
     if len(lines) <= n:
         return text
     return "\n".join([_TRUNCATION_MARKER, *lines[-n:]])
+
+
+def collected_ids(output: str) -> set[str]:
+    """Node ids from `pytest --collect-only -q` stdout, pure.
+
+    A node id line carries `::`; the trailing summary line ("N tests
+    collected", "no tests ran") does not, so it is excluded by the same test.
+    """
+    return {line.strip() for line in output.splitlines() if "::" in line}
+
+
+def coverage_floor_holds(before: set[str], after: set[str]) -> bool:
+    """True iff every id collected `before` a trim is still collected `after`."""
+    return before <= after
 
 
 def check_outcome(returncode: int | None, error: str | None) -> str:
