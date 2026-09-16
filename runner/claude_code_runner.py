@@ -228,11 +228,14 @@ def self_reported_commands(data: Mapping[str, Any]) -> list[dict[str, str]]:
     return [{"command": str(item), "source": "self_report"} for item in reported if item]
 
 
-def _call_fields(role: str, tier: str, model: str, tools: Sequence[str], payload: Mapping[str, Any]) -> dict[str, Any]:
+def _call_fields(
+    role: str, tier: str, model: str, tools: Sequence[str], payload: Mapping[str, Any], task_id: str | None = None
+) -> dict[str, Any]:
     """The one shape a call is recorded in — success or failure alike."""
     usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
     return {
         "role": role,
+        "task_id": task_id,
         "tier": tier,
         "model": model,
         "tools": list(tools),
@@ -641,6 +644,7 @@ class ClaudeCodeRunner:
         context: Sequence[str] = (),
         thread: str | None = None,
         budget_usd: float | None = None,
+        task: str | None = None,
     ) -> NodeResult:
         tier = self.tier_overrides.get(role, tier)
         model = self._model_for(tier)
@@ -711,7 +715,7 @@ class ClaudeCodeRunner:
                 # stops the budget or raises outright — ledgered here, once,
                 # before either exit, with the trace path the CLI just reported.
                 self._append_call_ledger(
-                    {**_call_fields(role, tier, used_model, tools, payload), "id": call_id, **retry_extra},
+                    {**_call_fields(role, tier, used_model, tools, payload, task), "id": call_id, **retry_extra},
                     ok=False, error=message,
                 )
                 if payload.get("subtype") == "error_max_budget_usd":
@@ -753,12 +757,12 @@ class ClaudeCodeRunner:
                 failed = Path(payload["trace"]).replace(Path(payload["trace"]).with_suffix(".error.jsonl"))
                 traced_payload = {**payload, "trace": str(failed)}
             self._append_call_ledger(
-                {**_call_fields(role, tier, used_model, tools, traced_payload), "id": call_id}, ok=False, error=message,
+                {**_call_fields(role, tier, used_model, tools, traced_payload, task), "id": call_id}, ok=False, error=message,
             )
 
         # Built before either raise below, so a malformed answer is ledgered
         # too — the run spent the call whether or not it parsed.
-        call = {**_call_fields(role, tier, used_model, tools, payload), "id": call_id, **retry_extra}
+        call = {**_call_fields(role, tier, used_model, tools, payload, task), "id": call_id, **retry_extra}
         data = payload.get("structured_output")
         if data is None:
             # An older build, or a session that answered in prose: the result

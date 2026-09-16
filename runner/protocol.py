@@ -79,6 +79,7 @@ class NodeRunner(Protocol):
         context: Sequence[str] = (),
         thread: str | None = None,
         budget_usd: float | None = None,
+        task: str | None = None,
     ) -> NodeResult:
         """Execute one node.
 
@@ -96,5 +97,8 @@ class NodeRunner(Protocol):
 
         `budget_usd` is a per-call dollar ceiling that overrides the role or
         tier one when given.
+
+        `task` names the task id this call belongs to, for a runner that keeps
+        a call ledger to stamp onto its own record. A runner may ignore it.
         """
         ...

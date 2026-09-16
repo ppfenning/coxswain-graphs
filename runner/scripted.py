@@ -43,7 +43,11 @@ class ScriptedRunner:
         context: Sequence[str] = (),
         thread: str | None = None,
         budget_usd: float | None = None,
+        task: str | None = None,
     ) -> NodeResult:
+        # `task` is not recorded on `.calls` — this double replays graphs whose
+        # existing assertions read that dict verbatim, and stamping `task_id`
+        # onto a call record is `ClaudeCodeRunner`'s own contract, not this one's.
         self.calls.append(
             {"role": role, "tier": tier, "prompt": prompt, "context": list(context), "thread": thread, "budget_usd": budget_usd}
         )

@@ -91,6 +91,18 @@ def test_tier_becomes_model_and_effort(fake_claude, tmp_path) -> None:
     assert argv[argv.index("--output-format") + 1] == "json"
 
 
+def test_a_task_kwarg_is_stamped_onto_the_call_as_task_id(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    runner.run(role="build", schema=SCHEMA, prompt="go", task="t1-probe")
+    assert runner.calls[-1]["task_id"] == "t1-probe"
+
+
+def test_no_task_kwarg_stamps_task_id_none(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["task_id"] is None
+
+
 def test_the_prompt_travels_on_stdin_and_the_schema_on_argv(fake_claude, tmp_path) -> None:
     runner = runner_for(fake_claude, tmp_path)
     runner.run(role="plan", schema=SCHEMA, prompt="the prompt, verbatim")
