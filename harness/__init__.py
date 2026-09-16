@@ -28,8 +28,13 @@ from harness.resolve import resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
 from harness.worktree import apply_patch, create_worktree
 
+# The core schema version this harness release was built against; must move
+# in step with any change to the four contracts core.SCHEMA_VERSION names.
+CORE_SCHEMA = "1.0"
+
 __all__ = [
     "APPLY_SCHEMA",
+    "CORE_SCHEMA",
     "DiscoveryError",
     "GraphSpec",
     "Invocation",

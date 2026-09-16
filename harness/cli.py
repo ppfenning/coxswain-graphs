@@ -23,12 +23,14 @@ from datetime import date as date_type
 from pathlib import Path
 from typing import Any
 
+import core
 import yaml
 from core import ledger, workstore
 from core.cartridge import CartridgeError
 from core.manifest import build_manifest, record_run
 
 from graphs._contract import ContractViolation
+from harness import CORE_SCHEMA
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, run_checks
 from harness.digest import build_digest
@@ -138,11 +140,27 @@ def _observe_trap_failures(
                 "cartridge_sha": cartridge.get("cartridge_sha"),
                 "overlay_sha": cartridge.get("overlay_sha"),
                 "provider_profile": provider_profile,
+                "schema": core.SCHEMA_VERSION,
             },
             ledger_path,
         )
         print(f"observation: trap did not hold for '{entry}' — recorded against its streak")
     return len(hits)
+
+
+def _core_schema_status(installed: str, required: str) -> tuple[str, str] | None:
+    """Compare MAJOR.MINOR core schema strings; None means proceed silently.
+
+    Otherwise ("fatal", message) on a MAJOR difference or ("warn", message)
+    on a MINOR-only difference.
+    """
+    installed_major, installed_minor = (int(p) for p in installed.split(".", 1))
+    required_major, required_minor = (int(p) for p in required.split(".", 1))
+    if installed_major != required_major:
+        return "fatal", f"core schema {installed} does not match harness CORE_SCHEMA {required}; upgrade coxswain-graphs"
+    if installed_minor != required_minor:
+        return "warn", f"core schema {installed} does not match harness CORE_SCHEMA {required}"
+    return None
 
 
 def _governance_line(hits: list[str], *, label: str = "") -> str:
@@ -355,6 +373,13 @@ def main(argv: list[str] | None = None) -> int:
     except CartridgeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    schema_status = _core_schema_status(core.SCHEMA_VERSION, CORE_SCHEMA)
+    if schema_status is not None:
+        level, message = schema_status
+        print(message, file=sys.stderr if level == "fatal" else sys.stdout)
+        if level == "fatal":
+            return 1
 
     runner = build_runner(
         scripted=args.scripted,
