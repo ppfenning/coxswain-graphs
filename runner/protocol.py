@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["BudgetStop", "NodeResult", "NodeRunner", "RunnerError"]
+__all__ = ["BudgetStop", "LimitStop", "NodeResult", "NodeRunner", "RunnerError"]
 
 
 class RunnerError(Exception):
@@ -56,6 +56,14 @@ class BudgetStop(RunnerError):
         self.session = session
         self.spent_usd = spent_usd
         self.partial_patch = partial_patch
+        self.detail = detail
+        super().__init__(detail)
+
+
+class LimitStop(RunnerError):
+    """The account's session limit stopped the CLI. `detail` is the raw banner text."""
+
+    def __init__(self, *, detail: str) -> None:
         self.detail = detail
         super().__init__(detail)
 

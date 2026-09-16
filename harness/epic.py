@@ -73,7 +73,7 @@ from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
 from harness.worktree import apply_patch, create_worktree, keep_worktree, prune_registrations, remove_worktree
 from runner.claude_code_runner import files_touched_from_patch
-from runner.protocol import RunnerError
+from runner.protocol import LimitStop, RunnerError
 
 __all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
 
@@ -104,6 +104,9 @@ PATCH_FOR_VALIDATION_CHARS = 120_000
 # count it is enforcing — see `_run_phase`, which quarantines these tasks with
 # a plain `quarantined.append` rather than `_quarantine_task`.
 ATTEMPT_CAP = 2
+
+# Distinct from a clean run's implicit 0, for a caller to act on the pause.
+EXIT_PAUSED = 3
 
 # docs/design/landing-model.md §5: the existing style_pass brief, plus the one
 # sentence that scopes it to a whole phase rather than one task's diff.
@@ -603,6 +606,7 @@ def run_epic(
         proposals: list[dict[str, Any]] = []
         complete: set[str] = set()
         stacks_rebased = 0
+        paused_until: str | None = None
 
         for phase in cyclic:
             phases.append(
@@ -651,7 +655,12 @@ def run_epic(
                 )
                 continue
 
-            record = _run_phase(ctx, initiative=initiative, phase=phase, parent=parent, items=items)
+            try:
+                record = _run_phase(ctx, initiative=initiative, phase=phase, parent=parent, items=items)
+            except LimitStop as exc:
+                # No quarantine, no attempt, every sibling task left as-is: stop now.
+                paused_until = exc.detail.split("resets", 1)[-1].strip()
+                break
             # Threads live for a phase: every task's plan/build/retry is done by now.
             close = getattr(ctx.runner, "close", None)
             if callable(close):
@@ -677,7 +686,10 @@ def run_epic(
             "tasks": tasks,
             "quarantined": quarantined,
             "proposals": proposals,
-            "exit_summary": [
+            **({"paused_until": paused_until, "exit_code": EXIT_PAUSED} if paused_until else {}),
+            "exit_summary": (
+                [f"paused: account session limit, resets {paused_until}"] if paused_until else []
+            ) + [
                 f"approved but not landed: {t['id']} — cox runs recover {run_id} {t['id']} --repo {repo}"
                 for t in approved_not_landed
             ] + [
@@ -1864,6 +1876,8 @@ def _execute(
     # task as `infra` and lets the phase continue rather than crashing `run_epic`.
     try:
         applied, detail = auto_apply(dict(item), cartridge=ctx.cartridge, runner=ctx.runner)
+    except LimitStop:
+        raise  # the account's own limit, not this task's; never through `_quarantine_task`
     except RunnerError as exc:
         arm = apply_arm_for(item.get("kind"), ctx.cartridge)
         reason = f"apply arm '{arm}' raised {type(exc).__name__}: {exc}"
