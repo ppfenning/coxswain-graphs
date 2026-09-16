@@ -67,7 +67,7 @@ from harness.escalate import escalate_self_modification
 from harness.gate import auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
-from harness.worktree import apply_patch, create_worktree, prune_registrations, remove_worktree
+from harness.worktree import apply_patch, create_worktree, keep_worktree, prune_registrations, remove_worktree
 
 __all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
 
@@ -491,6 +491,7 @@ def run_epic(
     assume: str | None = None,
     fix_attempts: int | None = None,
     resume_from: str | None = None,
+    keep_worktrees: bool = False,
 ) -> dict[str, Any]:
     """Drive a whole initiative: every phase, in dependency order, landing nothing.
 
@@ -503,138 +504,166 @@ def run_epic(
     checks is set aside and its siblings still gate; a phase that does not meet
     its goal blocks its own dependents and nothing else. One task must not take
     a phase with it, and one phase must not take an initiative with it.
+
+    Every exit — normal completion, an early return, or an exception raised
+    anywhere in the phase loop — cleans up this run's worktrees in a
+    `finally`: removed by default, or moved under `_kept/<run_id>` when
+    `keep_worktrees` is set. The primitives live in `harness.worktree`; this
+    only decides which one to call.
     """
     repo = Path(repo)
-    ok, head = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
+    ctx: _Ctx | None = None
     try:
-        # `utf-8-sig` also strips a leading BOM, which would otherwise survive
-        # into the first command's name and cmd and never resolve as a shell
-        # command. Either way a malformed file degrades to no repo checks,
-        # never to a run that dies on somebody else's typo.
-        agent_checks_text = (repo / ".agent-checks").read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError):
-        agent_checks_text = ""
-    ctx = _Ctx(
-        repo=repo,
-        cartridge=cartridge,
-        runner=runner,
-        specs=specs,
-        run_id=run_id,
-        date=date,
-        max_parallel=max_parallel,
-        ledger_path=Path(ledger_path),
-        provider_profile=provider_profile,
-        runs_dir=Path(runs_dir),
-        worktree_root=Path(str(worktree_root)).expanduser(),
-        assume=assume,
-        fix_attempts=fix_attempts,
-        resume_from=resume_from,
-        repo_checks=repo_checks(agent_checks_text),
-        initiative_id=str(initiative.get("id")),
-        # An unparented phase branches from the repository's current HEAD, read
-        # once here so every phase in a run stacks on the same ground.
-        default_ref=head.strip() if ok else "HEAD",
-    )
-
-    # The driver's own view of the work. `ready_tasks` answers from item state,
-    # so an EXECUTED `state_move` has to be reflected here or the next phase's
-    # tasks never become ready within this run. The arm remains the single
-    # writer of the store on disk; this is the driver keeping its own copy
-    # honest about what the arm just did.
-    items = [dict(item) for item in initiative.get("items") or []]
-
-    parents = phase_parents(items)
-    ordered, cyclic = phase_order(parents)
-
-    phases: list[dict[str, Any]] = []
-    tasks: list[dict[str, Any]] = []
-    quarantined: list[dict[str, Any]] = []
-    proposals: list[dict[str, Any]] = []
-    complete: set[str] = set()
-    stacks_rebased = 0
-
-    for phase in cyclic:
-        phases.append(
-            {
-                "phase": phase,
-                "status": "blocked",
-                "reason": (
-                    "phase dependency cycle: the task DAG is acyclic but the phase graph it "
-                    "induces is not, so no order over these phases exists"
-                ),
-            }
+        ok, head = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
+        try:
+            # `utf-8-sig` also strips a leading BOM, which would otherwise survive
+            # into the first command's name and cmd and never resolve as a shell
+            # command. Either way a malformed file degrades to no repo checks,
+            # never to a run that dies on somebody else's typo.
+            agent_checks_text = (repo / ".agent-checks").read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError):
+            agent_checks_text = ""
+        ctx = _Ctx(
+            repo=repo,
+            cartridge=cartridge,
+            runner=runner,
+            specs=specs,
+            run_id=run_id,
+            date=date,
+            max_parallel=max_parallel,
+            ledger_path=Path(ledger_path),
+            provider_profile=provider_profile,
+            runs_dir=Path(runs_dir),
+            worktree_root=Path(str(worktree_root)).expanduser(),
+            assume=assume,
+            fix_attempts=fix_attempts,
+            resume_from=resume_from,
+            repo_checks=repo_checks(agent_checks_text),
+            initiative_id=str(initiative.get("id")),
+            # An unparented phase branches from the repository's current HEAD, read
+            # once here so every phase in a run stacks on the same ground.
+            default_ref=head.strip() if ok else "HEAD",
         )
 
-    for phase in ordered:
-        parent_phases = sorted(parents.get(phase) or ())
+        # The driver's own view of the work. `ready_tasks` answers from item state,
+        # so an EXECUTED `state_move` has to be reflected here or the next phase's
+        # tasks never become ready within this run. The arm remains the single
+        # writer of the store on disk; this is the driver keeping its own copy
+        # honest about what the arm just did.
+        items = [dict(item) for item in initiative.get("items") or []]
 
-        if len(parent_phases) > 1:
-            # Two parents is a merge of two stacks, and a v1 stack has one base
-            # ref. Refusing beats picking one parent and silently building on
-            # half the ground.
+        parents = phase_parents(items)
+        ordered, cyclic = phase_order(parents)
+
+        phases: list[dict[str, Any]] = []
+        tasks: list[dict[str, Any]] = []
+        quarantined: list[dict[str, Any]] = []
+        proposals: list[dict[str, Any]] = []
+        complete: set[str] = set()
+        stacks_rebased = 0
+
+        for phase in cyclic:
             phases.append(
                 {
                     "phase": phase,
                     "status": "blocked",
-                    "parents": parent_phases,
                     "reason": (
-                        f"multiple parent phases ({', '.join(parent_phases)}); "
-                        "v1 stacks support one parent"
+                        "phase dependency cycle: the task DAG is acyclic but the phase graph it "
+                        "induces is not, so no order over these phases exists"
                     ),
                 }
             )
-            continue
 
-        parent = parent_phases[0] if parent_phases else None
-        if parent is not None and parent not in complete:
-            # v1 is blanket no: a phase unblocks its dependents only when
-            # `validate_phase` says the goal is met. The validator reports
-            # `quarantine_blocks_dependents`; nothing acts on it yet.
-            phases.append(
-                {
-                    "phase": phase,
-                    "status": "blocked",
-                    "parents": parent_phases,
-                    "reason": f"parent phase '{parent}' did not meet its goal; dependents do not run",
-                }
-            )
-            continue
+        for phase in ordered:
+            parent_phases = sorted(parents.get(phase) or ())
 
-        record = _run_phase(ctx, initiative=initiative, phase=phase, parent=parent, items=items)
-        # Threads live for a phase: every task's plan/build/retry is done by now.
-        close = getattr(ctx.runner, "close", None)
-        if callable(close):
-            close()
-        tasks.extend(record.pop("task_records"))
-        quarantined.extend(record.pop("quarantined"))
-        proposals.extend(record.pop("batch"))
-        stacks_rebased += 1 if record.get("rebased") else 0
-        phases.append(record)
-        if record["status"] == "complete":
-            complete.add(phase)
+            if len(parent_phases) > 1:
+                # Two parents is a merge of two stacks, and a v1 stack has one base
+                # ref. Refusing beats picking one parent and silently building on
+                # half the ground.
+                phases.append(
+                    {
+                        "phase": phase,
+                        "status": "blocked",
+                        "parents": parent_phases,
+                        "reason": (
+                            f"multiple parent phases ({', '.join(parent_phases)}); "
+                            "v1 stacks support one parent"
+                        ),
+                    }
+                )
+                continue
 
-    approved_not_landed = [t for t in tasks if t.get("outcome") == "approved_not_landed"]
-    return {
-        "run_id": run_id,
-        "date": date,
-        "initiative": ctx.initiative_id,
-        "phases": phases,
-        "tasks": tasks,
-        "quarantined": quarantined,
-        "proposals": proposals,
-        "exit_summary": [
-            f"approved but not landed: {t['id']} — cox runs recover {run_id} {t['id']} --repo {repo}"
-            for t in approved_not_landed
-        ],
-        "totals": {
-            "phases_complete": sum(1 for p in phases if p["status"] == "complete"),
-            "phases_partial": sum(1 for p in phases if p["status"] == "partial"),
-            "phases_blocked": sum(1 for p in phases if p["status"] == "blocked"),
-            "tasks_quarantined": sum(1 for q in quarantined if q.get("grain") == "task"),
-            "approved_not_landed": len(approved_not_landed),
-            "stacks_rebased": stacks_rebased,
-        },
-    }
+            parent = parent_phases[0] if parent_phases else None
+            if parent is not None and parent not in complete:
+                # v1 is blanket no: a phase unblocks its dependents only when
+                # `validate_phase` says the goal is met. The validator reports
+                # `quarantine_blocks_dependents`; nothing acts on it yet.
+                phases.append(
+                    {
+                        "phase": phase,
+                        "status": "blocked",
+                        "parents": parent_phases,
+                        "reason": f"parent phase '{parent}' did not meet its goal; dependents do not run",
+                    }
+                )
+                continue
+
+            record = _run_phase(ctx, initiative=initiative, phase=phase, parent=parent, items=items)
+            # Threads live for a phase: every task's plan/build/retry is done by now.
+            close = getattr(ctx.runner, "close", None)
+            if callable(close):
+                close()
+            tasks.extend(record.pop("task_records"))
+            quarantined.extend(record.pop("quarantined"))
+            proposals.extend(record.pop("batch"))
+            stacks_rebased += 1 if record.get("rebased") else 0
+            phases.append(record)
+            if record["status"] == "complete":
+                complete.add(phase)
+
+        approved_not_landed = [t for t in tasks if t.get("outcome") == "approved_not_landed"]
+        return {
+            "run_id": run_id,
+            "date": date,
+            "initiative": ctx.initiative_id,
+            "phases": phases,
+            "tasks": tasks,
+            "quarantined": quarantined,
+            "proposals": proposals,
+            "exit_summary": [
+                f"approved but not landed: {t['id']} — cox runs recover {run_id} {t['id']} --repo {repo}"
+                for t in approved_not_landed
+            ],
+            "totals": {
+                "phases_complete": sum(1 for p in phases if p["status"] == "complete"),
+                "phases_partial": sum(1 for p in phases if p["status"] == "partial"),
+                "phases_blocked": sum(1 for p in phases if p["status"] == "blocked"),
+                "tasks_quarantined": sum(1 for q in quarantined if q.get("grain") == "task"),
+                "approved_not_landed": len(approved_not_landed),
+                "stacks_rebased": stacks_rebased,
+            },
+        }
+    finally:
+        # Every exit — the return above, a raise from anywhere in this try, or
+        # a signal delivered as KeyboardInterrupt — lands here. Nothing before
+        # `ctx` exists can have made a worktree, so there is nothing to do yet.
+        if ctx is not None:
+            run_dir = ctx.worktree_root / ctx.run_id
+            if keep_worktrees:
+                # `keep_worktree` moves ONE named worktree to
+                # `_kept/<run_id>/<name>`; run_dir's own name is the run id,
+                # so calling it on run_dir directly would double that segment
+                # into `_kept/<run_id>/<run_id>`. Called once per phase
+                # directory instead, each move lands where work-shape.md §6
+                # says a kept run lands: `_kept/<run_id>/<phase>`.
+                if run_dir.is_dir():
+                    for phase_dir in sorted(run_dir.iterdir()):
+                        keep_worktree(ctx.repo, phase_dir, ctx.worktree_root, ctx.run_id)
+                    if not any(run_dir.iterdir()):
+                        run_dir.rmdir()
+            else:
+                remove_worktree(ctx.repo, run_dir)
 
 
 def _quarantine_task(

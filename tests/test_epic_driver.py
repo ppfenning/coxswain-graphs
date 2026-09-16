@@ -223,7 +223,8 @@ SPECS = {
 
 
 def drive(
-    repo, cart, tmp_path, *, runner=None, work=None, assume="a", run_id="epic-1", patches=None, fix_attempts=None
+    repo, cart, tmp_path, *, runner=None, work=None, assume="a", run_id="epic-1", patches=None, fix_attempts=None,
+    keep_worktrees=False,
 ):
     runner = runner or Runner(patches if patches is not None else {t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
     result = run_epic(
@@ -241,6 +242,7 @@ def drive(
         worktree_root=cart["landing_areas"]["worktree_root"],
         assume=assume,
         fix_attempts=fix_attempts,
+        keep_worktrees=keep_worktrees,
     )
     return result, runner
 
@@ -295,6 +297,49 @@ def test_the_happy_path_stacks_the_second_phase_on_the_first(repo, cart, tmp_pat
     assert git("rev-parse", "main", cwd=repo) == git("rev-parse", "main~0", cwd=repo)
     assert git("rev-list", "--count", "main", cwd=repo) == "1", "main has not moved"
     assert not is_ancestor(repo, "epic/demo-initiative/p1-foundations", "main")
+
+
+# ── cleanup on exit, work-shape.md §6/§8 ────────────────────────────────────
+
+
+class RaisingCloseRunner(Runner):
+    """A build that succeeds, then a close that does not — the exception a
+    `finally` has to survive, raised only after a worktree already exists."""
+
+    def close(self) -> None:
+        raise RuntimeError("close blew up")
+
+
+def test_a_normal_run_removes_its_worktree_directory_and_registration(repo, cart, tmp_path) -> None:
+    result, _ = drive(repo, cart, tmp_path, run_id="epic-clean")
+
+    assert result["totals"]["phases_complete"] == 2
+    assert not (Path(cart["landing_areas"]["worktree_root"]) / "epic-clean").exists()
+    assert "epic-clean" not in git("worktree", "list", cwd=repo)
+
+
+def test_a_run_that_raises_still_cleans_up_because_finally_fires(repo, cart, tmp_path) -> None:
+    runner = RaisingCloseRunner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+
+    with pytest.raises(RuntimeError, match="close blew up"):
+        drive(repo, cart, tmp_path, runner=runner, run_id="epic-raise")
+
+    assert not (Path(cart["landing_areas"]["worktree_root"]) / "epic-raise").exists()
+    assert "epic-raise" not in git("worktree", "list", cwd=repo)
+
+
+def test_keep_worktrees_moves_the_run_dir_under_kept_run_id_instead_of_deleting_it(repo, cart, tmp_path) -> None:
+    drive(repo, cart, tmp_path, run_id="epic-keep", keep_worktrees=True)
+
+    root = Path(cart["landing_areas"]["worktree_root"])
+    assert not (root / "epic-keep").exists(), "the emptied run directory should not survive the move"
+    kept = root / "_kept" / "epic-keep"
+    for phase in ("p1-foundations", "p2-rollout"):
+        phase_dir = kept / phase
+        assert phase_dir.is_dir(), f"{phase_dir} missing: §6 kept shape is _kept/<run_id>/<phase>"
+        assert any(phase_dir.rglob("*")), "the moved directory carried its contents, not an empty shell"
+    assert not (kept / "epic-keep").exists(), "the run id must not be doubled into the kept path"
+    assert "epic-keep" not in git("worktree", "list", cwd=repo)
 
 
 def test_every_phase_records_its_own_manifest_and_ledger_rows(repo, cart, tmp_path) -> None:
