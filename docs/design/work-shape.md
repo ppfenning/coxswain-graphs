@@ -68,7 +68,9 @@ that changes a ticket body. `Problem(task, rule, detail, fix)`. Rules:
   allowlist do not permit (`cox`, `uv`, `gh`, `git push`, `ruff` when not installed) → `fix: name only
   pytest, git status, git diff`.
 - **coupling:** two tickets in one phase whose `surfaces` share a test file, or whose named modules import
-  one another → `fix: merge, or order with needs`.
+  one another, are a problem only when neither reaches the other through `needs`; reachability is
+  transitive, so a chain A → B → C serializes all three and no pair among them is a problem → `fix: merge,
+  or order with needs`.
 - **size:** a body over ~700 words → `fix: point at a spec file in the repository` (the measured `plan`
   death band).
 
