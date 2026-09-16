@@ -258,6 +258,15 @@ def _call_fields(
     }
 
 
+def _effective_limit(shape_ceiling: float | None, node_cap: float | None) -> tuple[float | None, bool]:
+    """min(shape, cap) per cost-bounds.md §6 rule 2. True when the cap is the binding number."""
+    if node_cap is None:
+        return shape_ceiling, False
+    if shape_ceiling is None or node_cap < shape_ceiling:
+        return node_cap, True
+    return shape_ceiling, False
+
+
 class ClaudeCodeRunner:
     """Runs nodes as headless Claude Code sessions with structured output."""
 
@@ -293,6 +302,10 @@ class ClaudeCodeRunner:
         # a 101-turn build that finished anyway.
         self.budget_usd = {str(k): float(v) for k, v in (self.profile.get("budget_usd") or {}).items()}
         self.role_budget_usd = {str(k): float(v) for k, v in (self.profile.get("role_budget_usd") or {}).items()}
+        # The operator's per-node spend cap (docs/design/cost-bounds.md §1), set
+        # by the harness after construction, like `runs_dir`/`run_id`. Unset
+        # means the shape ceiling above is the only limit, exactly as before.
+        self.node_cap_usd: float | None = None
         # A profile may reassign a role's tier — the vendor axis owning cost.
         # Extraction-shaped roles a graph asked "standard" for can run cheap here.
         self.tier_overrides = {str(k): str(v) for k, v in (self.profile.get("tier_overrides") or {}).items()}
@@ -350,6 +363,15 @@ class ClaudeCodeRunner:
             known = ", ".join(sorted(self.tiers))
             raise RunnerError(f"provider profile has no model for tier '{tier}'; it declares: {known}")
         return str(model[0]) if isinstance(model, list) else str(model)
+
+    def _shape_ceiling(self, role: str | None, tier: str, budget_usd: float | None) -> float | None:
+        """The provider's own ceiling for this call, before any operator cap applies."""
+        budget = budget_usd
+        if budget is None:
+            budget = self.role_budget_usd.get(role) if role is not None else None
+        if budget is None:
+            budget = self.budget_usd.get(tier)
+        return budget
 
     @staticmethod
     def _read_context(context: Sequence[str]) -> str:
@@ -539,16 +561,12 @@ class ClaudeCodeRunner:
             json.dumps(dict(schema)),
             *_ISOLATION,
         ]
-        budget = budget_usd
-        if budget is None:
-            budget = self.role_budget_usd.get(role) if role is not None else None
-        if budget is None:
-            budget = self.budget_usd.get(tier)
-        if budget is not None:
+        effective, _ = _effective_limit(self._shape_ceiling(role, tier, budget_usd), self.node_cap_usd)
+        if effective is not None:
             # Resuming a stopped session may see the ceiling as covering the
             # whole session's spend rather than this invocation's, so the
             # fresh slice must cover at least the ceiling either way.
-            argv += ["--max-budget-usd", f"{spent_usd + budget:.4f}"]
+            argv += ["--max-budget-usd", f"{spent_usd + effective:.4f}"]
         if system:
             argv += ["--system-prompt", system]
         for extra in (self.repo_dir, scratch):
@@ -709,7 +727,15 @@ class ClaudeCodeRunner:
             # Name everything the CLI said about it. A bare `None` result was
             # the whole diagnosis of a build failure once; never again.
             detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
+            shape_ceiling = self._shape_ceiling(role, tier, budget_usd)
+            _, cap_governs = _effective_limit(shape_ceiling, self.node_cap_usd)
+            cap_stop = cap_governs and detail.get("subtype") == "error_max_budget_usd"
+            if cap_stop:
+                detail["subtype"] = "error_spend_cap"
             message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
+            if cap_stop:
+                ceiling_txt = f"${shape_ceiling:.4f}" if shape_ceiling is not None else "none"
+                message += f" (cap ${self.node_cap_usd:.4f} < shape ceiling {ceiling_txt})"
             if attempt == 2 or not _is_transient(payload):
                 # Every failed attempt that ends the node is billed, whether it
                 # stops the budget or raises outright — ledgered here, once,

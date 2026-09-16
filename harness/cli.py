@@ -208,6 +208,15 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     parser.add_argument("--ledger", default=_default_ledger())
     parser.add_argument("--worktree-root", help="override the cartridge's worktree_root")
     parser.add_argument(
+        "--node-cap-usd",
+        type=float,
+        default=None,
+        help=(
+            "operator's per-node spend cap; the effective limit becomes "
+            "min(shape ceiling, this) and a stop at the cap is error_spend_cap"
+        ),
+    )
+    parser.add_argument(
         "--keep-worktrees",
         action="store_true",
         help="on exit, move the run's worktree under <worktree_root>/_kept/<run_id> instead of deleting it",
@@ -353,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
         runner.runs_dir = Path(args.runs_dir)
     if hasattr(runner, "run_id"):
         runner.run_id = run_id
+    if hasattr(runner, "node_cap_usd"):
+        runner.node_cap_usd = args.node_cap_usd
 
     # A runner whose nodes can read the world gets a tool-computed map of it
     # first, so no node pays turns to draw one. The epic driver refreshes it per

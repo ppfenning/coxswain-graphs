@@ -31,10 +31,14 @@ class RunnerError(Exception):
 
 
 class BudgetStop(RunnerError):
-    """The CLI stopped a node on `error_max_budget_usd`, not a real failure.
+    """The CLI stopped a node on a budget limit, not a real failure.
 
-    The session named here still exists on disk with its whole context; a
-    later phase resumes it rather than starting the node over.
+    `error_max_budget_usd` names the shape ceiling (split the task);
+    `error_spend_cap` names the operator's `--node-cap-usd` (the operator's
+    limit), per docs/design/cost-bounds.md §1 — the effective limit sent to
+    the provider is `min(shape_ceiling, node_cap)`. The session named here
+    still exists on disk with its whole context; a later phase resumes it
+    rather than starting the node over.
     """
 
     def __init__(
