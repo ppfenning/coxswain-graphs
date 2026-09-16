@@ -38,6 +38,7 @@ merged in by `_Ctx.checks`.
 from __future__ import annotations
 
 import contextlib
+import difflib
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -78,6 +79,10 @@ __all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
 
 LIFECYCLE = "lifecycle"
 VALIDATE = "validate"
+# `graphs/ops/triage_quarantine.py`'s `GRAPH_NAME` is "triage" (docs/design/triage.md
+# §1), but its `SPEC.name` — the registry key `invoke_graphs` looks up — is
+# "triage-quarantine", because "triage" already names alert triage's subcommand.
+TRIAGE = "triage-quarantine"
 
 # The principal names the driver AND the graph whose work it records, so a
 # ledger row from a swarm stays distinguishable from the same graph run alone.
@@ -758,6 +763,31 @@ def _quarantine_task(
     return entry
 
 
+def _frontmatter_block(body: str) -> str | None:
+    """The text between the first pair of `---` fences, or None without one."""
+    lines = body.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            return "\n".join(lines[: index + 1])
+    return None
+
+
+def _ticket_amend_ramp(old_body: str, new_body: str) -> str:
+    """`ramp` for a `ticket_amend` proposal, per docs/design/triage.md §2.
+
+    Purely additive — only appended or repeated lines, frontmatter untouched —
+    rides the kind's streak (`"eligible"`); any removed line, or any change to
+    the frontmatter block, forces `"gated"` whatever the streak. `difflib`
+    decides; no model call.
+    """
+    if _frontmatter_block(old_body) != _frontmatter_block(new_body):
+        return "gated"
+    removed = any(line.startswith("- ") for line in difflib.ndiff(old_body.splitlines(), new_body.splitlines()))
+    return "gated" if removed else "eligible"
+
+
 def _attempt_cap_reason(attempts: Sequence[Mapping[str, Any]]) -> str:
     """The refusal's reason, naming every earlier run so a person has the history."""
     history = "; ".join(f"{a.get('run')}: {a.get('reason')}" for a in attempts)
@@ -893,12 +923,68 @@ def _run_phase(
     attempts_by_id = {
         str(item["id"]): [a for a in (item.get("attempts") or []) if a.get("kind") != "infra"] for item in all_ready
     }
-    for task_id, attempts in attempts_by_id.items():
-        if len(attempts) < ATTEMPT_CAP:
-            continue
-        reason = _attempt_cap_reason(attempts)
-        quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
-        print(f"  attempt cap: {task_id} refused ({len(attempts)} attempt(s) recorded)")
+    # A capped task is launched into `triage` (docs/design/triage.md §1) rather
+    # than quarantined outright: the graph classifies the attempt record and
+    # emits by class, and only a class `triage` could not turn into a write —
+    # or a repeated `(class, diagnosis)` it refuses to clear twice — still ends
+    # up quarantined here, plainly, never through `_quarantine_task`.
+    triage_batch: list[dict[str, Any]] = []
+    capped_ids = sorted(task_id for task_id, attempts in attempts_by_id.items() if len(attempts) >= ATTEMPT_CAP)
+    if capped_ids:
+        all_ready_by_id = {str(item["id"]): item for item in all_ready}
+        triaged, _, triage_failures = invoke_graphs(
+            [
+                Invocation(
+                    id=task_id,
+                    graph=TRIAGE,
+                    args={
+                        "cartridge": ctx.cartridge,
+                        "date": ctx.date,
+                        "work_item": all_ready_by_id[task_id],
+                        "attempts": attempts_by_id[task_id],
+                    },
+                )
+                for task_id in capped_ids
+            ],
+            specs=ctx.specs,
+            runner=ctx.runner,
+            run_id=f"{ctx.run_id}:{phase}",
+            max_parallel=ctx.max_parallel,
+        )
+        for failure in triage_failures:
+            task_id = failure.split(":", 1)[0]
+            reason = f"{_attempt_cap_reason(attempts_by_id[task_id])} triage itself failed: {failure}"
+            quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
+            print(f"  attempt cap: {task_id} refused; triage could not run ({failure})")
+
+        for result in triaged:
+            task_id = str(result.get("run_id", "")).rsplit(":", 1)[-1]
+            attempts = attempts_by_id[task_id]
+            if result.get("escalated"):
+                reason = (
+                    f"{_attempt_cap_reason(attempts)} triage repeats a prior "
+                    f"({result.get('class')!r}, {result.get('diagnosis')!r}) diagnosis; escalating to a person."
+                )
+                quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
+                print(f"  attempt cap: {task_id} launched triage, which escalated a repeated diagnosis")
+                continue
+
+            emitted = dict(result.get("emit") or {})
+            if "kind" not in emitted:
+                reason = (
+                    f"{_attempt_cap_reason(attempts)} triage classified this as "
+                    f"{result.get('class')!r} with no direct write; a person decides."
+                )
+                quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
+                print(f"  attempt cap: {task_id} launched triage -> {result.get('class')} (no proposal)")
+                continue
+
+            if emitted["kind"] == "ticket_amend":
+                old_body = str(all_ready_by_id[task_id].get("body") or "")
+                new_body = f"{old_body}\n\n{emitted.get('suggested_action', '')}".rstrip()
+                emitted["ramp"] = _ticket_amend_ramp(old_body, new_body)
+            triage_batch.append(emitted)
+            print(f"  attempt cap: {task_id} launched triage -> {result.get('class')} ({emitted['kind']})")
     ready = [item for item in all_ready if len(attempts_by_id[str(item["id"])]) < ATTEMPT_CAP]
 
     by_id = {str(item["id"]): item for item in items}
@@ -1230,6 +1316,7 @@ def _run_phase(
         rebase=rebase,
         by_id=by_id,
     )
+    batch = batch + triage_batch
     record["batch"] = batch
 
     # ── policy, then the gate, then execution in batch order ────────────────
