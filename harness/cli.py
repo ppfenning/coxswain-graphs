@@ -38,7 +38,7 @@ from harness.registry import GraphSpec, discover
 from harness.resolve import overlay_path, resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
 from harness.usage import record_usage
-from harness.worktree import apply_patch, create_worktree
+from harness.worktree import apply_patch, create_worktree, keep_worktree, remove_worktree
 from runner.protocol import RunnerError
 
 __all__ = ["main"]
@@ -207,6 +207,11 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     parser.add_argument("--ledger", default=_default_ledger())
     parser.add_argument("--worktree-root", help="override the cartridge's worktree_root")
     parser.add_argument(
+        "--keep-worktrees",
+        action="store_true",
+        help="on exit, move the run's worktree under <worktree_root>/_kept/<run_id> instead of deleting it",
+    )
+    parser.add_argument(
         "--resume-from",
         metavar="RUN_ID",
         help=(
@@ -296,6 +301,18 @@ def _read_overlay(repo: str | None) -> Any | None:
     return yaml.safe_load(Path(overlay_path(repo)).read_text(encoding="utf-8"))
 
 
+def _lifecycle_worktree(args: argparse.Namespace, cartridge: Mapping[str, Any], run_id: str) -> Path:
+    """Where the lifecycle graph's own worktree lives: `<worktree_root>/<run_id>`.
+
+    The one formula `_run_graph`'s check arm and its post-gate apply arm both
+    need to create the worktree, and `main`'s exit-time cleanup needs to find
+    the same directory again — kept here once so creation and cleanup can
+    never compute two different paths for the same run.
+    """
+    root = args.worktree_root or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees")
+    return Path(str(root)).expanduser() / run_id
+
+
 def main(argv: list[str] | None = None) -> int:
     specs = discover()
     parser = _build_parser(specs)
@@ -345,6 +362,12 @@ def main(argv: list[str] | None = None) -> int:
         checks = (cartridge.get("landing_areas") or {}).get("checks") or []
         runner.check_commands = [str(c.get("cmd")) for c in checks if isinstance(c, dict) and c.get("cmd")]
 
+    # `lifecycle` is the only graph this file ever creates a worktree for
+    # (the check arm and the post-gate apply arm inside `_run_graph`, both via
+    # `_lifecycle_worktree`); `epic`, `phase` and `cos` never reach that code,
+    # so there is nothing here for them to clean up.
+    worktree = _lifecycle_worktree(args, cartridge, run_id) if args.graph == "lifecycle" else None
+
     try:
         return _run_graph(specs=specs, parser=parser, args=args, cartridge=cartridge, runner=runner, run_id=run_id)
     finally:
@@ -357,6 +380,27 @@ def main(argv: list[str] | None = None) -> int:
         close = getattr(runner, "close", None)
         if callable(close):
             close()
+        # Cleanup runs last — quarantine, a caught exception's `return 1`, or
+        # anything still raising past this point — so a run never leaves its
+        # worktree behind for a human to notice. Guarded on the directory
+        # actually existing: a lifecycle run whose build produced no patch,
+        # or whose patch never reached an approved gate decision, never
+        # created one, and cleaning up a path that was never made would
+        # report a false "removed" or "FAILED to keep" for a run that did
+        # nothing wrong. `repo` is --repo when the worktree is a real `git
+        # worktree` of it (the check arm's `create_worktree`); when --repo
+        # was never given, `worktree` is its own standalone `git init` repo
+        # (the scratch dir `apply_patch` falls back to), never a linked
+        # worktree of this harness's own checkout, so `worktree` itself — not
+        # REPO_ROOT — is the only repo the cleanup call could mean there.
+        if worktree is not None and worktree.exists():
+            repo = Path(args.repo) if args.repo else worktree
+            if args.keep_worktrees:
+                ok, detail = keep_worktree(repo, worktree, worktree.parent, run_id)
+                print(f"worktree {'kept' if ok else 'FAILED to keep'}: {detail}", file=sys.stderr if not ok else sys.stdout)
+            else:
+                ok, detail = remove_worktree(repo, worktree)
+                print(f"worktree {'removed' if ok else 'FAILED to remove'}: {detail}", file=sys.stderr if not ok else sys.stdout)
 
 
 def _run_graph(
@@ -560,8 +604,7 @@ def _run_graph(
     # runs BEFORE the policy and the gate see anything: evidence attached
     # after the decision is already made is decoration, not evidence.
     if args.repo and args.graph == "lifecycle" and result.get("build", {}).get("patch"):
-        root = Path(args.worktree_root or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees"))
-        worktree = Path(str(root)).expanduser() / run_id
+        worktree = _lifecycle_worktree(args, cartridge, run_id)
         targets = [p for p in proposals if p.get("kind") == "draft_pr_create"]
 
         wt_ok, wt_detail = create_worktree(Path(args.repo), worktree, branch=f"agents/{run_id}")
@@ -647,8 +690,7 @@ def _run_graph(
     if not args.repo and args.graph == "lifecycle" and result.get("build", {}).get("patch"):
         approved = any(d["decision"] == "approved" for d in diffs)
         if approved:
-            root = Path(args.worktree_root or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees"))
-            worktree = Path(str(root)).expanduser() / run_id
+            worktree = _lifecycle_worktree(args, cartridge, run_id)
             ok, detail = apply_patch(result["build"]["patch"], worktree)
             print(f"\npatch {'applied in' if ok else 'FAILED to apply in'} {worktree}")
             if not ok:
