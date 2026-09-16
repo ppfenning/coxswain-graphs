@@ -34,6 +34,7 @@ from harness.epic import (
     task_outcome,
 )
 from harness.resume import load_result, save_result
+from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import BudgetStop, RunnerError
 
 SHA = "sha-fixture"
@@ -216,7 +217,7 @@ class Runner:
             return {
                 "patch": self.patches[task],
                 "summary": f"built {task}",
-                "files_touched": [f"{task}.txt"],
+                "files_touched": files_touched_from_patch(self.patches[task]),
                 "commands_run": [],
             }
         if role == "review_charter":
