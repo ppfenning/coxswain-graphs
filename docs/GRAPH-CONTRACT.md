@@ -127,6 +127,7 @@ staying small, enforced at the seam where it actually matters.
 |---|---|
 | `initiative-decompose` | decompose → adversary-on-the-edges → emit. Idea into phases and a task DAG. |
 | `lifecycle-propose` | scope → plan → [alternative plan → arbitrate plans] → [attack the plan] → build (worktree) → handoff → review → adversary → arbitrate → emit. One task. |
+| `triage` | facts (pure arithmetic over an item's attempts) → triage → emit. Classifies a stranded item at the attempt cap and emits by class, or escalates a repeated `(class, diagnosis)` pair. |
 | `triage-propose` | fetch → classify → verify → emit. Zero writes; proposes its own runbook corrections. |
 | `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared state vs actual. |
 | `phase-validate` | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver. |
@@ -135,7 +136,7 @@ staying small, enforced at the seam where it actually matters.
 | `coxswain` | one `dispatch` node over a driver-assembled docket. Selects; the driver invokes. |
 | `review-diff` | review_charter → review_adversary → verify_evidence → [arbitrate]. Reviews an arbitrary diff, outside any build's own run. |
 
-All seven are specified in `graphs/` and implemented.
+All eight are specified in `graphs/` and implemented.
 
 Running a *phase* is not a graph: the shell runs `lifecycle-propose` once per
 unblocked task, concurrently. Sequence belongs to a graph; concurrency belongs
