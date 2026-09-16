@@ -15,7 +15,11 @@
 # an optional `node_subtypes: {node: subtype}` mapping the caller assembles;
 # when absent, `facts` emits no `subtype:` key for that attempt.
 
+import pytest
+
+from graphs.ops import triage_quarantine
 from graphs.ops.triage_quarantine import check_citation, facts
+from runner import ScriptedRunner
 
 _WORK_ITEM = {"id": "t1", "title": "example", "last_commit": "2026-09-05T00:00:00Z"}
 
@@ -99,3 +103,108 @@ def test_a_diagnosis_quoting_no_objection_text_is_refused():
     )
     assert reason is not None
     assert "quotes no objection text" in reason
+
+
+# docs/design/triage.md §1's `triage`/`emit` and §6 rule 3, one literal test each.
+
+
+@pytest.fixture
+def cart(cartridge) -> dict:
+    cartridge["write_kinds"]["ticket_amend"] = {"risk": "low", "ramp": "eligible"}
+    cartridge["write_kinds"]["item_create"] = {"risk": "medium", "ramp": "gated"}
+    cartridge["write_kinds"]["notify"] = {"risk": "low", "ramp": "gated"}
+    return cartridge
+
+
+def _args(cart, attempts, **overrides) -> dict:
+    return {
+        "run_id": "r0",
+        "date": "2026-09-16",
+        "cartridge": cart,
+        "work_item": _WORK_ITEM,
+        "attempts": attempts,
+        **overrides,
+    }
+
+
+def _response(class_: str, diagnosis: str, cites: list, action: str) -> dict:
+    return {"class": class_, "diagnosis": diagnosis, "cites": cites, "action": action}
+
+
+def _runner(response: dict) -> ScriptedRunner:
+    return ScriptedRunner({"triage": response})
+
+
+def test_ticket_defect_emits_a_ticket_amend_proposal(cart):
+    response = _response(
+        "ticket_defect", "quotes missing null guard verbatim", ["attempt-1|review"], "append the guard clause"
+    )
+    result = triage_quarantine.run(_args(cart, [_ATTEMPT_1]), _runner(response))
+    assert result["emit"]["kind"] == "ticket_amend"
+    assert result["emit"]["rationale"] == response["diagnosis"]
+    assert result["emit"]["suggested_action"] == response["action"]
+
+
+def test_platform_defect_emits_an_item_create_proposal(cart):
+    response = _response(
+        "platform_defect",
+        "missing null guard shows a platform gap, not a ticket defect",
+        ["attempt-1|review"],
+        "file a mechanism for null-guard lint",
+    )
+    result = triage_quarantine.run(_args(cart, [_ATTEMPT_1]), _runner(response))
+    assert result["emit"]["kind"] == "item_create"
+    assert result["emit"]["subject_new"] is True
+
+
+def test_shape_emits_a_decompose_handoff(cart):
+    response = _response(
+        "shape",
+        "missing null guard shows the ticket was really two tasks",
+        ["attempt-1|review"],
+        "split into a guard task and a rename task",
+    )
+    result = triage_quarantine.run(_args(cart, [_ATTEMPT_1]), _runner(response))
+    assert result["emit"] == {
+        "handoff": "decompose",
+        "target": "t1",
+        "evidence": [{"check": "attempt-1|review", "output": "revise"}],
+        "rationale": response["diagnosis"],
+        "suggested_action": response["action"],
+    }
+
+
+def test_genuine_reject_emits_a_notify(cart):
+    response = _response(
+        "genuine_reject",
+        "missing null guard was a correct objection; the build was simply wrong",
+        ["attempt-1|review"],
+        "notify the owner and leave the item ready",
+    )
+    result = triage_quarantine.run(_args(cart, [_ATTEMPT_1]), _runner(response))
+    assert result["emit"]["kind"] == "notify"
+    assert result["escalated"] is False
+
+
+def test_the_attempts_triage_entry_carries_class_diagnosis_and_run(cart):
+    response = _response(
+        "ticket_defect", "quotes missing null guard verbatim", ["attempt-1|review"], "append the guard clause"
+    )
+    result = triage_quarantine.run(_args(cart, [_ATTEMPT_1]), _runner(response))
+    assert result["attempts_triage_entry"] == {
+        "class": "ticket_defect",
+        "diagnosis": response["diagnosis"],
+        "run": "r0",
+    }
+
+
+def test_the_same_class_diagnosis_pair_twice_escalates_instead_of_emitting(cart):
+    prior_triage = {"class": "ticket_defect", "diagnosis": "quotes missing null guard verbatim", "run": "r-9"}
+    prior_attempt = {**_ATTEMPT_1, "triage": prior_triage}
+    response = _response(
+        "ticket_defect", "quotes missing null guard verbatim", ["attempt-1|review"], "append the guard clause again"
+    )
+    result = triage_quarantine.run(_args(cart, [prior_attempt]), _runner(response))
+    assert result["escalated"] is True
+    assert result["prior"] == prior_triage
+    assert "emit" not in result

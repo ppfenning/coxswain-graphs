@@ -8,4 +8,5 @@
 - [retro-propose](retro-propose.md)
 - [review-diff](review-diff.md)
 - [sweep](sweep.md)
+- [triage](triage.md)
 - [triage-propose](triage-propose.md)
