@@ -25,6 +25,7 @@ from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
 from graphs.ops import triage_quarantine
 from harness.epic import (
+    EXIT_PAUSED,
     _ticket_amend_ramp,
     _trace_evidence,
     branch_action,
@@ -35,7 +36,7 @@ from harness.epic import (
 )
 from harness.resume import load_result, save_result
 from runner.claude_code_runner import files_touched_from_patch
-from runner.protocol import BudgetStop, RunnerError
+from runner.protocol import BudgetStop, LimitStop, RunnerError
 
 SHA = "sha-fixture"
 PROFILE = "anthropic-default"
@@ -271,6 +272,22 @@ class BudgetStopArm(Runner):
     def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "work_state_arm" and self.stops in prompt:
             raise BudgetStop(role="work_state_arm", thread=None, session=None, spent_usd=0.0, detail="budget")
+        return super().run(
+            role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd
+        )
+
+
+class LimitStopArm(Runner):
+    """Like `BudgetStopArm`, but the CLI's own session limit stopped the call."""
+
+    def __init__(self, patches: dict[str, str], *, stops: str, detail: str) -> None:
+        super().__init__(patches)
+        self.stops = stops
+        self.detail = detail
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+        if role == "work_state_arm" and self.stops in prompt:
+            raise LimitStop(detail=self.detail)
         return super().run(
             role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd
         )
@@ -725,6 +742,79 @@ def test_a_successful_arm_call_is_unchanged(repo, cart, tmp_path) -> None:
         task_record = next(t for t in result["tasks"] if t["id"] == task)
         assert task_record["merged"] is True
         assert task_record["outcome"] == "landed"
+
+
+def test_a_limitstop_from_the_apply_arm_pauses_the_run_with_no_quarantine_or_attempt(repo, cart, tmp_path) -> None:
+    """The session-limit banner stops the run in place; it is not the task's failure."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    work = workstore.read_initiative(wi)
+    banner = "You've hit your session limit · resets 10:50am (America/New_York)"
+    runner = LimitStopArm({"t1-probe": new_file_patch("t1-probe.txt")}, stops="t1-probe", detail=banner)
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-limit")
+
+    assert result["quarantined"] == []
+    assert result["paused_until"] == "10:50am (America/New_York)"
+    assert result["exit_code"] == EXIT_PAUSED
+    assert "paused: account session limit, resets 10:50am (America/New_York)" in result["exit_summary"]
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    assert not item.get("attempts")
+
+
+def test_a_limitstop_halts_the_phase_before_the_next_task_in_batch_order(repo, cart, tmp_path) -> None:
+    """Unlike an infra quarantine, a paused run never reaches a later task's own merge."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    for task, body in (("t1-probe", "read the vendor schema"), ("t2-bench", "time the join")):
+        (wi / "p1-foundations" / f"{task}.md").write_text(
+            f"---\nid: {task}\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+            f"title: {task}\n---\n\n{body}\n"
+        )
+    work = workstore.read_initiative(wi)
+    banner = "You've hit your session limit · resets 10:50am (America/New_York)"
+    runner = LimitStopArm(
+        {"t1-probe": new_file_patch("t1-probe.txt"), "t2-bench": new_file_patch("t2-bench.txt")},
+        stops="t1-probe", detail=banner,
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-limit-batch")
+
+    assert result["quarantined"] == []
+    t2_item = workstore.read_item(wi / "p1-foundations" / "t2-bench.md")
+    # `work_state_arm` runs in task-id order: t1-probe's pause happens before
+    # t2-bench's own turn, which an infra quarantine (below) would still take.
+    assert t2_item["state"] == "ready"
+    assert not t2_item.get("attempts")
+
+
+def test_an_ordinary_runnererror_still_quarantines_and_records_an_attempt(repo, cart, tmp_path) -> None:
+    """`LimitStop`'s new catch does not change how any other `RunnerError` is handled."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    work = workstore.read_initiative(wi)
+    runner = BudgetStopArm({"t1-probe": new_file_patch("t1-probe.txt")}, stops="t1-probe")
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-ordinary-fail")
+
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["kind"] == "infra"
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    assert item["attempts"][0]["kind"] == "infra"
 
 
 def test_two_infra_attempts_do_not_trip_the_attempt_cap(repo, cart, tmp_path) -> None:

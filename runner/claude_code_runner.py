@@ -28,6 +28,7 @@ to change rather than whatever the repository happens to have checked out.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -39,7 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from runner.protocol import BudgetStop, NodeResult, RunnerError
+from runner.protocol import BudgetStop, LimitStop, NodeResult, RunnerError
 
 __all__ = ["DEFAULT_TIER", "TIER_EFFORT", "ClaudeCodeRunner"]
 
@@ -134,6 +135,10 @@ def files_touched_from_patch(patch: str) -> list[str]:
 # Matched on the CLI's own words rather than on an exit code, because the exit
 # code is the same one a real refusal returns.
 _TRANSIENT_ERRORS = ("safeguards flagged", "reasoning_extraction")
+
+# A `subtype: success` payload whose result text is this banner is the account's
+# own session limit, not a node failure.
+_LIMIT_BANNER_RE = re.compile(r"you've hit your session limit|usage limit", re.IGNORECASE)
 
 
 def _is_transient(payload: Mapping[str, Any]) -> bool:
@@ -857,6 +862,13 @@ class ClaudeCodeRunner:
             ),
             "id": call_id, **retry_extra,
         }
+        # The account's session limit arrives as a successful call whose whole
+        # text is the banner. It is ledgered like every call that ends a node
+        # — the invariant at the BudgetStop path above — and then pauses the
+        # run instead of quarantining the task (arbiter, graphs-limit-pause-3).
+        if _LIMIT_BANNER_RE.search(str(payload.get("result") or "")):
+            self._append_call_ledger(call, ok=False, error="account session limit")
+            raise LimitStop(detail=str(payload["result"]))
         data = payload.get("structured_output")
         if data is None:
             # An older build, or a session that answered in prose: the result
