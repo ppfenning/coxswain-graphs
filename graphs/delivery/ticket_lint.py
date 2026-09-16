@@ -49,6 +49,8 @@ def _is_notation(candidate: str) -> bool:
     placeholder (`runs/<run>/tasks/...`) — the seat is describing a form,
     not naming a file it means to read."""
     stripped = candidate.strip("`,.()")
+    if stripped.startswith("/dev/"):
+        return True  # a device (`/dev/null`) is where output goes, not an artifact anyone reads
     return stripped in ("/", "~/") or "<" in stripped or ">" in stripped or not re.search(r"[\w.]", stripped)
 
 

@@ -29,6 +29,12 @@ def test_a_path_shape_with_a_placeholder_is_notation_not_a_reach_problem():
     assert lint_tickets(tasks, tree, [], "graphs") == []
 
 
+def test_a_device_path_is_notation_not_a_reach_problem():
+    """tools-chair-beater-1: "stdio to `/dev/null`" was refused as `names /dev/null, not inside`."""
+    tasks = [_task(body="spawn the beater with `setsid`, stdio to `/dev/null`, its own process group")]
+    assert lint_tickets(tasks, [], [], "graphs") == []
+
+
 def test_a_real_corpus_path_is_still_a_reach_refusal():
     tasks = [_task(body="read `runs/tools-loop-fixes-3.log` for the outcome")]
     problems = lint_tickets(tasks, [], [], "graphs")
