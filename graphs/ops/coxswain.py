@@ -53,6 +53,7 @@ DISPATCH_SCHEMA = {
                 "properties": {
                     "graph": {"type": "string"},
                     "why": {"type": "string"},
+                    "shape": {"type": "string", "enum": ["sweep", "decompose"]},
                 },
                 "required": ["graph", "why"],
                 "additionalProperties": False,
@@ -64,6 +65,11 @@ DISPATCH_SCHEMA = {
     "required": ["selections", "idle", "reasoning"],
     "additionalProperties": False,
 }
+
+
+def _shape_missing_why(item: Mapping[str, Any]) -> bool:
+    """True when `shape` is set but `why` carries nothing naming what is mechanical."""
+    return bool(item.get("shape")) and not str(item.get("why") or "").strip()
 
 
 def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
@@ -136,6 +142,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             raise ContractViolation(
                 f"dispatch selected '{name}', which the docket marks not runnable; the "
                 "graph enforces 'never dispatch past absent inputs' so the driver never has to"
+            )
+        if _shape_missing_why(item):
+            raise ContractViolation(
+                f"dispatch selected '{name}' with shape={item.get('shape')!r} and no why; "
+                "a shape without a why naming what about the work is mechanical is not a decision"
             )
 
     return {

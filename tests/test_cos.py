@@ -93,6 +93,28 @@ def test_selecting_a_graph_the_docket_never_named_is_refused(cart) -> None:
         coxswain.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
 
 
+def test_a_selection_with_no_shape_still_validates_as_before(cart) -> None:
+    response = {"selections": [{"graph": "retro", "why": "the ledger has rows"}], "idle": False, "reasoning": "run retro"}
+    result = coxswain.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
+    assert result["selections"] == response["selections"]
+
+
+def test_a_selection_with_shape_and_why_validates(cart) -> None:
+    response = {
+        "selections": [{"graph": "retro", "why": "one rule, many places, no unit needs its own design", "shape": "sweep"}],
+        "idle": False,
+        "reasoning": "run retro",
+    }
+    result = coxswain.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
+    assert result["selections"] == response["selections"]
+
+
+def test_a_selection_with_shape_and_no_why_is_rejected(cart) -> None:
+    response = {"selections": [{"graph": "retro", "why": "", "shape": "sweep"}], "idle": False, "reasoning": "r"}
+    with pytest.raises(ContractViolation, match="shape without a why"):
+        coxswain.run(cos_args(cart), ScriptedRunner({"dispatch": response}))
+
+
 def test_idle_true_with_selections_present_is_refused_as_incoherent(cart) -> None:
     response = {"selections": [{"graph": "retro", "why": "x"}], "idle": True, "reasoning": "r"}
     with pytest.raises(ContractViolation, match="incoherent"):
