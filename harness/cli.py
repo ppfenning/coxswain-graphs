@@ -159,10 +159,11 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "graph",
-        choices=sorted([*specs, "phase", "epic"]),
+        choices=sorted([*specs, "phase", "epic", "sweep"]),
         help=(
             "which graph to run ('phase' drives the lifecycle graph over one phase; "
-            "'epic' drives a whole initiative, phase by phase, gating each one)"
+            "'epic' drives a whole initiative, phase by phase, gating each one; "
+            "'sweep' is registered for coxswain dispatch but not yet runnable standalone)"
         ),
     )
     parser.add_argument("--team", required=True, help="team cartridge to resolve")
@@ -463,6 +464,18 @@ def _run_graph(
         for line in result.get("exit_summary") or []:
             print(f"  {line}", file=sys.stderr)
         return 0
+
+    if args.graph == "sweep" and "sweep" not in specs:
+        # Listed in `_build_parser`'s choices (docs/design/work-shape.md §1) so
+        # the coxswain and this CLI agree the name exists, but
+        # graphs/ops/sweep.py declares no SPEC yet, so it never lands in
+        # `specs`. Refuse here, the same way `parser.error` refuses a missing
+        # `--initiative` below, rather than let `specs[args.graph]` further
+        # down raise a bare `KeyError` for a choice argparse just accepted.
+        # Gated on `specs` (not just the literal name) so this refusal turns
+        # itself off the day a later task gives sweep a real SPEC, instead of
+        # outliving its own reason and blocking a working graph forever.
+        parser.error("sweep is registered but has no SPEC yet (graphs/ops/sweep.py); not runnable standalone")
 
     if args.graph == "phase":
         # Not one graph run but many, one per unblocked task. The work store is
