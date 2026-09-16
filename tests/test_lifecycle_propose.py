@@ -148,6 +148,10 @@ def test_contract_commands_match_by_shape_not_bytes() -> None:
     assert m("ruff check .", "ruff check . --fix 2>&1 | tail -20 && ruff check . 2>&1 | tail -20")
     assert m("pytest -q 2>&1 | tail -3", "pytest  -q 2>&1  | tail -3")
     assert m("pytest -q <your test file> ...", "pytest -q tests/test_cos.py 2>&1 | tail -15")
+    # tools-schema-version-4: a run covering a superset of the named files is the same evidence
+    assert m("pytest -q tests/test_a.py tests/test_b.py 2>&1 | tail -15", "pytest -q tests/test_a.py tests/test_b.py tests/test_c.py 2>&1 | tail -20")
+    assert m("pytest -q tests/test_a.py 2>&1 | tail -15", "pytest -q 2>&1 | tail -3")
+    assert not m("pytest -q tests/test_a.py tests/test_b.py 2>&1 | tail -15", "pytest -q tests/test_a.py 2>&1 | tail -15")
     assert not m("pytest -q tests/test_cos.py 2>&1 | tail -15", "echo hi")
     assert not m("ruff check .", "pytest -q")
 
