@@ -741,6 +741,60 @@ def test_assemble_docket_treats_a_verdictless_usage_payload_as_unmeasured() -> N
     assert docket["free_slots"] == docket["max_in_flight"] == 3
 
 
+def test_assemble_docket_without_stranded_says_unmeasured() -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+    )
+    assert docket["stranded"] == {"verdict": "unmeasured"}
+
+
+def test_assemble_docket_carries_a_measured_stranded_count_through() -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("retro"),
+        intake_root=None,
+        ledger_path=None,
+        alerts_present=False,
+        stranded={"verdict": "measured", "count": 2},
+    )
+    assert docket["stranded"] == {"verdict": "measured", "count": 2}
+
+
+class _FakeCompletedProcess:
+    def __init__(self, returncode: int, stdout: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_stranded_count_reports_two_stranded_runs(monkeypatch) -> None:
+    monkeypatch.setattr(cos.shutil, "which", lambda name: "/usr/bin/cox")
+    monkeypatch.setattr(
+        cos.subprocess,
+        "run",
+        lambda *a, **k: _FakeCompletedProcess(0, '[{"run": "r1"}, {"run": "r2"}]'),
+    )
+    assert cos.stranded_count() == {"verdict": "measured", "count": 2}
+
+
+def test_stranded_count_reports_zero_when_the_scan_finds_none(monkeypatch) -> None:
+    monkeypatch.setattr(cos.shutil, "which", lambda name: "/usr/bin/cox")
+    monkeypatch.setattr(cos.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0, "[]"))
+    assert cos.stranded_count() == {"verdict": "measured", "count": 0}
+
+
+def test_stranded_count_is_unmeasured_with_no_cox_on_path(monkeypatch) -> None:
+    monkeypatch.setattr(cos.shutil, "which", lambda name: None)
+    assert cos.stranded_count() == {"verdict": "unmeasured"}
+
+
+def test_stranded_count_is_unmeasured_when_the_body_is_not_a_list(monkeypatch) -> None:
+    monkeypatch.setattr(cos.shutil, "which", lambda name: "/usr/bin/cox")
+    monkeypatch.setattr(cos.subprocess, "run", lambda *a, **k: _FakeCompletedProcess(0, '{"count": 2}'))
+    assert cos.stranded_count() == {"verdict": "unmeasured"}
+
+
 def test_run_cos_invokes_only_the_free_slots_and_defers_the_rest(cart) -> None:
     retro_spec, retro_calls = _stub_spec("retro", "retro-propose")
     triage_spec, triage_calls = _stub_spec("triage", "triage-propose")

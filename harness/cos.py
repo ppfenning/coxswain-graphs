@@ -38,7 +38,10 @@ nothing and returns an empty record, honestly.
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
+import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -50,7 +53,7 @@ from core.ledger import read as read_ledger
 from graphs._spec import GraphSpec
 from harness.invoke import Invocation, invoke_graphs
 
-__all__ = ["CosError", "assemble_docket", "dispatch_line", "run_cos"]
+__all__ = ["CosError", "assemble_docket", "dispatch_line", "run_cos", "stranded_count"]
 
 
 class CosError(Exception):
@@ -161,6 +164,41 @@ def _gated_free_slots(
     return 0 if _usage_stops(usage_block) else _free_slots(max_in_flight, in_flight)
 
 
+def stranded_count() -> dict[str, Any]:
+    """`cox runs stranded --json`'s count, fetched at the edge.
+
+    No `cox` on PATH, a non-zero exit, a timeout, a body that does not parse,
+    or a parsed body that is not a JSON list all read as `{"verdict":
+    "unmeasured"}` — never a bare `0` that could pass for a scan.
+    """
+    if shutil.which("cox") is None:
+        return {"verdict": "unmeasured"}
+    try:
+        result = subprocess.run(
+            ["cox", "runs", "stranded", "--json"], capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            return {"verdict": "unmeasured"}
+        body = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {"verdict": "unmeasured"}
+    return {"verdict": "measured", "count": len(body)} if isinstance(body, list) else {"verdict": "unmeasured"}
+
+
+def _stranded_block(stranded: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The docket's view of `stranded_count`'s Assessment, `_usage_block`'s convention.
+
+    `None`, or a payload whose verdict is not 'measured' with an integer
+    count, reads as 'unmeasured'.
+    """
+    if not isinstance(stranded, Mapping):
+        return {"verdict": "unmeasured"}
+    count = stranded.get("count")
+    if stranded.get("verdict") != "measured" or not isinstance(count, int):
+        return {"verdict": "unmeasured"}
+    return {"verdict": "measured", "count": count}
+
+
 def assemble_docket(
     *,
     specs: Mapping[str, GraphSpec],
@@ -170,6 +208,7 @@ def assemble_docket(
     cartridge: Mapping[str, Any] | None = None,
     runs_dir: Path | str | None = None,
     usage: Mapping[str, Any] | None = None,
+    stranded: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read what is on hand, and mark each registered graph runnable or not.
 
@@ -202,6 +241,10 @@ def assemble_docket(
     verbatim as `usage` so a caller can say why. Omitted, or shaped without a
     recognised verdict, it reads as `{"verdict": "unmeasured"}` and changes
     nothing about today's slot arithmetic.
+
+    `stranded`, when given, is `stranded_count`'s Assessment of `cox runs
+    stranded` — this function only carries it through as `stranded`, per
+    `_usage_block`'s convention, and never fetches or recomputes it itself.
     """
     intake_items = read_queue(intake_root) if intake_root is not None else []
     ledger_rows = read_ledger(ledger_path) if ledger_path is not None else ()
@@ -248,6 +291,7 @@ def assemble_docket(
         "max_in_flight": max_in_flight,
         "free_slots": free_slots,
         "usage": usage_block,
+        "stranded": _stranded_block(stranded),
     }
 
 
