@@ -195,6 +195,32 @@ def test_assemble_docket_marks_runnability_from_what_is_constructible(tmp_path) 
     assert docket["ledger"] == {"rows": 1, "agreement": 1.0}
 
 
+def test_assemble_docket_marks_sweep_runnable_when_an_idea_is_queued(tmp_path) -> None:
+    intake_root = tmp_path / "intake"
+    intake_root.mkdir()
+    (intake_root / "001-idea.md").write_text("go arrow-native", encoding="utf-8")
+
+    docket = cos.assemble_docket(
+        specs=_specs("sweep"),
+        intake_root=intake_root,
+        ledger_path=None,
+        alerts_present=False,
+    )
+    assert docket["registry"] == [{"name": "sweep", "summary": "summary of sweep", "runnable": True, "reason": ""}]
+
+
+def test_assemble_docket_leaves_sweep_not_runnable_with_no_queued_idea(tmp_path) -> None:
+    docket = cos.assemble_docket(
+        specs=_specs("sweep"),
+        intake_root=tmp_path / "no-such-dir",
+        ledger_path=None,
+        alerts_present=False,
+    )
+    by_name = {row["name"]: row for row in docket["registry"]}
+    assert by_name["sweep"]["runnable"] is False
+    assert by_name["sweep"]["reason"], "an unrunnable entry must name what is missing"
+
+
 def test_assemble_docket_tolerates_a_missing_intake_dir_and_ledger(tmp_path) -> None:
     docket = cos.assemble_docket(
         specs=_specs("retro", "decompose", "triage"),
