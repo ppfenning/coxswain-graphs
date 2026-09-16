@@ -326,6 +326,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 "Judge the machine evidence and the change facts, not anyone's "
                 "account of the work. Name every gap you find; an empty list "
                 "means you found none, not that you did not look.\n\n"
+                # docs/design/validator-reach.md §1: the evidence array's `command`
+                # entries are what the harness watched happen, never a self-report.
+                "Every `command` entry in the evidence was observed by the harness; "
+                "there is no other place a build's commands can appear, and a ticket "
+                "requirement for a command is met by a matching `command` entry.\n\n"
                 "If you cannot rule without reading a file the diff does not "
                 "show, list it in needs_evidence as {\"path\": ..., \"why\": ...}: "
                 "path must be exactly a repository-relative file path as it "
