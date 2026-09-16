@@ -149,6 +149,49 @@ def test_keep_worktrees_flag_defaults_to_off_and_is_settable() -> None:
     assert on.keep_worktrees is True
 
 
+def test_sweep_is_a_selectable_graph_choice_and_round_trips_through_parsing() -> None:
+    parser = cli._build_parser(cli.discover())
+
+    parsed = parser.parse_args(["sweep", "--team", "acme", "--unverified-skills"])
+
+    graph_action = next(action for action in parser._actions if action.dest == "graph")
+    assert "sweep" in graph_action.choices
+    assert parsed.graph == "sweep"
+
+
+def test_sweep_refuses_cleanly_instead_of_crashing_on_a_missing_spec(monkeypatch, tmp_path) -> None:
+    run_id = "runS"
+    runner = SimpleNamespace(calls=[])
+    args = _Args(tmp_path, run_id)
+    args.worktree_root = str(tmp_path)
+    args.graph = "sweep"
+    _patch_common(monkeypatch, args, runner)
+
+    with pytest.raises(SystemExit, match="no SPEC yet"):
+        cli.main([])
+
+
+def test_sweep_guard_turns_itself_off_once_a_spec_registers_it() -> None:
+    class _Dispatched(Exception):
+        pass
+
+    def _run(graph_args, runner):
+        raise _Dispatched("sweep's own spec was reached")
+
+    class _RefusedInError(AssertionError):
+        pass
+
+    class _Parser:
+        def error(self, msg):
+            raise _RefusedInError(f"guard fired despite a registered spec: {msg}")
+
+    specs = {"sweep": SimpleNamespace(needs=[], graph_name="sweep", run=_run)}
+    args = SimpleNamespace(graph="sweep", date="2026-09-16")
+
+    with pytest.raises(_Dispatched):
+        cli._run_graph(specs=specs, parser=_Parser(), args=args, cartridge={}, runner=None, run_id="r")
+
+
 def test_a_normal_run_removes_the_lifecycle_worktree_on_exit(monkeypatch, tmp_path) -> None:
     run_id = "runW"
     runner = SimpleNamespace(calls=[])
