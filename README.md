@@ -83,6 +83,7 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 |---|---|---|
 | `initiative-decompose` | delivery | decompose → adversary-on-the-edges → emit. An idea into phases and a task DAG |
 | `lifecycle-propose` | delivery | scope → plan → [alternative plan → arbitrate plans] → [attack the plan] → build (worktree) → handoff → review → adversary → arbitrate → emit |
+| `triage` | ops | facts (pure arithmetic over an item's attempts) → triage → emit. Classifies a stranded item at the attempt cap and emits by class, or escalates a repeated `(class, diagnosis)` pair |
 | `triage-propose` | ops | fetch → classify → verify → emit. Zero writes; proposes corrections to the runbook it just used |
 | `epic-reconcile` | ops | compare (set arithmetic) → reconcile → emit. Declared state vs actual |
 | `phase-validate` | delivery | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver |
