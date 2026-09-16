@@ -25,7 +25,7 @@ from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
 from harness.epic import branch_action, phase_order, phase_parents, run_epic, task_outcome
 from harness.resume import save_result
-from runner.protocol import RunnerError
+from runner.protocol import BudgetStop, RunnerError
 
 SHA = "sha-fixture"
 PROFILE = "anthropic-default"
@@ -214,6 +214,21 @@ class Runner:
         if role == "style_pass":
             return {"patch": self.style.get(self._subject(prompt, PHASE_IDS), "")}
         raise RunnerError(f"no scripted response for role '{role}'")
+
+
+class BudgetStopArm(Runner):
+    """Like `Runner`, but the `work_state_arm` bookkeeping call for one named task stops on budget."""
+
+    def __init__(self, patches: dict[str, str], *, stops: str) -> None:
+        super().__init__(patches)
+        self.stops = stops
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+        if role == "work_state_arm" and self.stops in prompt:
+            raise BudgetStop(role="work_state_arm", thread=None, session=None, spent_usd=0.0, detail="budget")
+        return super().run(
+            role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd
+        )
 
 
 SPECS = {
@@ -507,6 +522,62 @@ def test_an_approved_and_quarantined_task_names_itself_in_the_exit_summary(repo,
     assert "check failed" in failed["reason"]
     assert result["totals"]["approved_not_landed"] == 1
     assert f"approved but not landed: t1-probe — cox runs recover epic-1 t1-probe --repo {repo}" in result["exit_summary"]
+
+
+def test_an_apply_arms_budgetstop_quarantines_the_task_as_infra_and_the_run_ends_clean(repo, cart, tmp_path) -> None:
+    """A `RunnerError` from the bookkeeping arm is quarantined, not a traceback."""
+    runner = BudgetStopArm({t: new_file_patch(f"{t}.txt") for t in TASK_IDS}, stops="t1-probe")
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["kind"] == "infra"
+    assert entry["patch_kept"] is True
+    assert "work_state_arm" in entry["reason"] and "BudgetStop" in entry["reason"]
+
+    # The task's own record agrees: merged but quarantined earns `approved_not_landed`, never `landed`.
+    task_record = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert task_record["status"] == "quarantined"
+    assert task_record["quarantine"] == entry["reason"]
+    assert task_record["merged"] is True
+    assert task_record["outcome"] == "approved_not_landed"
+    assert result["totals"]["approved_not_landed"] == 1
+
+    # The sibling task still landed, and the run wrote a phase record and exited normally.
+    assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
+    assert (tmp_path / "runs" / "epic-1:p1-foundations.json").exists()
+
+
+def test_a_successful_arm_call_is_unchanged(repo, cart, tmp_path) -> None:
+    """The new try/except around `auto_apply` in `_execute` leaves a clean run untouched."""
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
+
+    assert result["quarantined"] == []
+    for task in ("t1-probe", "t2-bench"):
+        assert is_ancestor(repo, f"epic/demo-initiative/p1-foundations--{task}", "epic/demo-initiative/p1-foundations")
+        task_record = next(t for t in result["tasks"] if t["id"] == task)
+        assert task_record["merged"] is True
+        assert task_record["outcome"] == "landed"
+
+
+def test_two_infra_attempts_do_not_trip_the_attempt_cap(repo, cart, tmp_path) -> None:
+    """`ATTEMPT_CAP` is 2: two real failures refuse a third run. Two `infra` ones must not."""
+    work = initiative(two_phases=False)
+    task = next(item for item in work["items"] if item["id"] == "t1-probe")
+    task["attempts"] = [
+        {
+            "run": f"epic-prior-{n}",
+            "phase": "p1-foundations",
+            "reason": "apply arm 'work_state_arm' raised BudgetStop: budget",
+            "kind": "infra",
+            "patch_kept": True,
+            "ts": "2026-09-01T00:00:00+00:00",
+        }
+        for n in (1, 2)
+    ]
+    result, _ = drive(repo, cart, tmp_path, work=work)
+
+    assert not any(q["id"] == "t1-probe" and "attempt cap" in q["reason"] for q in result["quarantined"])
+    assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t1-probe", "epic/demo-initiative/p1-foundations")
 
 
 def test_the_cli_exit_line_names_an_approved_and_unlanded_task(monkeypatch, tmp_path, capsys) -> None:
