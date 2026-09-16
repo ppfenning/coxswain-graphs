@@ -532,7 +532,10 @@ def _contract_command_matches(contract: str, ran: str) -> bool:
     placeholders stand for one token, and the builder may chain or wrap the
     command (`… && ruff check .`, `… 2>&1 | tail -20`), so the contract must
     appear inside what ran, whitespace-normalised."""
-    parts = [re.escape(p) for p in re.split(r"<[^>]*>", " ".join(contract.split()))]
+    # A quoted command that trails off — `pytest -q <file> ...` in a chair
+    # note — names its head, not a byte string: the tail is open.
+    contract = re.sub(r"\s*(\.\.\.|\u2026)\s*$", "", " ".join(contract.split()))
+    parts = [re.escape(p) for p in re.split(r"<[^>]*>", contract)]
     pattern = r"\S+".join(parts)
     return re.search(pattern, " ".join(ran.split())) is not None
 

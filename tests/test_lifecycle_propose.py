@@ -147,6 +147,7 @@ def test_contract_commands_match_by_shape_not_bytes() -> None:
     assert m("pytest -q <your test file> 2>&1 | tail -15", "pytest -q tests/test_cos.py 2>&1 | tail -15")
     assert m("ruff check .", "ruff check . --fix 2>&1 | tail -20 && ruff check . 2>&1 | tail -20")
     assert m("pytest -q 2>&1 | tail -3", "pytest  -q 2>&1  | tail -3")
+    assert m("pytest -q <your test file> ...", "pytest -q tests/test_cos.py 2>&1 | tail -15")
     assert not m("pytest -q tests/test_cos.py 2>&1 | tail -15", "echo hi")
     assert not m("ruff check .", "pytest -q")
 
