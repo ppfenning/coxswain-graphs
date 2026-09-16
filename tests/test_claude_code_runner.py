@@ -18,7 +18,9 @@ import pytest
 from runner import RunnerError
 from runner.claude_code_runner import (
     ClaudeCodeRunner,
+    _alt_model_for,
     files_touched_from_patch,
+    is_safeguard_refusal,
     next_spent,
     reconcile_patch,
     self_reported_commands,
@@ -905,6 +907,46 @@ def test_a_safeguard_error_twice_is_still_a_failure(sequenced_claude, tmp_path) 
     with pytest.raises(RunnerError, match="safeguards flagged"):
         runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")
     assert calls() == 2
+
+
+def test_is_safeguard_refusal_matches_the_literal_refusal_text_but_not_an_ordinary_error() -> None:
+    assert is_safeguard_refusal(SAFEGUARD) is True
+    assert is_safeguard_refusal(REFUSED) is False
+
+
+def test_alt_model_for_returns_the_next_binding_or_falls_back_to_the_same_model() -> None:
+    tiers = {"standard": ["sonnet", "opus"], "cheap": "haiku"}
+    assert _alt_model_for(tiers, "standard", "sonnet") == "opus"
+    assert _alt_model_for(tiers, "standard", "opus") == "sonnet"
+    assert _alt_model_for(tiers, "cheap", "haiku") == "haiku"
+
+
+def test_a_safeguard_refusal_retries_once_on_the_alternate_model(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(SAFEGUARD, OK)
+    profile = {**PROFILE, "tiers": {**PROFILE["tiers"], "standard": ["sonnet", "opus"]}}
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+
+    assert dict(runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")) == {"ok": True}
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 2
+    assert rows[1]["retry_of"] == rows[0]["id"]
+    assert rows[1]["reason"] == "safeguard_refusal"
+    assert rows[1]["model"] == "opus"
+
+
+def test_a_safeguard_refusal_that_recurs_on_the_alternate_model_propagates_the_original_error(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(SAFEGUARD, SAFEGUARD)
+    profile = {**PROFILE, "tiers": {**PROFILE["tiers"], "standard": ["sonnet", "opus"]}}
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+
+    with pytest.raises(RunnerError, match="safeguards flagged"):
+        runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 2
+    assert rows[1]["retry_of"] == rows[0]["id"]
+    assert rows[1]["model"] == "opus"
 
 
 def test_an_error_about_the_work_is_not_retried(sequenced_claude, tmp_path) -> None:

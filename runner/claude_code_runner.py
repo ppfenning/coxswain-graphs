@@ -148,6 +148,29 @@ def _is_transient(payload: Mapping[str, Any]) -> bool:
     return any(marker in said for marker in _TRANSIENT_ERRORS)
 
 
+def is_safeguard_refusal(payload: Mapping[str, Any]) -> bool:
+    """Pure: is this specifically the provider's safeguard classifier?
+
+    Narrower than `_is_transient` — scoped to the one phrase the CLI uses for
+    it, so only this failure earns an alternate-model retry and its own
+    ledger reason rather than a plain same-model one.
+    """
+    said = " ".join(
+        str(payload.get(key) or "") for key in ("subtype", "result", "errors")
+    ).lower()
+    return "safeguards flagged" in said
+
+
+def _alt_model_for(tiers: Mapping[str, Any], tier: str, model: str) -> str:
+    """The tier's next bound model after `model`, wrapping; `model` itself if the tier names only one."""
+    bindings = tiers.get(tier)
+    if not isinstance(bindings, list) or len(bindings) < 2:
+        return model
+    names = [str(b) for b in bindings]
+    idx = names.index(model) if model in names else -1
+    return names[(idx + 1) % len(names)]
+
+
 def next_spent(previous: float, reported_usd: float, stopped: bool) -> float:
     """A stop's `total_cost_usd` is the session's, replacing; a success's is this call's, adding."""
     return reported_usd if stopped else previous + reported_usd
@@ -323,7 +346,7 @@ class ClaudeCodeRunner:
         if not model:
             known = ", ".join(sorted(self.tiers))
             raise RunnerError(f"provider profile has no model for tier '{tier}'; it declares: {known}")
-        return str(model)
+        return str(model[0]) if isinstance(model, list) else str(model)
 
     @staticmethod
     def _read_context(context: Sequence[str]) -> str:
@@ -630,12 +653,17 @@ class ClaudeCodeRunner:
         # how a budget disappears; one retry is how a transient classifier
         # misfire stops costing a finished task its run.
         computed_patch, has_scratch = "", False
+        attempt_model = model
+        first_call_id = str(uuid.uuid4())
+        retry_extra: dict[str, Any] = {}
         for attempt in (1, 2):
+            call_id = first_call_id if attempt == 1 else str(uuid.uuid4())
+            used_model = attempt_model
             if thread:
                 state = self._thread(thread, role)
                 session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
                 proc = self._invoke(
-                    role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
+                    role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
                     spent_usd=state.get("spent_usd", 0.0),
                 )
@@ -645,7 +673,7 @@ class ClaudeCodeRunner:
             else:
                 with self._scratch(role) as scratch:
                     proc = self._invoke(
-                        role=role, tier=tier, model=model, tools=tools, schema=schema, prompt=prompt, packs=packs,
+                        role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                         scratch=scratch, patches=True, session=(), budget_usd=budget_usd,
                     )
                     if role in _PATCH_ROLES and scratch:
@@ -682,7 +710,10 @@ class ClaudeCodeRunner:
                 # Every failed attempt that ends the node is billed, whether it
                 # stops the budget or raises outright — ledgered here, once,
                 # before either exit, with the trace path the CLI just reported.
-                self._append_call_ledger(_call_fields(role, tier, model, tools, payload), ok=False, error=message)
+                self._append_call_ledger(
+                    {**_call_fields(role, tier, used_model, tools, payload), "id": call_id, **retry_extra},
+                    ok=False, error=message,
+                )
                 if payload.get("subtype") == "error_max_budget_usd":
                     spent = float(payload.get("total_cost_usd") or 0.0)
                     partial_patch = ""
@@ -703,6 +734,14 @@ class ClaudeCodeRunner:
                     )
                 raise RunnerError(message)
 
+            # A safeguard refusal specifically, not the broader transient set,
+            # moves the retry to the tier's alternate model and names why on
+            # the ledger; a plain reasoning-extraction misfire keeps retrying
+            # the same model exactly as before.
+            if is_safeguard_refusal(payload):
+                attempt_model = _alt_model_for(self.tiers, tier, used_model)
+                retry_extra = {"retry_of": call_id, "reason": "safeguard_refusal"}
+
             # Keep the failed attempt's trace. The retry writes to the same
             # filename, and a transient error that leaves no record behind is
             # one nobody can measure the frequency of later. Renamed BEFORE the
@@ -713,11 +752,13 @@ class ClaudeCodeRunner:
             if payload.get("trace"):
                 failed = Path(payload["trace"]).replace(Path(payload["trace"]).with_suffix(".error.jsonl"))
                 traced_payload = {**payload, "trace": str(failed)}
-            self._append_call_ledger(_call_fields(role, tier, model, tools, traced_payload), ok=False, error=message)
+            self._append_call_ledger(
+                {**_call_fields(role, tier, used_model, tools, traced_payload), "id": call_id}, ok=False, error=message,
+            )
 
         # Built before either raise below, so a malformed answer is ledgered
         # too — the run spent the call whether or not it parsed.
-        call = _call_fields(role, tier, model, tools, payload)
+        call = {**_call_fields(role, tier, used_model, tools, payload), "id": call_id, **retry_extra}
         data = payload.get("structured_output")
         if data is None:
             # An older build, or a session that answered in prose: the result
