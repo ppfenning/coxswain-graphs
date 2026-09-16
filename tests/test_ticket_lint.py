@@ -22,6 +22,11 @@ def test_a_command_the_sandbox_does_not_grant_is_a_grant_advisory():
     assert problems[0].severity == "advisory"
 
 
+def test_a_command_the_sandbox_grants_is_not_a_grant_advisory():
+    tasks = [_task(body="verify with `pytest -q tests/test_x.py` then `git diff --stat`")]
+    assert lint_tickets(tasks, [], ["pytest", "git status", "git diff"], "graphs") == []
+
+
 def test_a_fenced_block_with_two_risky_commands_yields_two_grant_advisories():
     tasks = [_task(body="```bash\ncox route lint t1\ngh pr view 5\n```")]
     problems = lint_tickets(tasks, [], [], "graphs")

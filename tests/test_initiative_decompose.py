@@ -380,3 +380,88 @@ def test_without_a_tree_surfaces_stay_as_declared(cart) -> None:
     result = decompose(cart)
     t1 = next(t for t in result["tasks"] if t["id"] == "t1")
     assert t1["surfaces"] == ["schema"]
+
+
+def test_a_reach_problem_comes_back_through_apply_corrections_as_a_refusal(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["~/scratch/notes.md"]}],
+    }
+    correction = {
+        "corrections": [{"task": "t1", "surface": "~/scratch/notes.md", "replacement": "graphs/notes.py"}],
+        "summary": "resolved",
+    }
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": decomposition, "review_adversary": [ACCEPTED, correction]})
+    result = initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, runner)
+    lint_call = runner.calls[-1]
+    assert lint_call["role"] == "review_adversary"
+    assert "t1: reach" in lint_call["prompt"]
+    assert result["tasks"][0]["surfaces"] == ["graphs/notes.py"]
+
+
+def test_a_body_sourced_reach_problem_still_quarantines_even_with_a_correction(cart) -> None:
+    """The correction schema only rewrites `surfaces`; a path named in prose has nothing to match."""
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "notes live at ~/scratch/notes.md", "needs": [], "surfaces": []}],
+    }
+    correction = {
+        "corrections": [{"task": "t1", "surface": "~/scratch/notes.md", "replacement": "graphs/notes.py"}],
+        "summary": "resolved",
+    }
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": decomposition, "review_adversary": [ACCEPTED, correction]})
+    with pytest.raises(ContractViolation, match="reach"):
+        initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, runner)
+
+
+def test_a_coupling_problem_comes_back_through_apply_corrections_as_a_refusal(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [
+            {"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["tests/test_x.py"]},
+            {"id": "t2", "phase": "p1", "title": "b", "body": "b", "needs": [], "surfaces": ["tests/test_x.py"]},
+        ],
+    }
+    correction = {
+        "corrections": [{"task": "t2", "surface": "tests/test_x.py", "replacement": "tests/test_y.py"}],
+        "summary": "split",
+    }
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": decomposition, "review_adversary": [ACCEPTED, correction]})
+    result = initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, runner)
+    lint_call = runner.calls[-1]
+    assert lint_call["role"] == "review_adversary"
+    assert "coupling" in lint_call["prompt"]
+    surfaces = {t["id"]: t["surfaces"] for t in result["tasks"]}
+    assert surfaces["t2"] == ["tests/test_y.py"]
+
+
+def test_a_grant_problem_is_recorded_as_a_lint_entry_not_a_refusal(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "```bash\ncox route lint t1\n```", "needs": [], "surfaces": []}],
+    }
+    result = decompose(cart, decomposition)
+    lint_entry = "grant: names `cox`, which is not granted (name only pytest, git status, git diff)"
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert task["lint"] == [lint_entry]
+    ticket = next(p for p in result["proposals"] if p["target"] == "t1")
+    assert f"lint=[{lint_entry}]" in ticket["suggested_action"]
+    assert {"check": "lint", "output": lint_entry} in ticket["evidence"]
+
+
+def test_a_size_problem_is_recorded_as_a_lint_entry_not_a_refusal(cart) -> None:
+    body = " ".join(["word"] * 750)
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": body, "needs": [], "surfaces": []}],
+    }
+    result = decompose(cart, decomposition)
+    lint_entry = "size: body is 750 words (point at a spec file in the repository)"
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert task["lint"] == [lint_entry]
+    ticket = next(p for p in result["proposals"] if p["target"] == "t1")
+    assert f"lint=[{lint_entry}]" in ticket["suggested_action"]
+    assert {"check": "lint", "output": lint_entry} in ticket["evidence"]
