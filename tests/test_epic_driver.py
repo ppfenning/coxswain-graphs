@@ -24,7 +24,7 @@ from core import ledger, workstore
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
 from harness.epic import branch_action, phase_order, phase_parents, run_epic, task_outcome
-from harness.resume import save_result
+from harness.resume import load_result, save_result
 from runner.protocol import BudgetStop, RunnerError
 
 SHA = "sha-fixture"
@@ -1072,6 +1072,132 @@ def test_a_build_the_fix_loop_refused_is_quarantined_with_the_loop_s_own_reason(
     assert "no_progress" in reason, reason
     assert "validate_chunk" not in reason, reason
     assert "'revise'" in reason, reason
+
+
+# ── a node failure mid-review writes the task record on the way out ────────
+
+
+class ArbitrateFailsRunner(Runner):
+    """Charter and adversary both answer; arbitrate then raises — the exact
+    shape the ticket names: build complete, charter review ran, then
+    arbitrate failed with a provider-side error."""
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+        if role == "review_adversary":
+            with self.lock:
+                self.calls.append({"role": role, "tier": tier, "prompt": prompt})
+            return dict(APPROVE)
+        if role == "arbitrate":
+            raise RunnerError("provider-side safeguard error")
+        return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd)
+
+
+def test_a_non_build_node_failure_quarantines_as_infra_with_the_patch_kept(repo, cart, tmp_path) -> None:
+    cart = dict(cart)
+    cart["skills"] = {**cart["skills"], "review_adversary": "acme-skills:review-adversary", "arbitrate": "acme-skills:arbitrate"}
+    cart["policy"] = {**cart["policy"], "review_tier": {"tier2_surfaces": ["dangerous"]}}
+    work = initiative(two_phases=False)
+    work["items"][0]["surfaces"] = ["dangerous"]
+    runner = ArbitrateFailsRunner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-infra")
+
+    quarantined = [q for q in result["quarantined"] if q["grain"] == "task"]
+    assert [q["id"] for q in quarantined] == ["t1-probe"]
+    assert quarantined[0]["kind"] == "infra"
+    assert quarantined[0]["patch_kept"] is True
+    assert "arbitrate" in quarantined[0]["reason"]
+
+    task_record = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    # Nothing was judged, so this is a harness fault, never "rejected" — the
+    # label a patch two reviewers actually declined gets.
+    assert task_record["outcome"] == "harness_fault"
+
+    saved = load_result(tmp_path / "runs", "epic-infra", "p1-foundations", "t1-probe")
+    assert saved is not None
+    assert saved["build"]["patch"].strip()
+    assert saved["failed_node"] == "arbitrate"
+
+
+class ArbitrateBudgetStopRunner(Runner):
+    """arbitrate hits its budget ceiling — a resumable stop, not a node
+    failure, so it must NOT convert to `infra`; it falls through to the
+    pre-existing `no_work` path exactly like any other `RunnerError` from a
+    non-build node did before this ticket."""
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+        if role == "review_adversary":
+            with self.lock:
+                self.calls.append({"role": role, "tier": tier, "prompt": prompt})
+            return dict(APPROVE)
+        if role == "arbitrate":
+            raise BudgetStop(role="arbitrate", thread=None, session=None, spent_usd=1.0, detail="budget ceiling hit")
+        return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd)
+
+
+def test_a_budget_stop_from_a_non_build_node_is_not_converted_to_infra(repo, cart, tmp_path) -> None:
+    cart = dict(cart)
+    cart["skills"] = {**cart["skills"], "review_adversary": "acme-skills:review-adversary", "arbitrate": "acme-skills:arbitrate"}
+    cart["policy"] = {**cart["policy"], "review_tier": {"tier2_surfaces": ["dangerous"]}}
+    work = initiative(two_phases=False)
+    work["items"][0]["surfaces"] = ["dangerous"]
+    runner = ArbitrateBudgetStopRunner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-budget-arb")
+
+    quarantined = [q for q in result["quarantined"] if q["grain"] == "task"]
+    assert [q["id"] for q in quarantined] == ["t1-probe"]
+    assert quarantined[0]["kind"] == "no_work"
+    assert "patch_kept" not in quarantined[0]
+    assert "t1-probe" not in [t["id"] for t in result["tasks"]]
+
+
+class AdversaryFailsRunner(Runner):
+    """Charter answers; the adversary then raises for one task only. The
+    charter's own verdict was already in hand when the adversary node
+    failed, so it must survive onto the saved result rather than being
+    dropped with the traceback."""
+
+    def __init__(self, patches: dict[str, str], *, fails_for: str, **kw) -> None:
+        super().__init__(patches, **kw)
+        self.fails_for = fails_for
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+        if role == "review_adversary":
+            if self.fails_for in prompt:
+                raise RunnerError("provider-side safeguard error")
+            return dict(APPROVE)
+        return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd)
+
+
+def test_the_charter_verdict_already_in_hand_survives_an_adversary_failure(repo, cart, tmp_path) -> None:
+    # tier1_max_changed_lines defaults to 150, so every small fixture patch
+    # already sits at tier 1 — binding review_adversary is enough to call it.
+    cart = dict(cart)
+    cart["skills"] = {**cart["skills"], "review_adversary": "acme-skills:review-adversary"}
+    runner = AdversaryFailsRunner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS}, fails_for="t1-probe")
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False), run_id="epic-adv-infra")
+
+    quarantined = [q for q in result["quarantined"] if q["grain"] == "task"]
+    assert [q["id"] for q in quarantined] == ["t1-probe"]
+    assert quarantined[0]["kind"] == "infra"
+    assert "review_adversary" in quarantined[0]["reason"]
+
+    saved = load_result(tmp_path / "runs", "epic-adv-infra", "p1-foundations", "t1-probe")
+    assert saved is not None
+    assert saved["failed_node"] == "review_adversary"
+    assert saved["review"]["verdict"] == "approve"
+
+
+def test_a_build_node_failure_is_still_quarantined_as_no_work(repo, cart, tmp_path) -> None:
+    """Unchanged: a build that never produced a patch has nothing to keep."""
+    runner = Runner({"t2-bench": new_file_patch("t2-bench.txt")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    quarantined = [q for q in result["quarantined"] if q["grain"] == "task"]
+    assert [q["id"] for q in quarantined] == ["t1-probe"]
+    assert quarantined[0]["kind"] == "no_work"
+    assert "patch_kept" not in quarantined[0]
+
+    assert "t1-probe" not in [t["id"] for t in result["tasks"]]
 
 
 def test_a_quarantined_task_records_an_attempt_on_its_own_work_item(repo, cart, tmp_path) -> None:
