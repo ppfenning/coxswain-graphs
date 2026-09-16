@@ -35,7 +35,12 @@ PHASE_IDS = ("p1-foundations", "p2-rollout")
 
 APPROVE = {"verdict": "approve", "findings": [], "rationale": "matches the charter"}
 CHUNK_OK = {"satisfied": True, "gaps": [], "reasoning": "the description is satisfied"}
-CHUNK_BAD = {"satisfied": False, "gaps": ["the probe reads nothing"], "reasoning": "not done"}
+CHUNK_BAD = {
+    "satisfied": False,
+    "gaps": ["the probe reads nothing"],
+    "reasoning": "not done",
+    "defects": [{"claim": "the probe reads nothing", "where": {"file": "t1-probe.txt"}}],
+}
 GOAL_MET = {
     "goal_met": True,
     "partial": False,

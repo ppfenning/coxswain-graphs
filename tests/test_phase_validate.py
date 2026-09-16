@@ -28,7 +28,21 @@ def _fs_reader(worktree: str, rel: str) -> str | None:
         return None
 
 CHUNK_OK = {"satisfied": True, "gaps": [], "reasoning": "the description is satisfied"}
-CHUNK_BAD = {"satisfied": False, "gaps": ["no migration"], "reasoning": "half of it is missing"}
+# t1-probe's evidence carries `check: "patch_apply"`, t2-bench's `check:
+# "checks:pytest"` (see PHASE_STATE below) — a defect's `where.file` must
+# name one of those, so the two tasks need distinct, well-formed refusals.
+CHUNK_BAD_T1 = {
+    "satisfied": False,
+    "gaps": ["no migration"],
+    "reasoning": "half of it is missing",
+    "defects": [{"claim": "no migration", "where": {"file": "patch_apply"}}],
+}
+CHUNK_BAD_T2 = {
+    "satisfied": False,
+    "gaps": ["no migration"],
+    "reasoning": "half of it is missing",
+    "defects": [{"claim": "no migration", "where": {"file": "checks:pytest"}}],
+}
 PHASE_MET = {
     "goal_met": True,
     "partial": False,
@@ -150,12 +164,24 @@ def test_chunk_verdicts_come_back_in_task_id_order(cart) -> None:
 
 
 def test_the_verdict_shapes_are_what_the_driver_reads(cart) -> None:
-    result, _ = run(cart, {"validate_chunk": CHUNK_BAD, "validate_phase": PHASE_UNMET})
+    result, _ = run(cart, {"validate_chunk": [CHUNK_BAD_T1, CHUNK_BAD_T2], "validate_phase": PHASE_UNMET})
     assert result["phase"] == "p1-foundations"
     assert result["phase_verdict"] == PHASE_UNMET
     assert result["chunk_verdicts"] == [
-        {"task": "t1-probe", "satisfied": False, "gaps": ["no migration"], "reasoning": "half of it is missing"},
-        {"task": "t2-bench", "satisfied": False, "gaps": ["no migration"], "reasoning": "half of it is missing"},
+        {
+            "task": "t1-probe",
+            "satisfied": False,
+            "gaps": ["no migration"],
+            "reasoning": "half of it is missing",
+            "defects": CHUNK_BAD_T1["defects"],
+        },
+        {
+            "task": "t2-bench",
+            "satisfied": False,
+            "gaps": ["no migration"],
+            "reasoning": "half of it is missing",
+            "defects": CHUNK_BAD_T2["defects"],
+        },
     ]
 
 
@@ -201,10 +227,15 @@ PLACEHOLDER = {
 # A real refusal that happens to be ABOUT a placeholder in the code. The
 # detector must not touch this: it is a finding, and the most valuable thing a
 # chunk validator says.
-REAL_REFUSAL_ABOUT_A_PLACEHOLDER = {
+REAL_REFUSAL_ABOUT_A_PLACEHOLDER_T1 = {
     "satisfied": False,
     "gaps": ["the request handler body is still a placeholder that raises NotImplementedError"],
     "reasoning": "the patch leaves a placeholder where the parser should be, so the task is not done",
+    "defects": [{"claim": "handler still raises NotImplementedError", "where": {"file": "patch_apply"}}],
+}
+REAL_REFUSAL_ABOUT_A_PLACEHOLDER_T2 = {
+    **REAL_REFUSAL_ABOUT_A_PLACEHOLDER_T1,
+    "defects": [{"claim": "handler still raises NotImplementedError", "where": {"file": "checks:pytest"}}],
 }
 
 
@@ -275,7 +306,9 @@ def test_a_real_gap_using_third_person_verify_or_redo_is_not_a_placeholder(cart,
         "gaps": [f"the loader {phrase} the row count before the write"],
         "reasoning": "the migration is missing a check",
     }
-    result, runner = run(cart, {"validate_chunk": [real_gap, real_gap], "validate_phase": PHASE_MET})
+    real_gap_t1 = {**real_gap, "defects": [{"claim": "no row-count check", "where": {"file": "patch_apply"}}]}
+    real_gap_t2 = {**real_gap, "defects": [{"claim": "no row-count check", "where": {"file": "checks:pytest"}}]}
+    result, runner = run(cart, {"validate_chunk": [real_gap_t1, real_gap_t2], "validate_phase": PHASE_MET})
     chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
     assert len(chunk_calls) == 2, "asked once per task; the repeated gap was never a placeholder"
     by_task = {v["task"]: v for v in result["chunk_verdicts"]}
@@ -287,7 +320,10 @@ def test_a_refusal_about_a_placeholder_in_the_code_is_a_verdict(cart) -> None:
     """The markers describe the author's own process, never the code under it."""
     result, runner = run(
         cart,
-        {"validate_chunk": REAL_REFUSAL_ABOUT_A_PLACEHOLDER, "validate_phase": PHASE_MET},
+        {
+            "validate_chunk": [REAL_REFUSAL_ABOUT_A_PLACEHOLDER_T1, REAL_REFUSAL_ABOUT_A_PLACEHOLDER_T2],
+            "validate_phase": PHASE_MET,
+        },
     )
     assert len([c for c in runner.calls if c["role"] == "validate_chunk"]) == 2, "asked once per task"
     assert not any(v["satisfied"] for v in result["chunk_verdicts"])
@@ -365,6 +401,7 @@ SECOND_STILL_ASKS = {
     "gaps": ["still missing something"],
     "reasoning": "even with the file, it is incomplete",
     "needs_evidence": ["migrations/0008_more.sql"],
+    "defects": [{"claim": "still missing something", "where": {"file": "patch_apply"}}],
 }
 
 SECOND_RULES_WITHOUT_THE_FILE = {
@@ -377,6 +414,7 @@ SECOND_REFUSES_ON_ITS_OWN_GAP = {
     "satisfied": False,
     "gaps": ["the join still drops rows with a null vendor_id"],
     "reasoning": "the patch alone shows a real gap, evidence or not",
+    "defects": [{"claim": "null vendor_id rows survive the join", "where": {"file": "patch_apply"}}],
 }
 
 
@@ -482,6 +520,7 @@ def test_a_second_needs_evidence_is_not_chased(cart, tmp_path) -> None:
         "satisfied": False,
         "gaps": ["still missing something"],
         "reasoning": "even with the file, it is incomplete",
+        "defects": SECOND_STILL_ASKS["defects"],
         "evidence_supplied": ["migrations/0007_add_col.sql"],
     }
 
@@ -533,3 +572,91 @@ def test_the_chunk_brief_states_that_command_evidence_is_trace_observed(cart) ->
     chunk_prompts = [c["prompt"] for c in runner.calls if c["role"] == "validate_chunk"]
     assert chunk_prompts
     assert all("observed by the harness" in p and "matching `command` entry" in p for p in chunk_prompts)
+
+
+# ── a refusal names a defect or it is not a refusal (validator-reach.md §2) ─
+
+
+def test_a_well_formed_defect_is_accepted(cart) -> None:
+    """Rule 5: `unsatisfied` with one defect naming a diff file quarantines as before."""
+    verdict = {
+        "satisfied": False,
+        "gaps": ["no migration"],
+        "reasoning": "half of it is missing",
+        "defects": [{"claim": "no migration", "where": {"file": "patch_apply"}}],
+    }
+    result, runner = run(cart, {"validate_chunk": [verdict, CHUNK_OK], "validate_phase": PHASE_MET})
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 2, "one ask per task; a well-formed refusal is not retried"
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t1-probe"]["satisfied"] is False
+    assert by_task["t1-probe"]["defects"] == verdict["defects"]
+    assert "validation" not in by_task["t1-probe"]
+
+
+def test_a_malformed_refusal_is_retried_once_with_the_quoted_malformation(cart) -> None:
+    """Rule 3: `defects: []` is malformed, and the retry quotes the malformation back."""
+    malformed = {"satisfied": False, "gaps": ["no migration"], "reasoning": "half of it is missing", "defects": []}
+    well_formed = {
+        "satisfied": False,
+        "gaps": ["no migration"],
+        "reasoning": "half of it is missing, named this time",
+        "defects": [{"claim": "no migration", "where": {"file": "patch_apply"}}],
+    }
+    result, runner = run(
+        cart, {"validate_chunk": [malformed, well_formed, CHUNK_OK], "validate_phase": PHASE_MET}
+    )
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 3, "two tasks; the malformed one is retried once"
+    assert "names no defect" in chunk_calls[1]["prompt"]
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t1-probe"]["satisfied"] is False
+    assert by_task["t1-probe"]["defects"] == well_formed["defects"]
+    assert "validation" not in by_task["t1-probe"]
+
+
+def test_a_defect_naming_an_unplaceable_file_is_retried_as_malformed(cart) -> None:
+    """Rule 6: a defect whose `where.file` matches neither a diff path nor an evidence check is malformed."""
+    unplaced = {
+        "satisfied": False,
+        "gaps": ["no migration"],
+        "reasoning": "half of it is missing",
+        "defects": [{"claim": "no migration", "where": {"file": "some/unrelated/file.py"}}],
+    }
+    well_formed = {
+        "satisfied": False,
+        "gaps": ["no migration"],
+        "reasoning": "half of it is missing, named this time",
+        "defects": [{"claim": "no migration", "where": {"file": "patch_apply"}}],
+    }
+    result, runner = run(
+        cart, {"validate_chunk": [unplaced, well_formed, CHUNK_OK], "validate_phase": PHASE_MET}
+    )
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 3, "two tasks; the ungrounded defect is retried once"
+    assert "matches neither a diff path nor an evidence entry" in chunk_calls[1]["prompt"]
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t1-probe"]["satisfied"] is False
+    assert by_task["t1-probe"]["defects"] == well_formed["defects"]
+    assert "validation" not in by_task["t1-probe"]
+
+
+def test_two_malformed_refusals_abstain_rather_than_quarantine(cart) -> None:
+    """Rule 4: a still-malformed retry abstains, and the record reflects the retry's own account."""
+    malformed_first = {"satisfied": False, "gaps": ["no migration"], "reasoning": "first attempt names nothing"}
+    malformed_second = {"satisfied": False, "gaps": ["no migration"], "reasoning": "second attempt, still nothing"}
+    result, runner = run(
+        cart, {"validate_chunk": [malformed_first, malformed_second], "validate_phase": PHASE_MET}
+    )
+    chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+    assert len(chunk_calls) == 4, "two tasks, each retried once for its malformed refusal"
+
+    by_task = {v["task"]: v for v in result["chunk_verdicts"]}
+    assert by_task["t1-probe"]["validation"] == {"verdict": "abstained", "reason": "malformed refusal x2"}
+    assert by_task["t1-probe"]["satisfied"] is not False, "not quarantined on an abstained validator alone"
+    assert by_task["t1-probe"]["reasoning"] == "second attempt, still nothing", (
+        "the record reflects the retry that was actually judged, not the first, discarded attempt"
+    )
