@@ -465,6 +465,29 @@ def test_backticked_code_fragments_are_not_scope_so_a_real_revision_is_progress(
     assert len(roles(scripted, "review_charter")) == 2
 
 
+MNEMONIC_PATCH = BIG_PATCH.replace("--- a/", "--- c/").replace("+++ b/", "+++ i/")
+MNEMONIC_PATCH_REVISED = BIG_PATCH_REVISED.replace("--- a/", "--- c/").replace("+++ b/", "+++ i/")
+
+
+def test_a_revision_under_mnemonic_diff_prefixes_is_still_seen_as_progress(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """graphs-build-output-valid-6: this repository's builders emit `c/`+`i/`
+    headers; a section parser keyed on `b/` saw no files at all, so no file
+    could ever have moved and every revision read as no_progress."""
+    scripted = runner(
+        plan_response,
+        [{**build_response, "patch": MNEMONIC_PATCH}, rebuilt(build_response, MNEMONIC_PATCH_REVISED)],
+        review_response,
+        review_adversary=[ADV_OBJECTS, ADV_APPROVES],
+        arbitrate=[ARBITRATION_NAMES_NO_FILE, ARBITRATION_APPROVES],
+    )
+    result = lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+
+    assert result["fix_loop"]["stopped"] != "no_progress"
+    assert len(roles(scripted, "review_charter")) == 2
+
+
 def test_the_same_objection_raised_again_stops_the_loop(
     cartridge, plan_response, build_response
 ) -> None:

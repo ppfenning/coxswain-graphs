@@ -505,7 +505,9 @@ _PATH_TOKEN = re.compile(r"^[\w.\-]+(?:/[\w.\-]+)*$")
 
 def _patch_sections(patch: str) -> dict[str, str]:
     """Each touched file's own diff text, sliced between its `+++ b/<path>` headers."""
-    marks = list(re.finditer(r"^\+\+\+ b/(\S+)", patch, re.MULTILINE))
+    # Builders emit `a/`+`b/` or, under diff.mnemonicPrefix, `c/`+`i/`/`w/`;
+    # any one-letter prefix is stripped so the key is the repository path.
+    marks = list(re.finditer(r"^\+\+\+ (?:[a-z]/)?(\S+)", patch, re.MULTILINE))
     return {m.group(1): patch[m.end() : n.start() if n else len(patch)] for m, n in zip(marks, marks[1:] + [None])}
 
 
