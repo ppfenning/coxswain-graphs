@@ -133,6 +133,7 @@ def cart(tmp_path) -> dict:
             "stack_rebase": {"risk": "high", "ramp": "eligible", "apply_arm": "shell"},
             "state_move": {"risk": "low", "ramp": "deferred", "apply_arm": "work_state_arm"},
             "self_modification": {"risk": "high", "ramp": "never", "apply_arm": "pr"},
+            "consolidate": {"risk": "low", "ramp": "deferred"},
         },
         "policy": {"graduation_n": 3, "regraduation_multiplier": 2, "caps": {}},
         "landing_areas": {
@@ -176,11 +177,12 @@ class Runner:
     — which is exactly how a task gets quarantined without the test faking one.
     """
 
-    def __init__(self, patches: dict[str, str], *, chunk=None, verdicts=None, style=None) -> None:
+    def __init__(self, patches: dict[str, str], *, chunk=None, verdicts=None, style=None, review=None) -> None:
         self.patches = patches
         self.chunk = chunk or {}
         self.verdicts = verdicts or {}
         self.style = style or {}
+        self.review = review or {}
         self.calls: list[dict] = []
         self.lock = threading.Lock()
 
@@ -204,7 +206,7 @@ class Runner:
                 "commands_run": [],
             }
         if role == "review_charter":
-            return dict(APPROVE)
+            return dict(self.review.get(self._subject(prompt, TASK_IDS), APPROVE))
         if role == "validate_chunk":
             return dict(self.chunk.get(self._subject(prompt, TASK_IDS), CHUNK_OK))
         if role == "validate_phase":
@@ -1078,6 +1080,63 @@ def test_two_runs_over_the_same_work_propose_the_same_things(repo, cart, tmp_pat
     second, _ = drive(repo, cart, tmp_path, assume="r", run_id="epic-2")
     shape = lambda result: [(p["kind"], p["target"].replace("epic-2", "epic-1")) for p in result["proposals"]]  # noqa: E731
     assert shape(first) == shape(second)
+
+
+# ── §4 consolidate ────────────────────────────────────────────────────────
+
+
+def _two_task_initiative(*, t2_surfaces: list[str]) -> dict:
+    """t1-probe and t2-bench, one phase, no dependency between them.
+
+    `surfaces` is the field `docs/design/work-shape.md` §3's coupling rule
+    already reads to decide who owns what; §4's ownership check reuses it.
+    """
+    items = [
+        {"id": "t1-probe", "phase": "p1-foundations", "state": "ready", "needs": [], "surfaces": [],
+         "title": "schema probe", "body": "read the vendor schema"},
+        {"id": "t2-bench", "phase": "p1-foundations", "state": "ready", "needs": [], "surfaces": t2_surfaces,
+         "title": "bench harness", "body": "time the join"},
+    ]
+    return {
+        "id": "demo-initiative", "title": "demo", "body": "make the vendor join measurable end to end",
+        "phases": ["p1-foundations"], "items": items,
+    }
+
+
+def test_a_finding_citing_a_file_the_other_task_owns_emits_one_consolidate_proposal(
+    repo, cart, tmp_path
+) -> None:
+    patches = {t: new_file_patch(f"{t}.txt") for t in ("t1-probe", "t2-bench")}
+    # Ordinary reviewer prose, not the taxonomy's own words: no "cannot satisfy",
+    # no "without touching", no literal "t2-bench" id — only the required `file`
+    # field naming a surface t2-bench actually claims.
+    blocked = {
+        "verdict": "approve",
+        "findings": [
+            {
+                "charter_principle": "cross-ticket reach",
+                "detail": "Landing this cleanly also needs an edit here, and that belongs to the bench ticket.",
+                "file": "t2-bench.txt",
+            }
+        ],
+        "rationale": "the patch is fine on its own terms",
+    }
+    runner = Runner(patches, review={"t1-probe": blocked})
+    work = _two_task_initiative(t2_surfaces=["t2-bench.txt"])
+    result, _ = drive(repo, cart, tmp_path, work=work, runner=runner)
+
+    consolidate = [p for p in result["proposals"] if p["kind"] == "consolidate"]
+    assert len(consolidate) == 1
+    assert consolidate[0]["target"] == "t1-probe and t2-bench"
+    assert consolidate[0]["evidence"][0]["output"] == blocked["findings"][0]["detail"]
+
+
+def test_a_run_with_no_such_finding_emits_no_consolidate_proposal(repo, cart, tmp_path) -> None:
+    # t2-bench owns t2-bench.txt, same as the positive case, but nothing t1-probe's
+    # review says ever names it: ownership alone never fires the proposal.
+    work = _two_task_initiative(t2_surfaces=["t2-bench.txt"])
+    result, _ = drive(repo, cart, tmp_path, work=work)
+    assert [p for p in result["proposals"] if p["kind"] == "consolidate"] == []
 
 
 # ── a build the fix loop refused never reaches a validator ──────────────────
