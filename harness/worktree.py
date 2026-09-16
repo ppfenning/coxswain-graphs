@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
-__all__ = ["apply_patch", "create_worktree", "normalise_patch"]
+__all__ = [
+    "apply_patch",
+    "create_worktree",
+    "keep_worktree",
+    "normalise_patch",
+    "prune_registrations",
+    "remove_worktree",
+]
 
 _TRAILING_MARKERS = ("</patch>", "</diff>", "</code>", "```")
 _MIDDLE_TAGS = ("</patch>", "</diff>", "<patch>", "<diff>")
@@ -107,3 +115,59 @@ def create_worktree(repo: Path, worktree: Path, *, branch: str, base: str | None
         cmd.append(base)
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def prune_registrations(repo: Path) -> tuple[bool, str]:
+    """Drop any `git worktree` administrative entry whose directory is gone.
+
+    A crashed run can leave `.git/worktrees/<name>` behind after the worktree
+    directory itself is deleted or moved out from under it; git's own registry
+    then blocks the next `worktree add` on the same branch or path with a
+    phantom "already exists" until this runs.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "prune", "--verbose"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def remove_worktree(repo: Path, worktree: Path) -> tuple[bool, str]:
+    """Delete a worktree and clear its registration, for every exit path.
+
+    Tries `git worktree remove` first so the registry and the directory come
+    off together; falls back to a plain `rmtree` for a directory that was
+    never registered — the scratch `git init` dir `apply_patch` falls back to
+    when there is no real repo behind a patch. Either way, `prune_registrations`
+    runs last so a stale entry never survives this call.
+    """
+    result = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)],
+        capture_output=True,
+        text=True,
+    )
+    detail = (result.stderr or result.stdout).strip()
+    if result.returncode != 0 and worktree.exists():
+        shutil.rmtree(worktree, ignore_errors=True)
+        detail = f"not a registered worktree, removed directly: {detail}" if detail else "removed directly"
+    prune_ok, prune_detail = prune_registrations(repo)
+    combined = f"{detail}\n{prune_detail}".strip() if prune_detail else detail
+    return (not worktree.exists()) and prune_ok, combined
+
+
+def keep_worktree(repo: Path, worktree: Path, worktree_root: Path, run_id: str) -> tuple[bool, str]:
+    """Move a worktree under `<worktree_root>/_kept/<run_id>` instead of deleting it.
+
+    For `--keep-worktrees`: the directory survives for post-mortem, moved out
+    from under its own registration so the branch and path it used are free
+    for the next run, and `prune_registrations` clears the now-stale entry.
+    """
+    dest = worktree_root / "_kept" / run_id / worktree.name
+    if not worktree.exists():
+        return False, f"nothing to keep at {worktree}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(worktree), str(dest))
+    prune_ok, prune_detail = prune_registrations(repo)
+    detail = f"kept at {dest}\n{prune_detail}".strip() if prune_detail else f"kept at {dest}"
+    return dest.exists() and prune_ok, detail

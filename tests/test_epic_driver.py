@@ -574,6 +574,31 @@ def test_a_worktree_that_cannot_be_opened_fails_the_phase_not_a_task(repo, cart,
     assert not any(q["grain"] == "task" for q in result["quarantined"])
 
 
+def test_open_phase_worktree_prunes_a_stale_registration_before_opening(repo, cart, tmp_path) -> None:
+    """A crashed prior run's leftover admin entry must not block the next open.
+
+    2026-09-08 `tools-chair-rename-18`: the worktree directory was gone but the
+    registration was not, and the next `worktree add` failed on the phantom.
+    """
+    import shutil
+
+    from harness.epic import _Ctx, _open_phase_worktree
+
+    ctx = _Ctx(
+        repo=repo, cartridge=cart, runner=None, specs={}, run_id="r", date="d",
+        max_parallel=1, ledger_path=tmp_path / "ledger.jsonl", provider_profile="p",
+        runs_dir=tmp_path / "runs", worktree_root=tmp_path / "worktrees", assume=None,
+        fix_attempts=None, initiative_id="demo-initiative", default_ref="main",
+    )
+    ok, detail, _ = _open_phase_worktree(ctx, "p1-foundations", "main")
+    assert ok, detail
+    shutil.rmtree(ctx.phase_worktree("p1-foundations"))
+
+    ok, detail, reused = _open_phase_worktree(ctx, "p1-foundations", "main")
+    assert ok, detail
+    assert reused is True
+
+
 # ── governance ──────────────────────────────────────────────────────────────
 
 
