@@ -311,6 +311,12 @@ def adjudicated(cartridge) -> dict:
     return cartridge
 
 
+def handoff_bound(cartridge) -> dict:
+    """Bind the handoff shuttle, so an incomplete handoff can send a build back."""
+    cartridge["skills"]["handoff"] = "acme-skills:handoff"
+    return cartridge
+
+
 ARBITRATION_SIDES_ADVERSARY = {"verdict": "revise", "sided_with": "adversary", "reasoning": "the objection holds"}
 
 
@@ -475,6 +481,43 @@ def test_a_retry_that_leaves_the_scoped_file_unchanged_still_stops(
 
     assert result["fix_loop"]["stopped"] == "no_progress"
     assert len(roles(scripted, "review_charter")) == 1, "the scope's own file never changed, so no second review"
+
+
+HANDOFF_INCOMPLETE = {
+    "complete": False, "blocking": False,
+    "missing": ["confirm this was tested against staging"], "brief": "needs confirmation",
+}
+HANDOFF_COMPLETE = {"complete": True, "blocking": False, "missing": [], "brief": ""}
+
+
+def test_a_byte_identical_resubmission_after_handoff_is_progress_but_after_a_revise_is_not(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """The same diff resent with new evidence answers a handoff's `missing`
+    list; the same diff resent after a review `revise` answers nothing."""
+    resubmitted = {**build_response, "commands_run": [*build_response["commands_run"], {"command": "pytest -q tests/test_x.py", "output": "1 passed"}]}
+    scripted = runner(
+        plan_response, [build_response, resubmitted], review_response,
+        handoff=[HANDOFF_INCOMPLETE, HANDOFF_COMPLETE],
+    )
+    result = lifecycle_propose.run(args(handoff_bound(cartridge)), scripted)
+    assert result["fix_loop"]["stopped"] != "no_progress", "new evidence for the same diff is progress"
+    assert len(roles(scripted, "review_charter")) == 1
+
+    # The first retry's handoff completes and hands off to a real reviewer's
+    # `revise`, in the same run — `prior_handoff` must reset to `False` there,
+    # or a second retry with yet more new evidence would misread as progress.
+    after_revise = {
+        **resubmitted, "summary": "resubmitted again",
+        "commands_run": [*resubmitted["commands_run"], {"command": "pytest -q tests/test_y.py", "output": "1 passed"}],
+    }
+    scripted = runner(
+        plan_response, [build_response, resubmitted, after_revise], review_response,
+        handoff=[HANDOFF_INCOMPLETE, HANDOFF_COMPLETE], review_charter=REVISE,
+    )
+    result = lifecycle_propose.run(args(handoff_bound(cartridge)), scripted)
+    assert result["fix_loop"]["stopped"] == "no_progress", "a revise names a change to make, not evidence to supply"
+    assert len(roles(scripted, "review_charter")) == 1, "the post-revise resubmission was never sent for a second review"
 
 
 ARBITRATION_NAMES_NO_FILE = {

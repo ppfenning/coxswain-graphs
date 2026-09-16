@@ -1641,6 +1641,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         else None
     )
     standing: set[str] = set()
+    # Whether the round that produced the current `verdict` ended at handoff
+    # (no reviewer has read this patch yet) rather than at a review verdict.
+    prior_handoff = handoff is not None and not handoff.get("complete")
 
     while verdict != "approve" and attempts <= fix_attempts and not review_quarantine and not frozen:
         # Every claim raised so far, not merely the last round's. Re-raising an
@@ -1705,6 +1708,10 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             # and none left means any file.
             touched = (scope & (set(prior) | set(current)) if scope else set()) or set(prior) | set(current)
             no_progress = not any(prior.get(f) != current.get(f) for f in touched)
+        # A resubmission after handoff evidence, not a review revise, is progress
+        # the moment the evidence itself moved, even with the diff unchanged.
+        if prior_handoff and no_progress:
+            no_progress = retry.get("commands_run") == build.get("commands_run") and retry.get("summary") == build.get("summary")
         if no_progress:
             # The retry is dropped rather than returned: `build` and `review`
             # must describe the same patch, or the record lies about what was
@@ -1723,7 +1730,13 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 if not handoff.get("complete"):
                     review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _handoff_critique(handoff)
                     any_review_placeholder = any_review_placeholder or review_placeholder
+                    prior_handoff = True
+                    # No reviewer has seen this build yet, so the round costs
+                    # half an attempt, not a whole one — two of these plus a
+                    # real review round must not exhaust the cap first.
+                    attempts -= 0.5
                     continue
+            prior_handoff = False
             tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
             review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _review_round(
                 runner,
