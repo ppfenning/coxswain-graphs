@@ -23,7 +23,16 @@ from core import ledger, workstore
 
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
-from harness.epic import _trace_evidence, branch_action, phase_order, phase_parents, run_epic, task_outcome
+from graphs.ops import triage_quarantine
+from harness.epic import (
+    _ticket_amend_ramp,
+    _trace_evidence,
+    branch_action,
+    phase_order,
+    phase_parents,
+    run_epic,
+    task_outcome,
+)
 from harness.resume import load_result, save_result
 from runner.protocol import BudgetStop, RunnerError
 
@@ -274,7 +283,7 @@ SPECS = {
 
 def drive(
     repo, cart, tmp_path, *, runner=None, work=None, assume="a", run_id="epic-1", patches=None, fix_attempts=None,
-    keep_worktrees=False,
+    keep_worktrees=False, specs=None,
 ):
     runner = runner or Runner(patches if patches is not None else {t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
     result = run_epic(
@@ -282,7 +291,7 @@ def drive(
         repo=repo,
         cartridge=cart,
         runner=runner,
-        specs=SPECS,
+        specs=specs if specs is not None else SPECS,
         run_id=run_id,
         date="2026-09-01",
         max_parallel=3,
@@ -726,6 +735,70 @@ def test_two_infra_attempts_do_not_trip_the_attempt_cap(repo, cart, tmp_path) ->
 
     assert not any(q["id"] == "t1-probe" and "attempt cap" in q["reason"] for q in result["quarantined"])
     assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t1-probe", "epic/demo-initiative/p1-foundations")
+
+
+# ── ticket_amend's additive check, and the attempt cap launching triage ─────
+
+
+def test_additive_ticket_amend_diff_stays_eligible() -> None:
+    old = "---\nid: t1\n---\nOriginal text."
+    new = old + "\n\n## 2026-09-16\nAppended note."
+    assert _ticket_amend_ramp(old, new) == "eligible"
+
+
+def test_a_removed_line_forces_the_amendment_gated() -> None:
+    old = "---\nid: t1\n---\nLine one.\nLine two."
+    new = "---\nid: t1\n---\nLine one."
+    assert _ticket_amend_ramp(old, new) == "gated"
+
+
+def test_a_frontmatter_change_forces_the_amendment_gated() -> None:
+    old = "---\nid: t1\nstate: ready\n---\nBody text."
+    new = "---\nid: t1\nstate: done\n---\nBody text.\n\nAppended."
+    assert _ticket_amend_ramp(old, new) == "gated"
+
+
+class TriageAttemptRunner(Runner):
+    """Like `Runner`, but scripts `role="triage"` with a `ticket_defect` classification."""
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+        if role == "triage":
+            with self.lock:
+                self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
+            return {
+                "class": "ticket_defect",
+                "diagnosis": "the earlier attempts hit check failed: bad output",
+                "cites": ["attempt-1|reason"],
+                "action": "add a note describing the missing fixture",
+            }
+        return super().run(
+            role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread,
+            budget_usd=budget_usd, task=task,
+        )
+
+
+def test_the_attempt_cap_launches_triage_instead_of_a_plain_quarantine(repo, cart, tmp_path) -> None:
+    work = initiative(two_phases=False)
+    task = next(item for item in work["items"] if item["id"] == "t1-probe")
+    task["attempts"] = [
+        {"run": f"epic-prior-{n}", "phase": "p1-foundations", "reason": "check failed: bad output",
+         "kind": "refused", "ts": f"2026-09-0{n}T00:00:00+00:00"}
+        for n in (1, 2)
+    ]
+    local_cart = {**cart, "write_kinds": {**cart["write_kinds"], "ticket_amend": {
+        "risk": "low", "ramp": "eligible", "apply_arm": "work_state_arm",
+    }}}
+    runner = TriageAttemptRunner({"t2-bench": new_file_patch("t2-bench.txt")})
+    result, _ = drive(
+        repo, local_cart, tmp_path, runner=runner, work=work,
+        specs={**SPECS, "triage-quarantine": triage_quarantine.SPEC},
+    )
+
+    assert any(call["role"] == "triage" for call in runner.calls)
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+    amend = next(p for p in result["proposals"] if p["target"] == "t1-probe")
+    assert amend["kind"] == "ticket_amend"
+    assert amend["ramp"] == "eligible"
 
 
 def test_the_cli_exit_line_names_an_approved_and_unlanded_task(monkeypatch, tmp_path, capsys) -> None:
@@ -1590,10 +1663,33 @@ def test_a_task_at_the_attempt_cap_is_refused_and_its_sibling_still_lands(repo, 
     )
     work = workstore.read_initiative(wi)
 
-    runner = Runner({"t2-bench": new_file_patch("t2-bench.txt")})
-    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-cap")
+    # `cart` declares no `notify` write kind, so a `genuine_reject` classification's
+    # proposal is itself refused — triage runs, but cannot turn this into a write,
+    # and the task still ends up quarantined, plainly, for a person to decide.
+    class TriageRejectRunner(Runner):
+        def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+            if role == "triage":
+                with self.lock:
+                    self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
+                return {
+                    "class": "genuine_reject",
+                    "diagnosis": "the record shows first refusal already happened once",
+                    "cites": ["attempt-1|reason"],
+                    "action": "no further action",
+                }
+            return super().run(
+                role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread,
+                budget_usd=budget_usd, task=task,
+            )
+
+    runner = TriageRejectRunner({"t2-bench": new_file_patch("t2-bench.txt")})
+    result, _ = drive(
+        repo, cart, tmp_path, runner=runner, work=work, run_id="epic-cap",
+        specs={**SPECS, "triage-quarantine": triage_quarantine.SPEC},
+    )
 
     assert not any(call["role"] in ("plan", "build") and "t1-probe" in call["prompt"] for call in runner.calls)
+    assert any(call["role"] == "triage" for call in runner.calls)
 
     quarantined = {q["id"]: q for q in result["quarantined"] if q["grain"] == "task"}
     assert set(quarantined) == {"t1-probe"}
