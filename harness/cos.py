@@ -174,8 +174,9 @@ def assemble_docket(
     """Read what is on hand, and mark each registered graph runnable or not.
 
     `retro` is runnable iff the ledger holds rows to retro over. `decompose`
-    is runnable iff the intake queue holds a queued idea. `triage` is runnable
-    iff the caller says it has alerts in hand this run — this driver never
+    and `sweep` are runnable iff the intake queue holds a queued idea — the
+    same fact, since either graph is what a queued idea decomposes into.
+    `triage` is runnable iff the caller says it has alerts in hand this run — this driver never
     fetches an alert queue itself, the same rule `triage-propose` holds for
     its own `alerts` argument. Every other registered graph — `lifecycle`,
     `reconcile`, `cos` itself, anything needing inputs this driver cannot
@@ -225,6 +226,8 @@ def assemble_docket(
         if name == "retro":
             return (bool(ledger_rows), "" if ledger_rows else "no ledger rows to run a retro over")
         if name == "decompose":
+            return (bool(intake_items), "" if intake_items else "the intake queue is empty")
+        if name == "sweep":
             return (bool(intake_items), "" if intake_items else "the intake queue is empty")
         if name == "triage":
             return (alerts_present, "" if alerts_present else "no alerts were provided this run")
