@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
@@ -229,7 +230,15 @@ def self_reported_commands(data: Mapping[str, Any]) -> list[dict[str, str]]:
 
 
 def _call_fields(
-    role: str, tier: str, model: str, tools: Sequence[str], payload: Mapping[str, Any], task_id: str | None = None
+    role: str,
+    tier: str,
+    model: str,
+    tools: Sequence[str],
+    payload: Mapping[str, Any],
+    task_id: str | None = None,
+    *,
+    ceiling_usd: float | None = None,
+    ceiling_source: str = "profile",
 ) -> dict[str, Any]:
     """The one shape a call is recorded in — success or failure alike."""
     usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
@@ -240,6 +249,8 @@ def _call_fields(
         "model": model,
         "tools": list(tools),
         "cost_usd": payload.get("total_cost_usd"),
+        "ceiling_usd": ceiling_usd,
+        "ceiling_source": ceiling_source,
         "turns": payload.get("num_turns"),
         "duration_ms": payload.get("duration_ms"),
         # Split, not summed: a cache read costs a tenth of a fresh token,
@@ -256,6 +267,19 @@ def _call_fields(
         **({"trace": payload["trace"]} if payload.get("trace") else {}),
         **({"commands_run": payload["commands_run"]} if "commands_run" in payload else {}),
     }
+
+
+def _load_bounds(path: Path) -> dict[tuple[str, str], Mapping[str, Any]] | None:
+    """Rows from `cox stats bounds --write`, keyed by (role, model). None when unreadable."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"warning: cost bounds file unreadable ({path}): {exc}", file=sys.stderr)
+        return None
+    rows = raw.get("rows") if isinstance(raw, Mapping) else None
+    if not isinstance(rows, list):
+        return {}
+    return {(str(r.get("role")), str(r.get("model"))): r for r in rows if isinstance(r, Mapping)}
 
 
 def _effective_limit(shape_ceiling: float | None, node_cap: float | None) -> tuple[float | None, bool]:
@@ -306,6 +330,14 @@ class ClaudeCodeRunner:
         # by the harness after construction, like `runs_dir`/`run_id`. Unset
         # means the shape ceiling above is the only limit, exactly as before.
         self.node_cap_usd: float | None = None
+        # The bounds file `cox stats bounds --write` produces, and the level
+        # column to read from it (docs/design/cost-bounds.md §2/§3/§6). Set by
+        # the harness after construction, like `node_cap_usd`; unset means the
+        # shape ceiling above is the only one, exactly as before.
+        self.cost_bounds_path: Path | None = None
+        self.cost_level: str = "moderate"
+        self._bounds: dict[tuple[str, str], Mapping[str, Any]] | None = None
+        self._bounds_loaded = False
         # A profile may reassign a role's tier — the vendor axis owning cost.
         # Extraction-shaped roles a graph asked "standard" for can run cheap here.
         self.tier_overrides = {str(k): str(v) for k, v in (self.profile.get("tier_overrides") or {}).items()}
@@ -364,14 +396,29 @@ class ClaudeCodeRunner:
             raise RunnerError(f"provider profile has no model for tier '{tier}'; it declares: {known}")
         return str(model[0]) if isinstance(model, list) else str(model)
 
-    def _shape_ceiling(self, role: str | None, tier: str, budget_usd: float | None) -> float | None:
-        """The provider's own ceiling for this call, before any operator cap applies."""
+    def _bounds_row(self, role: str | None, model: str) -> Mapping[str, Any] | None:
+        """The bounds file's row for (role, model), loaded and cached once."""
+        if not self._bounds_loaded:
+            self._bounds = _load_bounds(Path(self.cost_bounds_path)) if self.cost_bounds_path else {}
+            self._bounds_loaded = True
+        return (self._bounds or {}).get((role, model))
+
+    def _shape_ceiling(self, role: str | None, tier: str, model: str, budget_usd: float | None) -> tuple[float | None, str]:
+        """The provider's own ceiling for this call, before any operator cap applies.
+
+        docs/design/cost-bounds.md §6 rule 6: the bounds row wins over the
+        profile only when it has `n >= 20` and no explicit override was given.
+        """
+        if budget_usd is None:
+            row = self._bounds_row(role, model)
+            if row is not None and (row.get("n") or 0) >= 20 and row.get(self.cost_level) is not None:
+                return float(row[self.cost_level]), f"bounds:{self.cost_level}"
         budget = budget_usd
         if budget is None:
             budget = self.role_budget_usd.get(role) if role is not None else None
         if budget is None:
             budget = self.budget_usd.get(tier)
-        return budget
+        return budget, "profile"
 
     @staticmethod
     def _read_context(context: Sequence[str]) -> str:
@@ -561,7 +608,8 @@ class ClaudeCodeRunner:
             json.dumps(dict(schema)),
             *_ISOLATION,
         ]
-        effective, _ = _effective_limit(self._shape_ceiling(role, tier, budget_usd), self.node_cap_usd)
+        ceiling, _ = self._shape_ceiling(role, tier, model, budget_usd)
+        effective, _ = _effective_limit(ceiling, self.node_cap_usd)
         if effective is not None:
             # Resuming a stopped session may see the ceiling as covering the
             # whole session's spend rather than this invocation's, so the
@@ -727,7 +775,7 @@ class ClaudeCodeRunner:
             # Name everything the CLI said about it. A bare `None` result was
             # the whole diagnosis of a build failure once; never again.
             detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
-            shape_ceiling = self._shape_ceiling(role, tier, budget_usd)
+            shape_ceiling, ceiling_source = self._shape_ceiling(role, tier, used_model, budget_usd)
             _, cap_governs = _effective_limit(shape_ceiling, self.node_cap_usd)
             cap_stop = cap_governs and detail.get("subtype") == "error_max_budget_usd"
             if cap_stop:
@@ -741,7 +789,13 @@ class ClaudeCodeRunner:
                 # stops the budget or raises outright — ledgered here, once,
                 # before either exit, with the trace path the CLI just reported.
                 self._append_call_ledger(
-                    {**_call_fields(role, tier, used_model, tools, payload, task), "id": call_id, **retry_extra},
+                    {
+                        **_call_fields(
+                            role, tier, used_model, tools, payload, task,
+                            ceiling_usd=shape_ceiling, ceiling_source=ceiling_source,
+                        ),
+                        "id": call_id, **retry_extra,
+                    },
                     ok=False, error=message,
                 )
                 if payload.get("subtype") == "error_max_budget_usd":
@@ -783,12 +837,26 @@ class ClaudeCodeRunner:
                 failed = Path(payload["trace"]).replace(Path(payload["trace"]).with_suffix(".error.jsonl"))
                 traced_payload = {**payload, "trace": str(failed)}
             self._append_call_ledger(
-                {**_call_fields(role, tier, used_model, tools, traced_payload, task), "id": call_id}, ok=False, error=message,
+                {
+                    **_call_fields(
+                        role, tier, used_model, tools, traced_payload, task,
+                        ceiling_usd=shape_ceiling, ceiling_source=ceiling_source,
+                    ),
+                    "id": call_id,
+                },
+                ok=False, error=message,
             )
 
         # Built before either raise below, so a malformed answer is ledgered
         # too — the run spent the call whether or not it parsed.
-        call = {**_call_fields(role, tier, used_model, tools, payload, task), "id": call_id, **retry_extra}
+        ceiling_usd, ceiling_source = self._shape_ceiling(role, tier, used_model, budget_usd)
+        call = {
+            **_call_fields(
+                role, tier, used_model, tools, payload, task,
+                ceiling_usd=ceiling_usd, ceiling_source=ceiling_source,
+            ),
+            "id": call_id, **retry_extra,
+        }
         data = payload.get("structured_output")
         if data is None:
             # An older build, or a session that answered in prose: the result
