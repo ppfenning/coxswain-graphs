@@ -439,6 +439,32 @@ def test_an_arbitration_that_backticks_only_identifiers_scopes_to_any_file(
     assert len(roles(scripted, "review_charter")) == 2
 
 
+ARBITRATION_BACKTICKS_CODE_FRAGMENTS = {
+    "verdict": "revise",
+    "sided_with": "adversary",
+    "reasoning": "take the runs dir through `_runs_dir_for_land`, drop the bare `glob(\"*/*.json\")` and the `f.stem` read, add `--profile` to the parser",
+}
+
+
+def test_backticked_code_fragments_are_not_scope_so_a_real_revision_is_progress(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """tools-clean-guard-5: the arbiter backticked `glob("*/*.json")` and `f.stem`
+    — slash and suffix, but code. Treating them as scope meant no file could
+    ever move and the corrected build was stopped unreviewed."""
+    scripted = runner(
+        plan_response,
+        [{**build_response, "patch": BIG_PATCH}, rebuilt(build_response, BIG_PATCH_REVISED)],
+        review_response,
+        review_adversary=[ADV_OBJECTS, ADV_APPROVES],
+        arbitrate=[ARBITRATION_BACKTICKS_CODE_FRAGMENTS, ARBITRATION_APPROVES],
+    )
+    result = lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+
+    assert result["fix_loop"]["stopped"] != "no_progress"
+    assert len(roles(scripted, "review_charter")) == 2
+
+
 def test_the_same_objection_raised_again_stops_the_loop(
     cartridge, plan_response, build_response
 ) -> None:

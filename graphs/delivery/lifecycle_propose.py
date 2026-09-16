@@ -494,7 +494,13 @@ def _arbiter_scope(verdict: str, arbitration: Mapping[str, Any] | None) -> set[s
     if verdict != "revise" or not arbitration:
         return None
     tokens = re.findall(r"`([^`\s]+)`", str(arbitration.get("reasoning") or ""))
-    return {t for t in tokens if "/" in t or re.search(r"\.[A-Za-z0-9]{1,5}$", t)}
+    return {t for t in tokens if _PATH_TOKEN.match(t) and ("/" in t or re.search(r"\.[A-Za-z0-9]{1,5}$", t))}
+
+
+# A scope entry is a repository path, nothing else: `glob("*/*.json")` and
+# `f.stem` carry a slash or a suffix but are code, and admitting them once
+# scoped a real revision to files nobody could touch — which is no_progress.
+_PATH_TOKEN = re.compile(r"^[\w.\-]+(?:/[\w.\-]+)*$")
 
 
 def _patch_sections(patch: str) -> dict[str, str]:
@@ -1610,7 +1616,10 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             no_progress = SequenceMatcher(None, build.get("patch") or "", retry.get("patch") or "").ratio() >= NO_PROGRESS_RATIO
         else:
             prior, current = _patch_sections(build.get("patch") or ""), _patch_sections(retry.get("patch") or "")
-            touched = scope or set(prior) | set(current)
+            # A scope naming files neither patch touches would zero progress
+            # on nothing; only the scoped files that exist in a patch count,
+            # and none left means any file.
+            touched = (scope & (set(prior) | set(current)) if scope else set()) or set(prior) | set(current)
             no_progress = not any(prior.get(f) != current.get(f) for f in touched)
         if no_progress:
             # The retry is dropped rather than returned: `build` and `review`
