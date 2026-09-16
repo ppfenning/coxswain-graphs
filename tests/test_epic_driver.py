@@ -176,10 +176,11 @@ class Runner:
     — which is exactly how a task gets quarantined without the test faking one.
     """
 
-    def __init__(self, patches: dict[str, str], *, chunk=None, verdicts=None) -> None:
+    def __init__(self, patches: dict[str, str], *, chunk=None, verdicts=None, style=None) -> None:
         self.patches = patches
         self.chunk = chunk or {}
         self.verdicts = verdicts or {}
+        self.style = style or {}
         self.calls: list[dict] = []
         self.lock = threading.Lock()
 
@@ -210,6 +211,8 @@ class Runner:
             return dict(self.verdicts.get(self._subject(prompt, PHASE_IDS), GOAL_MET))
         if role == "work_state_arm":
             return {"applied": True, "detail": "state moved"}
+        if role == "style_pass":
+            return {"patch": self.style.get(self._subject(prompt, PHASE_IDS), "")}
         raise RunnerError(f"no scripted response for role '{role}'")
 
 
@@ -1107,3 +1110,87 @@ def test_a_refused_build_is_never_applied_and_never_shown_to_a_validator(repo, c
     assert refused["status"] == "quarantined"
     assert refused["evidence"] == [{"check": "fix_loop", "output": refused["quarantine"]}]
     assert "no_progress" in refused["quarantine"]
+
+
+# ── trim, once validate_phase is satisfied (docs/design/landing-model.md §5) ─
+
+_TRIM_PHASE = "p1-foundations"
+_TRIM_BRANCH = "epic/demo-initiative/p1-foundations"
+_TEST_FILE_PATCH = new_file_patch("test_thing.py", "def test_a(): assert True")
+
+_DELETE_BENCH_TXT = (
+    "diff --git a/t2-bench.txt b/t2-bench.txt\n"
+    "deleted file mode 100644\n"
+    "--- a/t2-bench.txt\n"
+    "+++ /dev/null\n"
+    "@@ -1 +0,0 @@\n"
+    "-ok\n"
+)
+
+_DROP_TEST_ID = (
+    "diff --git a/test_thing.py b/test_thing.py\n"
+    "deleted file mode 100644\n"
+    "--- a/test_thing.py\n"
+    "+++ /dev/null\n"
+    "@@ -1 +0,0 @@\n"
+    "-def test_a(): assert True\n"
+)
+
+_BREAK_CHECK = (
+    "diff --git a/t2-bench.txt b/t2-bench.txt\n"
+    "--- a/t2-bench.txt\n"
+    "+++ b/t2-bench.txt\n"
+    "@@ -1 +1 @@\n"
+    "-ok\n"
+    "+not-ok\n"
+)
+
+
+def _with_style(cart: dict) -> dict:
+    return {**cart, "skills": {**cart["skills"], "style_pass": "acme-skills:style-pass"}}
+
+
+def _trim_patches() -> dict[str, str]:
+    return {"t1-probe": _TEST_FILE_PATCH, "t2-bench": new_file_patch("t2-bench.txt")}
+
+
+def test_style_pass_is_invoked_exactly_once_per_phase_completion(repo, cart, tmp_path) -> None:
+    runner = Runner(_trim_patches(), style={_TRIM_PHASE: ""})
+    result, runner = drive(repo, _with_style(cart), tmp_path, runner=runner, work=initiative(two_phases=False))
+    assert result["phases"][0]["status"] == "complete"
+    assert sum(1 for c in runner.calls if c["role"] == "style_pass") == 1
+    assert "trim" not in result["phases"][0]
+
+
+def test_a_trim_that_keeps_every_id_and_passes_checks_is_applied_and_counted(repo, cart, tmp_path) -> None:
+    runner = Runner(_trim_patches(), style={_TRIM_PHASE: _DELETE_BENCH_TXT})
+    result, _ = drive(repo, _with_style(cart), tmp_path, runner=runner, work=initiative(two_phases=False))
+    assert result["phases"][0]["status"] == "complete"
+    assert result["phases"][0]["trim"] == "trim: 1 lines removed"
+    files = git("ls-tree", "-r", "--name-only", _TRIM_BRANCH, cwd=repo).splitlines()
+    assert "t2-bench.txt" not in files
+    assert "test_thing.py" in files
+
+
+def test_the_trim_commit_never_stages_a_nested_task_worktree_as_a_gitlink(repo, cart, tmp_path) -> None:
+    """`ctx.phase_worktree(phase)` still holds each task's own build worktree when the trim commits."""
+    runner = Runner(_trim_patches(), style={_TRIM_PHASE: _DELETE_BENCH_TXT})
+    result, _ = drive(repo, _with_style(cart), tmp_path, runner=runner, work=initiative(two_phases=False))
+    assert result["phases"][0]["trim"] == "trim: 1 lines removed"
+    assert "160000" not in git("ls-tree", "-r", _TRIM_BRANCH, cwd=repo)
+
+
+def test_a_trim_that_drops_a_collected_id_is_refused_and_the_branch_is_untouched(repo, cart, tmp_path) -> None:
+    runner = Runner(_trim_patches(), style={_TRIM_PHASE: _DROP_TEST_ID})
+    result, _ = drive(repo, _with_style(cart), tmp_path, runner=runner, work=initiative(two_phases=False))
+    assert result["phases"][0]["status"] == "complete"
+    assert result["phases"][0]["trim"] == "trim: refused (coverage floor)"
+    assert git("show", f"{_TRIM_BRANCH}:test_thing.py", cwd=repo) == "def test_a(): assert True"
+
+
+def test_a_trim_that_fails_a_configured_check_is_refused_and_the_branch_is_untouched(repo, cart, tmp_path) -> None:
+    runner = Runner(_trim_patches(), style={_TRIM_PHASE: _BREAK_CHECK})
+    result, _ = drive(repo, _with_style(cart), tmp_path, runner=runner, work=initiative(two_phases=False))
+    assert result["phases"][0]["status"] == "complete"
+    assert result["phases"][0]["trim"] == "trim: refused (coverage floor)"
+    assert git("show", f"{_TRIM_BRANCH}:t2-bench.txt", cwd=repo) == "ok"
