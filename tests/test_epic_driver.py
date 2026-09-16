@@ -624,6 +624,25 @@ def test_no_rebase_is_proposed_when_the_stack_is_still_on_its_base(repo, cart, t
     assert second["phases"][0]["status"] == "complete"
 
 
+# ── `dropped` is terminal, the same way `done` is ───────────────────────────
+
+
+def test_a_dropped_task_is_never_selected_for_build_or_review(repo, cart, tmp_path) -> None:
+    work = initiative(two_phases=False)
+    work["items"][1]["state"] = "dropped"
+    result, runner = drive(repo, cart, tmp_path, work=work)
+    assert not any(c["role"] == "build" and "t2-bench" in c["prompt"] for c in runner.calls)
+    assert result["phases"][0]["status"] == "complete"
+
+
+def test_a_phase_of_done_and_dropped_records_is_complete(repo, cart, tmp_path) -> None:
+    work = initiative(two_phases=False, done=("t1-probe",))
+    work["items"][1]["state"] = "dropped"
+    result, runner = drive(repo, cart, tmp_path, work=work)
+    assert result["phases"][0]["status"] == "complete"
+    assert runner.calls == [], "every item was already done or dropped — nothing to build or review"
+
+
 def test_a_stale_empty_reused_branch_is_recreated_before_any_task_builds(repo, cart, tmp_path) -> None:
     """Refused day one leaves the branch equal to its base — nothing of its own to lose."""
     work = initiative(two_phases=False)
@@ -668,6 +687,44 @@ def test_a_stale_reused_branch_with_its_own_commits_blocks_rather_than_building(
     third, _ = drive(repo, cart, tmp_path, work=work, run_id="epic-3")
     assert third["phases"][0]["status"] == "blocked"
     assert "rebase it through the gate" in third["phases"][0]["reason"]
+
+
+def test_a_stale_branch_whose_diff_adds_no_lines_is_recreated_not_blocked(repo, cart, tmp_path) -> None:
+    """Two of its own commits, net zero lines — old-logic 'has commits' would have blocked this."""
+    branch = "epic/demo-initiative/p1-foundations"
+    git("checkout", "-b", branch, cwd=repo)
+    (repo / "temp.txt").write_text("x\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "add temp", cwd=repo)
+    (repo / "temp.txt").unlink()
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "remove temp", cwd=repo)
+    git("checkout", "main", cwd=repo)
+
+    (repo / "moved.md").write_text("moved\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "advance main", cwd=repo)
+
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False), run_id="epic-2")
+    assert result["phases"][0]["status"] == "complete"
+    assert "recreated" in result["phases"][0]
+
+
+def test_a_stale_branch_whose_diff_adds_a_line_still_blocks(repo, cart, tmp_path) -> None:
+    branch = "epic/demo-initiative/p1-foundations"
+    git("checkout", "-b", branch, cwd=repo)
+    (repo / "keep.txt").write_text("kept\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "add keep", cwd=repo)
+    git("checkout", "main", cwd=repo)
+
+    (repo / "moved.md").write_text("moved\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "advance main", cwd=repo)
+
+    result, runner = drive(repo, cart, tmp_path, work=initiative(two_phases=False), run_id="epic-2")
+    assert result["phases"][0]["status"] == "blocked"
+    assert not any(c["role"] == "build" for c in runner.calls)
 
 
 class Revising(Runner):
