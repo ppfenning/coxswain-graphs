@@ -54,6 +54,7 @@ from core.workstore import WorkStoreError, record_attempt
 from graphs._contract import proposal
 from harness.autonomy import split_by_policy
 from harness.checks import (
+    HARNESS_FAULT_PREFIX,
     all_passed,
     checks_evidence,
     collected_ids,
@@ -687,16 +688,17 @@ def _quarantine_task(
     the quarantine entry itself.
 
     `kind` is the closed set from docs/design/observed-record.md §3. `infra`
-    reaches here two ways: the caller's own branch at the `_open_phase_worktree`
+    reaches here three ways: the caller's own branch at the `_open_phase_worktree`
     failure site, which marks the phase `phase_failed_to_start` before this
-    function ever sees a task, and `_execute`, when the apply arm itself raises
-    rather than reports. `unverified` is an approved patch the validator would
-    not sign off, so it is kept rather than discarded — `patch_kept: True` on
-    both the entry and the attempt. `infra` from `_execute` gets the same
-    `patch_kept`, but it names the BUILD's already-approved patch already on
-    the task record, not a resumable arm session: `auto_apply`'s `runner.run`
-    call carries no `thread=`, so nothing about the failed arm call itself
-    survives to be resumed.
+    function ever sees a task; `_execute`, when the apply arm itself raises
+    rather than reports; and a non-build node raising mid-round, where the patch
+    a later node was handed is kept rather than discarded. `unverified` is an
+    approved patch the validator would not sign off, kept for the same reason.
+    Both carry `patch_kept: True` on both the entry and the attempt. `infra` from
+    `_execute` names the BUILD's already-approved patch already on the task
+    record, not a resumable arm session: `auto_apply`'s `runner.run` call carries
+    no `thread=`, so nothing about the failed arm call itself survives to be
+    resumed.
 
     `detail`, when given, is stored as the attempt's own `reason` in place of
     the terse one on `entry` — the next build's carried-forward brief gets the
@@ -971,6 +973,38 @@ def _run_phase(
     for result in sorted(results, key=lambda r: str(r.get("ticket"))):
         task = str(result.get("ticket"))
 
+        # A non-build node raised mid-round: review, adversary, arbitrate,
+        # validate or handoff never reached a verdict, so nothing here was
+        # judged and `_unapproved` has nothing to read. The patch a later
+        # node was handed is kept rather than lost to the traceback.
+        failed_node = result.get("failed_node")
+        if failed_node is not None:
+            patch = str((result.get("build") or {}).get("patch") or "")
+            detail = str(result.get("failed_node_reason") or f"node '{failed_node}' failed")
+            # Prefixed so `is_harness_fault` recognises it: this task's
+            # quarantine never went through `built[task]`, so the shared
+            # outcome loop below reads no verdicts for it and would otherwise
+            # call `task_outcome` "rejected" — the same label a patch two
+            # reviewers actually declined gets, for a patch nothing judged.
+            reason = f"{HARNESS_FAULT_PREFIX} {detail}"
+            record["task_records"].append(
+                {
+                    "id": task,
+                    "phase": phase,
+                    "branch": ctx.scratch_branch(task),
+                    "evidence": [{"check": "fix_loop", "output": reason}],
+                    "quarantine": reason,
+                    "governance_hits": [],
+                    "draft": None,
+                    "merged": False,
+                    "status": "quarantined",
+                    "build": {"patch": patch},
+                    "failed_node": failed_node,
+                }
+            )
+            quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=reason, kind="infra"))
+            continue
+
         # The loop's refusal is the answer, and it is free. Applying a patch the
         # reviewers rejected costs a worktree, a check run and both validators
         # before anything says no, and what finally says no is a validator
@@ -1120,6 +1154,15 @@ def _run_phase(
             verdict = record["phase_verdict"] = dict(validations[0].get("phase_verdict") or {})
             chunk_by_task = {str(v.get("task")): v for v in record["chunk_verdicts"]}
         else:
+            # `validate_phase` raised for the WHOLE batch, not a single task —
+            # `chunk_by_task` stays empty, and the loop below only quarantines
+            # a task whose chunk verdict is present AND unsatisfied, so every
+            # surviving task reaches the gate with no verdict at all rather
+            # than a per-task `infra` quarantine. That is a real gap of the
+            # same shape this ticket closes for a single task's node calls,
+            # but closing it here means deciding what a WHOLE PHASE does when
+            # its one validation call fails — hold every task, or requarantine
+            # the batch — which this ticket's per-task scope does not cover.
             record["reason"] = f"the validator failed: {'; '.join(failures)}"
 
     # An unsatisfied chunk verdict quarantines its task BEFORE the gate. A task
