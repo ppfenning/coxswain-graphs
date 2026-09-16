@@ -137,3 +137,17 @@ bearing cartridge and reading back its keys. Passing `cartridge` unchanged
 picks up `overlay_sha` automatically once `build_manifest` reads it the way it
 already reads `cartridge_sha`; landing that read is a change to
 `agent-cartridges`, not to `agent-graphs`.
+
+## What a seat can see
+
+A build seat sees one repository worktree. It cannot analyse the platform's
+own operational record — the runs, ledgers, and usage accounting that the
+harness keeps about itself — because that record lives outside any single
+checkout and a ticket that asks a seat to reach for it is asking for
+something no seat can honestly answer. Those questions route instead to
+`cox stats`, which is the deterministic surface for roles, explain,
+coverage, and series; whatever it cannot answer, the chair answers by hand
+and files as a stats gap. A read-only analyst seat for this corpus is
+deferred, not built. The exact paths a ticket may not name are enforced by
+the `reach` rule and listed in `docs/design/validator-reach.md` §3, not
+repeated here.
