@@ -295,6 +295,8 @@ def _cos_docket_args(*, cartridge: Mapping[str, Any], args: argparse.Namespace) 
     function a test can call directly, rather than something only a full CLI
     invocation could exercise.
     """
+    from harness.cos import stranded_count
+
     intake_root = next(
         (
             entry.get("path")
@@ -309,6 +311,7 @@ def _cos_docket_args(*, cartridge: Mapping[str, Any], args: argparse.Namespace) 
         "alerts_present": bool(getattr(args, "alerts", None)),
         "cartridge": cartridge,
         "runs_dir": args.runs_dir,
+        "stranded": stranded_count(),
     }
 
 
