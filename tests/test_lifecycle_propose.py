@@ -326,6 +326,119 @@ def test_a_retry_that_changes_nothing_stops_instead_of_buying_a_second_opinion(
     )
 
 
+BIG_PATCH = "--- a/src/a.py\n+++ b/src/a.py\n" + "".join(f"-old{i}\n+new{i}\n" for i in range(250))
+BIG_PATCH_REVISED = "--- a/src/a.py\n+++ b/src/a.py\n" + "".join(
+    (f"-old{i}\n+fixed{i}\n" if i >= 247 else f"-old{i}\n+new{i}\n") for i in range(250)
+)
+ARBITRATION_SCOPED = {"verdict": "revise", "sided_with": "adversary", "reasoning": "rename the key in `src/a.py` only"}
+ARBITRATION_APPROVES = {"verdict": "approve", "sided_with": "neither", "reasoning": "both reviewers now agree"}
+
+
+def test_a_revision_scoped_to_the_named_file_is_progress_even_at_high_similarity(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """Six lines changed out of five hundred is 0.99 similar by the whole-patch
+    measure, but it is exactly what the arbiter's scope asked for."""
+    scripted = runner(
+        plan_response,
+        [{**build_response, "patch": BIG_PATCH}, rebuilt(build_response, BIG_PATCH_REVISED)],
+        review_response,
+        review_adversary=[ADV_OBJECTS, ADV_APPROVES],
+        arbitrate=[ARBITRATION_SCOPED, ARBITRATION_APPROVES],
+    )
+    result = lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+
+    assert result["fix_loop"]["stopped"] != "no_progress"
+    assert len(roles(scripted, "review_charter")) == 2, "the in-scope retry bought a second review"
+
+
+def test_a_byte_identical_resubmission_still_stops_whether_or_not_it_carried_a_scope(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    for arbitrate in (ARBITRATION_SCOPED, ARBITRATION_SIDES_ADVERSARY):
+        scripted = runner(
+            plan_response,
+            [{**build_response, "patch": BIG_PATCH}, {**build_response, "patch": BIG_PATCH, "summary": "resubmitted"}],
+            review_response,
+            review_adversary=ADV_OBJECTS,
+            arbitrate=arbitrate,
+        )
+        result = lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+        assert result["fix_loop"]["stopped"] == "no_progress"
+        assert len(roles(scripted, "review_charter")) == 1, "the byte-identical patch was never reviewed again"
+
+
+SCOPE_UNCHANGED_PATCH = BIG_PATCH + "--- a/src/b.py\n+++ b/src/b.py\n-old\n+new\n"
+SCOPE_UNCHANGED_RETRY = BIG_PATCH + "--- a/src/b.py\n+++ b/src/b.py\n-old\n+new again\n"
+
+
+def test_a_retry_that_leaves_the_scoped_file_unchanged_still_stops(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """A cosmetic edit to a file outside the scope makes a non-identical whole
+    patch, but the scoped file's own section never moved — still no progress."""
+    scripted = runner(
+        plan_response,
+        [{**build_response, "patch": SCOPE_UNCHANGED_PATCH}, rebuilt(build_response, SCOPE_UNCHANGED_RETRY)],
+        review_response,
+        review_adversary=ADV_OBJECTS,
+        arbitrate=ARBITRATION_SCOPED,
+    )
+    result = lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+
+    assert result["fix_loop"]["stopped"] == "no_progress"
+    assert len(roles(scripted, "review_charter")) == 1, "the scope's own file never changed, so no second review"
+
+
+ARBITRATION_NAMES_NO_FILE = {
+    "verdict": "revise",
+    "sided_with": "adversary",
+    "reasoning": "rename the third key from ts to run, populate it from run_id, update the six fixture sites",
+}
+ARBITRATION_NAMES_ONLY_KEYS = {
+    "verdict": "revise",
+    "sided_with": "adversary",
+    "reasoning": "Revise: rename the third key of the record from `ts` to `run` and update the six fixture sites; nothing else may be reopened.",
+}
+
+
+def test_an_arbitration_that_names_no_file_still_treats_any_change_as_progress(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """The graphs-triage-5 reasoning names files in prose, not backticks — a scope
+    naming nothing, not no scope at all, so a real change still counts."""
+    scripted = runner(
+        plan_response,
+        [{**build_response, "patch": BIG_PATCH}, rebuilt(build_response, BIG_PATCH_REVISED)],
+        review_response,
+        review_adversary=[ADV_OBJECTS, ADV_APPROVES],
+        arbitrate=[ARBITRATION_NAMES_NO_FILE, ARBITRATION_APPROVES],
+    )
+    result = lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+
+    assert result["fix_loop"]["stopped"] != "no_progress"
+    assert len(roles(scripted, "review_charter")) == 2
+
+
+def test_an_arbitration_that_backticks_only_identifiers_scopes_to_any_file(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    """The graphs-triage-5 arbiter backticked the keys `ts` and `run`, never a
+    path — those are not scope, so the revision counts as progress and reaches
+    review instead of re-firing the very stop this loop exists to close."""
+    scripted = runner(
+        plan_response,
+        [{**build_response, "patch": BIG_PATCH}, rebuilt(build_response, BIG_PATCH_REVISED)],
+        review_response,
+        review_adversary=[ADV_OBJECTS, ADV_APPROVES],
+        arbitrate=[ARBITRATION_NAMES_ONLY_KEYS, ARBITRATION_APPROVES],
+    )
+    result = lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+
+    assert result["fix_loop"]["stopped"] != "no_progress"
+    assert len(roles(scripted, "review_charter")) == 2
+
+
 def test_the_same_objection_raised_again_stops_the_loop(
     cartridge, plan_response, build_response
 ) -> None:

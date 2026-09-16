@@ -486,6 +486,23 @@ def _claims(adversary: Mapping[str, Any] | None) -> set[str]:
     }
 
 
+def _arbiter_scope(verdict: str, arbitration: Mapping[str, Any] | None) -> set[str] | None:
+    """Backticked, path-shaped tokens in a revise arbitration's `reasoning`
+    (a `/` or a file suffix); None outside that case. Backticked identifiers
+    such as a renamed key are house style, not scope — a reasoning that
+    names none reads as an empty scope, which means any file."""
+    if verdict != "revise" or not arbitration:
+        return None
+    tokens = re.findall(r"`([^`\s]+)`", str(arbitration.get("reasoning") or ""))
+    return {t for t in tokens if "/" in t or re.search(r"\.[A-Za-z0-9]{1,5}$", t)}
+
+
+def _patch_sections(patch: str) -> dict[str, str]:
+    """Each touched file's own diff text, sliced between its `+++ b/<path>` headers."""
+    marks = list(re.finditer(r"^\+\+\+ b/(\S+)", patch, re.MULTILINE))
+    return {m.group(1): patch[m.end() : n.start() if n else len(patch)] for m, n in zip(marks, marks[1:] + [None])}
+
+
 def _is_budget_stop(exc: Exception) -> bool:
     """Whether a `RunnerError` is the CLI's dollar-ceiling stop, not some other failure."""
     return "error_max_budget_usd" in str(exc).lower()
@@ -1586,11 +1603,16 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             retry = resumed
         attempts += 1
 
-        # No progress. Comparing the two patches is cheap, deterministic and
-        # pure — difflib reads nothing — and it catches the failure mode that
-        # matters most: a builder that returns its own diff back, unchanged,
-        # and would otherwise buy a second opinion from a fresh reviewer.
-        if SequenceMatcher(None, build.get("patch") or "", retry.get("patch") or "").ratio() >= NO_PROGRESS_RATIO:
+        # No progress: a revise arbitration is judged by whether its scoped
+        # files' own diff text moved, not the whole patch; no scope means any file.
+        scope = _arbiter_scope(verdict, arbitration)
+        if scope is None:
+            no_progress = SequenceMatcher(None, build.get("patch") or "", retry.get("patch") or "").ratio() >= NO_PROGRESS_RATIO
+        else:
+            prior, current = _patch_sections(build.get("patch") or ""), _patch_sections(retry.get("patch") or "")
+            touched = scope or set(prior) | set(current)
+            no_progress = not any(prior.get(f) != current.get(f) for f in touched)
+        if no_progress:
             # The retry is dropped rather than returned: `build` and `review`
             # must describe the same patch, or the record lies about what was
             # reviewed. The attempt is still counted — it was still spent.
