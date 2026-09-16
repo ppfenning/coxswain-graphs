@@ -348,11 +348,10 @@ def branch_action(reused: bool, head_moved: bool, has_own_commits: bool) -> str:
     return "block" if has_own_commits else "recreate"
 
 
-def _phase_branch_diff_adds_lines(ctx: _Ctx, phase: str, base_ref: str) -> bool:
-    """Does the branch's diff against `base_ref` add anything, or would recreating it lose nothing?"""
-    ok, out = _git("-C", str(ctx.repo), "diff", "--numstat", f"{base_ref}..{ctx.phase_branch(phase)}")
-    added = sum(int(line.split("\t")[0]) for line in out.splitlines() if line.split("\t")[0].isdigit())
-    return ok and added > 0
+def _phase_branch_has_unlanded_commits(ctx: _Ctx, phase: str) -> bool:
+    """Patch-id semantics: a `+` line from `git cherry` is a commit not yet landed on the default branch."""
+    ok, out = _git("-C", str(ctx.repo), "cherry", ctx.default_ref, ctx.phase_branch(phase))
+    return ok and any(line.startswith("+") for line in out.splitlines())
 
 
 def _rebase(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str]:
@@ -859,7 +858,7 @@ def _run_phase(
     # Decided before a single task builds: a reused branch behind its base is
     # either recreated (nothing of its own to lose) or blocked (something is).
     head_moved = reused and _parent_head_moved(ctx, phase, base_ref)
-    has_own_commits = head_moved and _phase_branch_diff_adds_lines(ctx, phase, base_ref)
+    has_own_commits = head_moved and _phase_branch_has_unlanded_commits(ctx, phase)
     action = branch_action(reused, head_moved, has_own_commits)
 
     if action == "block":
@@ -903,7 +902,7 @@ def _run_phase(
             quarantined.append({"id": phase, "phase": phase, "grain": "phase", "reason": record["reason"]})
             return record
         record["reused_branch"] = reused
-        record["recreated"] = f"phase branch {branch} recreated from {base_ref} (it carried nothing of its own)"
+        record["recreated"] = f"phase branch {branch} recreated from {base_ref}: its commits already landed there via squash-merge"
 
     # A runner whose nodes can read the world reads THIS phase's branch — not
     # whatever the repository happens to have checked out. Phase N+1 stacks on
