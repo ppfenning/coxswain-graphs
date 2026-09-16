@@ -65,6 +65,27 @@ VALIDATE_CHUNK_SCHEMA = {
                 ]
             },
         },
+        # docs/design/validator-reach.md §2: a refusal names a defect or it is
+        # not a refusal. `where.file` must resolve to a diff path or an
+        # evidence `check` — checked by `_malformed_defect_refusal`, not here.
+        "defects": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "where": {
+                        "type": "object",
+                        "properties": {"file": {"type": "string"}, "line": {"type": "integer"}},
+                        "required": ["file"],
+                        "additionalProperties": False,
+                    },
+                    "evidence_ref": {"type": "string"},
+                },
+                "required": ["claim", "where"],
+                "additionalProperties": False,
+            },
+        },
     },
     "required": ["satisfied", "gaps", "reasoning"],
     "additionalProperties": False,
@@ -213,6 +234,31 @@ def _harness_fault_verdict(second: Mapping[str, Any]) -> dict[str, Any]:
         ],
         "reasoning": str(second.get("reasoning") or "")[:200],
     }
+
+
+def _malformed_defect_refusal(verdict: Mapping[str, Any], task: Mapping[str, Any]) -> str | None:
+    """Pure: why this `satisfied: false` verdict names no defect, or None if it does.
+
+    docs/design/validator-reach.md §2: `unsatisfied` with no defect is not a
+    refusal. A defect's `where.file` must resolve to a path in the task's own
+    diff or to a `check` the evidence array already carries — anything else
+    is a claim the harness cannot place.
+    """
+    if verdict.get("satisfied") is not False:
+        return None
+    defects = verdict.get("defects") or []
+    if not defects:
+        return "the refusal names no defect"
+    patch = str(task.get("patch") or "")
+    checks = {str(e.get("check")) for e in task.get("evidence") or [] if isinstance(e, Mapping)}
+    for defect in defects:
+        where = defect.get("where") if isinstance(defect, Mapping) else None
+        file = where.get("file") if isinstance(where, Mapping) else None
+        if not isinstance(file, str) or not file:
+            return f"a defect names no file: {defect!r}"
+        if file not in checks and f"+++ b/{file}" not in patch and f"--- a/{file}" not in patch:
+            return f"the defect naming {file!r} matches neither a diff path nor an evidence entry"
+    return None
 
 
 def _as_request(item: Any) -> dict[str, str] | None:
@@ -378,23 +424,63 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     prompt=_second_chunk_prompt(chunk_prompt, read_pairs, unread),
                 )
                 base_verdict = _harness_fault_verdict(second_raw) if second_stalled else second_raw
+                verdict_is_harness_fault = second_stalled
                 evidence_supplied: list[str] | None = [path for path, _ in read_pairs]
                 evidence_unread = [f"{path} ({reason})" for path, reason in unread]
             else:
                 base_verdict = first_verdict
+                verdict_is_harness_fault = stalled
                 evidence_supplied = None
                 evidence_unread = []
 
-            entry = {
-                "task": str(task.get("id")),
-                "satisfied": bool(base_verdict.get("satisfied")),
-                "gaps": list(base_verdict.get("gaps") or []),
-                "reasoning": str(base_verdict.get("reasoning", "")),
-            }
-            if evidence_supplied is not None:
-                entry["evidence_supplied"] = evidence_supplied
-            if evidence_unread:
-                entry["evidence_unread"] = evidence_unread
+            # docs/design/validator-reach.md §2: a refusal names a defect or
+            # it is not a refusal. Never applied to a harness-fault verdict —
+            # that is already a placeholder's cost, not a claim to re-ask.
+            abstained: dict[str, str] | None = None
+            if not verdict_is_harness_fault:
+                malformation = _malformed_defect_refusal(base_verdict, task)
+                if malformation:
+                    retried = dict(
+                        runner.run(
+                            role="validate_chunk",
+                            tier="standard",
+                            schema=VALIDATE_CHUNK_SCHEMA,
+                            context=context,
+                            prompt=(
+                                f"{chunk_prompt}\n\n"
+                                f"Your refusal names no defect: {malformation}. A defect "
+                                "must carry {\"claim\": ..., \"where\": {\"file\": ...}}, "
+                                "and file must be a path in the diff or a `check` from the "
+                                "evidence you were given. Answer again, naming one."
+                            ),
+                        )
+                    )
+                    base_verdict = retried
+                    if _malformed_defect_refusal(retried, task):
+                        abstained = {"verdict": "abstained", "reason": "malformed refusal x2"}
+
+            if abstained is not None:
+                entry = {
+                    "task": str(task.get("id")),
+                    "satisfied": True,
+                    "gaps": [],
+                    "reasoning": str(base_verdict.get("reasoning", "")),
+                    "validation": abstained,
+                }
+            else:
+                entry = {
+                    "task": str(task.get("id")),
+                    "satisfied": bool(base_verdict.get("satisfied")),
+                    "gaps": list(base_verdict.get("gaps") or []),
+                    "reasoning": str(base_verdict.get("reasoning", "")),
+                }
+                defects = list(base_verdict.get("defects") or [])
+                if defects:
+                    entry["defects"] = defects
+                if evidence_supplied is not None:
+                    entry["evidence_supplied"] = evidence_supplied
+                if evidence_unread:
+                    entry["evidence_unread"] = evidence_unread
             chunk_verdicts.append(entry)
 
     phase_verdict, phase_stalled = _verdict(
