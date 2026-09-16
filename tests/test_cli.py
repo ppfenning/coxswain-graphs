@@ -26,6 +26,7 @@ class _Args:
     provider_profile = "acme"
     keep_worktrees = False
     worktree_root = None
+    node_cap_usd = None
 
     def __init__(self, runs_dir, run_id) -> None:
         self.runs_dir = runs_dir
@@ -111,6 +112,19 @@ def test_a_raise_inside_the_dispatched_graph_still_leaves_usage_json(monkeypatch
 
     written = json.loads((tmp_path / f"{run_id}.usage.json").read_text(encoding="utf-8"))
     assert written["summary"]["calls"] == 1
+
+
+def test_node_cap_usd_threads_from_the_flag_to_the_constructed_runner(monkeypatch, tmp_path) -> None:
+    run_id = "runC"
+    runner = SimpleNamespace(calls=[], node_cap_usd=None)
+    args = _Args(tmp_path, run_id)
+    args.worktree_root = str(tmp_path)
+    args.node_cap_usd = 1.5
+    _patch_common(monkeypatch, args, runner)
+    monkeypatch.setattr(cli, "_run_graph", lambda **k: 0)
+
+    assert cli.main([]) == 0
+    assert runner.node_cap_usd == 1.5
 
 
 def test_close_runs_after_record_usage_so_a_clearing_close_still_leaves_full_usage(monkeypatch, tmp_path) -> None:

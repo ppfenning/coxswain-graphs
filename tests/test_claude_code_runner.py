@@ -491,6 +491,24 @@ def test_a_call_level_budget_overrides_the_role_ceiling(fake_claude, tmp_path) -
     assert argv[argv.index("--max-budget-usd") + 1] == "2.5000"
 
 
+def test_a_node_cap_below_the_shape_ceiling_becomes_the_effective_limit(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 2.0}}, claude_bin=str(script), cwd=tmp_path)
+    runner.node_cap_usd = 0.5
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.5000"
+
+
+def test_a_node_cap_above_the_shape_ceiling_leaves_the_ceiling_effective(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 0.35}}, claude_bin=str(script), cwd=tmp_path)
+    runner.node_cap_usd = 2.0
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.3500"
+
+
 def test_the_scripted_runner_records_the_budget_override() -> None:
     runner = ScriptedRunner({"plan": {"ok": True}})
     runner.run(role="plan", tier="standard", schema=SCHEMA, prompt="go", budget_usd=1.25)
@@ -996,6 +1014,30 @@ def test_a_budget_stop_without_a_thread_has_no_session(sequenced_claude, tmp_pat
     with pytest.raises(BudgetStop) as exc_info:
         runner.run(role="build", schema=SCHEMA, prompt="build it")
     assert exc_info.value.session is None
+
+
+def test_a_budget_stop_governed_by_the_node_cap_is_error_spend_cap_with_both_numbers(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(REFUSED)
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 2.0}}, claude_bin=str(script), cwd=tmp_path)
+    runner.node_cap_usd = 0.5
+
+    with pytest.raises(BudgetStop) as exc_info:
+        runner.run(role="build", schema=SCHEMA, prompt="build it")
+    assert "error_spend_cap" in exc_info.value.detail
+    assert "0.5000" in exc_info.value.detail and "2.0000" in exc_info.value.detail
+
+
+def test_a_budget_stop_with_the_cap_looser_than_the_ceiling_stays_error_max_budget_usd(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(REFUSED)
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 0.5}}, claude_bin=str(script), cwd=tmp_path)
+    runner.node_cap_usd = 2.0
+
+    with pytest.raises(BudgetStop) as exc_info:
+        runner.run(role="build", schema=SCHEMA, prompt="build it")
+    assert "error_max_budget_usd" in exc_info.value.detail
+    assert "error_spend_cap" not in exc_info.value.detail
 
 
 def test_a_threaded_budget_stop_keeps_the_thread_for_a_resume(sequenced_claude, tmp_path, repo) -> None:
