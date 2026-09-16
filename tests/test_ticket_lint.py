@@ -65,6 +65,20 @@ def test_an_in_repo_relative_path_containing_a_workspace_segment_is_not_a_reach_
     assert lint_tickets(tasks, [], [], "graphs") == []
 
 
+def test_a_ticket_naming_workspace_runs_is_refused_with_the_corpus_correction():
+    tasks = [_task(body="check workspace/runs/2026-09-08.json for the failure")]
+    problems = lint_tickets(tasks, [], [], "graphs")
+    assert len(problems) == 1
+    assert problems[0].rule == "reach"
+    assert problems[0].severity == "refusal"
+    assert problems[0].fix == "route this to `cox stats` or the chair; the build seat sees one repository worktree"
+
+
+def test_the_same_ticket_with_the_corpus_path_removed_passes():
+    tasks = [_task(body="check the failure in the ticket's own history")]
+    assert lint_tickets(tasks, [], [], "graphs") == []
+
+
 def test_two_tasks_whose_named_modules_import_one_another_is_a_coupling_refusal():
     tasks = [
         _task(id="t1", surfaces=["graphs/delivery/a.py"]),
