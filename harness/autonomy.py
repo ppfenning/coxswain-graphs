@@ -24,6 +24,10 @@ def split_by_policy(
     THE CALLER FILTERS. `autonomy_policy` refuses rows spanning more than one
     configuration rather than averaging across them, so the filter here is not a
     nicety — it is the precondition that makes the question answerable at all.
+    `provider_profile` narrows every row up front, one value for the whole
+    call. `model` narrows per item instead, because a batch of proposals can
+    carry different bindings; a row recorded under a different model is not
+    this item's streak any more than a row from a different cartridge is.
 
     Note what an auto-applied proposal does NOT get: a ledger row. The ledger
     records what happened at the gate, and an auto-apply never reached one. If
@@ -73,7 +77,12 @@ def split_by_policy(
             **({"subject": item["subject"]} if "subject" in item else {}),
             **({"subject_new": item["subject_new"]} if "subject_new" in item else {}),
         }
-        if autonomy_policy(item["kind"], item["risk"], rows, config) == AUTO:
+        # Unlike the subject fallback above, this is a strict partition, not a
+        # widening one: a row is read only when its model matches the item's
+        # exactly, so a row with no model counts for a modelless item and for
+        # no other, and a row recorded under any other model never counts.
+        scoped_rows = [row for row in rows if row.get("model") == item.get("model")]
+        if autonomy_policy(item["kind"], item["risk"], scoped_rows, config) == AUTO:
             auto.append(item)
             applied_so_far[item["kind"]] += 1
         else:
