@@ -138,6 +138,19 @@ def test_a_placeholder_build_is_reprompted_once_then_quarantined_as_build_output
     assert result["proposals"] == []
 
 
+def test_contract_commands_match_by_shape_not_bytes() -> None:
+    """graphs-triage-11: the ticket said `pytest -q <your test file> 2>&1 | tail -15`
+    and the builder ran `pytest -q tests/test_cos.py 2>&1 | tail -15`; another
+    chained `ruff check . --fix … && ruff check . 2>&1 | tail -20`. Both are the
+    contract's commands, and a valid build was quarantined for them."""
+    m = lifecycle_propose._contract_command_matches
+    assert m("pytest -q <your test file> 2>&1 | tail -15", "pytest -q tests/test_cos.py 2>&1 | tail -15")
+    assert m("ruff check .", "ruff check . --fix 2>&1 | tail -20 && ruff check . 2>&1 | tail -20")
+    assert m("pytest -q 2>&1 | tail -3", "pytest  -q 2>&1  | tail -3")
+    assert not m("pytest -q tests/test_cos.py 2>&1 | tail -15", "echo hi")
+    assert not m("ruff check .", "pytest -q")
+
+
 def test_a_build_whose_files_and_contract_commands_all_agree_passes_through_unchanged(
     cartridge, plan_response, review_response
 ) -> None:
