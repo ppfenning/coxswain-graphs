@@ -675,6 +675,7 @@ def _quarantine_task(
     task: str,
     reason: str,
     kind: Literal["refused", "no_work", "unverified", "infra"],
+    detail: str | None = None,
 ) -> dict[str, Any]:
     """Build a task's quarantine entry AND leave a record on its own work item.
 
@@ -691,6 +692,10 @@ def _quarantine_task(
     `unverified` is an approved patch the validator would not sign off, so it
     is kept rather than discarded — `patch_kept: True` on both the entry and
     the attempt.
+
+    `detail`, when given, is stored as the attempt's own `reason` in place of
+    the terse one on `entry` — the next build's carried-forward brief gets the
+    fuller text, the printed quarantine line stays short.
     """
     patch_kept = kind == "unverified"
     entry: dict[str, Any] = {"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": kind}
@@ -703,7 +708,7 @@ def _quarantine_task(
                 path,
                 run=ctx.run_id,
                 phase=phase,
-                reason=reason,
+                reason=detail or reason,
                 kind=kind,
                 ts=datetime.now(UTC).isoformat(),
                 **({"patch_kept": True} if patch_kept else {}),
@@ -1011,6 +1016,14 @@ def _run_phase(
                 "branch": build["branch"],
                 "evidence": build["evidence"],
                 "quarantine": build.get("quarantine"),
+                # A quarantined task never reaches `surviving` below, so this is
+                # the only task record it gets — the per-check results have to
+                # land here too, not only on the `phase_state` a survivor's
+                # validator sees.
+                "change_facts": {
+                    **(build["result"].get("change_facts") or {}),
+                    **({"checks": build["checks"]} if "checks" in build else {}),
+                },
                 "governance_hits": hits,
                 "draft": None,
                 "merged": False,
@@ -1026,8 +1039,15 @@ def _run_phase(
             if is_harness_fault(reason):
                 quarantined.append({"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
             else:
+                failing = [c for c in (build.get("checks") or []) if not c.get("passed")]
+                detail = "\n\n".join(
+                    f"{c.get('name')}: {c.get('cmd')}\nexit {c.get('exit_code')}\n{c.get('output_tail') or ''}"
+                    for c in failing
+                ) or None
                 quarantined.append(
-                    _quarantine_task(ctx, by_id, phase=phase, task=task, reason=reason, kind="no_work")
+                    _quarantine_task(
+                        ctx, by_id, phase=phase, task=task, reason=reason, kind="no_work", detail=detail
+                    )
                 )
             continue
         surviving.append(task)
@@ -1050,7 +1070,10 @@ def _run_phase(
                     # recollection, and the graph strips one if it arrives.
                     "description": str((by_id.get(task) or {}).get("body") or ""),
                     "evidence": built[task]["evidence"],
-                    "change_facts": dict(built[task]["result"].get("change_facts") or {}),
+                    "change_facts": {
+                        **(built[task]["result"].get("change_facts") or {}),
+                        **({"checks": built[task]["checks"]} if "checks" in built[task] else {}),
+                    },
                     "review_verdict": str((built[task]["result"].get("review") or {}).get("verdict") or ""),
                     # The patch is machine evidence — the diff git applied — not
                     # the builder's account of it. A validator without it said,

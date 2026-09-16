@@ -402,7 +402,7 @@ def test_a_failing_check_quarantines_that_task_and_the_sibling_still_merges(repo
 
     quarantined = result["quarantined"]
     assert [q["id"] for q in quarantined] == ["t1-probe"]
-    assert "checks failed" in quarantined[0]["reason"]
+    assert "check failed" in quarantined[0]["reason"]
     assert quarantined[0]["kind"] == "no_work"
     assert "patch_kept" not in quarantined[0]
     assert result["totals"]["tasks_quarantined"] == 1
@@ -414,7 +414,7 @@ def test_a_failing_check_quarantines_that_task_and_the_sibling_still_merges(repo
     # The validator was told about the quarantine, and its verdict is what
     # decides the phase — which then does not unblock its dependent.
     prompt = next(c["prompt"] for c in runner.calls if c["role"] == "validate_phase")
-    assert "t1-probe" in prompt and "checks failed" in prompt
+    assert "t1-probe" in prompt and "check failed" in prompt
     assert result["phases"][0]["status"] == "partial"
     assert result["phases"][1]["status"] == "blocked"
     assert "did not meet its goal" in result["phases"][1]["reason"]
@@ -429,6 +429,60 @@ def test_the_failing_checks_evidence_reaches_the_record(repo, cart, tmp_path) ->
     result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
     failed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
     assert any(row["check"] == "checks:state" and "FAIL" in row["output"] for row in failed["evidence"])
+
+
+def test_change_facts_carries_the_full_checks_result_for_a_quarantined_task(repo, cart, tmp_path) -> None:
+    """The task record a failing check actually reaches — it never becomes a survivor."""
+    runner = Runner(
+        {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")},
+        verdicts={"p1-foundations": GOAL_UNMET},
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+    failed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert failed["status"] == "quarantined"
+    checks = failed["change_facts"]["checks"]
+    assert checks is not None
+    assert any(c["name"] == "state" and c["passed"] is False for c in checks)
+
+
+def test_change_facts_carries_the_full_checks_result_not_just_the_evidence_summary(repo, cart, tmp_path) -> None:
+    """The validator sees the whole per-check result object, not only the terse evidence line."""
+    runner = Runner({"t1-probe": new_file_patch("t1-probe.txt"), "t2-bench": new_file_patch("t2-bench.txt")})
+    _, runner = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+    prompt = next(c["prompt"] for c in runner.calls if c["role"] == "validate_phase")
+    assert "'id': 't1-probe'" in prompt
+    assert "'name': 'state'" in prompt and "'passed': True" in prompt and "'exit_code': 0" in prompt
+
+
+def test_a_failing_checks_detail_reaches_the_stored_attempt_and_the_next_ticket_body(repo, cart, tmp_path) -> None:
+    """The stored attempt carries the check's name, command and tail — the terse quarantine reason does not."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    work = workstore.read_initiative(wi)
+
+    runner = Runner({"t1-probe": new_file_patch("t1-probe.txt", "broken")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-checkfail")
+
+    terse = result["quarantined"][0]["reason"]
+    assert terse == "configured check failed: state — 1 failed"
+
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    stored = item["attempts"][0]["reason"]
+    assert "state" in stored and "check.py" in stored and "exit 1" in stored and "1 failed" in stored
+    assert stored != terse
+
+    work2 = workstore.read_initiative(wi)
+    runner2 = Runner({"t1-probe": new_file_patch("t1-probe.txt")})
+    drive(repo, cart, tmp_path, runner=runner2, work=work2, run_id="epic-checkfail-2")
+    prompt = next(c["prompt"] for c in runner2.calls if c["role"] == "build" and "t1-probe" in c["prompt"])
+    assert "check.py" in prompt and "1 failed" in prompt
 
 
 # ── outcome and the exit line: an approved build that does not land ─────────
@@ -450,7 +504,7 @@ def test_an_approved_and_quarantined_task_names_itself_in_the_exit_summary(repo,
 
     failed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
     assert failed["outcome"] == "approved_not_landed"
-    assert "checks failed" in failed["reason"]
+    assert "check failed" in failed["reason"]
     assert result["totals"]["approved_not_landed"] == 1
     assert f"approved but not landed: t1-probe — cox runs recover epic-1 t1-probe --repo {repo}" in result["exit_summary"]
 
@@ -523,7 +577,7 @@ def test_a_failing_repo_declared_check_quarantines_naming_it(repo, cart, tmp_pat
     result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
     quarantined = result["quarantined"]
     reason = next(q["reason"] for q in quarantined if q["id"] == "t1-probe")
-    assert "configured checks failed" in reason and "false" in reason
+    assert "configured check failed" in reason and "false" in reason
 
 
 def test_a_build_budget_under_the_cap_reaches_the_build_call(repo, cart, tmp_path) -> None:

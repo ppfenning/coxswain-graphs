@@ -221,5 +221,8 @@ def quarantine_reason(results: Sequence[Mapping[str, Any]]) -> str | None:
     if not real_failures:
         unrunnable = next(r for r in results if r.get("outcome") == "unrunnable")
         return f"{HARNESS_FAULT_PREFIX} check '{unrunnable['name']}' could not run: {unrunnable.get('error')}"
-    failed = ", ".join(r["name"] for r in results if not r.get("passed"))
-    return f"configured checks failed: {failed} — see evidence"
+    failing = [r for r in results if not r.get("passed")]
+    names = ", ".join(r["name"] for r in failing)
+    first_line = next((ln for ln in str(failing[0].get("output_tail") or "").splitlines() if ln.strip()), "")
+    detail = f" — {first_line}" if first_line else ""
+    return f"configured check failed: {names}{detail}"

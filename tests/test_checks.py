@@ -307,9 +307,9 @@ def test_quarantine_reason_is_the_harness_fault_wording_for_an_unrunnable_check(
     assert reason == "harness fault: check 'ghost' could not run: No such file or directory"
 
 
-def test_quarantine_reason_is_the_ordinary_wording_plus_see_evidence_for_a_real_failure() -> None:
+def test_quarantine_reason_is_the_ordinary_wording_with_no_tail_for_a_real_failure() -> None:
     results = [{"name": "tests", "passed": False, "outcome": "failed"}]
-    assert quarantine_reason(results) == "configured checks failed: tests — see evidence"
+    assert quarantine_reason(results) == "configured check failed: tests"
 
 
 def test_quarantine_reason_does_not_hide_a_real_failure_behind_an_unrunnable_one() -> None:
@@ -318,8 +318,20 @@ def test_quarantine_reason_does_not_hide_a_real_failure_behind_an_unrunnable_one
         {"name": "lint", "passed": False, "outcome": "unrunnable", "error": "No such file or directory"},
     ]
     reason = quarantine_reason(results)
-    assert reason == "configured checks failed: tests, lint — see evidence"
+    assert reason == "configured check failed: tests, lint"
     assert not is_harness_fault(reason)
+
+
+def test_quarantine_reason_names_the_check_and_the_first_non_empty_tail_line() -> None:
+    results = [{
+        "name": "lint",
+        "passed": False,
+        "outcome": "failed",
+        "output_tail": "F401 harness/x.py:3 unused import\nF401 harness/y.py:9 unused import",
+    }]
+    reason = quarantine_reason(results)
+    assert reason == "configured check failed: lint — F401 harness/x.py:3 unused import"
+    assert "see evidence" not in reason
 
 
 # ---------------------------------------------------------------------------
