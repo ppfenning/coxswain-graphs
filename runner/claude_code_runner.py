@@ -97,6 +97,32 @@ def reconcile_patch(reported: str, computed: str) -> tuple[str, str | None]:
     """The scratch's own diff over the model's account of it, or a named failure."""
     return (computed, None) if computed else ("", "patch_empty")
 
+
+def _unprefixed(token: str) -> str:
+    """Strip the one-letter path prefix git puts on a `+++`/`---` token — `a/`, `b/`, or (under `diff.mnemonicPrefix`) `c/`, `i/`, `w/`, `o/`."""
+    _, sep, rest = token.partition("/")
+    return rest if sep else token
+
+
+def files_touched_from_patch(patch: str) -> list[str]:
+    """The paths a patch changes, read from its own '+++'/'---' headers — never asked.
+
+    `+++ b/<path>` names every add or modify; a deletion has `+++ /dev/null` and
+    is named by `--- a/<path>` instead. Pure: no git invoked, no filesystem touched.
+    """
+    seen: list[str] = []
+    minus_token = ""
+    for line in patch.splitlines():
+        if line.startswith("--- "):
+            minus_token = line[4:]
+        elif line.startswith("+++ "):
+            plus_token = line[4:]
+            path = _unprefixed(minus_token if plus_token == "/dev/null" else plus_token)
+            if path and path not in seen:
+                seen.append(path)
+    return seen
+
+
 # Errors that are about the CALL, not about the work. The provider's own
 # safeguard classifier occasionally flags an ordinary node message — an
 # arbitration prompt quoting two reviewers reads, to a classifier, like an
@@ -127,6 +153,58 @@ def next_spent(previous: float, reported_usd: float, stopped: bool) -> float:
     return reported_usd if stopped else previous + reported_usd
 
 
+def _tool_result_text(content: Any) -> str:
+    """A tool result's own text, however the CLI shaped it."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            str(block.get("text") or "") for block in content if isinstance(block, Mapping) and block.get("type") == "text"
+        )
+    return ""
+
+
+def trace_commands(trace: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Every Bash call the trace shows was run, paired with its own tool result, in order.
+
+    Matched by `tool_use_id`, since parallel tool calls in one assistant turn
+    do not resolve in the order they were issued. Pure: reads `trace`, never
+    mutates it, touches nothing on disk.
+    """
+    pending: dict[str, str] = {}
+    commands: list[dict[str, str]] = []
+    for event in trace:
+        if not isinstance(event, Mapping):
+            continue
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if event.get("type") == "assistant":
+            for block in content or []:
+                if isinstance(block, Mapping) and block.get("type") == "tool_use" and block.get("name") == "Bash":
+                    tool_input = block.get("input")
+                    command = tool_input.get("command") if isinstance(tool_input, Mapping) else None
+                    tool_id = block.get("id")
+                    if command and tool_id:
+                        pending[tool_id] = str(command)
+        elif event.get("type") == "user":
+            for block in content or []:
+                if isinstance(block, Mapping) and block.get("type") == "tool_result" and block.get("tool_use_id") in pending:
+                    commands.append({
+                        "command": pending.pop(block["tool_use_id"]),
+                        "output": _tool_result_text(block.get("content")),
+                        "source": "trace",
+                    })
+    return commands
+
+
+def self_reported_commands(data: Mapping[str, Any]) -> list[dict[str, str]]:
+    """The model's own account of what it ran — kept only when no trace exists to derive it."""
+    reported = data.get("commands_run")
+    if not isinstance(reported, list):
+        return []
+    return [{"command": str(item), "source": "self_report"} for item in reported if item]
+
+
 def _call_fields(role: str, tier: str, model: str, tools: Sequence[str], payload: Mapping[str, Any]) -> dict[str, Any]:
     """The one shape a call is recorded in — success or failure alike."""
     usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
@@ -150,6 +228,7 @@ def _call_fields(role: str, tier: str, model: str, tools: Sequence[str], payload
         ),
         "output_tokens": int(usage.get("output_tokens") or 0),
         **({"trace": payload["trace"]} if payload.get("trace") else {}),
+        **({"commands_run": payload["commands_run"]} if "commands_run" in payload else {}),
     }
 
 
@@ -481,17 +560,22 @@ class ClaudeCodeRunner:
         n = sum(1 for c in self.calls if c["role"] == role) + 1
         path = self.trace_dir / f"{role}-{n}.jsonl"
         path.write_text(stdout + "\n", encoding="utf-8")
+        events: list[dict[str, Any]] = []
         last: dict[str, Any] | None = None
         for line in stdout.splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(event, dict) and event.get("type") == "result":
+            if not isinstance(event, dict):
+                continue
+            events.append(event)
+            if event.get("type") == "result":
                 last = event
         if last is None:
             raise RunnerError(f"node '{role}': no result event in the stream (trace at {path})")
         last["trace"] = str(path)
+        last["commands_run"] = trace_commands(events)
         return last
 
     # ── execution ───────────────────────────────────────────────────────────
@@ -649,6 +733,10 @@ class ClaudeCodeRunner:
             self._append_call_ledger(call, ok=False, error=message)
             raise RunnerError(message)
 
+        # Appended now, not after reconciliation below: a same-role retry's
+        # trace file is numbered from this count (`_payload`), and a call that
+        # fails the patch_empty gate must still hold its slot or the retry
+        # overwrites the failed attempt's own trace file.
         self.calls.append(call)
         if role in _PATCH_ROLES and has_scratch:
             patch, reason = reconcile_patch(str(data.get("patch") or ""), computed_patch)
@@ -657,5 +745,10 @@ class ClaudeCodeRunner:
                 self._append_call_ledger(call, ok=False, error=message)
                 raise RunnerError(message)
             data = {**data, "patch": patch}
-        self._append_call_ledger(call, ok=True)
+        self.calls[-1] = {
+            **call,
+            "files_touched": files_touched_from_patch(str(data.get("patch") or "")),
+            "commands_run": call.get("commands_run", self_reported_commands(data)),
+        }
+        self._append_call_ledger(self.calls[-1], ok=True)
         return NodeResult(data)

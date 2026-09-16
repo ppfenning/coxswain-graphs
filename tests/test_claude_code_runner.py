@@ -16,7 +16,14 @@ from pathlib import Path
 import pytest
 
 from runner import RunnerError
-from runner.claude_code_runner import ClaudeCodeRunner, next_spent, reconcile_patch
+from runner.claude_code_runner import (
+    ClaudeCodeRunner,
+    files_touched_from_patch,
+    next_spent,
+    reconcile_patch,
+    self_reported_commands,
+    trace_commands,
+)
 from runner.protocol import BudgetStop
 from runner.scripted import ScriptedRunner
 
@@ -381,6 +388,16 @@ def test_a_successful_build_returns_the_scratchs_diff_not_the_models(fake_claude
     assert out["summary"] == "did the thing" and out["files_touched"] == ["f.txt"]
 
 
+def test_the_recorded_calls_files_touched_comes_from_the_scratchs_diff_not_the_model(fake_claude, tmp_path, repo) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": False, "total_cost_usd": 0.01, "num_turns": 1,
+                "structured_output": {"files_touched": ["f.txt"], "patch": "diff --git a/test.txt\n-a\n+b\n"}})
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["files_touched"] == ["built.txt"], "derived from the reconciled patch, not the model's report"
+
+
 def test_a_build_that_edited_nothing_is_refused_as_patch_empty(tmp_path, repo) -> None:
     """A bare `cat` of the canned output: no `.git` write, so the scratch stays clean."""
     output = tmp_path / "output.json"
@@ -511,7 +528,8 @@ def test_a_trace_dir_switches_to_stream_json_and_keeps_every_event(fake_claude, 
     events = [
         {"type": "system", "subtype": "init"},
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/r/f.py"}}]}},
-        {"type": "user", "message": {"content": []}},
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pytest -q"}}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "39 passed"}]}},
         {"type": "result", "subtype": "success", "is_error": False, "structured_output": {"ok": True},
          "num_turns": 2, "total_cost_usd": 0.02, "usage": {"input_tokens": 10, "cache_read_input_tokens": 90, "output_tokens": 5}},
     ]
@@ -522,8 +540,9 @@ def test_a_trace_dir_switches_to_stream_json_and_keeps_every_event(fake_claude, 
     assert argv[argv.index("--output-format") + 1] == "stream-json" and "--verbose" in argv
     assert dict(out) == {"ok": True}
     trace = tmp_path / "trace" / "build-1.jsonl"
-    assert trace.is_file() and len(trace.read_text().splitlines()) == 4
+    assert trace.is_file() and len(trace.read_text().splitlines()) == 5
     assert runner.calls[-1]["trace"] == str(trace) and runner.calls[-1]["turns"] == 2
+    assert runner.calls[-1]["commands_run"] == [{"command": "pytest -q", "output": "39 passed", "source": "trace"}]
     runner.run(role="build", schema=SCHEMA, prompt="again")
     assert (tmp_path / "trace" / "build-2.jsonl").is_file(), "one file per call, numbered per role"
 
@@ -542,6 +561,95 @@ def test_without_a_trace_dir_nothing_changes(fake_claude, tmp_path) -> None:
     argv = recorded(fake_claude)["argv"]
     assert argv[argv.index("--output-format") + 1] == "json" and "--verbose" not in argv
     assert "trace" not in runner.calls[-1]
+
+
+# ── derived evidence: files_touched, commands_run ────────────────────────────
+
+
+def _tool_use(tool_id: str, command: str) -> dict:
+    return {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_id, "name": "Bash", "input": {"command": command}}]}}
+
+
+def _tool_result(tool_id: str, output: str) -> dict:
+    return {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id, "content": output}]}}
+
+
+def test_trace_commands_returns_bash_commands_in_call_order() -> None:
+    trace = [
+        _tool_use("t1", "pytest -q"),
+        _tool_result("t1", "39 passed"),
+        _tool_use("t2", "ruff check ."),
+        _tool_result("t2", "All checks passed!"),
+    ]
+    assert trace_commands(trace) == [
+        {"command": "pytest -q", "output": "39 passed", "source": "trace"},
+        {"command": "ruff check .", "output": "All checks passed!", "source": "trace"},
+    ]
+
+
+def test_trace_commands_with_no_bash_calls_returns_nothing() -> None:
+    trace = [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/r/f.py"}}]}},
+        {"type": "result", "subtype": "success"},
+    ]
+    assert trace_commands(trace) == []
+
+
+def test_self_reported_commands_tags_the_models_own_list() -> None:
+    assert self_reported_commands({"commands_run": ["pytest -q", "ruff check ."]}) == [
+        {"command": "pytest -q", "source": "self_report"},
+        {"command": "ruff check .", "source": "self_report"},
+    ]
+
+
+def test_self_reported_commands_with_none_reported_is_nothing() -> None:
+    assert self_reported_commands({}) == []
+
+
+def test_files_touched_from_patch_reads_the_plus_and_minus_headers() -> None:
+    patch = (
+        "diff --git a/runner/x.py b/runner/x.py\n"
+        "--- a/runner/x.py\n"
+        "+++ b/runner/x.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        "diff --git a/tests/y.py b/tests/y.py\n"
+        "--- a/tests/y.py\n"
+        "+++ b/tests/y.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    assert files_touched_from_patch(patch) == ["runner/x.py", "tests/y.py"]
+
+
+def test_files_touched_from_patch_with_no_patch_returns_nothing() -> None:
+    assert files_touched_from_patch("") == []
+
+
+def test_files_touched_from_patch_names_a_deleted_file_by_its_minus_header() -> None:
+    patch = (
+        "diff --git a/a.py b/a.py\n"
+        "--- a/a.py\n"
+        "+++ b/a.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        "diff --git a/b.py b/b.py\n"
+        "deleted file mode 100644\n"
+        "--- a/b.py\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n"
+        "-old\n"
+    )
+    assert files_touched_from_patch(patch) == ["a.py", "b.py"]
+
+
+def test_files_touched_from_patch_strips_mnemonic_prefixes_too() -> None:
+    """`git -c diff.mnemonicPrefix=true diff` headers read `c/... i/...`, not `a/... b/...`."""
+    patch = "diff --git c/built.txt i/built.txt\n--- /dev/null\n+++ i/built.txt\n@@ -0,0 +1 @@\n+edited\n"
+    assert files_touched_from_patch(patch) == ["built.txt"]
 
 
 # ── the per-call ledger ──────────────────────────────────────────────────────
@@ -956,6 +1064,37 @@ def test_a_patch_empty_refusal_is_not_ledgered_as_a_success(tmp_path, repo) -> N
     rows = _ledger_lines(tmp_path, "r1")
     assert len(rows) == 1
     assert rows[0]["ok"] is False and "patch_empty" in rows[0]["error"]
+
+
+def test_a_patch_empty_retry_does_not_overwrite_the_failed_attempts_trace(tmp_path, repo) -> None:
+    """The failed attempt must still occupy a slot in `self.calls`, or `_payload` numbers the retry's
+    trace file the same as the one it just lost — the exact loss this initiative exists to close."""
+    failed = tmp_path / "failed.json"
+    failed.write_text(
+        json.dumps({"type": "result", "is_error": False, "total_cost_usd": 0.01, "num_turns": 1, "structured_output": {"patch": ""}}) + "\n",
+        encoding="utf-8",
+    )
+    ok = tmp_path / "ok.json"
+    ok.write_text(
+        json.dumps({"type": "result", "is_error": False, "total_cost_usd": 0.01, "num_turns": 1, "structured_output": {"summary": "done"}}) + "\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "attempted"
+    script = tmp_path / "claude"
+    script.write_text(
+        f"#!/bin/sh\nif [ -f {marker} ]; then echo edited > built.txt; cat {ok}; else touch {marker}; cat {failed}; fi\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo, trace_dir=tmp_path / "trace")
+    with pytest.raises(RunnerError, match="patch_empty"):
+        runner.run(role="build", schema=SCHEMA, prompt="go")
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    trace_dir = tmp_path / "trace"
+    failed_trace = json.loads((trace_dir / "build-1.jsonl").read_text().splitlines()[-1])
+    ok_trace = json.loads((trace_dir / "build-2.jsonl").read_text().splitlines()[-1])
+    assert failed_trace["structured_output"] == {"patch": ""}
+    assert ok_trace["structured_output"] == {"summary": "done"}
 
 
 def test_a_successful_resume_keeps_accumulating_spend(sequenced_claude, tmp_path, repo) -> None:
