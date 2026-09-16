@@ -35,6 +35,13 @@ def test_a_device_path_is_notation_not_a_reach_problem():
     assert lint_tickets(tasks, [], [], "graphs") == []
 
 
+def test_an_absolute_spelling_of_a_repository_file_is_not_a_reach_problem():
+    """graphs-advisory-not-surface-1: the seat wrote the repo file's absolute path and was refused."""
+    tasks = [_task(body="the emit step in /home/x/repos/coxswain-graphs/graphs/delivery/ticket_lint.py merges advisories")]
+    tree = [{"path": "graphs/delivery/ticket_lint.py", "repo": "graphs"}]
+    assert lint_tickets(tasks, tree, [], "graphs") == []
+
+
 def test_a_real_corpus_path_is_still_a_reach_refusal():
     tasks = [_task(body="read `runs/tools-loop-fixes-3.log` for the outcome")]
     problems = lint_tickets(tasks, [], [], "graphs")
