@@ -423,6 +423,10 @@ def test_run_cos_runs_the_cos_graph_itself_when_no_result_is_given(cart) -> None
     assert runner.calls[0]["role"] == "dispatch"
 
 
+def test_known_graphs_names_sweep_for_coxswain_dispatch() -> None:
+    assert "sweep" in cos._KNOWN_GRAPHS
+
+
 def test_run_cos_raises_a_cos_error_for_a_selection_it_has_no_recipe_for(cart) -> None:
     weird_spec, _ = _stub_spec("lifecycle", "lifecycle-propose")
     specs = {"lifecycle": weird_spec}

@@ -69,7 +69,7 @@ class CosError(Exception):
 # Which graphs this driver can build invocation args for. `assemble_docket`
 # marks everything else not runnable, so `run_cos` should never see a
 # selection outside this set — `CosError` exists for the day something drifts.
-_KNOWN_GRAPHS = ("retro", "decompose", "triage")
+_KNOWN_GRAPHS = ("retro", "decompose", "triage", "sweep")
 
 _DEFAULT_MAX_IN_FLIGHT = 3
 
