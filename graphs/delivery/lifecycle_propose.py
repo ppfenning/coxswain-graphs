@@ -535,9 +535,25 @@ def _contract_command_matches(contract: str, ran: str) -> bool:
     # A quoted command that trails off — `pytest -q <file> ...` in a chair
     # note — names its head, not a byte string: the tail is open.
     contract = re.sub(r"\s*(\.\.\.|\u2026)\s*$", "", " ".join(contract.split()))
+    ran = " ".join(ran.split())
     parts = [re.escape(p) for p in re.split(r"<[^>]*>", contract)]
-    pattern = r"\S+".join(parts)
-    return re.search(pattern, " ".join(ran.split())) is not None
+    if re.search(r"\S+".join(parts), ran) is not None:
+        return True
+    # A pytest line names files to prove, not an argv to reproduce: a run
+    # that covers every named file — or a bare `pytest -q` over the whole
+    # suite — is the same evidence, however the builder spelled it.
+    want, got = _pytest_files(contract), _pytest_files(ran)
+    if want is None or got is None:
+        return False
+    return not got or want <= got
+
+
+def _pytest_files(command: str) -> set[str] | None:
+    """The test paths a `pytest` invocation names (empty set = whole suite); None if it is not one."""
+    head = command.split("|")[0].split("&&")[0].split(";")[0]
+    if not re.match(r"^\s*(python\S*\s+-m\s+)?pytest\b", head):
+        return None
+    return {t for t in head.split()[1:] if not t.startswith("-") and (t.endswith(".py") or "/" in t)}
 
 
 def _is_budget_stop(exc: Exception) -> bool:
