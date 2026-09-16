@@ -38,7 +38,7 @@ def cart(cartridge) -> dict:
     return cartridge
 
 
-def seed(path: Path, outcome: str, n: int, kind: str = "draft_pr_create") -> None:
+def seed(path: Path, outcome: str, n: int, kind: str = "draft_pr_create", model: str | None = None) -> None:
     ledger.append(
         [
             {
@@ -50,6 +50,7 @@ def seed(path: Path, outcome: str, n: int, kind: str = "draft_pr_create") -> Non
                 "outcome": outcome,
                 "cartridge_sha": SHA,
                 "provider_profile": PROFILE,
+                **({"model": model} if model is not None else {}),
             }
             for i in range(n)
         ],
@@ -113,6 +114,31 @@ def test_the_caller_filters_so_policy_is_never_handed_mixed_rows(cart, tmp_path)
     )
     auto, _ = split([PROPOSAL], cart, path)  # must not raise
     assert len(auto) == 1
+
+
+def test_same_model_binding_shares_a_streak(cart, tmp_path) -> None:
+    path = tmp_path / "l.jsonl"
+    seed(path, "clean", 3, model="claude-a")
+    auto, gated = split([{**PROPOSAL, "model": "claude-a"}], cart, path)
+    assert len(auto) == 1 and gated == []
+
+
+def test_a_different_model_does_not_inherit_the_streak(cart, tmp_path) -> None:
+    """A streak earned under one model binding is not another model's streak."""
+    path = tmp_path / "l.jsonl"
+    seed(path, "clean", 3, model="claude-a")
+    auto, gated = split([{**PROPOSAL, "model": "claude-b"}], cart, path)
+    assert auto == [], "a different model binding must not inherit the streak"
+    assert len(gated) == 1
+
+
+def test_a_row_without_model_does_not_count_for_an_item_that_has_one(cart, tmp_path) -> None:
+    """§6 rule 7: a row without model never counts toward a streak read for a binding."""
+    path = tmp_path / "l.jsonl"
+    seed(path, "clean", 3)  # legacy rows, written before any graph set model
+    auto, gated = split([{**PROPOSAL, "model": "claude-a"}], cart, path)
+    assert auto == [], "a modelless row must not count toward a model-bearing item's streak"
+    assert len(gated) == 1
 
 
 def test_caps_bound_a_graduated_kind_within_one_run(cart, tmp_path) -> None:
