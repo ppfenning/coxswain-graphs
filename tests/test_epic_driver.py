@@ -743,11 +743,15 @@ def test_the_cli_exit_line_names_an_approved_and_unlanded_task(monkeypatch, tmp_
         },
     )
 
+    profile = tmp_path / "provider.yaml"
+    profile.write_text("provider: acme\n", encoding="utf-8")
+
     exit_code = cli.main(
         [
             "epic", "--team", "acme", "--unverified-skills",
             "--initiative", str(tmp_path / "initiative"), "--repo", "/repo",
             "--run-id", "epic-1", "--runs-dir", str(tmp_path / "runs"),
+            "--provider-profile", str(profile),
         ]
     )
 

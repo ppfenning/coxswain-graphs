@@ -12,6 +12,7 @@ driver, running the lifecycle graph once per ready task, concurrently.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -250,6 +251,13 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     return parser
 
 
+def _provider_profile_scope(path: Path | str) -> str:
+    """`stem@sha12` of the resolved profile file's bytes (triage.md §4)."""
+    resolved = Path(path)
+    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()[:12]
+    return f"{resolved.stem}@{digest}"
+
+
 def _materialise(spec: GraphSpec, args: argparse.Namespace, parser: argparse.ArgumentParser) -> dict[str, Any]:
     """Turn a spec's declared needs into graph args. All I/O happens HERE.
 
@@ -453,7 +461,7 @@ def _run_graph(
             date=args.date,
             max_parallel=args.max_parallel,
             ledger_path=args.ledger,
-            provider_profile=Path(args.provider_profile).stem,
+            provider_profile=_provider_profile_scope(args.provider_profile),
             runs_dir=args.runs_dir,
             worktree_root=args.worktree_root
             or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees"),
@@ -619,7 +627,7 @@ def _run_graph(
             print(f"{graph_name} failed: {exc}", file=sys.stderr)
             return 1
 
-    provider_profile = Path(args.provider_profile).stem
+    provider_profile = _provider_profile_scope(args.provider_profile)
     proposals = result.get("proposals", [])
 
     # The check arm. Only when --repo names the project this change targets,
