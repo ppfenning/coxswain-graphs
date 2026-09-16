@@ -562,7 +562,10 @@ def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int) -
         if line.startswith("+++ ")
     ]
     if surfaces:
-        outside = [path for path in touched if path not in surfaces]
+        # A surface written `path (new)` names the path; the marker is the
+        # decompose's note that the file does not exist yet, not part of it.
+        declared = {re.sub(r"\s*\([^)]*\)\s*$", "", str(s_)) for s_ in surfaces}
+        outside = [path for path in touched if path not in declared]
         if outside:
             return False, (
                 f"partial work touches {outside[0]} outside the task's surfaces: "
