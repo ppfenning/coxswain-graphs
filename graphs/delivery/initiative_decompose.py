@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
+from graphs.delivery.ticket_lint import Problem, lint_tickets
 from runner.protocol import NodeRunner
 
 __all__ = ["GRAPH_NAME", "initiative_text", "resolve_surfaces", "run", "surface_problem"]
@@ -163,6 +164,13 @@ def surface_problem(unresolved: Sequence[str]) -> str | None:
     if not unresolved:
         return None
     return "\n".join(f"unbuildable: surfaces are prose — {item}" for item in unresolved)
+
+
+def _lint_refusal_text(problems: Sequence[Problem]) -> str | None:
+    """One line per reach/coupling `Problem`; `None` when there is nothing to refuse."""
+    if not problems:
+        return None
+    return "\n".join(f"{p.task}: {p.rule} — {p.detail} ({p.fix})" for p in problems)
 
 
 def _apply_surface_resolutions(tasks: list[dict[str, Any]], tree: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -377,6 +385,52 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 raise ContractViolation(surface_problem(problems))
         tasks = _split_cross_repo(_apply_surface_resolutions(tasks, tree), tree)
 
+    grants = list(args.get("grants") or [])
+    repo_name = str(args.get("repo") or "")
+    lint_problems = lint_tickets(tasks, tree, grants, repo_name)
+    refusals = [p for p in lint_problems if p.severity == "refusal"]
+    if refusals:
+        # reach and coupling block the run, same as an unresolved surface does:
+        # quarantine outright with no adversary bound, otherwise ask it for a
+        # correction and re-lint before trusting the result. The correction
+        # schema only rewrites `surfaces` (see _apply_corrections below), so a
+        # reach hit sourced from body prose rather than a declared surface has
+        # nothing for the correction to match — the wrong belief to hold here
+        # is that a correction can reach into prose; it cannot, and the run
+        # quarantines on the second lint exactly as it would with no adversary
+        # bound at all.
+        if "review_adversary" not in bound:
+            raise ContractViolation(_lint_refusal_text(refusals))
+        correction = dict(
+            runner.run(
+                role="review_adversary",
+                tier="deep",
+                schema=UNBUILDABLE_SCHEMA,
+                context=context,
+                prompt=(
+                    "Ticket lint refused these tasks for reach or coupling. Resolve "
+                    "each so the problem no longer holds.\n\n" + (_lint_refusal_text(refusals) or "")
+                ),
+            )
+        )
+        tasks = _apply_corrections(tasks, correction.get("corrections") or [])
+        lint_problems = lint_tickets(tasks, tree, grants, repo_name)
+        refusals = [p for p in lint_problems if p.severity == "refusal"]
+        if refusals:
+            raise ContractViolation(_lint_refusal_text(refusals))
+
+    advisories = [p for p in lint_problems if p.severity == "advisory"]
+    if advisories:
+        # grant and size never block; they land on the ticket as a `lint:`
+        # entry for the human at the gate to see.
+        notes: dict[str, list[str]] = {}
+        for p in advisories:
+            notes.setdefault(p.task, []).append(f"{p.rule}: {p.detail} ({p.fix})")
+        tasks = [
+            dict(t, lint=[*(t.get("lint") or []), *notes[str(t["id"])]]) if str(t["id"]) in notes else t
+            for t in tasks
+        ]
+
     shape = epic_shape(
         cartridge,
         phases=len({t["phase"] for t in tasks}),
@@ -404,6 +458,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 *(
                     [{"check": "adversary on the DAG", "output": "adversary edges applied: " + str(challenge.get("summary"))}]
                     if challenge
+                    else []
+                ),
+                *(
+                    [{"check": "lint", "output": "; ".join(task.get("lint") or [])}]
+                    if task.get("lint")
                     else []
                 ),
             ],
@@ -473,10 +532,15 @@ def _item_action(task: Mapping[str, Any], *, landing: str, initiative_id: str | 
     # not exist — the third live run landed exactly that and the DAG refused.
     needs = ", ".join(str(n) for n in task.get("needs") or [])
     surfaces = ", ".join(str(x) for x in task.get("surfaces") or [])
+    # Ticket lint's grant/size warnings land here too — docs/design/work-shape.md
+    # §3 puts them in the ticket's own `lint:` frontmatter list, not just the
+    # in-memory task the graph returns. `; ` separates entries because a single
+    # entry's own detail and fix routinely carry commas.
+    lint = "; ".join(str(x) for x in task.get("lint") or [])
     return (
         f"create {where}/{task['id']}.md with frontmatter id={task['id']}, "
         f"title={task.get('title') or task['id']!s}, phase={task.get('phase')}, state=ready, "
-        f"needs=[{needs}], surfaces=[{surfaces}]; body = the rationale"
+        f"needs=[{needs}], surfaces=[{surfaces}], lint=[{lint}]; body = the rationale"
     )
 
 
@@ -502,5 +566,8 @@ SPEC = GraphSpec(
         Need("intake_path", flag="--from-intake", required=False,
              help="path to the intake file this idea came from, when it did; links initiative.md "
                   "and the intake file both ways"),
+        Need("grants", flag="--grants", kind="json_file", required=False,
+             help="JSON array of commands the build seat's sandbox actually permits, for the "
+                  "ticket-lint grant rule (default: none granted)"),
     ),
 )
