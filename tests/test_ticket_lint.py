@@ -14,6 +14,27 @@ def test_a_path_outside_the_target_repo_is_a_reach_refusal():
     assert problems[0].severity == "refusal"
 
 
+def test_a_bare_slash_between_words_is_not_a_reach_problem():
+    """tools-schema-version-1: "cartridges 1.0 / graphs 1.0" was refused as `names /, not inside`."""
+    tasks = [_task(body="doctor prints `schema ok cartridges 1.0 / graphs 1.0 / tools 1.0`")]
+    tree = [{"path": "graphs/delivery/ticket_lint.py", "repo": "graphs"}]
+    assert lint_tickets(tasks, tree, [], "graphs") == []
+
+
+def test_a_path_shape_with_a_placeholder_is_notation_not_a_reach_problem():
+    """tools-clean-guard-1..3, graphs-gate-landing-1: the seat wrote `runs/<run>/tasks/<phase>/<task>.json`
+    to describe the record's shape and the corpus rule refused the whole decompose."""
+    tasks = [_task(body="the record under `runs/<run>/tasks/<phase>/<task>.json` says landed")]
+    tree = [{"path": "graphs/delivery/ticket_lint.py", "repo": "graphs"}]
+    assert lint_tickets(tasks, tree, [], "graphs") == []
+
+
+def test_a_real_corpus_path_is_still_a_reach_refusal():
+    tasks = [_task(body="read `runs/tools-loop-fixes-3.log` for the outcome")]
+    problems = lint_tickets(tasks, [], [], "graphs")
+    assert [p.rule for p in problems] == ["reach"]
+
+
 def test_a_command_the_sandbox_does_not_grant_is_a_grant_advisory():
     tasks = [_task(body="verify with `cox route lint t1`")]
     problems = lint_tickets(tasks, [], ["pytest", "git status", "git diff"], "graphs")
