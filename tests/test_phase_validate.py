@@ -525,3 +525,11 @@ def test_a_worktree_with_no_reader_still_gets_a_second_ask(cart, tmp_path) -> No
     by_task = {v["task"]: v for v in result["chunk_verdicts"]}
     assert by_task["t1-probe"]["evidence_supplied"] == []
     assert by_task["t1-probe"]["evidence_unread"] == ["migrations/0007_add_col.sql (no evidence reader was supplied)"]
+
+
+def test_the_chunk_brief_states_that_command_evidence_is_trace_observed(cart) -> None:
+    """validator-reach.md §1: the validator is told what a `command` entry is and that nothing else can carry one."""
+    _, runner = run(cart)
+    chunk_prompts = [c["prompt"] for c in runner.calls if c["role"] == "validate_chunk"]
+    assert chunk_prompts
+    assert all("observed by the harness" in p and "matching `command` entry" in p for p in chunk_prompts)

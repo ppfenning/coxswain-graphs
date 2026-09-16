@@ -33,7 +33,7 @@ the validator reads.
   one `{"check": "files_touched", "source": "trace", "output": "<path per line>"}`. Entries come from the
   build call's `commands_run` where `source == "trace"`; a self-reported command (`source: self_report`)
   is NOT folded in — the validator must never be shown a claim as an observation.
-- `graphs/delivery/lifecycle_propose.py`: the validation brief states, in one sentence, that every
+- `graphs/delivery/phase_validate.py` (`chunk_prompt`, the brief `validate_chunk` reads): the validation brief states, in one sentence, that every
   `command` entry was observed by the harness, that there is no other place a build's commands can appear,
   and that a ticket requirement for a command is met by a matching `command` entry.
 - Order is preserved (the trace's order), so "ran the tests after the edit" is checkable.
@@ -43,7 +43,7 @@ the validator reads.
 - `validate_chunk`'s output schema gains `defects: [{claim, where: {file, line?}, evidence_ref?}]`.
   `unsatisfied` with an empty `defects` list is **malformed**. `where.file` names a path in the diff or an
   `evidence` entry's `check`; a claim that names neither is also malformed.
-- The harness (`lifecycle_propose.py`, at the validate site) handles malformed like a placeholder review:
+- The harness (`graphs/delivery/phase_validate.py`, at the `validate_chunk` site — its same-role retry is the pattern) handles malformed like a placeholder review:
   one retry of the same node with the malformation quoted back ("your refusal names no defect"); a second
   malformed answer is recorded on the task record as `validation: {verdict: abstained, reason:
   "malformed refusal x2"}` and the task proceeds on the reviewers' verdicts. An abstention never discards
