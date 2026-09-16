@@ -65,10 +65,11 @@ from harness.checks import (
 )
 from harness.digest import build_digest
 from harness.escalate import escalate_self_modification
-from harness.gate import auto_apply, gate
+from harness.gate import apply_arm_for, auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
 from harness.worktree import apply_patch, create_worktree, keep_worktree, prune_registrations, remove_worktree
+from runner.protocol import RunnerError
 
 __all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
 
@@ -686,18 +687,22 @@ def _quarantine_task(
     the quarantine entry itself.
 
     `kind` is the closed set from docs/design/observed-record.md §3. `infra`
-    is never passed here: nothing ran for the task at all, so that case is
-    the caller's own branch at the `_open_phase_worktree` failure site, which
-    marks the phase `phase_failed_to_start` and never reaches this function.
-    `unverified` is an approved patch the validator would not sign off, so it
-    is kept rather than discarded — `patch_kept: True` on both the entry and
-    the attempt.
+    reaches here two ways: the caller's own branch at the `_open_phase_worktree`
+    failure site, which marks the phase `phase_failed_to_start` before this
+    function ever sees a task, and `_execute`, when the apply arm itself raises
+    rather than reports. `unverified` is an approved patch the validator would
+    not sign off, so it is kept rather than discarded — `patch_kept: True` on
+    both the entry and the attempt. `infra` from `_execute` gets the same
+    `patch_kept`, but it names the BUILD's already-approved patch already on
+    the task record, not a resumable arm session: `auto_apply`'s `runner.run`
+    call carries no `thread=`, so nothing about the failed arm call itself
+    survives to be resumed.
 
     `detail`, when given, is stored as the attempt's own `reason` in place of
     the terse one on `entry` — the next build's carried-forward brief gets the
     fuller text, the printed quarantine line stays short.
     """
-    patch_kept = kind == "unverified"
+    patch_kept = kind in ("unverified", "infra")
     entry: dict[str, Any] = {"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": kind}
     if patch_kept:
         entry["patch_kept"] = True
@@ -846,7 +851,11 @@ def _run_phase(
     # again — quarantined here, plainly, never through `_quarantine_task`,
     # because a refusal is not an attempt and must not grow the count it is
     # enforcing.
-    attempts_by_id = {str(item["id"]): item.get("attempts") or [] for item in all_ready}
+    # An `infra` attempt is the apply arm's own failure, not the task's, so it
+    # must not grow the count the cap enforces.
+    attempts_by_id = {
+        str(item["id"]): [a for a in (item.get("attempts") or []) if a.get("kind") != "infra"] for item in all_ready
+    }
     for task_id, attempts in attempts_by_id.items():
         if len(attempts) < ATTEMPT_CAP:
             continue
@@ -1158,7 +1167,7 @@ def _run_phase(
     for item in batch:
         slot, subject = slots.get(id(item), ("other", ""))
         if id(item) in auto_ids:
-            applied, _ = _execute(ctx, item, slot=slot, subject=subject, phase=phase, state=state)
+            applied, _ = _execute(ctx, item, slot=slot, subject=subject, phase=phase, state=state, by_id=by_id)
             # Auto-cleared: NO gate diff and NO ledger row. Autonomy is spent by
             # acting; a row here would let a kind ratchet itself up on its own
             # say-so, which is the self-report the ledger exists to disbelieve.
@@ -1168,25 +1177,37 @@ def _run_phase(
         decision, edited = decided.get(id(item), ("refused", False))
         applied = False
         if decision == "approved":
-            applied, _ = _execute(ctx, item, slot=slot, subject=subject, phase=phase, state=state)
+            applied, _ = _execute(ctx, item, slot=slot, subject=subject, phase=phase, state=state, by_id=by_id)
             record["rebased"] = record["rebased"] or (applied and slot == "rebase")
         # Built here rather than by `gate.apply_decisions`, which cannot know
         # about a branch this driver created: `applied` is what actually
         # happened, so an approved merge that conflicted records `skipped`.
         diffs.append(gate_diff(item, decision, applied=applied, edited=edited))
 
+    # `_execute` can quarantine a task after its merge already succeeded — the
+    # apply arm failing on its own bookkeeping, not the code — so that failure
+    # must reach the task record here, or reconciliation below would see only
+    # `merged=True` and report it `landed`.
+    quarantined_by_task = {q["id"]: q["reason"] for q in state.quarantined if q.get("grain") == "task"}
+
     for task_record in record["task_records"]:
         task = task_record["id"]
         task_record["draft"] = ctx.draft_branch(phase, task) if state.landed.get(task) else None
         task_record["merged"] = bool(state.merged.get(task))
-        if state.merged.get(task) is False and not task_record.get("quarantine"):
+        if task in quarantined_by_task and not task_record.get("quarantine"):
+            task_record["status"] = "quarantined"
+            task_record["quarantine"] = quarantined_by_task[task]
+        elif state.merged.get(task) is False and not task_record.get("quarantine"):
             task_record["status"] = "quarantined"
         verdicts = (built.get(task) or {}).get("result") or {}
         task_record["outcome"] = task_outcome(
             str((verdicts.get("review") or {}).get("verdict") or "") or None,
             str((verdicts.get("arbitration") or {}).get("verdict") or "") or None,
             task_record.get("quarantine"),
-            task_record["merged"],
+            # Merged AND quarantined only happens when `_execute`'s own
+            # bookkeeping step failed after the code already landed — that is
+            # not `landed` in the sense this outcome reports.
+            task_record["merged"] and not task_record.get("quarantine"),
         )
         task_record["reason"] = task_record.get("quarantine")
 
@@ -1493,6 +1514,7 @@ def _execute(
     subject: str,
     phase: str,
     state: _Execution,
+    by_id: Mapping[str, dict[str, Any]],
 ) -> tuple[bool, str]:
     """Do what the gate — or the policy — cleared. Dispatch on the KIND, not the slot.
 
@@ -1544,8 +1566,17 @@ def _execute(
 
     # Everything else goes to the arm the cartridge names — the same call
     # `gate.apply_decisions` makes, because an apply arm is a role and the same
-    # runner that ran the read-only nodes runs the write.
-    applied, detail = auto_apply(dict(item), cartridge=ctx.cartridge, runner=ctx.runner)
+    # runner that ran the read-only nodes runs the write. The build itself was
+    # already reviewed, adversaried and arbitrated; a `RunnerError` here is the
+    # arm's own infrastructure failing, not the task, so it quarantines the
+    # task as `infra` and lets the phase continue rather than crashing `run_epic`.
+    try:
+        applied, detail = auto_apply(dict(item), cartridge=ctx.cartridge, runner=ctx.runner)
+    except RunnerError as exc:
+        arm = apply_arm_for(item.get("kind"), ctx.cartridge)
+        reason = f"apply arm '{arm}' raised {type(exc).__name__}: {exc}"
+        state.quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=subject, reason=reason, kind="infra"))
+        return False, reason
     if slot == "state_move":
         state.moved[subject] = applied
     return applied, detail
