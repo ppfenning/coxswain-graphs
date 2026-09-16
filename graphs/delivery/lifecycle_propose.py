@@ -520,10 +520,21 @@ def _build_output_valid(build: Mapping[str, Any], ticket_text: str) -> str | Non
     files, touched = set(_patch_sections(build.get("patch") or "")), set(build.get("files_touched") or [])
     if files != touched:
         return f"files_touched {sorted(touched)} does not match the patch's files {sorted(files)}"
-    run = {str(e.get("command") or "").strip(): str(e.get("output") or "").strip()
-           for e in build.get("commands_run") or [] if isinstance(e, Mapping)}
-    missing = [c for c in _CONTRACT_COMMAND_RE.findall(ticket_text) if not run.get(c)]
+    run = [(str(e.get("command") or "").strip(), str(e.get("output") or "").strip())
+           for e in build.get("commands_run") or [] if isinstance(e, Mapping)]
+    missing = [c for c in _CONTRACT_COMMAND_RE.findall(ticket_text)
+               if not any(_contract_command_matches(c, cmd) and out for cmd, out in run)]
     return f"commands_run has no output for {missing}" if missing else None
+
+
+def _contract_command_matches(contract: str, ran: str) -> bool:
+    """A contract line names a shape, not a byte string: `<your test file>`
+    placeholders stand for one token, and the builder may chain or wrap the
+    command (`… && ruff check .`, `… 2>&1 | tail -20`), so the contract must
+    appear inside what ran, whitespace-normalised."""
+    parts = [re.escape(p) for p in re.split(r"<[^>]*>", " ".join(contract.split()))]
+    pattern = r"\S+".join(parts)
+    return re.search(pattern, " ".join(ran.split())) is not None
 
 
 def _is_budget_stop(exc: Exception) -> bool:
@@ -543,9 +554,9 @@ def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int) -
         return False, "no session to resume"
 
     touched = [
-        line[len("+++ b/") :].strip()
+        _diff_path(line[len("+++ ") :].strip())
         for line in (stop.partial_patch or "").splitlines()
-        if line.startswith("+++ b/")
+        if line.startswith("+++ ")
     ]
     if surfaces:
         outside = [path for path in touched if path not in surfaces]
