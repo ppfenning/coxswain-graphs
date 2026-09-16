@@ -69,7 +69,10 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
   cartridge hash and provider profile. A graduated kind goes to its apply arm —
   itself a role — instead of the gate. An auto-applied proposal records **no
   ledger row**: autonomy is spent by acting and re-earned only at a gate, so a
-  kind can never ratchet itself up on its own say-so.
+  kind can never ratchet itself up on its own say-so. A ledger row that is
+  recorded carries `schema`, the installed core schema version, alongside
+  `run_id`, `ts`, `principal`, `kind`, `risk`, `outcome`, `cartridge_sha` and
+  `provider_profile`.
 - **A graph registers itself.** Each module declares a `SPEC` — its subcommand,
   its entrypoint, and its inputs as declarative `Need`s — and the harness
   discovers it. Adding a graph to the CLI is dropping a module into `graphs/`,
