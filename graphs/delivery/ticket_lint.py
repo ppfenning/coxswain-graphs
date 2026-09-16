@@ -43,8 +43,20 @@ def _tokens(text: str) -> list[str]:
     return re.findall(r"\S+", text)
 
 
+def _is_notation(candidate: str) -> bool:
+    """A token that is not a path at all: a bare slash between words
+    ("cartridges 1.0 / graphs 1.0"), or a shape with an angle-bracket
+    placeholder (`runs/<run>/tasks/...`) — the seat is describing a form,
+    not naming a file it means to read."""
+    stripped = candidate.strip("`,.()")
+    return stripped in ("/", "~/") or "<" in stripped or ">" in stripped or not re.search(r"[\w.]", stripped)
+
+
 def _looks_rooted(candidate: str) -> bool:
-    """True for `~/...`, `/...`, or `workspace/...` — a rooted prefix, not a mid-path segment."""
+    """True for `~/...`, `/...`, or `workspace/...` — a rooted prefix followed
+    by a real name, not a mid-path segment and not notation."""
+    if _is_notation(candidate):
+        return False
     stripped = candidate.strip("`,.()")
     return stripped.startswith(_ROOTED_PREFIXES) or stripped.startswith("workspace/")
 
@@ -57,6 +69,8 @@ def _reach_candidates(task: Mapping[str, Any]) -> list[str]:
 
 def _looks_corpus(candidate: str) -> bool:
     """True if `candidate` names a path under a §3 corpus denylist entry."""
+    if _is_notation(candidate):
+        return False
     stripped = candidate.strip("`,.()")
     for pattern in _CORPUS_DENYLIST:
         if pattern.startswith("*"):
