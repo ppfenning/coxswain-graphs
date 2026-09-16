@@ -341,7 +341,9 @@ def test_the_happy_path_stacks_the_second_phase_on_the_first(repo, cart, tmp_pat
     assert result["totals"]["phases_complete"] == 2
     assert result["totals"]["tasks_quarantined"] == 0
 
-    # Both drafts landed and both merged into the phase branch.
+    # Both merged into the phase branch, and both read `approved` — nothing in
+    # a run writes `done` — but p2's task still sees t1-probe ready to build
+    # on: `_ready_view` presents a merged parent as satisfied for `needs`.
     assert {b for b in branches(repo) if b.startswith("epic/demo-initiative/p1-foundations--")} == {
         "epic/demo-initiative/p1-foundations--t1-probe",
         "epic/demo-initiative/p1-foundations--t2-bench",
@@ -678,8 +680,14 @@ def test_an_approved_and_quarantined_task_names_itself_in_the_exit_summary(repo,
     failed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
     assert failed["outcome"] == "approved_not_landed"
     assert "check failed" in failed["reason"]
-    assert result["totals"]["approved_not_landed"] == 1
+    # t1-probe is quarantined (recover); t2-bench merged clean but nothing in
+    # this run writes `done`, so it is unlanded too (land) — both count.
+    assert result["totals"]["approved_not_landed"] == 2
     assert f"approved but not landed: t1-probe — cox runs recover epic-1 t1-probe --repo {repo}" in result["exit_summary"]
+    assert (
+        f"approved but not landed: t2-bench — cox runs land epic-1 --repo {repo} --task t2-bench --apply"
+        in result["exit_summary"]
+    )
 
 
 def test_an_apply_arms_budgetstop_quarantines_the_task_as_infra_and_the_run_ends_clean(repo, cart, tmp_path) -> None:
@@ -698,9 +706,11 @@ def test_an_apply_arms_budgetstop_quarantines_the_task_as_infra_and_the_run_ends
     assert task_record["quarantine"] == entry["reason"]
     assert task_record["merged"] is True
     assert task_record["outcome"] == "approved_not_landed"
-    assert result["totals"]["approved_not_landed"] == 1
+    # t2-bench merged clean too, and is unlanded the same way — nothing in
+    # this run writes `done`.
+    assert result["totals"]["approved_not_landed"] == 2
 
-    # The sibling task still landed, and the run wrote a phase record and exited normally.
+    # The sibling task still merged into the phase stack, and the run wrote a phase record and exited normally.
     assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
     assert (tmp_path / "runs" / "epic-1:p1-foundations.json").exists()
 
@@ -1045,14 +1055,32 @@ def test_an_escalated_tasks_state_move_lands_on_approved_not_done(repo, cart, tm
     assert landed["outcome"] == "landed"
 
 
-def test_a_task_outside_governance_paths_still_lands_on_done(repo, cart, tmp_path) -> None:
-    """The new escalated-only branch leaves a normally-merged task's record alone."""
+def test_a_normally_merged_task_reads_approved_never_done_until_cox_lands_it(repo, cart, tmp_path) -> None:
+    """Merging into the phase stack is not landing — only `cox runs land` writes `done`."""
     result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
 
     task = next(t for t in result["tasks"] if t["id"] == "t1-probe")
     assert task["merged"] is True
     assert task["outcome"] == "landed"
     assert task["status"] == "built"
+    assert task["state"] == "approved"
+    assert (
+        f"approved but not landed: t1-probe — cox runs land epic-1 --repo {repo} --task t1-probe --apply"
+        in result["exit_summary"]
+    )
+
+
+def test_a_dependent_phase_builds_in_run_off_a_merged_but_unlanded_parent(repo, cart, tmp_path) -> None:
+    """`_ready_view` lets p2 build on p1 in one run even though p1 reads `approved`, not `done`."""
+    result, _ = drive(repo, cart, tmp_path)
+
+    parent = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert parent["merged"] is True
+    assert parent["state"] == "approved"
+
+    dependent = next(t for t in result["tasks"] if t["id"] == "t3-cutover")
+    assert dependent["merged"] is True
+    assert result["phases"][1]["status"] == "complete"
 
 
 def test_a_dependent_phase_stays_blocked_on_an_escalated_parent_in_the_same_run(repo, cart, tmp_path) -> None:

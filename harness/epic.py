@@ -666,6 +666,10 @@ def run_epic(
                 complete.add(phase)
 
         approved_not_landed = [t for t in tasks if t.get("outcome") == "approved_not_landed"]
+        # `outcome == "landed"` only ever meant "merged into the phase stack,
+        # not quarantined" — never a claim that `cox runs land` ran — so any
+        # such task whose item still reads `approved` is unlanded too.
+        merged_not_landed = [t for t in tasks if t.get("outcome") == "landed" and t.get("state") == "approved"]
         return {
             "run_id": run_id,
             "date": date,
@@ -677,13 +681,16 @@ def run_epic(
             "exit_summary": [
                 f"approved but not landed: {t['id']} — cox runs recover {run_id} {t['id']} --repo {repo}"
                 for t in approved_not_landed
+            ] + [
+                f"approved but not landed: {t['id']} — cox runs land {run_id} --repo {repo} --task {t['id']} --apply"
+                for t in merged_not_landed
             ],
             "totals": {
                 "phases_complete": sum(1 for p in phases if p["status"] == "complete"),
                 "phases_partial": sum(1 for p in phases if p["status"] == "partial"),
                 "phases_blocked": sum(1 for p in phases if p["status"] == "blocked"),
                 "tasks_quarantined": sum(1 for q in quarantined if q.get("grain") == "task"),
-                "approved_not_landed": len(approved_not_landed),
+                "approved_not_landed": len(approved_not_landed) + len(merged_not_landed),
                 "stacks_rebased": stacks_rebased,
             },
         }
@@ -795,6 +802,25 @@ def _attempt_cap_reason(attempts: Sequence[Mapping[str, Any]]) -> str:
         f"attempt cap: {len(attempts)} earlier run(s) quarantined this task — {history}. "
         "Refusing a third run; a person decides."
     )
+
+
+def _ready_view(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`items`, with a merged-but-unlanded parent presented as `done` for `needs`.
+
+    `ready_tasks` satisfies a `needs` entry only against a literal `done`, and
+    nothing in a run ever writes that — `cox runs land` does. Without this, a
+    dependent phase's task would never become ready until a human landed the
+    parent, even though the parent's code is already sitting on the phase
+    branch stack the dependent builds from. Only a task that actually merged
+    (`item["merged"]`) is presented this way; an escalated or conflicted
+    parent stays `approved`, so its dependent still waits, unchanged. The
+    view is read-only and local to this call — `items` itself, and every
+    other read anywhere else, still shows `approved`.
+    """
+    return [
+        {**item, "state": "done"} if item.get("state") == "approved" and item.get("merged") else item
+        for item in items
+    ]
 
 
 def _run_phase(
@@ -912,7 +938,7 @@ def _run_phase(
 
     # A dropped task is terminal like a done one: it never gets rebuilt or
     # re-reviewed, and never blocks the phase behind it.
-    all_ready = [item for item in workstore.ready_tasks(items, phase=phase) if item.get("state") != "dropped"]
+    all_ready = [item for item in workstore.ready_tasks(_ready_view(items), phase=phase) if item.get("state") != "dropped"]
 
     # A third run of the same task is refused outright rather than tried
     # again — quarantined here, plainly, never through `_quarantine_task`,
@@ -1383,15 +1409,23 @@ def _run_phase(
         task_record["reason"] = task_record.get("quarantine")
 
     # An executed `state_move` is reflected in the driver's own copy of the work
-    # so the next phase's tasks can become ready inside this run. A task whose
-    # merge never landed is not `done` — an escalated merge, or one that lost
-    # to a conflict, reads `approved`, so a dependent never sees it as ready.
+    # so the next phase's tasks can become ready inside this run. `run_epic`
+    # lands nothing itself — only `cox runs land` writes `done` (tools #153) —
+    # so every moved task reads `approved` here, whether it merged into the
+    # phase stack or not. `item["merged"]` is a second, internal-only field
+    # (never returned to a caller) that `_ready_view` below reads to tell a
+    # merged-but-unlanded parent from an escalated one that never reached the
+    # stack at all.
     for task, moved in state.moved.items():
         if moved:
-            target_state = "done" if state.merged.get(task) else "approved"
+            merged = bool(state.merged.get(task))
             for item in items:
                 if str(item["id"]) == task:
-                    item["state"] = target_state
+                    item["state"] = "approved"
+                    item["merged"] = merged
+            for task_record in record["task_records"]:
+                if task_record["id"] == task:
+                    task_record["state"] = "approved"
 
     record["status"], reason = _phase_status(
         verdict,
@@ -1577,7 +1611,7 @@ def _phase_status(
     so the phase is partial no matter how good the work was.
     """
     if not ready and not quarantined and all(
-        item.get("state") in ("done", "dropped") for item in items if item.get("phase") == phase
+        item.get("state") in ("done", "dropped", "approved") for item in items if item.get("phase") == phase
     ):
         return "complete", "every task in the phase was already done"
     if not validated:
