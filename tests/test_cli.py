@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -293,6 +294,31 @@ def test_keep_worktrees_moves_the_dir_under_kept_run_id(monkeypatch, tmp_path) -
     assert str(worktree) not in fake.registered
     assert (tmp_path / "_kept" / run_id / run_id).is_dir()
     assert fake.keep_calls == [(worktree, worktree, tmp_path, run_id)]
+
+
+def test_provider_profile_scope_is_deterministic_across_call_sites(tmp_path) -> None:
+    profile = tmp_path / "claude-code.yaml"
+    profile.write_bytes(b"model: claude\n")
+    expected = f"claude-code@{hashlib.sha256(profile.read_bytes()).hexdigest()[:12]}"
+
+    first = cli._provider_profile_scope(profile)
+    second = cli._provider_profile_scope(profile)
+
+    assert first == second == expected
+
+
+def test_editing_the_profile_file_changes_the_hash_but_not_the_stem(tmp_path) -> None:
+    profile = tmp_path / "claude-code.yaml"
+    profile.write_bytes(b"model: claude\n")
+    before = cli._provider_profile_scope(profile)
+
+    profile.write_bytes(b"model: claude-opus\n")
+    after = cli._provider_profile_scope(profile)
+
+    before_stem, before_hash = before.split("@")
+    after_stem, after_hash = after.split("@")
+    assert before_stem == after_stem == "claude-code"
+    assert before_hash != after_hash
 
 
 def test_a_run_that_raises_after_creating_a_worktree_leaves_no_directory_and_no_registration(
