@@ -571,6 +571,15 @@ def test_a_revision_under_mnemonic_diff_prefixes_is_still_seen_as_progress(
     assert len(roles(scripted, "review_charter")) == 2
 
 
+def test_a_surface_marked_new_still_covers_the_partial_work_it_names() -> None:
+    """tools-schema-version-3: the budget stop's continuation was refused because the
+    partial patch touched `agent_tools/schema.py` and the surface read
+    `agent_tools/schema.py (new)` — the marker is not part of the path."""
+    stop = lifecycle_propose.BudgetStop(role="build", thread="t", spent_usd=1.16, detail="ceiling", session="s1", partial_patch="--- a/agent_tools/schema.py\n+++ b/agent_tools/schema.py\n+x\n")
+    ok, why = lifecycle_propose._continue_ok(stop, surfaces=["agent_tools/schema.py (new)", "README.md"], continuations=0)
+    assert "outside the task's surfaces" not in why
+
+
 def test_the_same_objection_raised_again_stops_the_loop(
     cartridge, plan_response, build_response
 ) -> None:
