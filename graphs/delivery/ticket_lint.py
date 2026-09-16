@@ -21,6 +21,10 @@ _ROOTED_PREFIXES = ("~/", "/")
 _RISKY_SINGLE = frozenset({"cox", "uv", "gh", "ruff"})
 _RISKY_TWO_WORD = frozenset({"git push"})
 
+# docs/design/validator-reach.md §3, verbatim.
+_CORPUS_DENYLIST = ("workspace/", "runs/", "*.usage.json", "ledger.jsonl", "~/.local/state")
+_CORPUS_CORRECTION = "route this to `cox stats` or the chair; the build seat sees one repository worktree"
+
 
 @dataclass(frozen=True)
 class Problem:
@@ -51,14 +55,39 @@ def _reach_candidates(task: Mapping[str, Any]) -> list[str]:
     return list(dict.fromkeys(body_hits + surface_hits))
 
 
+def _looks_corpus(candidate: str) -> bool:
+    """True if `candidate` names a path under a §3 corpus denylist entry."""
+    stripped = candidate.strip("`,.()")
+    for pattern in _CORPUS_DENYLIST:
+        if pattern.startswith("*"):
+            if stripped.endswith(pattern[1:]):
+                return True
+        elif stripped == pattern or stripped.startswith(pattern) or stripped.endswith("/" + pattern):
+            return True
+    return False
+
+
+def _corpus_candidates(task: Mapping[str, Any]) -> list[str]:
+    body_hits = [t.strip("`,.()") for t in _tokens(str(task.get("body") or "")) if _looks_corpus(t)]
+    surface_hits = [s for s in task.get("surfaces") or [] if _looks_corpus(s)]
+    return list(dict.fromkeys(body_hits + surface_hits))
+
+
 def _reach_problems(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[str, Any]], repo: str) -> list[Problem]:
     known_paths = {str(row.get("path")) for row in tree}
-    return [
-        Problem(str(task["id"]), "reach", f"names {path}, not inside {repo}", "move the artifact into the repository or drop the reference")
-        for task in tasks
-        for path in _reach_candidates(task)
-        if path not in known_paths
-    ]
+    problems: list[Problem] = []
+    for task in tasks:
+        corpus_hits = _corpus_candidates(task)
+        problems.extend(
+            Problem(str(task["id"]), "reach", f"names {path}, out of the build seat's reach", _CORPUS_CORRECTION)
+            for path in corpus_hits
+        )
+        problems.extend(
+            Problem(str(task["id"]), "reach", f"names {path}, not inside {repo}", "move the artifact into the repository or drop the reference")
+            for path in _reach_candidates(task)
+            if path not in known_paths and path not in corpus_hits
+        )
+    return problems
 
 
 def _is_test_surface(path: str) -> bool:
