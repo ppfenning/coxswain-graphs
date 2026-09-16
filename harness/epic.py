@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1235,7 +1236,7 @@ def _collected_ids(worktree: Path) -> set[str] | None:
     harness fault, not a reason to let the exception end the whole run.
     """
     try:
-        proc = subprocess.run(["pytest", "--collect-only", "-q"], cwd=worktree, capture_output=True, text=True)
+        proc = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q"], cwd=worktree, capture_output=True, text=True)
     except (FileNotFoundError, OSError):
         return None
     return collected_ids(proc.stdout)
