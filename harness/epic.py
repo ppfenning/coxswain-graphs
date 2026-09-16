@@ -1242,6 +1242,11 @@ def _run_phase(
             task_record["quarantine"] = quarantined_by_task[task]
         elif state.merged.get(task) is False and not task_record.get("quarantine"):
             task_record["status"] = "quarantined"
+        elif not task_record["merged"] and not task_record.get("quarantine"):
+            # Approved but its merge was never attempted — escalated to
+            # `self_modification`, or any other reason `merge_stack` did not
+            # run — so the task is not `done` yet, only `approved`.
+            task_record["status"] = "approved"
         verdicts = (built.get(task) or {}).get("result") or {}
         task_record["outcome"] = task_outcome(
             str((verdicts.get("review") or {}).get("verdict") or "") or None,
@@ -1255,12 +1260,15 @@ def _run_phase(
         task_record["reason"] = task_record.get("quarantine")
 
     # An executed `state_move` is reflected in the driver's own copy of the work
-    # so the next phase's tasks can become ready inside this run.
-    for task, done in state.moved.items():
-        if done:
+    # so the next phase's tasks can become ready inside this run. A task whose
+    # merge never landed is not `done` — an escalated merge, or one that lost
+    # to a conflict, reads `approved`, so a dependent never sees it as ready.
+    for task, moved in state.moved.items():
+        if moved:
+            target_state = "done" if state.merged.get(task) else "approved"
             for item in items:
                 if str(item["id"]) == task:
-                    item["state"] = "done"
+                    item["state"] = target_state
 
     record["status"], reason = _phase_status(
         verdict,
