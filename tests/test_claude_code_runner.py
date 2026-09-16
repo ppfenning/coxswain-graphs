@@ -491,6 +491,69 @@ def test_a_call_level_budget_overrides_the_role_ceiling(fake_claude, tmp_path) -
     assert argv[argv.index("--max-budget-usd") + 1] == "2.5000"
 
 
+def _bounds_file(tmp_path: Path, rows: list[dict]) -> Path:
+    path = tmp_path / "bounds.json"
+    path.write_text(json.dumps({"generated": "2026-09-16", "db": "stats.db", "rows": rows}), encoding="utf-8")
+    return path
+
+
+def test_a_bounds_row_with_enough_history_sets_the_ceiling_and_its_source(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    bounds = _bounds_file(tmp_path, [{"role": "build", "model": "sonnet", "n": 25, "strict": 0.1, "moderate": 0.2, "liberal": 0.6}])
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.cost_bounds_path = bounds
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.2000"
+    assert runner.calls[-1]["ceiling_usd"] == 0.2
+    assert runner.calls[-1]["ceiling_source"] == "bounds:moderate"
+
+
+def test_a_bounds_row_with_too_little_history_falls_back_to_the_profile(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    bounds = _bounds_file(tmp_path, [{"role": "build", "model": "sonnet", "n": 10, "strict": 0.1, "moderate": 0.2, "liberal": 0.6}])
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.cost_bounds_path = bounds
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.6000"
+    assert runner.calls[-1]["ceiling_usd"] == 0.6
+    assert runner.calls[-1]["ceiling_source"] == "profile"
+
+
+def test_a_bounds_path_that_does_not_resolve_falls_back_to_the_profile(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.cost_bounds_path = tmp_path / "missing-bounds.json"
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.6000"
+    assert runner.calls[-1]["ceiling_usd"] == 0.6
+    assert runner.calls[-1]["ceiling_source"] == "profile"
+
+
+def test_no_bounds_file_behaves_exactly_as_today(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.6000"
+    assert runner.calls[-1]["ceiling_usd"] == 0.6
+    assert runner.calls[-1]["ceiling_source"] == "profile"
+
+
+def test_a_strict_level_picks_the_strict_column(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    bounds = _bounds_file(tmp_path, [{"role": "build", "model": "sonnet", "n": 25, "strict": 0.1, "moderate": 0.2, "liberal": 0.6}])
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.cost_bounds_path = bounds
+    runner.cost_level = "strict"
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.1000"
+    assert runner.calls[-1]["ceiling_source"] == "bounds:strict"
+
+
 def test_a_node_cap_below_the_shape_ceiling_becomes_the_effective_limit(fake_claude, tmp_path) -> None:
     script, _, _ = fake_claude
     runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 2.0}}, claude_bin=str(script), cwd=tmp_path)
