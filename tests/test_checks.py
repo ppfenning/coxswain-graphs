@@ -24,6 +24,8 @@ from harness.checks import (
     all_passed,
     check_outcome,
     checks_evidence,
+    collected_ids,
+    coverage_floor_holds,
     is_harness_fault,
     quarantine_reason,
     repo_checks,
@@ -453,3 +455,28 @@ def test_repo_checks_names_are_the_first_word():
 def test_repo_checks_never_raises_on_odd_input():
     assert repo_checks("") == []
     assert repo_checks(None) == []
+
+
+def test_collected_ids_reads_node_ids_and_drops_the_summary_line():
+    output = textwrap.dedent(
+        """\
+        tests/test_a.py::test_one
+        tests/test_a.py::test_two
+        2 tests collected in 0.01s
+        """
+    )
+    ids = collected_ids(output)
+    assert ids == {"tests/test_a.py::test_one", "tests/test_a.py::test_two"}
+    assert "2 tests collected in 0.01s" not in ids
+
+
+def test_coverage_floor_holds_when_before_is_a_subset_of_after():
+    before = {"tests/test_a.py::test_one"}
+    after = {"tests/test_a.py::test_one", "tests/test_a.py::test_two"}
+    assert coverage_floor_holds(before, after) is True
+
+
+def test_coverage_floor_fails_when_a_before_id_is_missing_from_after():
+    before = {"tests/test_a.py::test_one", "tests/test_a.py::test_two"}
+    after = {"tests/test_a.py::test_one"}
+    assert coverage_floor_holds(before, after) is False
