@@ -799,6 +799,60 @@ def test_a_governance_patch_cannot_earn_its_merge(repo, cart, tmp_path) -> None:
     assert {row["outcome"] for row in rows} == {"skipped"}, "approved, never executed — neither win nor reversal"
 
 
+def test_an_escalated_tasks_state_move_lands_on_approved_not_done(repo, cart, tmp_path) -> None:
+    """A merge that was never applied cannot read `done` — only `approved`."""
+    runner = Runner(
+        {
+            "t1-probe": new_file_patch("harness/x.py", "ok"),
+            "t2-bench": new_file_patch("t2-bench.txt"),
+        }
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    escalated = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert escalated["merged"] is False
+    assert escalated["outcome"] == "approved_not_landed"
+    assert escalated["status"] == "approved"
+
+    landed = next(t for t in result["tasks"] if t["id"] == "t2-bench")
+    assert landed["merged"] is True
+    assert landed["outcome"] == "landed"
+
+
+def test_a_task_outside_governance_paths_still_lands_on_done(repo, cart, tmp_path) -> None:
+    """The new escalated-only branch leaves a normally-merged task's record alone."""
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
+
+    task = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert task["merged"] is True
+    assert task["outcome"] == "landed"
+    assert task["status"] == "built"
+
+
+def test_a_dependent_phase_stays_blocked_on_an_escalated_parent_in_the_same_run(repo, cart, tmp_path) -> None:
+    """`approved`, never `done`, is what keeps a dependent from reading its parent as ready."""
+    runner = Runner(
+        {
+            "t1-probe": new_file_patch("harness/x.py", "ok"),
+            "t2-bench": new_file_patch("t2-bench.txt"),
+            "t3-cutover": new_file_patch("t3-cutover.txt"),
+        }
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=True))
+
+    p1, p2 = result["phases"]
+    assert p1["status"] == "partial"
+    assert p2["status"] == "blocked"
+    assert "did not meet its goal" in p2["reason"]
+    assert not any(c["role"] == "build" and "t3-cutover" in c["prompt"] for c in runner.calls), (
+        "p2 never ran, so its own task was never built off ground p1 never actually landed"
+    )
+
+    escalated = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert escalated["status"] == "approved"
+    assert escalated["merged"] is False
+
+
 # ── the branch-action decision, on literals ─────────────────────────────────
 
 
