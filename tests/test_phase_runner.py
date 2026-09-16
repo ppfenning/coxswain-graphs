@@ -45,7 +45,7 @@ class SlowRunner:
         self.active = 0
         self.peak = 0
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         with self.lock:
             self.active += 1
             self.peak = max(self.peak, self.active)
@@ -107,7 +107,7 @@ def test_one_failing_task_does_not_take_the_phase_with_it(cartridge) -> None:
     """The others already did their work; it is still worth gating."""
 
     class Flaky(SlowRunner):
-        def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+        def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
             if role == "build" and "t2-second" in prompt:
                 from runner.protocol import RunnerError
 
@@ -129,7 +129,7 @@ def test_one_failing_task_does_not_take_the_phase_with_it(cartridge) -> None:
 
 def test_failures_are_reported_in_a_stable_order(cartridge) -> None:
     class AllBroken(SlowRunner):
-        def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+        def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
             from runner.protocol import RunnerError
 
             raise RunnerError("down")

@@ -23,7 +23,7 @@ from core import ledger, workstore
 
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
-from harness.epic import branch_action, phase_order, phase_parents, run_epic, task_outcome
+from harness.epic import _trace_evidence, branch_action, phase_order, phase_parents, run_epic, task_outcome
 from harness.resume import load_result, save_result
 from runner.protocol import BudgetStop, RunnerError
 
@@ -189,7 +189,7 @@ class Runner:
     def _subject(self, prompt: str, candidates) -> str | None:
         return next((c for c in candidates if c in prompt), None)
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         with self.lock:
             self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
 
@@ -218,6 +218,34 @@ class Runner:
         raise RunnerError(f"no scripted response for role '{role}'")
 
 
+class CommandsRunner(Runner):
+    """Like `Runner`, but appends a `ClaudeCodeRunner`-shaped ledger row per build call.
+
+    `harness/epic._trace_evidence` reads `runner.calls` for a `role: "build"` row whose
+    `task_id` matches the task — never `files_touched`, which two tasks can share. This
+    double stamps `task_id` from the `task=` kwarg the graph now passes, same as
+    `ClaudeCodeRunner.run` does, so the harness's own selection is what is under test.
+    """
+
+    def __init__(self, patches: dict[str, str], *, commands_run: dict[str, list[dict]] | None = None) -> None:
+        super().__init__(patches)
+        self.commands_run = commands_run or {}
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+        result = super().run(
+            role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd
+        )
+        if role == "build":
+            with self.lock:
+                self.calls.append({
+                    "role": "build",
+                    "task_id": task,
+                    "files_touched": [f"{task}.txt"],
+                    "commands_run": self.commands_run.get(task, []),
+                })
+        return result
+
+
 class BudgetStopArm(Runner):
     """Like `Runner`, but the `work_state_arm` bookkeeping call for one named task stops on budget."""
 
@@ -225,7 +253,7 @@ class BudgetStopArm(Runner):
         super().__init__(patches)
         self.stops = stops
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "work_state_arm" and self.stops in prompt:
             raise BudgetStop(role="work_state_arm", thread=None, session=None, spent_usd=0.0, detail="budget")
         return super().run(
@@ -446,6 +474,119 @@ def test_the_failing_checks_evidence_reaches_the_record(repo, cart, tmp_path) ->
     result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
     failed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
     assert any(row["check"] == "checks:state" and "FAIL" in row["output"] for row in failed["evidence"])
+
+
+def test_trace_commands_land_in_order_and_a_self_reported_one_is_never_folded_in(repo, cart, tmp_path) -> None:
+    # Deliberately not alphabetical ("ruff" then "echo") — a regression that
+    # sorted commands instead of preserving trace order would fail this.
+    runner = CommandsRunner(
+        {"t1-probe": new_file_patch("t1-probe.txt"), "t2-bench": new_file_patch("t2-bench.txt")},
+        commands_run={
+            "t1-probe": [
+                {"command": "ruff check .", "output": "All checks passed!", "source": "trace"},
+                {"command": "echo done", "output": "done", "source": "trace"},
+                {"command": "pytest -q --cov", "output": "not run", "source": "self_report"},
+            ]
+        },
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+    landed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    rows = [row for row in landed["evidence"] if row["check"] == "command"]
+    assert rows == [
+        {"check": "command", "source": "trace", "output": "ruff check .\nAll checks passed!"},
+        {"check": "command", "source": "trace", "output": "echo done\ndone"},
+    ]
+
+
+def test_files_touched_appears_exactly_once(repo, cart, tmp_path) -> None:
+    runner = CommandsRunner({"t1-probe": new_file_patch("t1-probe.txt")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+    landed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    rows = [row for row in landed["evidence"] if row["check"] == "files_touched"]
+    assert rows == [{"check": "files_touched", "source": "trace", "output": "t1-probe.txt"}]
+
+
+def test_two_tasks_with_identical_files_touched_each_get_their_own_evidence(repo, cart, tmp_path) -> None:
+    """`task_id` selects the call, not `files_touched` — which two tasks can share."""
+    runner = CommandsRunner(
+        {"t1-probe": new_file_patch("shared.txt"), "t2-bench": new_file_patch("shared.txt")},
+        commands_run={
+            "t1-probe": [{"command": "one", "output": "1", "source": "trace"}],
+            "t2-bench": [{"command": "two", "output": "2", "source": "trace"}],
+        },
+    )
+    # Both tasks' patches touch the same file, so a match keyed on
+    # `files_touched` would collide; `task_id` is what disambiguates the two
+    # ledger rows below.
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+    t1 = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    t2 = next(t for t in result["tasks"] if t["id"] == "t2-bench")
+    assert [r["output"] for r in t1["evidence"] if r["check"] == "command"] == ["one\n1"]
+    assert [r["output"] for r in t2["evidence"] if r["check"] == "command"] == ["two\n2"]
+
+
+class RetriedCommandsRunner(CommandsRunner):
+    """Reviews t1-probe's first patch as `revise` once, so the fix loop retries
+    the build — two `role: "build"` ledger rows share one `task_id`. Evidence
+    must come from the last, the retry whose patch the record actually applied.
+    """
+
+    def __init__(self, patches: dict[str, str]) -> None:
+        super().__init__(patches, commands_run={"t1-probe": [{"command": "first", "output": "1", "source": "trace"}]})
+        self._revised = False
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+        if role == "review_charter" and "t1-probe" in prompt and not self._revised:
+            self._revised = True
+            with self.lock:
+                self.calls.append({"role": role, "tier": tier, "prompt": prompt})
+            return dict(REVISE)
+        if role == "build" and task == "t1-probe" and self._revised:
+            self.commands_run["t1-probe"] = [{"command": "second", "output": "2", "source": "trace"}]
+            # A retry that repeats the same patch reads as "no progress" and is
+            # refused before a second build call is even ledgered — so the
+            # retry has to change the patch to prove anything about which call
+            # the evidence comes from.
+            self.patches["t1-probe"] = new_file_patch("t1-probe.txt") + new_file_patch("t1-probe-retry.txt")
+        return super().run(
+            role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread,
+            budget_usd=budget_usd, task=task,
+        )
+
+
+def test_a_retried_builds_evidence_comes_from_the_last_call(repo, cart, tmp_path) -> None:
+    runner = RetriedCommandsRunner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+    landed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    rows = [row for row in landed["evidence"] if row["check"] == "command"]
+    assert rows == [{"check": "command", "source": "trace", "output": "second\n2"}]
+
+
+def test_trace_evidence_ignores_the_epics_own_style_pass_call_on_the_shared_ledger() -> None:
+    """`_trim_phase` is `harness/epic.py`'s own direct `ctx.runner.run` call — `role:
+    "style_pass"`, one per PHASE, carrying no `task_id` because a phase is not a task.
+    Its row lands on the same shared `ctx.runner.calls` a build call's does; the
+    `role == "build"` filter, not a `task_id` match, is what keeps it out of a task's
+    evidence.
+    """
+    calls = [
+        {"role": "style_pass", "task_id": None, "commands_run": [{"command": "x", "output": "y", "source": "trace"}], "files_touched": ["z.txt"]},
+        {"role": "build", "task_id": "t1-probe", "commands_run": [{"command": "real", "output": "1", "source": "trace"}], "files_touched": ["t1-probe.txt"]},
+    ]
+    assert _trace_evidence(calls, "t1-probe", "") == [
+        {"check": "command", "source": "trace", "output": "real\n1"},
+        {"check": "files_touched", "source": "trace", "output": "t1-probe.txt"},
+    ]
+
+
+def test_a_resumed_tasks_files_touched_falls_back_to_the_patch_when_no_call_matches() -> None:
+    """A resumed task (`--resume-from`) makes no build call in this run, so `calls`
+    holds no `task_id`-matching row — `files_touched` must still name the reused
+    patch's own files, not go empty.
+    """
+    assert _trace_evidence([], "t1-probe", new_file_patch("t1-probe.txt")) == [
+        {"check": "files_touched", "source": "trace", "output": "t1-probe.txt"},
+    ]
 
 
 def test_change_facts_carries_the_full_checks_result_for_a_quarantined_task(repo, cart, tmp_path) -> None:
@@ -984,7 +1125,7 @@ def test_a_stale_branch_whose_diff_adds_a_line_still_blocks(repo, cart, tmp_path
 class Revising(Runner):
     """Reviews everything as `revise`, so the fix loop is the only thing running."""
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_charter":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -1162,7 +1303,7 @@ class RefusedRunner(Runner):
         super().__init__(patches, **kw)
         self.refused = refused
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_charter" and self.refused in prompt:
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -1195,7 +1336,7 @@ class ArbitrateFailsRunner(Runner):
     shape the ticket names: build complete, charter review ran, then
     arbitrate failed with a provider-side error."""
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_adversary":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -1237,7 +1378,7 @@ class ArbitrateBudgetStopRunner(Runner):
     pre-existing `no_work` path exactly like any other `RunnerError` from a
     non-build node did before this ticket."""
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_adversary":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -1273,7 +1414,7 @@ class AdversaryFailsRunner(Runner):
         super().__init__(patches, **kw)
         self.fails_for = fails_for
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None):
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_adversary":
             if self.fails_for in prompt:
                 raise RunnerError("provider-side safeguard error")

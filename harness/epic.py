@@ -55,6 +55,7 @@ from graphs._contract import proposal
 from harness.autonomy import split_by_policy
 from harness.checks import (
     HARNESS_FAULT_PREFIX,
+    _tail_lines,
     all_passed,
     checks_evidence,
     collected_ids,
@@ -70,6 +71,7 @@ from harness.gate import apply_arm_for, auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
 from harness.worktree import apply_patch, create_worktree, keep_worktree, prune_registrations, remove_worktree
+from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import RunnerError
 
 __all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
@@ -372,6 +374,38 @@ def _rebase(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str]:
 # ── one task's build, applied and measured in a worktree the harness owns ────
 
 
+def _trace_evidence(calls: Sequence[Any], task: str, patch: str) -> list[dict[str, Any]]:
+    """Evidence rows the harness itself observed, per docs/design/validator-reach.md §1.
+
+    Commands are selected by `task_id` — stamped onto the call ledger by
+    `ClaudeCodeRunner.run`'s own `task` kwarg — never by `files_touched`, which two
+    tasks (or a fix-loop retry) can share. `ctx.runner.calls` accumulates across every
+    task and retry, so the LAST matching `role: "build"` call is the one whose patch
+    this record actually applied. One `command` row per `commands_run` entry with
+    `source == "trace"`, in trace order — a `self_report` entry is a claim, not an
+    observation, and is never folded in.
+
+    A resumed task (`--resume-from`) makes no build call in THIS run, so no ledger
+    entry matches at all — `files_touched` then falls back to the reconciled `patch`
+    itself, still exactly one row, never empty for a non-empty patch.
+    """
+    call = next(
+        (c for c in reversed(calls) if isinstance(c, Mapping) and c.get("role") == "build" and c.get("task_id") == task),
+        {},
+    )
+    commands = [
+        {
+            "check": "command",
+            "source": "trace",
+            "output": f"{entry.get('command', '')}\n{_tail_lines(str(entry.get('output') or ''))}",
+        }
+        for entry in (call.get("commands_run") or [])
+        if isinstance(entry, Mapping) and entry.get("source") == "trace"
+    ]
+    files = call.get("files_touched") or files_touched_from_patch(patch)
+    return [*commands, {"check": "files_touched", "source": "trace", "output": "\n".join(files)}]
+
+
 def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) -> dict[str, Any]:
     """Apply one task's patch on a scratch branch off the phase branch, and check it.
 
@@ -398,6 +432,7 @@ def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) 
     if not ok:
         record["quarantine"] = f"patch did not apply: {detail}"
         return record
+    record["evidence"].extend(_trace_evidence(getattr(ctx.runner, "calls", None) or [], task, patch))
 
     # Commit BEFORE the checks run, so the branch holds exactly the applied
     # patch and nothing else. Checks execute things — a test run drops
@@ -1363,6 +1398,11 @@ def _trim_phase(ctx: _Ctx, phase: str) -> str | None:
     ok, diff = _git("-C", str(ctx.repo), "diff", f"{ctx.default_ref}...{branch}")
     if not ok or not diff.strip():
         return None
+    # The only direct `ctx.runner.run` call this module owns. No `task=` here:
+    # `style_pass` runs once over the whole PHASE diff — every task's work
+    # combined — so there is no single task id to stamp, and its ledger row
+    # is `role: "style_pass"`, which `_trace_evidence`'s `role == "build"`
+    # filter excludes regardless of `task_id` (see the test naming this call).
     result = ctx.runner.run(
         role="style_pass",
         tier="standard",
