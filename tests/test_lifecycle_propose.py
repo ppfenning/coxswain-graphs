@@ -116,6 +116,71 @@ def test_a_truncated_patch_is_retried_once_and_a_second_truncation_is_recorded(
     assert result["proposals"] == []
 
 
+def test_a_placeholder_build_is_reprompted_once_then_quarantined_as_build_output_invalid(
+    cartridge, plan_response, review_response
+) -> None:
+    """A patch whose own files diverge from `files_touched` is not evidence of a
+    change — the loop must not hand a placeholder on to handoff or review."""
+    placeholder = {
+        "patch": "--- a/src/a.py\n+++ b/src/a.py\n-old\n+new\n",
+        "summary": "placeholder",
+        "files_touched": ["a.py"],
+        "commands_run": [{"command": "echo hi", "output": "hi"}],
+    }
+    scripted = runner(plan_response, [placeholder, placeholder], review_response)
+    result = lifecycle_propose.run(args(cartridge), scripted)
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 2
+    assert "does not match the patch's files" in build_calls[1]["prompt"]
+    assert result["fix_loop"]["stopped"] == "build_output_invalid"
+    assert result["fix_loop"]["attempts"] == 1, "the reprompt is an infra attempt, not a build attempt"
+    assert result["handoff"] is None
+    assert result["proposals"] == []
+
+
+def test_a_build_whose_files_and_contract_commands_all_agree_passes_through_unchanged(
+    cartridge, plan_response, review_response
+) -> None:
+    """The ticket id alone never carries the contract — a real caller (`harness/phase.py`,
+    `harness/epic.py`) passes it separately as `ticket_body`, so the fixture does too."""
+    body = "evidence is `pytest -q tests/test_cos.py` then `ruff check .`."
+    good = {
+        "patch": "--- a/src/a.py\n+++ b/src/a.py\n-old\n+new\n",
+        "summary": "fix",
+        "files_touched": ["src/a.py"],
+        "commands_run": [
+            {"command": "pytest -q tests/test_cos.py", "output": "1 passed"},
+            {"command": "ruff check .", "output": "All checks passed!"},
+        ],
+    }
+    scripted = runner(plan_response, good, review_response)
+    result = lifecycle_propose.run(args(cartridge, ticket="TICKET-3", ticket_body=body), scripted)
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 1, "a clean first try is never reprompted"
+    assert result["fix_loop"]["stopped"] is None
+    assert result["build"]["patch"] == good["patch"]
+
+
+def test_a_build_missing_a_contract_command_named_only_in_the_ticket_body_is_reprompted(
+    cartridge, plan_response, review_response
+) -> None:
+    """Proves the check reads `ticket_text` (id + body), not the bare `ticket` id:
+    the commands live only in `ticket_body` here, same as every real caller."""
+    body = "run `pytest -q tests/test_cos.py` and `ruff check .` before done."
+    under_evidenced = {
+        "patch": "--- a/src/a.py\n+++ b/src/a.py\n-old\n+new\n",
+        "summary": "fix",
+        "files_touched": ["src/a.py"],
+        "commands_run": [{"command": "pytest -q tests/test_cos.py", "output": "1 passed"}],
+    }
+    scripted = runner(plan_response, [under_evidenced, under_evidenced], review_response)
+    result = lifecycle_propose.run(args(cartridge, ticket="TICKET-4", ticket_body=body), scripted)
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 2
+    assert "ruff check ." in build_calls[1]["prompt"], "the missing command is named, not just 'invalid'"
+    assert result["fix_loop"]["stopped"] == "build_output_invalid"
+
+
 def test_approved_review_emits_a_draft_pr_proposal_and_applies_nothing(
     cartridge, plan_response, build_response, review_response
 ) -> None:
@@ -377,9 +442,13 @@ def test_a_retry_that_leaves_the_scoped_file_unchanged_still_stops(
 ) -> None:
     """A cosmetic edit to a file outside the scope makes a non-identical whole
     patch, but the scoped file's own section never moved — still no progress."""
+    touched = ["src/a.py", "src/b.py"]
     scripted = runner(
         plan_response,
-        [{**build_response, "patch": SCOPE_UNCHANGED_PATCH}, rebuilt(build_response, SCOPE_UNCHANGED_RETRY)],
+        [
+            {**build_response, "patch": SCOPE_UNCHANGED_PATCH, "files_touched": touched},
+            {**rebuilt(build_response, SCOPE_UNCHANGED_RETRY), "files_touched": touched},
+        ],
         review_response,
         review_adversary=ADV_OBJECTS,
         arbitrate=ARBITRATION_SCOPED,

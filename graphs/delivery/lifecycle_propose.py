@@ -511,6 +511,21 @@ def _patch_sections(patch: str) -> dict[str, str]:
     return {m.group(1): patch[m.end() : n.start() if n else len(patch)] for m, n in zip(marks, marks[1:] + [None])}
 
 
+# A ticket's own contract commands, always backtick-fenced in its prose.
+_CONTRACT_COMMAND_RE = re.compile(r"`(pytest -q[^`\n]*|ruff check \.)`")
+
+
+def _build_output_valid(build: Mapping[str, Any], ticket_text: str) -> str | None:
+    """None when the patch's files match `files_touched` and its contract commands ran with output."""
+    files, touched = set(_patch_sections(build.get("patch") or "")), set(build.get("files_touched") or [])
+    if files != touched:
+        return f"files_touched {sorted(touched)} does not match the patch's files {sorted(files)}"
+    run = {str(e.get("command") or "").strip(): str(e.get("output") or "").strip()
+           for e in build.get("commands_run") or [] if isinstance(e, Mapping)}
+    missing = [c for c in _CONTRACT_COMMAND_RE.findall(ticket_text) if not run.get(c)]
+    return f"commands_run has no output for {missing}" if missing else None
+
+
 def _is_budget_stop(exc: Exception) -> bool:
     """Whether a `RunnerError` is the CLI's dollar-ceiling stop, not some other failure."""
     return "error_max_budget_usd" in str(exc).lower()
@@ -1506,12 +1521,41 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         truncation = patch_parses(build.get("patch") or "")
     patch_truncated = truncation is not None
 
+    # A patch whose files diverge from `files_touched`, or whose contract
+    # commands are missing or unevidenced, is asked again once, named.
+    invalid = None if patch_truncated else _build_output_valid(build, ticket_text)
+    if invalid is not None:
+        try:
+            build = runner.run(
+                role="build", tier="standard", thread=str(ticket), task=str(ticket), schema=BUILD_SCHEMA,
+                context=context, budget_usd=build_budget_usd,
+                prompt=(
+                    f"Carry out this plan and return the change as a unified diff.\n\n"
+                    f"Ticket: {ticket_text}\nPlan: {plan}\n\n{invalid} Return the patch only — it is "
+                    "applied by the shell into a worktree, never by you."
+                ),
+            )
+        except BudgetStop as exc:
+            resumed, continuations, reason, stop = _resume_build(
+                runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
+                surfaces=surfaces, stop=exc, continuations=continuations,
+            )
+            if resumed is None:
+                raise BudgetStop(
+                    role=stop.role, thread=stop.thread, session=stop.session, spent_usd=stop.spent_usd,
+                    partial_patch=stop.partial_patch, detail=f"{stop.detail} — continuation refused: {reason}",
+                ) from stop
+            build = resumed
+        invalid = _build_output_valid(build, ticket_text)
+    build_output_invalid = invalid is not None
+    frozen = patch_truncated or build_output_invalid
+
     facts = _change_facts(build)
     tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
 
     handoff: dict[str, Any] | None = None
     try:
-        if not patch_truncated and "handoff" in bound:
+        if not frozen and "handoff" in bound:
             handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts, ticket_id=ticket)
 
         # A non-blocking refusal costs a build attempt, not the run. Review is
@@ -1524,6 +1568,10 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         if patch_truncated:
             review, adversary, arbitration = _patch_truncated_review(truncation), None, None
             verdict, review_placeholder, review_quarantine = "revise", False, False
+        elif build_output_invalid:
+            review = {"verdict": "revise", "rationale": "build_output_invalid",
+                      "findings": [{"charter_principle": "harness fault", "detail": invalid, "file": ""}]}
+            adversary, arbitration, verdict, review_placeholder, review_quarantine = None, None, "revise", False, False
         elif handoff is not None and not handoff.get("complete"):
             review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _handoff_critique(handoff)
         else:
@@ -1555,12 +1603,13 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # is the same shape: nothing to send back and revise.
     stopped: str | None = (
         "patch_truncated" if patch_truncated
+        else "build_output_invalid" if build_output_invalid
         else "harness fault: review placeholders" if review_quarantine
         else None
     )
     standing: set[str] = set()
 
-    while verdict != "approve" and attempts <= fix_attempts and not review_quarantine and not patch_truncated:
+    while verdict != "approve" and attempts <= fix_attempts and not review_quarantine and not frozen:
         # Every claim raised so far, not merely the last round's. Re-raising an
         # objection from two rounds ago is no more progress than re-raising the
         # one from the last.
