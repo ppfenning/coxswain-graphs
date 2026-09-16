@@ -1193,6 +1193,7 @@ def _run_phase(
         escalated=escalated,
         chunk_by_task=chunk_by_task,
         rebase=rebase,
+        by_id=by_id,
     )
     record["batch"] = batch
 
@@ -1463,6 +1464,68 @@ def _phase_status(
     return "complete", ""
 
 
+def _finding_entries(result: Mapping[str, Any], chunk: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Every (text, file) a review, adversary or validate verdict wrote for one task.
+
+    Only a review finding's `file` is structured: REVIEW_SCHEMA requires it on
+    every entry (`graphs/delivery/lifecycle_propose.py`), so it is read straight
+    off rather than guessed at. An adversary objection and a validate gap or
+    reasoning string carry no such field — `("text", "")` — and are matched on
+    their own prose in `_cited_surface` below.
+    """
+    review = (result.get("review") or {}).get("findings") or []
+    adversary = (result.get("adversary") or {}).get("objections") or []
+    entries = [(str(f.get("detail") or ""), str(f.get("file") or "")) for f in review]
+    entries += [(f"{o.get('claim') or ''} {o.get('why_wrong') or ''}".strip(), "") for o in adversary]
+    entries += [(str(g), "") for g in chunk.get("gaps") or []]
+    entries.append((str(chunk.get("reasoning") or ""), ""))
+    return entries
+
+
+def _cited_surface(text: str, file: str, surfaces: Sequence[str]) -> str | None:
+    """The one entry of `surfaces` that `file` names outright, or that `text` quotes."""
+    if file and file in surfaces:
+        return file
+    return next((s for s in surfaces if s and s in text), None)
+
+
+def _consolidation_pairs(
+    built: Mapping[str, Mapping[str, Any]],
+    surviving: Sequence[str],
+    chunk_by_task: Mapping[str, Mapping[str, Any]],
+    by_id: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """One entry per pair of surviving tasks a finding names as blocked on a file the other owns.
+
+    `docs/design/work-shape.md` §4, quoted verbatim: "a review, adversary or
+    validate finding stating that a build cannot satisfy its ticket without
+    touching a file another ticket in the phase owns." §4 names no phrase to
+    match — the fact it describes is OWNERSHIP, and `docs/design/work-shape.md`
+    §3's coupling rule already computes that off each ticket's own `surfaces`
+    list, so a finding qualifies here on the same evidence: the file it names
+    is a `surfaces` entry of a DIFFERENT surviving task in this phase, never on
+    a model's choice of words.
+    """
+    seen: set[frozenset[str]] = set()
+    pairs: list[dict[str, str]] = []
+    for task in surviving:
+        entries = _finding_entries(built[task]["result"], chunk_by_task.get(task) or {})
+        for other in surviving:
+            if other == task or frozenset({task, other}) in seen:
+                continue
+            surfaces = [str(s) for s in (by_id.get(other) or {}).get("surfaces") or []]
+            if not surfaces:
+                continue
+            for text, file in entries:
+                cited = _cited_surface(text, file, surfaces)
+                if cited is None:
+                    continue
+                seen.add(frozenset({task, other}))
+                pairs.append({"task": task, "other": other, "file": cited, "text": text})
+                break
+    return pairs
+
+
 def _build_batch(
     ctx: _Ctx,
     *,
@@ -1472,6 +1535,7 @@ def _build_batch(
     escalated: set[str],
     chunk_by_task: Mapping[str, Mapping[str, Any]],
     rebase: Mapping[str, Any] | None,
+    by_id: Mapping[str, Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[int, tuple[str, str]]]:
     """Everything this phase asks for, in task-id order, plus what each slot means.
 
@@ -1543,6 +1607,23 @@ def _build_batch(
         )
         batch.append(move)
         slots[id(move)] = ("state_move", task)
+
+    for pair in _consolidation_pairs(built, surviving, chunk_by_task, by_id):
+        task, other, file, text = pair["task"], pair["other"], pair["file"], pair["text"]
+        ids = " and ".join(sorted((task, other)))
+        # Propose only, per conventions.md's propose-don't-write posture: no
+        # slots entry, so `_execute`'s default ("other", "") slot never merges
+        # or moves anything on this proposal's account.
+        batch.append(
+            proposal(
+                ctx.cartridge,
+                kind="consolidate",
+                target=ids,
+                evidence=[{"check": "review/adversary/validate finding", "output": text}],
+                rationale=f"{task} cannot satisfy its ticket without touching {file}, which {other} owns",
+                suggested_action=f"merge {ids} into one ticket and mark the superseded one dropped",
+            )
+        )
 
     return batch, slots
 
