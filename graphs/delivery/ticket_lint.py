@@ -89,6 +89,13 @@ def _corpus_candidates(task: Mapping[str, Any]) -> list[str]:
     return list(dict.fromkeys(body_hits + surface_hits))
 
 
+def _inside_by_suffix(path: str, known_paths: set[str]) -> bool:
+    """An absolute (or `~/`) spelling of a file the tree already lists —
+    `/home/x/repos/coxswain-graphs/graphs/delivery/initiative_decompose.py`
+    — names the repository's own file, not something outside it."""
+    return any(path.endswith("/" + known) for known in known_paths if known)
+
+
 def _reach_problems(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[str, Any]], repo: str) -> list[Problem]:
     known_paths = {str(row.get("path")) for row in tree}
     problems: list[Problem] = []
@@ -101,7 +108,7 @@ def _reach_problems(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[s
         problems.extend(
             Problem(str(task["id"]), "reach", f"names {path}, not inside {repo}", "move the artifact into the repository or drop the reference")
             for path in _reach_candidates(task)
-            if path not in known_paths and path not in corpus_hits
+            if path not in known_paths and path not in corpus_hits and not _inside_by_suffix(path, known_paths)
         )
     return problems
 
