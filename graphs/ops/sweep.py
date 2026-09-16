@@ -184,6 +184,21 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     return {"run_id": run_id, "date": date, "plan": plan, "verify": verify, "review": review}
 
 
-# No SPEC yet: wiring this graph into harness discovery, `harness/cos.py`'s
-# `_KNOWN_GRAPHS`, and the CLI is the next task, alongside the docs tables
-# that registering a SPEC here would otherwise leave inconsistent.
+from graphs._spec import GraphSpec, Need  # noqa: E402
+
+SPEC = GraphSpec(
+    name="sweep",
+    graph_name=GRAPH_NAME,
+    run=run,
+    summary="one rule applied everywhere it matches: plan, apply in a fresh worktree, verify by grep, then review",
+    needs=(
+        Need("repo", flag="--target-repo", help="the repository the sweep runs over"),
+        Need("idea", flag="--idea", kind="text_or_path", help="the rule to apply, or a path to it"),
+        Need(
+            "ref",
+            flag="--ref",
+            required=False,
+            help="the ref review-diff checks the resulting diff against (default HEAD)",
+        ),
+    ),
+)

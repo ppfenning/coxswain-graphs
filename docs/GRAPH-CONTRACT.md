@@ -131,6 +131,7 @@ staying small, enforced at the seam where it actually matters.
 | `epic-reconcile` | compare (set arithmetic) → reconcile → emit. Declared state vs actual. |
 | `phase-validate` | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver. |
 | `retro-propose` | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite. |
+| `sweep` | sweep_plan → sweep_apply → sweep_verify → [review pair]. Ceilings on sweep_plan and, only where a rule can't be scripted, the one sweep_apply build call; verify is a grep, no model. |
 | `coxswain` | one `dispatch` node over a driver-assembled docket. Selects; the driver invokes. |
 | `review-diff` | review_charter → review_adversary → verify_evidence → [arbitrate]. Reviews an arbitrary diff, outside any build's own run. |
 

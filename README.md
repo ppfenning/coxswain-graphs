@@ -87,6 +87,7 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 | `epic-reconcile` | ops | compare (set arithmetic) → reconcile → emit. Declared state vs actual |
 | `phase-validate` | delivery | validate_chunk per task → validate_phase against the phase's ORIGINAL goal. Invoked by the epic driver |
 | `retro-propose` | ops | stats (pure arithmetic over ledger rows) → retro → emit. Proposes only what it can cite |
+| `sweep` | ops | sweep_plan → sweep_apply → sweep_verify → [review pair]. One rule applied everywhere it matches; sweep_apply calls a model only when the rule can't be scripted, one build call, and sweep_verify runs no model at all |
 | `coxswain` | ops | one `dispatch` node over a driver-assembled docket. Selects; the harness invokes |
 | `review-diff` | delivery | review_charter → review_adversary → verify_evidence → [arbitrate]. Verdict and findings out, nothing written or pushed |
 
