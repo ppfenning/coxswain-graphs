@@ -43,6 +43,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
 from core import workstore
@@ -51,13 +52,22 @@ from core.workstore import WorkStoreError, record_attempt
 
 from graphs._contract import proposal
 from harness.autonomy import split_by_policy
-from harness.checks import checks_evidence, is_harness_fault, quarantine_reason, repo_checks, run_checks
+from harness.checks import (
+    all_passed,
+    checks_evidence,
+    collected_ids,
+    coverage_floor_holds,
+    is_harness_fault,
+    quarantine_reason,
+    repo_checks,
+    run_checks,
+)
 from harness.digest import build_digest
 from harness.escalate import escalate_self_modification
 from harness.gate import auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
-from harness.worktree import apply_patch, create_worktree, prune_registrations
+from harness.worktree import apply_patch, create_worktree, prune_registrations, remove_worktree
 
 __all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
 
@@ -84,6 +94,21 @@ PATCH_FOR_VALIDATION_CHARS = 120_000
 # count it is enforcing — see `_run_phase`, which quarantines these tasks with
 # a plain `quarantined.append` rather than `_quarantine_task`.
 ATTEMPT_CAP = 2
+
+# docs/design/landing-model.md §5: the existing style_pass brief, plus the one
+# sentence that scopes it to a whole phase rather than one task's diff.
+_STYLE_PASS_PROMPT = (
+    "Make the narrow style edit an approved diff still needs, or return nothing. "
+    "Remove duplication the tickets introduced separately; remove shims whose exit "
+    "condition the phase has met."
+)
+
+_STYLE_PASS_SCHEMA = {
+    "type": "object",
+    "properties": {"patch": {"type": "string"}},
+    "required": ["patch"],
+    "additionalProperties": False,
+}
 
 
 def _carry_forward(body: str, attempts: list[dict[str, Any]], patch: str | None, *, limit: int) -> str:
@@ -1133,6 +1158,15 @@ def _run_phase(
     if reason:
         record.setdefault("reason", reason)
 
+    # docs/design/landing-model.md §5: one style_pass over the assembled phase
+    # diff, run only once validate_phase itself has said the goal is met — a
+    # trim is not a second opinion on completeness, it runs after that
+    # question is already settled.
+    if record["status"] == "complete" and verdict is not None and verdict.get("goal_met") and "style_pass" in ctx.bound:
+        outcome = _trim_phase(ctx, phase)
+        if outcome is not None:
+            record["trim"] = f"trim: {outcome}"
+
     # Release the phase branch. Git refuses to check one branch out in two
     # worktrees, and re-entrancy — a later run building on the branch this one
     # left — is a stated requirement, so the worktree keeps its files and gives
@@ -1162,6 +1196,103 @@ def _run_phase(
     record["manifest"] = f"{ctx.run_id}:{phase}"
     record["totals"] = totals
     return record
+
+
+def _collected_ids(worktree: Path) -> set[str] | None:
+    """`pytest --collect-only -q` in `worktree`, read back as node ids.
+
+    `None` when pytest itself could not launch (mirrors `run_checks`'s own
+    `FileNotFoundError`/`OSError` handling) — a missing interpreter is a
+    harness fault, not a reason to let the exception end the whole run.
+    """
+    try:
+        proc = subprocess.run(["pytest", "--collect-only", "-q"], cwd=worktree, capture_output=True, text=True)
+    except (FileNotFoundError, OSError):
+        return None
+    return collected_ids(proc.stdout)
+
+
+def _trim_phase(ctx: _Ctx, phase: str) -> str | None:
+    """Run `style_pass` once over the phase's assembled diff, gated on the coverage floor.
+
+    §5 is literal: the diff is against `main` (`ctx.default_ref`), not the
+    parent phase's branch — a phase branch is stacked on its unlanded parent
+    within one run, so diffing anything narrower would hide exactly the
+    cross-phase duplication and shims the extra sentence exists to catch.
+
+    `None` means style_pass had nothing to offer — an empty patch is not a
+    refusal, there was no trim to gate. Otherwise the outcome half of the
+    phase record's `trim: ...` line (docs/design/landing-model.md §5). Before
+    and after both collect from fresh worktrees of the phase branch, never
+    `ctx.phase_worktree(phase)` itself — it still holds every task's own
+    build worktree nested under it, and `pytest --collect-only` would walk
+    straight into them. Every refusal path returns before the real phase
+    worktree is touched, so a tripped floor leaves the branch exactly as
+    `validate_phase` left it. Both scratch worktrees and the branches they
+    were created on are torn down on every exit from the `with`, whether the
+    floor held or not — `create_worktree` names them, nobody else deletes them.
+    """
+    worktree = ctx.phase_worktree(phase)
+    branch = ctx.phase_branch(phase)
+    ok, diff = _git("-C", str(ctx.repo), "diff", f"{ctx.default_ref}...{branch}")
+    if not ok or not diff.strip():
+        return None
+    result = ctx.runner.run(
+        role="style_pass",
+        tier="standard",
+        schema=_STYLE_PASS_SCHEMA,
+        prompt=f"{_STYLE_PASS_PROMPT}\n\nPhase: {phase}\n\nPhase diff:\n{diff}",
+        context=list(ctx.cartridge.get("context") or []),
+    )
+    patch = str(result.get("patch") or "")
+    if not patch.strip():
+        return None
+
+    before_branch = f"epic-trim-before/{ctx.run_id}/{phase}"
+    after_branch = f"epic-trim-after/{ctx.run_id}/{phase}"
+    outcome: str | None = None
+    with TemporaryDirectory() as scratch:
+        before_tree = Path(scratch) / "before"
+        after_tree = Path(scratch) / "after"
+        try:
+            ok, _ = create_worktree(ctx.repo, before_tree, branch=before_branch, base=branch)
+            before = _collected_ids(before_tree) if ok else None
+
+            ok, _ = create_worktree(ctx.repo, after_tree, branch=after_branch, base=branch)
+            applied = ok and apply_patch(patch, after_tree)[0]
+            after = _collected_ids(after_tree) if applied else None
+
+            if before is None or after is None:
+                outcome = "refused (coverage floor)"
+            else:
+                checks_ok = all_passed(run_checks(after_tree, ctx.checks)) if ctx.checks else True
+                if not (coverage_floor_holds(before, after) and checks_ok):
+                    outcome = "refused (coverage floor)"
+        finally:
+            remove_worktree(ctx.repo, before_tree)
+            remove_worktree(ctx.repo, after_tree)
+            _git("-C", str(ctx.repo), "branch", "-D", before_branch)
+            _git("-C", str(ctx.repo), "branch", "-D", after_branch)
+    if outcome is not None:
+        return outcome
+
+    applied, _ = apply_patch(patch, worktree)
+    if not applied:
+        return "refused (coverage floor)"
+    # `-u`, never `-A`: `worktree` still holds every task's own nested build
+    # worktree (`task_worktree(phase, task) = phase_worktree(phase) / task`),
+    # untracked from the phase branch's own point of view. `-A` would stage
+    # each one as a gitlink at mode 160000, landing a pointer at a commit on
+    # the harness-owned `agents/<run>/<task>` scratch namespace into the
+    # commit this phase later squash-merges to main. `-u` restages only paths
+    # already tracked on the branch — exactly what style_pass's patch touched.
+    ok, _ = _git(*_IDENTITY, "-C", str(worktree), "add", "-u")
+    if ok:
+        ok, _ = _git(*_IDENTITY, "-C", str(worktree), "commit", "-q", "-m", f"epic {ctx.run_id}: trim {phase}")
+    if not ok:
+        return "refused (coverage floor)"
+    removed = sum(1 for line in patch.splitlines() if line.startswith("-") and not line.startswith("---"))
+    return f"{removed} lines removed"
 
 
 def _phase_status(
