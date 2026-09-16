@@ -465,3 +465,24 @@ def test_a_size_problem_is_recorded_as_a_lint_entry_not_a_refusal(cart) -> None:
     ticket = next(p for p in result["proposals"] if p["target"] == "t1")
     assert f"lint=[{lint_entry}]" in ticket["suggested_action"]
     assert {"check": "lint", "output": lint_entry} in ticket["evidence"]
+
+
+def test_a_grant_advisory_lands_under_lint_and_never_in_surfaces(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [
+            {
+                "id": "t1",
+                "phase": "p1",
+                "title": "a",
+                "body": "```bash\ncox route lint t1\n```",
+                "needs": [],
+                "surfaces": ["graphs/schema.py"],
+            },
+        ],
+    }
+    result = decompose(cart, decomposition)
+    lint_entry = "grant: names `cox`, which is not granted (name only pytest, git status, git diff)"
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert task["lint"] == [lint_entry]
+    assert task["surfaces"] == ["graphs/schema.py"]
