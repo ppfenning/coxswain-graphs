@@ -1195,8 +1195,8 @@ def test_a_stale_reused_branch_with_its_own_commits_blocks_rather_than_building(
     assert "rebase it through the gate" in third["phases"][0]["reason"]
 
 
-def test_a_stale_branch_whose_diff_adds_no_lines_is_recreated_not_blocked(repo, cart, tmp_path) -> None:
-    """Two of its own commits, net zero lines — old-logic 'has commits' would have blocked this."""
+def test_a_stale_branch_whose_commits_cancel_out_still_blocks(repo, cart, tmp_path) -> None:
+    """Two of its own commits, net zero lines — patch-id sees two real, unlanded commits and blocks."""
     branch = "epic/demo-initiative/p1-foundations"
     git("checkout", "-b", branch, cwd=repo)
     (repo / "temp.txt").write_text("x\n", encoding="utf-8")
@@ -1212,14 +1212,42 @@ def test_a_stale_branch_whose_diff_adds_no_lines_is_recreated_not_blocked(repo, 
     git("commit", "-qm", "advance main", cwd=repo)
 
     result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False), run_id="epic-2")
+    assert result["phases"][0]["status"] == "blocked"
+
+
+def test_a_stale_branch_squash_merged_onto_main_is_recreated_not_blocked(repo, cart, tmp_path) -> None:
+    """A commit whose patch-id already landed on main (via squash-merge) is not 'its own' anymore."""
+    branch = "epic/demo-initiative/p1-foundations"
+    git("checkout", "-b", branch, cwd=repo)
+    (repo / "keep.txt").write_text("ok\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "add keep", cwd=repo)
+    git("checkout", "main", cwd=repo)
+
+    # Stand-in for the epic's own squash-merge: the identical change lands on
+    # main directly, so the branch's commit has no `+` in `git cherry main branch`.
+    (repo / "keep.txt").write_text("ok\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "squash: add keep", cwd=repo)
+
+    cherry = git("cherry", "main", branch, cwd=repo)
+    assert not any(line.startswith("+") for line in cherry.splitlines())
+
+    main_before_tasks = git("rev-parse", "main", cwd=repo)
+    before = git("rev-parse", branch, cwd=repo)
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False), run_id="epic-2")
     assert result["phases"][0]["status"] == "complete"
     assert "recreated" in result["phases"][0]
+    # The new branch is stacked on main's tip, not on the deleted branch's own commit.
+    assert is_ancestor(repo, main_before_tasks, branch)
+    assert not is_ancestor(repo, before, branch)
+    assert [p for p in result["proposals"] if p["kind"] == "stack_rebase"] == []
 
 
 def test_a_stale_branch_whose_diff_adds_a_line_still_blocks(repo, cart, tmp_path) -> None:
     branch = "epic/demo-initiative/p1-foundations"
     git("checkout", "-b", branch, cwd=repo)
-    (repo / "keep.txt").write_text("kept\n", encoding="utf-8")
+    (repo / "keep.txt").write_text("ok\n", encoding="utf-8")
     git("add", "-A", cwd=repo)
     git("commit", "-qm", "add keep", cwd=repo)
     git("checkout", "main", cwd=repo)
