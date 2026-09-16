@@ -57,7 +57,7 @@ from harness.escalate import escalate_self_modification
 from harness.gate import auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
-from harness.worktree import apply_patch, create_worktree
+from harness.worktree import apply_patch, create_worktree, prune_registrations
 
 __all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
 
@@ -279,7 +279,12 @@ def _open_phase_worktree(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, st
     Re-entrancy is the point: a second driver run over the same initiative
     builds on the branch the first one left, rather than starting a parallel
     one beside it under a different run id.
+
+    Prunes stale `git worktree` registrations first: a crashed prior run can
+    leave a phantom entry pointing at a directory that is already gone, and
+    that phantom is what blocked `tools-chair-rename-18` on 2026-09-08.
     """
+    prune_registrations(ctx.repo)
     branch = ctx.phase_branch(phase)
     worktree = ctx.phase_worktree(phase)
     worktree.parent.mkdir(parents=True, exist_ok=True)
