@@ -69,12 +69,15 @@ the printed line (`quarantined task [<kind>]: <id> — <reason>`), and `record_a
 | `refused`    | reviewers/arbiter rejected the patch                 | `epic.py:890`                        |
 | `no_work`    | nothing produced: budget death, attempt cap, handoff incomplete | `:763`, `:856`, plan/budget paths |
 | `unverified` | approved chain, validator unsatisfied — PATCH KEPT    | `:1011`                              |
-| `infra`      | nothing ran: worktree/branch failure                  | `_open_phase_worktree` `:276` callers |
+| `infra`      | nothing ran: worktree/branch failure; OR a non-build node (review/adversary/arbitrate/handoff) raised mid-round with a build already in hand — PATCH KEPT | `_open_phase_worktree` `:276` callers; `_run_phase`'s per-task loop on a `failed_node` result |
 
 `unverified` never discards: the task record keeps `build.patch` (it already does) and the phase record entry
-carries `"patch_kept": true` so `cox runs land` can offer it. `infra` is NOT a task outcome: it is recorded on
-the phase as `phase_failed_to_start` with the reason, and the tasks stay `ready` untouched. The two
-`quarantined.append` sites that bypass `_quarantine_task` (`:754`, `:936`) go through it.
+carries `"patch_kept": true` so `cox runs land` can offer it. The worktree/branch-failure shape of `infra` is
+NOT a task outcome: it is recorded on the phase as `phase_failed_to_start` with the reason, and the tasks
+stay `ready` untouched. The mid-round shape IS a task outcome — a patch was built and handed to a later node
+that never reached a verdict — so it is recorded per task, exactly like `unverified`, and carries `patch_kept`
+for the same reason: a kept patch is a thing `cox runs land` can still offer. The two `quarantined.append`
+sites that bypass `_quarantine_task` (`:754`, `:936`) go through it.
 
 ## 4. Consumers read the record, not the prose  (tools)
 
@@ -103,6 +106,7 @@ of who supplies it); no schema migration of existing rows beyond adding nullable
 §1 a `RunnerError` still appends a line and `record_usage` still writes `usage.json`. §2 a trace with two
 Bash calls yields two `commands_run` entries with `source: trace`; a patch touching `a.py` and deleting
 `b.py` yields both in `files_touched`; a build payload lacking both fields validates. §3 each kind is
-emitted from its site; an `unverified` entry carries `patch_kept`. §4 a log line quoting the budget string
-in prose yields no event; a `calls.jsonl`-only run ingests with its cost; coverage over a three-run literal
-corpus prints seven rows.
+emitted from its site; an `unverified` entry carries `patch_kept`; a non-build node raising mid-round
+quarantines `infra` with `patch_kept`, a saved task record carrying `build.patch` and `failed_node`, and
+a phase record that lists the task. §4 a log line quoting the budget string in prose yields no event; a
+`calls.jsonl`-only run ingests with its cost; coverage over a three-run literal corpus prints seven rows.
