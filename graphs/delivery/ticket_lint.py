@@ -91,7 +91,7 @@ def _corpus_candidates(task: Mapping[str, Any]) -> list[str]:
 
 def _inside_by_suffix(path: str, known_paths: set[str]) -> bool:
     """An absolute (or `~/`) spelling of a file the tree already lists —
-    `/home/x/repos/coxswain-graphs/graphs/delivery/initiative_decompose.py`
+    an absolute checkout path ending in `graphs/delivery/initiative_decompose.py`
     — names the repository's own file, not something outside it."""
     return any(path.endswith("/" + known) for known in known_paths if known)
 
