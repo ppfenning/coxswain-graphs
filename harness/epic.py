@@ -692,10 +692,12 @@ def run_epic(
         merged_not_landed = [t for t in tasks if t.get("outcome") == "landed" and t.get("state") == "approved"]
         # Same command as the printed line, kept alongside the task so the
         # courier note below can never drift from what a human already reads.
+        # `land` subsumes `recover` for this purpose and never needs a phase
+        # branch resolved, so it is the one printed here; `recover` stays
+        # available on the command line for a human repairing the stack itself.
         unlanded = [
-            (t, f"cox runs recover {run_id} {t['id']} --repo {repo}") for t in approved_not_landed
-        ] + [
-            (t, f"cox runs land {run_id} --repo {repo} --task {t['id']} --apply") for t in merged_not_landed
+            (t, f"cox runs land {run_id} --repo {repo} --task {t['id']} --apply")
+            for t in approved_not_landed + merged_not_landed
         ]
         for t, command in unlanded:
             send_to_courier(f"coxswain://task/{t['id']}", "chair", command)
@@ -1139,6 +1141,10 @@ def _run_phase(
     # resume has one place to look and the record of what ran is complete.
     results = [*reused, *results]
     for result in results:
+        # `cox runs land`/`recover` resolve a phase branch as `epic/<initiative>/<phase>`;
+        # without these two fields on the saved record, neither command can find it.
+        result.setdefault("initiative", ctx.initiative_id)
+        result.setdefault("phase", phase)
         save_result(result, runs_dir=ctx.runs_dir, run_id=ctx.run_id, phase=phase, task=str(result.get("ticket")))
 
     built: dict[str, dict[str, Any]] = {}
