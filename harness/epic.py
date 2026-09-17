@@ -66,6 +66,7 @@ from harness.checks import (
     repo_checks,
     run_checks,
 )
+from harness.courier_adapter import send as send_to_courier
 from harness.digest import build_digest
 from harness.escalate import escalate_self_modification
 from harness.gate import apply_arm_for, auto_apply, gate
@@ -681,6 +682,15 @@ def run_epic(
         # not quarantined" — never a claim that `cox runs land` ran — so any
         # such task whose item still reads `approved` is unlanded too.
         merged_not_landed = [t for t in tasks if t.get("outcome") == "landed" and t.get("state") == "approved"]
+        # Same command as the printed line, kept alongside the task so the
+        # courier note below can never drift from what a human already reads.
+        unlanded = [
+            (t, f"cox runs recover {run_id} {t['id']} --repo {repo}") for t in approved_not_landed
+        ] + [
+            (t, f"cox runs land {run_id} --repo {repo} --task {t['id']} --apply") for t in merged_not_landed
+        ]
+        for t, command in unlanded:
+            send_to_courier(f"coxswain://task/{t['id']}", "chair", command)
         return {
             "run_id": run_id,
             "date": date,
@@ -693,11 +703,7 @@ def run_epic(
             "exit_summary": (
                 [f"paused: account session limit, resets {paused_until}"] if paused_until else []
             ) + [
-                f"approved but not landed: {t['id']} — cox runs recover {run_id} {t['id']} --repo {repo}"
-                for t in approved_not_landed
-            ] + [
-                f"approved but not landed: {t['id']} — cox runs land {run_id} --repo {repo} --task {t['id']} --apply"
-                for t in merged_not_landed
+                f"approved but not landed: {t['id']} — {command}" for t, command in unlanded
             ],
             "totals": {
                 "phases_complete": sum(1 for p in phases if p["status"] == "complete"),
