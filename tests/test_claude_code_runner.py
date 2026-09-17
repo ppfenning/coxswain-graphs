@@ -928,6 +928,13 @@ REFUSED = {
     "total_cost_usd": 0.97,
 }
 OK = {"type": "result", "is_error": False, "structured_output": {"ok": True}, "total_cost_usd": 0.02, "num_turns": 3}
+STRUCTURED_OUTPUT_ERROR = {
+    "type": "result",
+    "is_error": True,
+    "subtype": "error_max_structured_output_retries",
+    "result": "Failed to provide valid structured output after 5 attempts: the response could not be parsed as JSON",
+    "num_turns": 5,
+}
 
 
 @pytest.fixture
@@ -1025,6 +1032,20 @@ def test_a_safeguard_refusal_retries_once_on_the_alternate_model(sequenced_claud
     assert len(rows) == 2
     assert rows[1]["retry_of"] == rows[0]["id"]
     assert rows[1]["reason"] == "safeguard_refusal"
+    assert rows[1]["model"] == "opus"
+
+
+def test_a_structured_output_error_retries_once_on_the_alternate_model(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(STRUCTURED_OUTPUT_ERROR, OK)
+    profile = {**PROFILE, "tiers": {**PROFILE["tiers"], "standard": ["sonnet", "opus"]}}
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+
+    assert dict(runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")) == {"ok": True}
+    rows = _ledger_lines(tmp_path, "r1")
+    assert len(rows) == 2
+    assert rows[1]["retry_of"] == rows[0]["id"]
+    assert rows[1]["reason"] == "structured_output"
     assert rows[1]["model"] == "opus"
 
 
