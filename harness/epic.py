@@ -496,11 +496,19 @@ def _unapproved(result: Mapping[str, Any]) -> str | None:
     loop = result.get("fix_loop") or {}
     stopped = str(loop.get("stopped") or "") or "the reviewers did not approve the build"
     attempts = loop.get("attempts")
-    verdict = str((result.get("review") or {}).get("verdict") or "") or "none recorded"
     counted = f" after {attempts} build attempt{'s' if attempts != 1 else ''}" if attempts else ""
+    arbitration = result.get("arbitration") or {}
+    if arbitration.get("verdict"):
+        verdict = str(arbitration["verdict"])
+        reasoning = str(arbitration.get("reasoning") or "").split(". ", 1)[0].split(".", 1)[0]
+        detail = f", sided_with {arbitration.get('sided_with')}: {reasoning}"
+    else:
+        verdict = str((result.get("review") or {}).get("verdict") or "") or "none recorded"
+        objections = (result.get("adversary") or {}).get("objections") or []
+        detail = f": {objections[0].get('claim') or ''}" if objections else ""
     return (
         f"the fix loop stopped: {stopped}{counted}; the last review verdict was "
-        f"'{verdict}' and no build was approved"
+        f"'{verdict}'{detail} and no build was approved"
     )
 
 
