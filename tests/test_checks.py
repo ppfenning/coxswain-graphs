@@ -26,6 +26,7 @@ from harness.checks import (
     checks_evidence,
     collected_ids,
     coverage_floor_holds,
+    fixable_checks,
     is_harness_fault,
     quarantine_reason,
     repo_checks,
@@ -467,6 +468,14 @@ def test_repo_checks_names_are_the_first_word():
 def test_repo_checks_never_raises_on_odd_input():
     assert repo_checks("") == []
     assert repo_checks(None) == []
+
+
+def test_fixable_checks_selects_only_entries_with_a_fix_command():
+    checks = [
+        {"name": "lint", "cmd": "ruff check .", "fix": "ruff check . --fix"},
+        {"name": "pytest", "cmd": "pytest -q"},
+    ]
+    assert fixable_checks(checks) == [{"name": "lint", "cmd": "ruff check . --fix"}]
 
 
 def test_collected_ids_reads_node_ids_and_drops_the_summary_line():

@@ -61,6 +61,7 @@ from harness.checks import (
     checks_evidence,
     collected_ids,
     coverage_floor_holds,
+    fixable_checks,
     is_harness_fault,
     quarantine_reason,
     repo_checks,
@@ -460,6 +461,27 @@ def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) 
     if not ok:
         record["quarantine"] = f"the applied patch could not be committed: {detail}"
         return record
+
+    # Mechanical, model-free: a lint fix is not a build attempt, so it runs
+    # here rather than looping the fix back through review. Its changes land
+    # on the same commit the checks below see, and get folded into `result`'s
+    # own patch so every later reader — validation, escalation, merge — sees
+    # the fixed file, not the one the build actually produced.
+    fixable = fixable_checks(ctx.checks)
+    record["lint_fix_checks"] = [c["name"] for c in fixable]
+    record["lint_fixed"] = False
+    if fixable:
+        run_checks(worktree, fixable)
+        _, dirty = _git("-C", str(worktree), "status", "--porcelain")
+        if dirty:
+            _git(*_IDENTITY, "-C", str(worktree), "add", "-A")
+            ok, detail = _git(*_IDENTITY, "-C", str(worktree), "commit", "-q", "-m", "lint fix")
+            if ok:
+                record["lint_fixed"] = True
+                build_field = result.get("build")
+                _, folded = _git("-C", str(worktree), "diff", ctx.phase_branch(phase), "HEAD")
+                if isinstance(build_field, dict) and folded:
+                    build_field["patch"] = folded + "\n"
 
     if ctx.checks:
         results = run_checks(worktree, ctx.checks)
@@ -1252,6 +1274,8 @@ def _run_phase(
                 "draft": None,
                 "merged": False,
                 "status": "quarantined" if build.get("quarantine") else "built",
+                "lint_fixed": build.get("lint_fixed", False),
+                "lint_fix_checks": build.get("lint_fix_checks", []),
             }
         )
         if build.get("quarantine"):
@@ -1263,6 +1287,12 @@ def _run_phase(
             if is_harness_fault(reason):
                 quarantined.append({"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
             else:
+                # This branch is only reached for a task the fix loop already
+                # approved — `_unapproved` above quarantines anything else as
+                # `refused` before a worktree is even opened. A check still
+                # failing here, after the lint_fix step had its chance, is a
+                # non-functional finding on an approved patch, not grounds to
+                # discard it: `unverified` keeps it, same as `validate_chunk`.
                 failing = [c for c in (build.get("checks") or []) if not c.get("passed")]
                 detail = "\n\n".join(
                     f"{c.get('name')}: {c.get('cmd')}\nexit {c.get('exit_code')}\n{c.get('output_tail') or ''}"
@@ -1270,7 +1300,7 @@ def _run_phase(
                 ) or None
                 quarantined.append(
                     _quarantine_task(
-                        ctx, by_id, phase=phase, task=task, reason=reason, kind="no_work", detail=detail
+                        ctx, by_id, phase=phase, task=task, reason=reason, kind="unverified", detail=detail
                     )
                 )
             continue

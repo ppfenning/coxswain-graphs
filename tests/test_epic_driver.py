@@ -510,8 +510,11 @@ def test_a_failing_check_quarantines_that_task_and_the_sibling_still_merges(repo
     quarantined = result["quarantined"]
     assert [q["id"] for q in quarantined] == ["t1-probe"]
     assert "check failed" in quarantined[0]["reason"]
-    assert quarantined[0]["kind"] == "no_work"
-    assert "patch_kept" not in quarantined[0]
+    # No `fix` is configured on this check, so the lint_fix step is a no-op
+    # and the failure is a non-functional finding on an approved patch: kept,
+    # not discarded.
+    assert quarantined[0]["kind"] == "unverified"
+    assert quarantined[0]["patch_kept"] is True
     assert result["totals"]["tasks_quarantined"] == 1
 
     # The sibling's work is untouched by its neighbour's failure.
@@ -526,6 +529,87 @@ def test_a_failing_check_quarantines_that_task_and_the_sibling_still_merges(repo
     assert result["phases"][1]["status"] == "blocked"
     assert "did not meet its goal" in result["phases"][1]["reason"]
     assert result["totals"]["phases_complete"] == 0
+
+
+# ── the lint_fix step, mechanical and model-free ─────────────────────────────
+
+
+def test_a_checks_fix_command_lands_the_folded_patch(repo, cart, tmp_path) -> None:
+    cart["landing_areas"]["checks"] = [
+        {"name": "state", "cmd": f"{sys.executable} check.py", "fix": "printf ok > t1-probe.txt"}
+    ]
+    runner = Runner(
+        {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")}
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    assert not result["quarantined"]
+    task = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert task["lint_fixed"] is True
+    assert task["lint_fix_checks"] == ["state"]
+    landed = git("show", "epic/demo-initiative/p1-foundations:t1-probe.txt", cwd=repo)
+    assert landed.strip() == "ok"
+
+
+def test_a_fix_command_runs_once_and_never_for_a_check_with_none_configured(repo, cart, tmp_path) -> None:
+    cart["landing_areas"]["checks"] = [
+        {
+            "name": "state",
+            "cmd": f"{sys.executable} check.py",
+            "fix": "printf ok > t1-probe.txt && printf 1 >> fix-count.marker",
+        },
+        {"name": "style", "cmd": "true"},
+    ]
+    runner = Runner(
+        {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")}
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    task = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert task["lint_fix_checks"] == ["state"]
+    landed = git("show", "epic/demo-initiative/p1-foundations:fix-count.marker", cwd=repo)
+    assert landed.strip() == "1"
+
+
+def test_a_residual_failure_after_the_fix_step_keeps_the_patch_as_unverified(repo, cart, tmp_path) -> None:
+    """The fix ran, something else is still wrong: a non-functional finding never discards an approved patch."""
+    cart["landing_areas"]["checks"] = [
+        {"name": "state", "cmd": f"{sys.executable} check.py", "fix": "printf ok > unrelated.txt"}
+    ]
+    runner = Runner(
+        {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")},
+        verdicts={"p1-foundations": GOAL_UNMET},
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["kind"] == "unverified"
+    assert entry["patch_kept"] is True
+
+    task = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert task["lint_fixed"] is True
+    assert "check failed" in task["quarantine"]
+
+
+def test_an_unapproved_task_with_a_failing_check_is_unchanged(repo, cart, tmp_path) -> None:
+    """The fix step and the checks gate are never reached for a task the loop refused."""
+    cart["landing_areas"]["checks"] = [
+        {"name": "state", "cmd": f"{sys.executable} check.py", "fix": "printf ok > t1-probe.txt"}
+    ]
+    runner = RefusedRunner(
+        {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")},
+        refused="t1-probe",
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    quarantined = [q for q in result["quarantined"] if q["grain"] == "task"]
+    assert [q["id"] for q in quarantined] == ["t1-probe"]
+    assert quarantined[0]["kind"] == "refused"
+    assert "patch_kept" not in quarantined[0]
+
+    task_entry = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert "lint_fixed" not in task_entry
+    assert "checks" not in task_entry
 
 
 def test_the_failing_checks_evidence_reaches_the_record(repo, cart, tmp_path) -> None:
