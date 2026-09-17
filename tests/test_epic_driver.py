@@ -333,6 +333,33 @@ def test_phase_edges_are_derived_from_the_task_edges() -> None:
     assert phase_order(parents) == (["p1-foundations", "p2-rollout"], [])
 
 
+def test_phase_parents_drops_cross_phase_needs_whose_tasks_are_already_done() -> None:
+    """A `done` need is already on the base ref: it imposes no stacking requirement."""
+    items = [
+        {"id": "t1-probe", "phase": "p1-foundations", "state": "done", "needs": []},
+        {"id": "t2-bench", "phase": "p2-rollout", "state": "done", "needs": []},
+        {"id": "t3-cutover", "phase": "p3-cutover", "state": "todo", "needs": ["t1-probe", "t2-bench"]},
+    ]
+    assert phase_parents(items)["p3-cutover"] == set()
+
+
+def test_phase_parents_keeps_a_single_unsatisfied_cross_phase_need() -> None:
+    items = [
+        {"id": "t1-probe", "phase": "p1-foundations", "state": "in_progress", "needs": []},
+        {"id": "t3-cutover", "phase": "p2-rollout", "state": "todo", "needs": ["t1-probe"]},
+    ]
+    assert phase_parents(items)["p2-rollout"] == {"p1-foundations"}
+
+
+def test_phase_parents_still_reports_two_unsatisfied_parents() -> None:
+    items = [
+        {"id": "t1-probe", "phase": "p1-foundations", "state": "in_progress", "needs": []},
+        {"id": "t0-seed", "phase": "p0-seed", "state": "pending", "needs": []},
+        {"id": "t3-cutover", "phase": "p2-rollout", "state": "todo", "needs": ["t1-probe", "t0-seed"]},
+    ]
+    assert phase_parents(items)["p2-rollout"] == {"p1-foundations", "p0-seed"}
+
+
 def test_a_phase_with_two_parents_is_blocked_rather_than_guessed_at(repo, cart, tmp_path) -> None:
     """One stack has one base ref; picking a parent would build on half the ground."""
     work = initiative()

@@ -235,12 +235,15 @@ def phase_parents(items: Sequence[Mapping[str, Any]]) -> dict[str, set[str]]:
     declared phase order would be a second source of truth that nobody checked.
     """
     phase_of = {str(item["id"]): str(item.get("phase") or "") for item in items}
+    state_of = {str(item["id"]): item.get("state") for item in items}
     parents: dict[str, set[str]] = {phase: set() for phase in phase_of.values() if phase}
     for item in items:
         here = str(item.get("phase") or "")
         for need in item.get("needs") or []:
             there = phase_of.get(str(need))
-            if here and there and there != here:
+            # A `done` need is already on the base ref, so it imposes no stacking
+            # requirement — only an unsatisfied need makes its phase a parent.
+            if here and there and there != here and state_of.get(str(need)) != "done":
                 parents[here].add(there)
     return parents
 
