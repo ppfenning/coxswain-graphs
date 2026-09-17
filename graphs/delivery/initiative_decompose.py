@@ -19,6 +19,7 @@ the work store is written by an apply arm after a human said yes.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -27,6 +28,18 @@ from graphs.delivery.ticket_lint import Problem, lint_tickets
 from runner.protocol import NodeRunner
 
 __all__ = ["GRAPH_NAME", "initiative_text", "resolve_surfaces", "run", "surface_problem"]
+
+# A `/` or a file suffix, no spaces, optional trailing `(new)` marker — the
+# same shape lifecycle_propose._PATH_TOKEN checks. An all-caps bare token
+# (LICENSE, README) has neither and is kept on the naming convention alone.
+_PATH_TOKEN = re.compile(r"^[\w.\-]+(?:/[\w.\-]+)*$")
+
+
+def _looks_like_a_surface(entry: str) -> bool:
+    body = entry[: -len(" (new)")] if entry.endswith(" (new)") else entry
+    if not _PATH_TOKEN.match(body):
+        return False
+    return "/" in body or bool(re.search(r"\.[A-Za-z0-9]{1,5}$", body)) or body.isupper()
 
 GRAPH_NAME = "initiative-decompose"
 
@@ -430,6 +443,24 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             dict(t, lint=[*(t.get("lint") or []), *notes[str(t["id"])]]) if str(t["id"]) in notes else t
             for t in tasks
         ]
+
+    # The seat's own structured output sometimes copies an advisory sentence
+    # into `surfaces` after seeing one in a retry prompt (build-output-valid,
+    # limit-pause). Same path shape as lifecycle_propose._PATH_TOKEN: a `/` or
+    # a file suffix, no spaces, optional trailing `(new)`; an all-caps root
+    # file like LICENSE has neither and is kept on that alone. What doesn't
+    # look like a path moves to `lint` here, the one place every task passes.
+    tasks = [
+        dict(
+            t,
+            surfaces=[s for s in t.get("surfaces") or [] if _looks_like_a_surface(str(s))],
+            lint=[
+                *(t.get("lint") or []),
+                *(f"dropped from surfaces: {s}" for s in t.get("surfaces") or [] if not _looks_like_a_surface(str(s))),
+            ],
+        )
+        for t in tasks
+    ]
 
     shape = epic_shape(
         cartridge,

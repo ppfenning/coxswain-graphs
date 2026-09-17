@@ -375,11 +375,12 @@ def test_a_task_whose_surfaces_span_two_repos_is_split_one_per_repo(cart) -> Non
     assert sorted(t2["needs"]) == ["t1--graphs-repo", "t1--harness-repo"]
 
 
-def test_without_a_tree_surfaces_stay_as_declared(cart) -> None:
-    """No tree means nothing to resolve against; the old behaviour is unchanged."""
+def test_without_a_tree_only_path_shaped_surfaces_stay_declared(cart) -> None:
+    """No tree means nothing to resolve against, but a bare declared token still isn't a path."""
     result = decompose(cart)
     t1 = next(t for t in result["tasks"] if t["id"] == "t1")
-    assert t1["surfaces"] == ["schema"]
+    assert t1["surfaces"] == []
+    assert t1["lint"] == ["dropped from surfaces: schema"]
 
 
 def test_a_reach_problem_comes_back_through_apply_corrections_as_a_refusal(cart) -> None:
@@ -486,3 +487,24 @@ def test_a_grant_advisory_lands_under_lint_and_never_in_surfaces(cart) -> None:
     task = next(t for t in result["tasks"] if t["id"] == "t1")
     assert task["lint"] == [lint_entry]
     assert task["surfaces"] == ["graphs/schema.py"]
+
+
+def test_a_non_path_entry_in_surfaces_is_dropped_to_lint(cart) -> None:
+    advisory = "grant: names `cox`, which is not granted (name only pytest, git status, git diff)"
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [
+            {
+                "id": "t1",
+                "phase": "p1",
+                "title": "a",
+                "body": "b",
+                "needs": [],
+                "surfaces": ["graphs/schema.py", "pkg/mod.py (new)", "widget-thing", advisory],
+            },
+        ],
+    }
+    result = decompose(cart, decomposition)
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert task["surfaces"] == ["graphs/schema.py", "pkg/mod.py (new)"]
+    assert task["lint"] == ["dropped from surfaces: widget-thing", f"dropped from surfaces: {advisory}"]
