@@ -40,7 +40,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from runner.protocol import BudgetStop, LimitStop, NodeResult, RunnerError
+from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
+
+# Per docs/design/vendor-axis.md §2: session resume on a budget stop, structured
+# output, and Bash/Read/Edit tool grants are real; 200_000 is Claude's published
+# context window (Sonnet/Opus/Haiku all share it).
+CAPABILITIES: Mapping[str, Any] = {
+    Capability.STRUCTURED_OUTPUT.value: True,
+    Capability.TOOL_USE.value: True,
+    Capability.RESUME.value: True,
+    Capability.STREAMING.value: True,
+    Capability.MAX_CONTEXT.value: 200_000,
+}
 
 __all__ = ["DEFAULT_TIER", "TIER_EFFORT", "ClaudeCodeRunner"]
 
@@ -327,6 +338,7 @@ class ClaudeCodeRunner:
         run_id: str | None = None,
     ) -> None:
         self.profile = dict(profile)
+        self.capabilities = dict(CAPABILITIES)
         self.tiers = dict(self.profile.get("tiers") or {})
         if not self.tiers:
             raise RunnerError("provider profile declares no tiers")
