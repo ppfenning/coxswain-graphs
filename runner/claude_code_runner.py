@@ -134,7 +134,7 @@ def files_touched_from_patch(patch: str) -> list[str]:
 #
 # Matched on the CLI's own words rather than on an exit code, because the exit
 # code is the same one a real refusal returns.
-_TRANSIENT_ERRORS = ("safeguards flagged", "reasoning_extraction")
+_TRANSIENT_ERRORS = ("safeguards flagged", "reasoning_extraction", "error_max_structured_output_retries")
 
 # A `subtype: success` payload whose result text is this banner is the account's
 # own session limit, not a node failure.
@@ -165,6 +165,19 @@ def is_safeguard_refusal(payload: Mapping[str, Any]) -> bool:
         str(payload.get(key) or "") for key in ("subtype", "result", "errors")
     ).lower()
     return "safeguards flagged" in said
+
+
+def is_max_structured_output_retries(payload: Mapping[str, Any]) -> bool:
+    """Pure: did the CLI give up parsing structured output after its own retries?
+
+    Narrower than `_is_transient` for the same reason as `is_safeguard_refusal`:
+    scoped to the one subtype the CLI uses, so only this failure earns the
+    alternate-model retry and its own ledger reason.
+    """
+    said = " ".join(
+        str(payload.get(key) or "") for key in ("subtype", "result", "errors")
+    ).lower()
+    return "error_max_structured_output_retries" in said
 
 
 def _alt_model_for(tiers: Mapping[str, Any], tier: str, model: str) -> str:
@@ -823,13 +836,16 @@ class ClaudeCodeRunner:
                     )
                 raise RunnerError(message)
 
-            # A safeguard refusal specifically, not the broader transient set,
-            # moves the retry to the tier's alternate model and names why on
-            # the ledger; a plain reasoning-extraction misfire keeps retrying
-            # the same model exactly as before.
+            # A safeguard refusal, or the CLI's own structured-output retries
+            # running out, moves the retry to the tier's alternate model and
+            # names why on the ledger; a plain reasoning-extraction misfire
+            # keeps retrying the same model exactly as before.
             if is_safeguard_refusal(payload):
                 attempt_model = _alt_model_for(self.tiers, tier, used_model)
                 retry_extra = {"retry_of": call_id, "reason": "safeguard_refusal"}
+            elif is_max_structured_output_retries(payload):
+                attempt_model = _alt_model_for(self.tiers, tier, used_model)
+                retry_extra = {"retry_of": call_id, "reason": "structured_output"}
 
             # Keep the failed attempt's trace. The retry writes to the same
             # filename, and a transient error that leaves no record behind is
