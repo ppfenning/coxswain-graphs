@@ -26,6 +26,7 @@ __all__ = [
     "checks_evidence",
     "collected_ids",
     "coverage_floor_holds",
+    "fixable_checks",
     "is_harness_fault",
     "quarantine_reason",
     "repo_checks",
@@ -95,6 +96,15 @@ def repo_checks(text: str) -> list[dict]:
     lines = (stripped for stripped in (line.strip() for line in text.splitlines()) if stripped and not stripped.startswith("#"))
     unique = dict.fromkeys(lines)  # first occurrence wins, order preserved
     return [{"name": line.split(None, 1)[0], "cmd": line} for line in unique]
+
+
+def fixable_checks(checks: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Checks carrying a `fix` command, reshaped to `{name, cmd}` for `run_checks`.
+
+    A check without `fix` is not a candidate. The `fix` string runs verbatim —
+    `--unsafe-fixes` or any other flag is never added on its behalf.
+    """
+    return [{"name": c["name"], "cmd": c["fix"]} for c in checks if c.get("fix")]
 
 
 def run_checks(
