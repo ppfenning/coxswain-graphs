@@ -7,6 +7,7 @@ the person who just drew the graph is the last person likely to spot one.
 from __future__ import annotations
 
 import pytest
+import yaml
 
 from graphs._contract import ContractViolation
 from graphs.delivery import initiative_decompose
@@ -262,8 +263,8 @@ def test_a_proposal_names_the_bound_landing_not_the_abstract_one(cart) -> None:
     action = result["proposals"][0]["suggested_action"]
     assert action.startswith("create work/init/"), action
     assert "planned_work" not in action
-    assert "title=" in action and "needs=[" in action
-    empty = next(p["suggested_action"] for p in result["proposals"] if "needs=[]" in p["suggested_action"])
+    assert "title:" in action and "needs:" in action
+    empty = next(p["suggested_action"] for p in result["proposals"] if "needs: []" in p["suggested_action"])
     assert "none" not in empty, "an empty list prints as [], never as a word the arm would copy"
 
 
@@ -449,7 +450,7 @@ def test_a_grant_problem_is_recorded_as_a_lint_entry_not_a_refusal(cart) -> None
     task = next(t for t in result["tasks"] if t["id"] == "t1")
     assert task["lint"] == [lint_entry]
     ticket = next(p for p in result["proposals"] if p["target"] == "t1")
-    assert f"lint=[{lint_entry}]" in ticket["suggested_action"]
+    assert f"lint:\n- '{lint_entry}'" in ticket["suggested_action"]
     assert {"check": "lint", "output": lint_entry} in ticket["evidence"]
 
 
@@ -464,7 +465,7 @@ def test_a_size_problem_is_recorded_as_a_lint_entry_not_a_refusal(cart) -> None:
     task = next(t for t in result["tasks"] if t["id"] == "t1")
     assert task["lint"] == [lint_entry]
     ticket = next(p for p in result["proposals"] if p["target"] == "t1")
-    assert f"lint=[{lint_entry}]" in ticket["suggested_action"]
+    assert f"lint:\n- '{lint_entry}'" in ticket["suggested_action"]
     assert {"check": "lint", "output": lint_entry} in ticket["evidence"]
 
 
@@ -508,3 +509,38 @@ def test_a_non_path_entry_in_surfaces_is_dropped_to_lint(cart) -> None:
     task = next(t for t in result["tasks"] if t["id"] == "t1")
     assert task["surfaces"] == ["graphs/schema.py", "pkg/mod.py (new)"]
     assert task["lint"] == ["dropped from surfaces: widget-thing", f"dropped from surfaces: {advisory}"]
+
+
+def test_a_title_carrying_a_colon_round_trips_through_yaml(cart) -> None:
+    title = "Pure steward core: evidence-bar check and proposal rendering for the ceiling case"
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": title, "body": "b", "needs": [], "surfaces": []}],
+    }
+    result = decompose(cart, decomposition)
+    ticket = next(p for p in result["proposals"] if p["target"] == "t1")
+    block = ticket["suggested_action"].split("with frontmatter\n", 1)[1].rsplit("\nbody = ", 1)[0]
+    assert yaml.safe_load(block)["title"] == title
+
+
+def test_a_body_ending_in_a_closing_tag_is_written_without_it(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "the rationale text\n</content>", "needs": [], "surfaces": []}],
+    }
+    result = decompose(cart, decomposition)
+    ticket = next(p for p in result["proposals"] if p["target"] == "t1")
+    assert ticket["rationale"] == "the rationale text"
+
+
+def test_duplicated_lint_entries_are_written_once(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "```bash\ncox route lint t1\n```", "needs": [], "surfaces": []}],
+    }
+    result = decompose(cart, decomposition)
+    lint_entry = "grant: names `cox`, which is not granted (name only pytest, git status, git diff)"
+    task = dict(next(t for t in result["tasks"] if t["id"] == "t1"), lint=[lint_entry, lint_entry, lint_entry])
+    action = initiative_decompose._item_action(task, landing="work", initiative_id=None)
+    block = action.split("with frontmatter\n", 1)[1].rsplit("\nbody = ", 1)[0]
+    assert yaml.safe_load(block)["lint"] == [lint_entry]
