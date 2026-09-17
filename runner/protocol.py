@@ -21,9 +21,13 @@ The runner is the only object in the system that gets to know either mapping.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
-__all__ = ["BudgetStop", "LimitStop", "NodeResult", "NodeRunner", "RunnerError"]
+__all__ = ["BudgetStop", "Capability", "LimitStop", "NodeResult", "NodeRunner", "ProviderProfile", "RunnerError", "resolve_profile"]
+
+_TIERS = ("cheap", "standard", "deep")
 
 
 class RunnerError(Exception):
@@ -75,6 +79,57 @@ class NodeResult(dict):
     moved the reasoning into the wrong place, and blows structured-output limits
     on a busy day.
     """
+
+
+class Capability(StrEnum):
+    """A thing a provider profile may declare, per tier."""
+
+    STRUCTURED_OUTPUT = "structured_output"
+    TOOL_USE = "tool_use"
+    RESUME = "resume"
+    STREAMING = "streaming"
+    MAX_CONTEXT = "max_context"
+
+
+@dataclass(frozen=True)
+class ProviderProfile:
+    """A tier's capabilities and per-tier model, per docs/design/vendor-axis.md §3."""
+
+    capabilities: Mapping[str, Any]
+    tiers: Mapping[str, str]
+
+    def has(self, capability: Capability) -> bool:
+        return bool(self.capabilities.get(capability.value))
+
+
+def resolve_profile(
+    provider_profile: ProviderProfile | Mapping[str, ProviderProfile],
+    *,
+    role: str,
+    tier: str,
+    required: Sequence[Capability] = (),
+) -> tuple[ProviderProfile, dict[str, str] | None]:
+    """Resolve `tier`, retrying one tier up per §5 if `required` is unmet."""
+    by_tier = provider_profile if isinstance(provider_profile, Mapping) else dict.fromkeys(_TIERS, provider_profile)
+    profile = by_tier[tier]
+    missing = next((c for c in required if not profile.has(c)), None)
+    if missing is None:
+        return profile, None
+    index = _TIERS.index(tier)
+    if index + 1 == len(_TIERS):
+        raise RunnerError(f"{role} needs {missing.value}; no tier above {tier!r}")
+    resolved_tier = _TIERS[index + 1]
+    resolved = by_tier[resolved_tier]
+    still_missing = next((c for c in required if not resolved.has(c)), None)
+    if still_missing is not None:
+        raise RunnerError(f"{role} needs {still_missing.value}; {resolved_tier!r} lacks it too")
+    return resolved, {
+        "event": "capability_fallback",
+        "role": role,
+        "requested_tier": tier,
+        "resolved_tier": resolved_tier,
+        "missing_capability": missing.value,
+    }
 
 
 @runtime_checkable
