@@ -23,6 +23,8 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import yaml
+
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
 from graphs.delivery.ticket_lint import Problem, lint_tickets
 from runner.protocol import NodeRunner
@@ -497,7 +499,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     else []
                 ),
             ],
-            rationale=str(task.get("body") or decomposition.get("rationale", "")),
+            rationale=_strip_trailing_tag(str(task.get("body") or decomposition.get("rationale", ""))),
             # The whole item, in the action. The arm sees the proposal and
             # nothing else, so an action that named only an id would leave it
             # inventing the title and guessing the initiative — the first live
@@ -555,24 +557,34 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     }
 
 
+def _strip_trailing_tag(body: str) -> str:
+    """Drop a trailing closing tag on its own line — the seat's own output wrapper, not the ticket."""
+    return re.sub(r"\n?</[^\n>]+>\s*$", "", body)
+
+
 def _item_action(task: Mapping[str, Any], *, landing: str, initiative_id: str | None) -> str:
     """Pure: the create action, carrying every field the work-item arm must write."""
     where = "/".join(part for part in (landing, initiative_id, str(task.get("phase"))) if part)
     # Empty stays `[]`, never a placeholder word: the arm copies this text into
     # frontmatter verbatim, and `needs: [none]` is an edge to a task that does
     # not exist — the third live run landed exactly that and the DAG refused.
-    needs = ", ".join(str(n) for n in task.get("needs") or [])
-    surfaces = ", ".join(str(x) for x in task.get("surfaces") or [])
     # Ticket lint's grant/size warnings land here too — docs/design/work-shape.md
-    # §3 puts them in the ticket's own `lint:` frontmatter list, not just the
-    # in-memory task the graph returns. `; ` separates entries because a single
-    # entry's own detail and fix routinely carry commas.
-    lint = "; ".join(str(x) for x in task.get("lint") or [])
-    return (
-        f"create {where}/{task['id']}.md with frontmatter id={task['id']}, "
-        f"title={task.get('title') or task['id']!s}, phase={task.get('phase')}, state=ready, "
-        f"needs=[{needs}], surfaces=[{surfaces}], lint=[{lint}]; body = the rationale"
-    )
+    # §3 puts them in the ticket's own `lint:` frontmatter list. A retried seat
+    # can see the same advisory more than once; dedupe keeps it to one.
+    frontmatter = {
+        "id": task["id"],
+        "title": task.get("title") or task["id"],
+        "phase": task.get("phase"),
+        "state": "ready",
+        "needs": [str(n) for n in task.get("needs") or []],
+        "surfaces": [str(x) for x in task.get("surfaces") or []],
+        "lint": list(dict.fromkeys(str(x) for x in task.get("lint") or [])),
+    }
+    # Real YAML, not a hand-quoted guess: the arm copies this block verbatim
+    # into the ticket's frontmatter, and a title carrying `: ` broke exactly
+    # that the first time nothing here quoted it.
+    block = yaml.safe_dump(frontmatter, sort_keys=False, allow_unicode=True, width=1000)
+    return f"create {where}/{task['id']}.md with frontmatter\n{block}body = the rationale"
 
 
 from graphs._spec import GraphSpec, Need  # noqa: E402
