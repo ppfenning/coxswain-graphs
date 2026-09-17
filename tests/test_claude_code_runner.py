@@ -26,7 +26,7 @@ from runner.claude_code_runner import (
     self_reported_commands,
     trace_commands,
 )
-from runner.protocol import BudgetStop
+from runner.protocol import BudgetStop, Capability, ProviderProfile, resolve_profile
 from runner.scripted import ScriptedRunner
 
 PROFILE = {
@@ -230,6 +230,19 @@ def test_a_missing_binary_is_named(tmp_path) -> None:
 def test_a_profile_without_tiers_is_refused() -> None:
     with pytest.raises(RunnerError, match="no tiers"):
         ClaudeCodeRunner({"runner": "claude-code"})
+
+
+def test_the_runner_declares_the_full_capability_set() -> None:
+    runner = ClaudeCodeRunner(PROFILE)
+    assert set(runner.capabilities) == {c.value for c in Capability}
+    assert runner.capabilities["resume"] is True
+
+
+def test_a_role_needing_resume_resolves_on_claude_code_with_no_fallback() -> None:
+    profile = ProviderProfile(capabilities=ClaudeCodeRunner(PROFILE).capabilities, tiers=PROFILE["tiers"])
+    resolved, fallback = resolve_profile(profile, role="build", tier="cheap", required=[Capability.RESUME])
+    assert resolved is profile
+    assert fallback is None
 
 
 # ── selection ────────────────────────────────────────────────────────────────
