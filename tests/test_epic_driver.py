@@ -753,10 +753,13 @@ def test_an_approved_and_quarantined_task_names_itself_in_the_exit_summary(repo,
     failed = next(t for t in result["tasks"] if t["id"] == "t1-probe")
     assert failed["outcome"] == "approved_not_landed"
     assert "check failed" in failed["reason"]
-    # t1-probe is quarantined (recover); t2-bench merged clean but nothing in
-    # this run writes `done`, so it is unlanded too (land) — both count.
+    # t1-probe is quarantined; t2-bench merged clean but nothing in this run
+    # writes `done` — both are unlanded, and `land` handles both cases.
     assert result["totals"]["approved_not_landed"] == 2
-    assert f"approved but not landed: t1-probe — cox runs recover epic-1 t1-probe --repo {repo}" in result["exit_summary"]
+    assert (
+        f"approved but not landed: t1-probe — cox runs land epic-1 --repo {repo} --task t1-probe --apply"
+        in result["exit_summary"]
+    )
     assert (
         f"approved but not landed: t2-bench — cox runs land epic-1 --repo {repo} --task t2-bench --apply"
         in result["exit_summary"]
@@ -1199,6 +1202,20 @@ def test_an_escalated_tasks_state_move_lands_on_approved_not_done(repo, cart, tm
     landed = next(t for t in result["tasks"] if t["id"] == "t2-bench")
     assert landed["merged"] is True
     assert landed["outcome"] == "landed"
+
+    # The saved record is what `cox runs land`/`recover` read back, and both
+    # resolve a phase branch as `epic/<initiative>/<phase>` — so the record
+    # needs both fields, not just the ones the graph itself produced.
+    saved = load_result(tmp_path / "runs", "epic-1", "p1-foundations", "t1-probe")
+    assert saved["initiative"] == "demo-initiative"
+    assert saved["phase"] == "p1-foundations"
+
+    # `recover` needs the phase branch the merge never reached; `land` never
+    # does, so it is the command named here for an escalated, unmerged task.
+    assert (
+        f"approved but not landed: t1-probe — cox runs land epic-1 --repo {repo} --task t1-probe --apply"
+        in result["exit_summary"]
+    )
 
 
 def test_a_normally_merged_task_reads_approved_never_done_until_cox_lands_it(repo, cart, tmp_path) -> None:
