@@ -28,6 +28,7 @@ from harness.epic import (
     EXIT_PAUSED,
     _ticket_amend_ramp,
     _trace_evidence,
+    _unapproved,
     branch_action,
     phase_order,
     phase_parents,
@@ -712,6 +713,34 @@ def test_task_outcome_names_all_four_cases() -> None:
     assert task_outcome("approve", None, "configured checks failed: state — see evidence", False) == "approved_not_landed"
     assert task_outcome(None, "approve", "harness fault: check 'state' could not run: boom", False) == "harness_fault"
     assert task_outcome("revise", None, None, False) == "rejected"
+
+
+def test_unapproved_names_the_arbitration_verdict_and_its_first_sentence() -> None:
+    result = {
+        "fix_loop": {"stopped": "attempts_exhausted", "attempts": 2},
+        "review": {"verdict": "approve"},
+        "arbitration": {
+            "verdict": "revise",
+            "sided_with": "adversary",
+            "reasoning": "The adversary is right. The reviewer missed the null case.",
+        },
+    }
+    assert _unapproved(result) == (
+        "the fix loop stopped: attempts_exhausted after 2 build attempts; the last review "
+        "verdict was 'revise', sided_with adversary: The adversary is right and no build "
+        "was approved"
+    )
+
+
+def test_unapproved_names_the_review_verdict_when_no_arbitration_ran() -> None:
+    result = {
+        "fix_loop": {"stopped": "attempts_exhausted", "attempts": 2},
+        "review": {"verdict": "revise"},
+    }
+    assert _unapproved(result) == (
+        "the fix loop stopped: attempts_exhausted after 2 build attempts; the last review "
+        "verdict was 'revise' and no build was approved"
+    )
 
 
 def test_an_approved_and_quarantined_task_names_itself_in_the_exit_summary(repo, cart, tmp_path) -> None:
