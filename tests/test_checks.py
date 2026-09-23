@@ -22,6 +22,7 @@ import pytest
 
 from harness.checks import (
     all_passed,
+    check_feedback,
     check_outcome,
     checks_evidence,
     collected_ids,
@@ -29,6 +30,7 @@ from harness.checks import (
     fixable_checks,
     is_harness_fault,
     quarantine_reason,
+    refix_route,
     repo_checks,
     run_checks,
 )
@@ -501,3 +503,38 @@ def test_coverage_floor_fails_when_a_before_id_is_missing_from_after():
     before = {"tests/test_a.py::test_one", "tests/test_a.py::test_two"}
     after = {"tests/test_a.py::test_one"}
     assert coverage_floor_holds(before, after) is False
+
+
+# ── where an approved build whose checks failed goes next ───────────────────
+
+_B023 = "B023 Function definition does not bind loop variable `directory`"
+_LINT_FAIL = {"name": "lint", "cmd": "ruff check .", "passed": False, "outcome": "failed", "exit_code": 1, "output_tail": _B023}
+_TEST_FAIL = {"name": "pytest", "cmd": "pytest -q", "passed": False, "outcome": "failed", "exit_code": 1, "output_tail": "1 failed"}
+_TEST_OK = {"name": "pytest", "cmd": "pytest -q", "passed": True, "outcome": "passed", "exit_code": 0, "output_tail": ""}
+_CONFIGURED = [{"name": "lint", "cmd": "ruff check ."}, {"name": "pytest", "cmd": "pytest -q"}]
+
+
+def test_check_feedback_quotes_the_failing_output_and_skips_a_passing_check() -> None:
+    assert check_feedback([_LINT_FAIL, _TEST_OK]) == f"lint: ruff check .\nexit 1\n{_B023}"
+
+
+def test_a_lint_only_failure_with_attempts_left_goes_to_style_pass() -> None:
+    assert refix_route([_LINT_FAIL, _TEST_OK], _CONFIGURED, attempts_left=2, style_bound=True) == "style_pass"
+
+
+def test_a_lint_failure_with_no_style_seat_or_a_test_failure_goes_back_as_a_revise() -> None:
+    assert refix_route([_LINT_FAIL], _CONFIGURED, attempts_left=2, style_bound=False) == "revise"
+    assert refix_route([_LINT_FAIL, _TEST_FAIL], _CONFIGURED, attempts_left=2, style_bound=True) == "revise"
+
+
+def test_a_check_with_a_fix_command_counts_as_lint_whatever_it_is_called() -> None:
+    configured = [{"name": "style", "cmd": "black --check .", "fix": "black ."}]
+    failed = [{"name": "style", "passed": False, "outcome": "failed"}]
+    assert refix_route(failed, configured, attempts_left=1, style_bound=True) == "style_pass"
+
+
+def test_no_attempts_left_a_harness_fault_or_a_pass_all_quarantine() -> None:
+    assert refix_route([_LINT_FAIL], _CONFIGURED, attempts_left=0, style_bound=True) == "quarantine"
+    unrunnable = {"name": "lint", "cmd": "ruff", "passed": False, "outcome": "unrunnable", "error": "not found"}
+    assert refix_route([unrunnable], _CONFIGURED, attempts_left=2, style_bound=True) == "quarantine"
+    assert refix_route([_TEST_OK], _CONFIGURED, attempts_left=2, style_bound=True) == "quarantine"
