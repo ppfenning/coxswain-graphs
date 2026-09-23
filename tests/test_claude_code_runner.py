@@ -939,6 +939,23 @@ def test_the_builder_is_handed_the_projects_check_commands_verbatim(fake_claude,
     assert "exactly: `pytest" not in argv[argv.index("--system-prompt") + 1], "only the builder runs anything"
 
 
+def test_the_builder_is_told_to_run_every_check_and_may_run_the_lint_command(fake_claude, tmp_path, repo) -> None:
+    """A lint error the builder never ran fails after review and costs a rerun (B023, 2026-09-23)."""
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.check_commands = ["pytest -q", "ruff check ."]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    system = argv[argv.index("--system-prompt") + 1]
+    assert "Run every one of them before you produce the diff, a lint command as much as the tests" in system
+    allowed = argv[argv.index("--allowedTools") + 1 : argv.index("--tools")]
+    assert "Bash(ruff:*)" in allowed, "the sentence is worthless unless the sandbox lets the lint command run"
+    runner.check_commands = []
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert "a lint command as much as the tests" not in argv[argv.index("--system-prompt") + 1], "no checks, nothing to run"
+
+
 def test_bash_is_pre_approved_for_the_checks_and_git_and_nothing_else(fake_claude, tmp_path, repo) -> None:
     """acceptEdits never covered Bash: seven epics of builds never ran a test."""
     runner = runner_for(fake_claude, tmp_path, repo_dir=repo)

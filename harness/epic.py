@@ -53,23 +53,26 @@ from core.manifest import build_manifest, gate_diff, record_run
 from core.workstore import WorkStoreError, record_attempt
 
 from graphs._contract import proposal
+from graphs.delivery.lifecycle_propose import DEFAULT_FIX_ATTEMPTS
 from harness.autonomy import split_by_policy
 from harness.checks import (
     HARNESS_FAULT_PREFIX,
     _tail_lines,
     all_passed,
+    check_feedback,
     checks_evidence,
     collected_ids,
     coverage_floor_holds,
     fixable_checks,
     is_harness_fault,
     quarantine_reason,
+    refix_route,
     repo_checks,
     run_checks,
 )
 from harness.courier_adapter import send as send_to_courier
 from harness.digest import build_digest
-from harness.escalate import escalate_self_modification
+from harness.escalate import escalate_self_modification, touched_paths
 from harness.gate import apply_arm_for, auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
@@ -116,6 +119,12 @@ _STYLE_PASS_PROMPT = (
     "Make the narrow style edit an approved diff still needs, or return nothing. "
     "Remove duplication the tickets introduced separately; remove shims whose exit "
     "condition the phase has met."
+)
+
+_CHECK_FIX_PROMPT = (
+    "The diff below was approved, then a configured check failed on it. Make the smallest "
+    "edit that fixes the failure shown, as a unified diff against the tree with the "
+    "approved diff already applied, or return nothing."
 )
 
 _STYLE_PASS_SCHEMA = {
@@ -491,6 +500,162 @@ def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) 
         if reason:
             record["quarantine"] = reason
     return record
+
+
+def _lifecycle_invocation(
+    ctx: _Ctx, task: Mapping[str, Any], *, body: str, fix_attempts: int | None
+) -> Invocation:
+    return Invocation(
+        id=str(task["id"]),
+        graph=LIFECYCLE,
+        args={
+            "date": ctx.date,
+            "ticket": task["id"],
+            "ticket_title": task.get("title") or "",
+            "ticket_body": body,
+            "cartridge": ctx.cartridge,
+            "surfaces": list(task.get("surfaces") or []),
+            "patterns": list(task.get("patterns") or []),
+            **({"fix_attempts": fix_attempts} if fix_attempts is not None else {}),
+            **({"build_budget_usd": task["budget_usd"]} if task.get("budget_usd") is not None else {}),
+        },
+    )
+
+
+def _style_fix(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any], build: dict[str, Any]) -> bool:
+    """One `style_pass` over an approved build whose lint failed, then the checks again.
+
+    The seat is a model and no reviewer sees its edit, so it is bounded three
+    ways. Its patch passes the coverage floor `_trim_phase` uses, no collected
+    test id may disappear. Only the paths it names are staged, because the
+    checks have already written byproducts into this worktree. And the edit is
+    recorded as an evidence row, for whoever reads the gate. True when the patch
+    applied, held the floor and was committed; `build` then carries the fresh
+    check results and `result`'s patch the folded diff. False restores the
+    worktree, for a fall back to a revise.
+    """
+    worktree = ctx.task_worktree(phase, task)
+    before = _collected_ids(worktree)
+    if before is None:
+        return False  # no floor can be measured, so no model call is worth buying
+    patch = str((result.get("build") or {}).get("patch") or "")
+    edit = ctx.runner.run(
+        role="style_pass",
+        tier="standard",
+        schema=_STYLE_PASS_SCHEMA,
+        task=task,
+        context=list(ctx.cartridge.get("context") or []),
+        prompt=(
+            f"{_CHECK_FIX_PROMPT}\n\nTicket: {task}\n\nFailing checks:\n{check_feedback(build['checks'])}"
+            f"\n\nApproved diff:\n{patch[:PATCH_FOR_VALIDATION_CHARS]}"
+        ),
+    ).get("patch")
+    if not str(edit or "").strip():
+        return False
+    if not apply_patch(str(edit), worktree)[0]:
+        return False
+    after = _collected_ids(worktree)
+    if after is None or not coverage_floor_holds(before, after):
+        _git("-C", str(worktree), "reset", "--hard", "-q")
+        _git("-C", str(worktree), "clean", "-fdq")
+        build["evidence"].append({"check": "style_pass", "output": "refused (coverage floor)"})
+        return False
+    paths = touched_paths(str(edit))
+    staged, _ = _git(*_IDENTITY, "-C", str(worktree), "add", "-A", "--", *paths)
+    if not staged or not _git(*_IDENTITY, "-C", str(worktree), "commit", "-q", "-m", "style pass")[0]:
+        return False
+    _, folded = _git("-C", str(worktree), "diff", ctx.phase_branch(phase), "HEAD")
+    build_field = result.get("build")
+    if isinstance(build_field, dict) and folded:
+        build_field["patch"] = folded + "\n"
+    results = run_checks(worktree, ctx.checks)
+    build["checks"] = results
+    build["evidence"] = [
+        *(row for row in build["evidence"] if not str(row.get("check")).startswith("checks:")),
+        {"check": "style_pass", "output": f"edit applied after approval, not reviewed: {', '.join(paths)}"},
+        *checks_evidence(results),
+    ]
+    build["quarantine"] = quarantine_reason(results)
+    return True
+
+
+def _refix(
+    ctx: _Ctx,
+    by_id: Mapping[str, Mapping[str, Any]],
+    *,
+    phase: str,
+    task: str,
+    result: dict[str, Any],
+    build: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Send an approved build whose checks failed back through the fix loop, while attempts remain.
+
+    The loop approved this build, and a configured check then failed on it: a
+    one-token lint error cost a whole rerun when that was quarantined at once.
+    The check's own output goes back to the builder, either through the
+    `style_pass` seat for a lint-only failure or as a fresh lifecycle run whose
+    ticket body carries it, and the checks run again on what comes back.
+    Attempts are the loop's own budget, `fix_attempts` plus the first build,
+    less what the loop already spent and what each re-entry spends. Once none
+    remain, or a re-entry is not approved, the build quarantines as before.
+    A task gets at most one `style_pass` edit; a revise is a whole reviewed
+    lifecycle run, and each one leaves an evidence row saying what it spent.
+    """
+    limit = DEFAULT_FIX_ATTEMPTS if ctx.fix_attempts is None else ctx.fix_attempts
+    spent = float((result.get("fix_loop") or {}).get("attempts") or 1)
+    item = {**(by_id.get(task) or {}), "id": task}
+    routes: list[str] = []
+    while build.get("quarantine") and "checks" in build:
+        left = limit + 1 - spent
+        # One unreviewed style edit per task: a second failure goes to a reviewed revise.
+        style_open = "style_pass" in ctx.bound and "style_pass" not in routes
+        route = refix_route(build["checks"], ctx.checks, attempts_left=left, style_bound=style_open)
+        if route == "quarantine":
+            break
+        if route == "style_pass" and _style_fix(ctx, phase=phase, task=task, result=result, build=build):
+            spent += 1
+            routes.append("style_pass")
+            continue
+        failed = {
+            "run": ctx.run_id,
+            "phase": phase,
+            "reason": f"approved, then failed its configured checks:\n{check_feedback(build['checks'])}",
+        }
+        body = _carry_forward(
+            item.get("body") or "",
+            [*(item.get("attempts") or []), failed],
+            str((result.get("build") or {}).get("patch") or ""),
+            limit=PATCH_FOR_VALIDATION_CHARS,
+        )
+        retried, _, failures = invoke_graphs(
+            [_lifecycle_invocation(ctx, item, body=body, fix_attempts=max(int(left) - 1, 0))],
+            specs=ctx.specs,
+            runner=ctx.runner,
+            run_id=f"{ctx.run_id}:{phase}:refix{len(routes) + 1}",
+            max_parallel=1,
+        )
+        why = failures[0] if failures else None
+        if why is None and retried[0].get("failed_node") is not None:
+            why = f"node '{retried[0]['failed_node']}' failed"
+        if why is None:
+            why = _unapproved(retried[0])
+        if why is not None:
+            build["evidence"].append({"check": "fix loop re-entry", "output": f"not approved: {why}"})
+            break
+        result = retried[0]
+        result.setdefault("initiative", ctx.initiative_id)
+        result.setdefault("phase", phase)
+        save_result(result, runs_dir=ctx.runs_dir, run_id=ctx.run_id, phase=phase, task=task)
+        spent += float((result.get("fix_loop") or {}).get("attempts") or 1)
+        routes.append("revise")
+        names = ", ".join(str(c["name"]) for c in build["checks"] if not c.get("passed"))
+        remove_worktree(ctx.repo, ctx.task_worktree(phase, task))
+        _git("-C", str(ctx.repo), "branch", "-D", ctx.scratch_branch(task))
+        build = _build_task(ctx, phase=phase, task=task, result=result)
+        build["evidence"].append(
+            {"check": "fix loop re-entry", "output": f"revise after {names}: attempts spent {spent:g} of {limit + 1}"}
+        )
+    return result, ({**build, "refix": routes} if routes else build)
 
 
 def _unapproved(result: Mapping[str, Any]) -> str | None:
@@ -1124,25 +1289,16 @@ def _run_phase(
     if runnable:
         results, _, failures = invoke_graphs(
             [
-                Invocation(
-                    id=str(task["id"]),
-                    graph=LIFECYCLE,
-                    args={
-                        "date": ctx.date,
-                        "ticket": task["id"],
-                        "ticket_title": task.get("title") or "",
-                        "ticket_body": _carry_forward(
-                            task.get("body") or "",
-                            list(task.get("attempts") or []),
-                            patches_for_attempt.get(str(task["id"])),
-                            limit=PATCH_FOR_VALIDATION_CHARS,
-                        ),
-                        "cartridge": ctx.cartridge,
-                        "surfaces": list(task.get("surfaces") or []),
-                        "patterns": list(task.get("patterns") or []),
-                        **({"fix_attempts": ctx.fix_attempts} if ctx.fix_attempts is not None else {}),
-                        **({"build_budget_usd": task["budget_usd"]} if task.get("budget_usd") is not None else {}),
-                    },
+                _lifecycle_invocation(
+                    ctx,
+                    task,
+                    body=_carry_forward(
+                        task.get("body") or "",
+                        list(task.get("attempts") or []),
+                        patches_for_attempt.get(str(task["id"])),
+                        limit=PATCH_FOR_VALIDATION_CHARS,
+                    ),
+                    fix_attempts=ctx.fix_attempts,
                 )
                 for task in runnable
             ],
@@ -1231,13 +1387,14 @@ def _run_phase(
             continue
 
         build = _build_task(ctx, phase=phase, task=task, result=result)
-        build["result"] = result
+        final, build = _refix(ctx, by_id, phase=phase, task=task, result=result, build=build)
+        build["result"] = final
         built[task] = build
 
         # Evidence first, escalation second — the same order `cli.py` uses, and
         # for the same reason: the gate should see the tests' opinion of a
         # governance change too.
-        for item in result.get("proposals") or []:
+        for item in final.get("proposals") or []:
             if item.get("kind") in _DRAFT_KINDS:
                 item.setdefault("evidence", []).extend(build["evidence"])
 
@@ -1246,8 +1403,8 @@ def _run_phase(
         # window where no streak on a mundane kind can carry a governance edit
         # past the gate.
         build["proposals"], hits = escalate_self_modification(
-            result.get("proposals") or [],
-            patch=str((result.get("build") or {}).get("patch") or ""),
+            final.get("proposals") or [],
+            patch=str((final.get("build") or {}).get("patch") or ""),
             cartridge=ctx.cartridge,
             ledger_path=ctx.ledger_path,
         )
@@ -1276,6 +1433,7 @@ def _run_phase(
                 "status": "quarantined" if build.get("quarantine") else "built",
                 "lint_fixed": build.get("lint_fixed", False),
                 "lint_fix_checks": build.get("lint_fix_checks", []),
+                **({"refix": build["refix"]} if build.get("refix") else {}),
             }
         )
         if build.get("quarantine"):
@@ -1293,11 +1451,7 @@ def _run_phase(
                 # failing here, after the lint_fix step had its chance, is a
                 # non-functional finding on an approved patch, not grounds to
                 # discard it: `unverified` keeps it, same as `validate_chunk`.
-                failing = [c for c in (build.get("checks") or []) if not c.get("passed")]
-                detail = "\n\n".join(
-                    f"{c.get('name')}: {c.get('cmd')}\nexit {c.get('exit_code')}\n{c.get('output_tail') or ''}"
-                    for c in failing
-                ) or None
+                detail = check_feedback(build.get("checks") or []) or None
                 quarantined.append(
                     _quarantine_task(
                         ctx, by_id, phase=phase, task=task, reason=reason, kind="unverified", detail=detail
