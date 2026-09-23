@@ -789,6 +789,183 @@ def test_a_failing_checks_detail_reaches_the_stored_attempt_and_the_next_ticket_
     assert "check.py" in prompt and "1 failed" in prompt
 
 
+# ── a check that fails after approval re-enters the fix loop ─────────────────
+
+_LINT_EDIT = (
+    "diff --git a/t1-probe.txt b/t1-probe.txt\n"
+    "--- a/t1-probe.txt\n"
+    "+++ b/t1-probe.txt\n"
+    "@@ -1 +1 @@\n"
+    "-broken\n"
+    "+ok\n"
+)
+
+
+class Repairing(Runner):
+    """Builds a broken patch until the ticket body carries a failed check, then the good one.
+
+    Also answers the re-entry `style_pass` call, if any, with the lint edit.
+    """
+
+    def __init__(self, patches: dict[str, str], *, repaired: dict[str, str], style_edit: str = _LINT_EDIT) -> None:
+        super().__init__(patches)
+        self.repaired = repaired
+        self.style_edit = style_edit
+
+    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+        if role == "build" and "failed its configured checks" in prompt:
+            task = self._subject(prompt, TASK_IDS)
+            with self.lock:
+                self.calls.append({"role": role, "tier": tier, "prompt": prompt})
+            patch = self.repaired[task]
+            return {"patch": patch, "summary": f"built {task}", "files_touched": files_touched_from_patch(patch), "commands_run": []}
+        if role == "style_pass" and "a configured check failed" in prompt:
+            with self.lock:
+                self.calls.append({"role": role, "tier": tier, "prompt": prompt})
+            return {"patch": self.style_edit}
+        return super().run(
+            role=role, tier=tier, schema=schema, prompt=prompt, context=context, budget_usd=budget_usd, task=task
+        )
+
+
+def _broken_probe() -> dict[str, str]:
+    return {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")}
+
+
+def test_an_approved_build_whose_lint_fails_re_enters_the_fix_loop_with_the_lint_output(repo, cart, tmp_path) -> None:
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
+    runner = Repairing(_broken_probe(), repaired={"t1-probe": new_file_patch("t1-probe.txt")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    assert not result["quarantined"]
+    assert builds_per_task(runner) == {"t1-probe": 2, "t2-bench": 1}
+    retry = next(c["prompt"] for c in runner.calls if c["role"] == "build" and "failed its configured checks" in c["prompt"])
+    assert "lint: " in retry and "check.py" in retry and "1 failed" in retry
+    task = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert task["refix"] == ["revise"]
+    assert {"check": "fix loop re-entry", "output": "revise after lint: attempts spent 2 of 3"} in task["evidence"]
+    assert git("show", "epic/demo-initiative/p1-foundations:t1-probe.txt", cwd=repo).strip() == "ok"
+
+
+def test_a_lint_only_failure_goes_through_the_style_pass_seat_not_a_second_build(repo, cart, tmp_path) -> None:
+    cart["skills"]["style_pass"] = "acme-skills:style"
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
+    runner = Repairing(_broken_probe(), repaired={})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    assert not result["quarantined"]
+    assert builds_per_task(runner) == {"t1-probe": 1, "t2-bench": 1}
+    styled = next(c["prompt"] for c in runner.calls if c["role"] == "style_pass" and "a configured check failed" in c["prompt"])
+    assert "check.py" in styled and "1 failed" in styled
+    task = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert task["refix"] == ["style_pass"]
+    assert git("show", "epic/demo-initiative/p1-foundations:t1-probe.txt", cwd=repo).strip() == "ok"
+
+
+def test_with_no_attempts_left_an_approved_build_whose_lint_fails_quarantines_as_before(repo, cart, tmp_path) -> None:
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
+    runner = Repairing(_broken_probe(), repaired={"t1-probe": new_file_patch("t1-probe.txt")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False), fix_attempts=0)
+
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["kind"] == "unverified" and entry["reason"] == "configured check failed: lint — 1 failed"
+    assert builds_per_task(runner) == {"t1-probe": 1, "t2-bench": 1}
+    assert "refix" not in next(t for t in result["tasks"] if t["id"] == "t1-probe")
+
+
+def test_a_check_that_keeps_failing_stops_re_entering_when_the_attempts_run_out(repo, cart, tmp_path) -> None:
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
+    runner = Repairing(_broken_probe(), repaired={"t1-probe": new_file_patch("t1-probe.txt", "still broken")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False), fix_attempts=1)
+
+    assert [q["id"] for q in result["quarantined"]] == ["t1-probe"]
+    assert builds_per_task(runner)["t1-probe"] == 2, "the first build plus the one attempt fix_attempts=1 allows"
+
+
+_TEST_A = new_file_patch("test_thing.py", "def test_a(): assert True")
+_LINT_EDIT_DROPPING_A_TEST = _LINT_EDIT + (
+    "diff --git a/test_thing.py b/test_thing.py\n"
+    "deleted file mode 100644\n"
+    "--- a/test_thing.py\n"
+    "+++ /dev/null\n"
+    "@@ -1 +0,0 @@\n"
+    "-def test_a(): assert True\n"
+)
+
+
+def test_a_style_edit_that_drops_a_collected_test_is_refused_and_falls_back_to_a_revise(repo, cart, tmp_path) -> None:
+    """The lint goes green if the model deletes the test; the coverage floor is what says no."""
+    cart["skills"]["style_pass"] = "acme-skills:style"
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
+    broken = {"t1-probe": new_file_patch("t1-probe.txt", "broken") + _TEST_A, "t2-bench": new_file_patch("t2-bench.txt")}
+    runner = Repairing(
+        broken,
+        repaired={"t1-probe": new_file_patch("t1-probe.txt") + _TEST_A},
+        style_edit=_LINT_EDIT_DROPPING_A_TEST,
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    assert not result["quarantined"]
+    assert any(c["role"] == "style_pass" and "a configured check failed" in c["prompt"] for c in runner.calls)
+    assert builds_per_task(runner) == {"t1-probe": 2, "t2-bench": 1}, "the refused edit fell back to a reviewed revise"
+    assert next(t for t in result["tasks"] if t["id"] == "t1-probe")["refix"] == ["revise"]
+    landed = git("ls-tree", "-r", "--name-only", "epic/demo-initiative/p1-foundations", cwd=repo).splitlines()
+    assert "test_thing.py" in landed
+
+
+def test_a_style_edit_commits_only_the_paths_it_names_never_a_check_byproduct(repo, cart, tmp_path) -> None:
+    """Checks drop files into the worktree; an `add -A` after them would carry those to the merge."""
+    (repo / "check_bp.py").write_text(
+        "import pathlib, sys\n"
+        "pathlib.Path('byproduct.dat').write_text('x')\n"
+        "probe = pathlib.Path('t1-probe.txt')\n"
+        "sys.exit(0 if not probe.exists() or probe.read_text().strip() == 'ok' else 1)\n",
+        encoding="utf-8",
+    )
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "byproduct check", cwd=repo)
+    cart["skills"]["style_pass"] = "acme-skills:style"
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check_bp.py"}]
+    runner = Repairing(_broken_probe(), repaired={})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    assert not result["quarantined"]
+    task = next(t for t in result["tasks"] if t["id"] == "t1-probe")
+    assert task["refix"] == ["style_pass"]
+    assert {"check": "style_pass", "output": "edit applied after approval, not reviewed: t1-probe.txt"} in task["evidence"]
+    landed = git("ls-tree", "-r", "--name-only", "epic/demo-initiative/p1-foundations", cwd=repo).splitlines()
+    assert "byproduct.dat" not in landed
+    assert "t1-probe.txt" in landed
+
+
+_LINT_EDIT_STILL_BROKEN = _LINT_EDIT.replace("+ok", "+still broken")
+
+
+def test_a_task_gets_one_style_edit_then_a_reviewed_revise(repo, cart, tmp_path) -> None:
+    cart["skills"]["style_pass"] = "acme-skills:style"
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
+    runner = Repairing(
+        _broken_probe(), repaired={"t1-probe": new_file_patch("t1-probe.txt")}, style_edit=_LINT_EDIT_STILL_BROKEN
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    assert not result["quarantined"]
+    assert sum(1 for c in runner.calls if c["role"] == "style_pass" and "a configured check failed" in c["prompt"]) == 1
+    assert next(t for t in result["tasks"] if t["id"] == "t1-probe")["refix"] == ["style_pass", "revise"]
+    assert builds_per_task(runner) == {"t1-probe": 2, "t2-bench": 1}
+
+
+def test_no_measurable_coverage_floor_means_no_style_call_and_a_reviewed_revise(repo, cart, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.epic._collected_ids", lambda _worktree: None)
+    cart["skills"]["style_pass"] = "acme-skills:style"
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
+    runner = Repairing(_broken_probe(), repaired={"t1-probe": new_file_patch("t1-probe.txt")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    assert not any(c["role"] == "style_pass" and "a configured check failed" in c["prompt"] for c in runner.calls)
+    assert next(t for t in result["tasks"] if t["id"] == "t1-probe")["refix"] == ["revise"]
+
+
 # ── outcome and the exit line: an approved build that does not land ─────────
 
 

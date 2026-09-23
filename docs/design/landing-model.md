@@ -72,6 +72,15 @@ is a field the record already holds.
   cartridge resolves for the repo — the edge passes the resolved list in `repo_facts["checks"]`; the
   `checks` step runs them in order and stops at the first failure, naming it. A land never opens a PR that
   CI will fail for a rule the worktree could have run.
+- A configured check that fails on a build the reviewers approved goes back into the fix loop, not
+  straight to quarantine: a lint-only failure through the `style_pass` seat, under the same coverage
+  floor as §5, anything else (or a style edit the floor refuses) as a fresh, fully reviewed lifecycle run
+  whose ticket body carries the check's output. `fix_attempts` plus the first build is the
+  budget, and each re-entry spends from it. The task quarantines as `unverified` only when none remain.
+  The builder is told to run every configured check, lint included, before it returns the diff.
+  The style edit is the one change in this path that no reviewer reads: it is limited to one per task,
+  staged by the paths it names, and recorded as an evidence row for whoever reads the gate. It can still
+  change behaviour in non-test code, and the checks and the floor cannot see that.
 
 ## 5. Trim the assembled diff, under a coverage floor  (graphs, last)
 

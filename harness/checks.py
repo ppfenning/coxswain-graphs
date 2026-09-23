@@ -22,6 +22,7 @@ from typing import Any
 __all__ = [
     "HARNESS_FAULT_PREFIX",
     "all_passed",
+    "check_feedback",
     "check_outcome",
     "checks_evidence",
     "collected_ids",
@@ -29,6 +30,7 @@ __all__ = [
     "fixable_checks",
     "is_harness_fault",
     "quarantine_reason",
+    "refix_route",
     "repo_checks",
     "run_checks",
 ]
@@ -43,6 +45,7 @@ _COUNT_RE = re.compile(r"(\d+)\s+(passed|failed|error|errors|skipped)\b", re.IGN
 _TAIL_CHARS = 2000
 _TAIL_LINES = 20
 _TRUNCATION_MARKER = f"... [truncated to last {_TAIL_LINES} lines]"
+_LINT_NAMES = frozenset({"lint", "ruff"})
 
 
 def _parse_counts(output: str) -> dict[str, int]:
@@ -222,6 +225,37 @@ def all_passed(results: Sequence[Mapping[str, Any]]) -> bool:
 
 def is_harness_fault(reason: str) -> bool:
     return reason.startswith(HARNESS_FAULT_PREFIX)
+
+
+def check_feedback(results: Sequence[Mapping[str, Any]]) -> str:
+    """The failing checks' name, command, exit code and output tail, for a builder to read."""
+    return "\n\n".join(
+        f"{r.get('name')}: {r.get('cmd')}\nexit {r.get('exit_code')}\n{_tail_lines(str(r.get('output_tail') or ''))}"
+        for r in results
+        if not r.get("passed")
+    )
+
+
+def refix_route(
+    results: Sequence[Mapping[str, Any]],
+    checks: Sequence[Mapping[str, Any]],
+    *,
+    attempts_left: float,
+    style_bound: bool,
+) -> str:
+    """Where an approved build whose checks failed goes next: quarantine, style_pass or revise.
+
+    Only a real failure re-enters, and only while an attempt remains. A failure
+    counts as style-only when every failing check has a `fix` command or is
+    named lint or ruff, and the `style_pass` seat is bound.
+    """
+    reason = quarantine_reason(results)
+    if reason is None or is_harness_fault(reason) or attempts_left <= 0:
+        return "quarantine"
+    lint = {c["name"] for c in checks if c.get("fix") or c["name"] in _LINT_NAMES}
+    if style_bound and all(r["name"] in lint for r in results if not r.get("passed")):
+        return "style_pass"
+    return "revise"
 
 
 def quarantine_reason(results: Sequence[Mapping[str, Any]]) -> str | None:

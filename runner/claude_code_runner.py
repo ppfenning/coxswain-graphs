@@ -622,7 +622,9 @@ class ClaudeCodeRunner:
                     "root, and nothing else to test with: the environment is already set up, the "
                     "right interpreter and packages are on PATH for those commands, and probing for "
                     "them (`which`, `--version`, `python -m ...`, `echo`) is a wasted turn every time. "
-                    "If a command as written fails to start, report that verbatim and stop."
+                    "If a command as written fails to start, report that verbatim and stop. Run every "
+                    "one of them before you produce the diff, a lint command as much as the tests: a "
+                    "check you skip here fails after review and costs a whole rerun."
                 )
             permitted = ", ".join(
                 f"`{name[len('Bash('):-len(':*)')]}`" for name in self._allowed_bash()
