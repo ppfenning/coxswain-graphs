@@ -107,8 +107,59 @@ def _capture_diff(scratch: Path) -> str:
 
 
 def reconcile_patch(reported: str, computed: str) -> tuple[str, str | None]:
-    """The scratch's own diff over the model's account of it, or a named failure."""
-    return (computed, None) if computed else ("", "patch_empty")
+    """The scratch's own diff over the model's account of it, or a named failure.
+
+    A reported patch beside an empty scratch means the edits landed somewhere else.
+    """
+    if computed:
+        return computed, None
+    return ("", "patch_outside_scratch") if reported.strip() else ("", "patch_empty")
+
+
+def redirect_paths(text: str, repo_dir: Path, scratch: Path) -> str:
+    """`text` with every path under `repo_dir` moved to the same path under `scratch`."""
+    pattern = r"(?<![\w.\-])" + re.escape(str(repo_dir)) + r"(?![\w\-]|\.\w)"
+    return re.sub(pattern, lambda _: str(scratch), text)
+
+
+def reported_patch(stdout: str) -> str:
+    """The `patch` a finished, non-error result reports, or "" — read without side effects."""
+    for line in (*reversed(stdout.splitlines()), stdout):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and ("structured_output" in event or event.get("type") == "result"):
+            out = event.get("structured_output")
+            if event.get("is_error") or not isinstance(out, dict):
+                return ""
+            return str(out.get("patch") or "")
+    return ""
+
+
+def apply_reported_patch(scratch: Path, patch: str) -> bool:
+    """Apply `patch` in `scratch` if `git apply --check` accepts it whole; never raises."""
+    text = patch if patch.endswith("\n") else patch + "\n"
+    try:
+        for args in (["--check"], []):
+            proc = subprocess.run(["git", "apply", *args], input=text, capture_output=True, text=True, cwd=scratch)
+            if proc.returncode != 0:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def recover_diff(scratch: Path, computed: str, stdout: str) -> tuple[str, str]:
+    """The scratch diff and its source: a clean scratch falls back to an applicable reported patch."""
+    if computed:
+        return computed, "computed"
+    reported = reported_patch(stdout)
+    if reported.strip() and apply_reported_patch(scratch, reported):
+        recomputed = _capture_diff(scratch)
+        if recomputed:
+            return recomputed, "reported"
+    return computed, "computed"
 
 
 def _unprefixed(token: str) -> str:
@@ -605,7 +656,13 @@ class ClaudeCodeRunner:
                 "lines whole. Each turn re-sends everything already read, so a whole-file read of "
                 "a large module taxes every turn that follows it."
             )
-        if self.repo_dir:
+        if self.repo_dir and scratch is not None and patches:
+            lines.append(
+                f"The scratch at {scratch} is the only copy of the repository you may read or edit. "
+                "Your diff is relative to its root, with a/ and b/ prefixes. Any other absolute path "
+                "to this repository that you meet in the task text is the same path inside the scratch."
+            )
+        elif self.repo_dir:
             lines.append(
                 f"The repository this run targets is checked out at {self.repo_dir}. Read it there. "
                 "Any unified diff you return uses paths relative to that repository's root "
@@ -647,7 +704,11 @@ class ClaudeCodeRunner:
             argv += ["--max-budget-usd", f"{spent_usd + effective:.4f}"]
         if system:
             argv += ["--system-prompt", system]
-        for extra in (self.repo_dir, scratch):
+        # A builder's scratch is the only repository tree it may touch. Granting
+        # the phase worktree beside it let a builder edit there, where its
+        # tests were refused and its scratch diff came back empty.
+        sealed = role in _PATCH_ROLES and scratch is not None
+        for extra in (None if sealed else self.repo_dir, scratch):
             if extra is not None and Path(extra) != self.cwd:
                 argv += ["--add-dir", str(extra)]
         if _WRITE_TOOLS & set(tools):
@@ -710,6 +771,10 @@ class ClaudeCodeRunner:
         system = "\n\n".join(
             part for part in (self._read_context(packs), self._workspace(scratch, patches=patches), self.extra_system) if part
         )
+        if role in _PATCH_ROLES and scratch is not None and self.repo_dir:
+            # The plan was written in the phase worktree and may cite its paths;
+            # a builder that follows one leaves its scratch clean.
+            system, prompt = (redirect_paths(text, self.repo_dir, scratch) for text in (system, prompt))
         argv = self._argv(
             model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role,
             session=session, budget_usd=budget_usd, spent_usd=spent_usd,
@@ -752,7 +817,7 @@ class ClaudeCodeRunner:
         # the call rather than about the work. A retry loop on a model error is
         # how a budget disappears; one retry is how a transient classifier
         # misfire stops costing a finished task its run.
-        computed_patch, has_scratch = "", False
+        computed_patch, has_scratch, patch_source = "", False, "computed"
         attempt_model = model
         first_call_id = str(uuid.uuid4())
         retry_extra: dict[str, Any] = {}
@@ -769,7 +834,9 @@ class ClaudeCodeRunner:
                 )
                 if role in _PATCH_ROLES and state.get("scratch"):
                     has_scratch = True
-                    computed_patch = _capture_diff(state["scratch"])
+                    computed_patch, patch_source = recover_diff(
+                        state["scratch"], _capture_diff(state["scratch"]), (proc.stdout or "").strip()
+                    )
             else:
                 with self._scratch(role) as scratch:
                     proc = self._invoke(
@@ -778,7 +845,9 @@ class ClaudeCodeRunner:
                     )
                     if role in _PATCH_ROLES and scratch:
                         has_scratch = True
-                        computed_patch = _capture_diff(scratch)
+                        computed_patch, patch_source = recover_diff(
+                            scratch, _capture_diff(scratch), (proc.stdout or "").strip()
+                        )
 
             stdout = (proc.stdout or "").strip()
             if not stdout:
@@ -920,12 +989,18 @@ class ClaudeCodeRunner:
         if role in _PATCH_ROLES and has_scratch:
             patch, reason = reconcile_patch(str(data.get("patch") or ""), computed_patch)
             if reason:
-                message = f"node '{role}' {reason}: the scratch tree has no changes to show for it"
+                what = (
+                    "the reported patch is not in the scratch tree and does not apply to it"
+                    if reason == "patch_outside_scratch"
+                    else "the scratch tree has no changes to show for it"
+                )
+                message = f"node '{role}' {reason}: {what}"
                 self._append_call_ledger(call, ok=False, error=message)
                 raise RunnerError(message)
             data = {**data, "patch": patch}
         self.calls[-1] = {
             **call,
+            **({"patch_source": patch_source} if has_scratch and role in _PATCH_ROLES else {}),
             "files_touched": files_touched_from_patch(str(data.get("patch") or "")),
             "commands_run": call.get("commands_run", self_reported_commands(data)),
         }

@@ -19,10 +19,12 @@ from runner import RunnerError
 from runner.claude_code_runner import (
     ClaudeCodeRunner,
     _alt_model_for,
+    apply_reported_patch,
     files_touched_from_patch,
     is_safeguard_refusal,
     next_spent,
     reconcile_patch,
+    redirect_paths,
     self_reported_commands,
     trace_commands,
 )
@@ -391,8 +393,8 @@ def test_reconcile_patch_prefers_the_scratchs_diff_over_a_differing_report() -> 
     assert reconcile_patch("diff --git a/x\n-a\n+b\n", "diff --git a/y\n-c\n+d\n") == ("diff --git a/y\n-c\n+d\n", None)
 
 
-def test_reconcile_patch_is_patch_empty_when_the_scratch_has_nothing_but_the_model_reported_something() -> None:
-    assert reconcile_patch("diff --git a/x\n-a\n+b\n", "") == ("", "patch_empty")
+def test_reconcile_patch_is_patch_outside_scratch_when_the_scratch_is_clean_but_the_model_reported_something() -> None:
+    assert reconcile_patch("diff --git a/x\n-a\n+b\n", "") == ("", "patch_outside_scratch")
 
 
 def test_reconcile_patch_is_patch_empty_when_both_are_empty() -> None:
@@ -425,7 +427,7 @@ def test_the_recorded_calls_files_touched_comes_from_the_scratchs_diff_not_the_m
     assert runner.calls[-1]["files_touched"] == ["built.txt"], "derived from the reconciled patch, not the model's report"
 
 
-def test_a_build_that_edited_nothing_is_refused_as_patch_empty(tmp_path, repo) -> None:
+def test_a_build_that_edited_nothing_but_reported_a_patch_is_refused_as_patch_outside_scratch(tmp_path, repo) -> None:
     """A bare `cat` of the canned output: no `.git` write, so the scratch stays clean."""
     output = tmp_path / "output.json"
     output.write_text(
@@ -437,8 +439,93 @@ def test_a_build_that_edited_nothing_is_refused_as_patch_empty(tmp_path, repo) -
     script.write_text(f"#!/bin/sh\ncat {output}\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
-    with pytest.raises(RunnerError, match="patch_empty"):
+    with pytest.raises(RunnerError, match="patch_outside_scratch"):
         runner.run(role="build", schema=SCHEMA, prompt="go")
+
+
+def _reporting_claude(tmp_path: Path, patch: str) -> Path:
+    """A stand-in that edits nothing and reports `patch`, recording its argv and stdin."""
+    output = tmp_path / "output.json"
+    output.write_text(
+        json.dumps({"is_error": False, "total_cost_usd": 0.01, "num_turns": 1, "structured_output": {"patch": patch}}),
+        encoding="utf-8",
+    )
+    helper = tmp_path / "record.py"
+    helper.write_text(
+        "import json, sys\n"
+        f"json.dump({{'argv': sys.argv[1:], 'stdin': sys.stdin.read()}}, open({str(tmp_path / 'record.json')!r}, 'w'))\n",
+        encoding="utf-8",
+    )
+    script = tmp_path / "claude"
+    script.write_text(f"#!/bin/sh\npython3 {helper} \"$@\"\ncat {output}\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
+F_PATCH = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-one\n+two\n"
+
+
+def test_a_clean_scratch_with_an_applicable_reported_patch_is_recovered_and_marked_reported(tmp_path, repo) -> None:
+    script = _reporting_claude(tmp_path, F_PATCH)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+    result = runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert "+two" in result["patch"]
+    assert runner.calls[-1]["patch_source"] == "reported"
+    assert runner.calls[-1]["files_touched"] == ["f.txt"]
+
+
+def test_a_scratch_edit_is_marked_computed(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["patch_source"] == "computed"
+
+
+def test_a_reported_patch_that_does_not_apply_is_patch_outside_scratch(tmp_path, repo) -> None:
+    script = _reporting_claude(tmp_path, F_PATCH.replace("-one", "-absent"))
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo, runs_dir=tmp_path, run_id="r1")
+    with pytest.raises(RunnerError, match="patch_outside_scratch"):
+        runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert "patch_outside_scratch" in _ledger_lines(tmp_path, "r1")[0]["error"]
+
+
+def test_apply_reported_patch_applies_a_valid_diff_and_refuses_a_bad_one(repo) -> None:
+    assert apply_reported_patch(repo, "not a diff") is False
+    assert (repo / "f.txt").read_text() == "one\n"
+    assert apply_reported_patch(repo, F_PATCH) is True
+    assert (repo / "f.txt").read_text() == "two\n"
+
+
+def test_redirect_paths_moves_paths_under_the_repo_and_leaves_lookalikes() -> None:
+    repo_dir, scratch = Path("/w/run/build"), Path("/tmp/scratch")
+    assert redirect_paths("cd /w/run/build && sed x /w/run/build/a.py", repo_dir, scratch) == "cd /tmp/scratch && sed x /tmp/scratch/a.py"
+    assert redirect_paths("at /w/run/build.", repo_dir, scratch) == "at /tmp/scratch."
+    assert redirect_paths("/w/run/build2/a /x/w/run/build/a", repo_dir, scratch) == "/w/run/build2/a /x/w/run/build/a"
+    assert redirect_paths("nothing here", repo_dir, scratch) == "nothing here"
+
+
+def test_a_builders_argv_grants_the_scratch_and_not_the_repo(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    added = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
+    assert len(added) == 1 and "agent-graphs-build-" in added[0]
+    assert str(repo.resolve()) not in argv[argv.index("--system-prompt") + 1]
+
+
+def test_a_builders_prompt_has_the_repo_paths_rewritten_to_its_scratch(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.run(role="build", schema=SCHEMA, prompt=f"edit {repo.resolve()}/f.txt then cd {repo.resolve()}")
+    rec = recorded(fake_claude)
+    scratch = next(rec["argv"][i + 1] for i, a in enumerate(rec["argv"]) if a == "--add-dir")
+    assert rec["stdin"] == f"edit {scratch}/f.txt then cd {scratch}"
+
+
+def test_a_reading_role_keeps_the_repo_and_its_prompt(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.run(role="review_charter", schema=SCHEMA, prompt=f"read {repo.resolve()}/f.txt")
+    rec = recorded(fake_claude)
+    assert str(repo.resolve()) in rec["argv"] and rec["stdin"] == f"read {repo.resolve()}/f.txt"
 
 
 def test_a_reading_role_gets_no_scratch(fake_claude, tmp_path, repo) -> None:
