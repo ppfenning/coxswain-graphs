@@ -7,6 +7,7 @@ import pytest
 from graphs._contract import ContractViolation
 from graphs.delivery import lifecycle_propose
 from runner import ScriptedRunner
+from runner.tier_resolution import Hints
 
 
 def args(cartridge, **overrides):
@@ -48,7 +49,7 @@ def test_nodes_ask_for_roles_and_tiers_never_skills_or_models(
     assert [(c["role"], c["tier"]) for c in scripted.calls] == [
         ("plan", "standard"),
         ("build", "standard"),
-        ("review_charter", "standard"),
+        ("review_charter", None),
     ]
 
 
@@ -320,7 +321,7 @@ def handoff_bound(cartridge) -> dict:
 ARBITRATION_SIDES_ADVERSARY = {"verdict": "revise", "sided_with": "adversary", "reasoning": "the objection holds"}
 
 
-def test_reviewers_run_at_standard_and_arbitration_stays_deep(
+def test_reviewers_and_arbitration_declare_a_role_and_no_tier(
     cartridge, plan_response, build_response, review_response
 ) -> None:
     scripted = runner(
@@ -329,9 +330,9 @@ def test_reviewers_run_at_standard_and_arbitration_stays_deep(
     )
     lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
     assert [(c["role"], c["tier"]) for c in scripted.calls if c["role"] != "plan" and c["role"] != "build"] == [
-        ("review_charter", "standard"),
-        ("review_adversary", "standard"),
-        ("arbitrate", "deep"),
+        ("review_charter", None),
+        ("review_adversary", None),
+        ("arbitrate", None),
     ]
 
 
@@ -1085,3 +1086,99 @@ def test_both_reviewers_placeholdering_quarantines_rather_than_rebuilds(
     assert result["fix_loop"]["stopped"] == "harness fault: review placeholders"
     assert result["fix_loop"]["review_placeholder"] is True
     assert result["proposals"] == []
+
+
+# --- call sites declare a role and hints, never a tier -------------------------------------
+
+HEADERED_PATCH = (
+    "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1,1 +1,2 @@\n-old line\n+new line\n+another\n"
+    "diff --git a/src/b.py b/src/b.py\n--- a/src/b.py\n+++ b/src/b.py\n@@ -1,1 +1,1 @@\n-x\n+y\n"
+)
+TWO_FILES = ["src/a.py", "src/b.py"]
+SOLE_ARBITER = Hints(judgment="high", files_changed=2, lines_changed=5, attempt=1)
+
+
+def declared(scripted, role):
+    """(hints, tier) of every call for `role`."""
+    return [(c["hints"], c["tier"]) for c in roles(scripted, role)]
+
+
+def test_hints_count_files_and_lines_from_the_patch_and_leave_the_rest_unknown() -> None:
+    assert lifecycle_propose._hints(HEADERED_PATCH, attempt=2, judgment="high") == Hints(
+        judgment="high", files_changed=2, lines_changed=5, attempt=2
+    )
+    assert lifecycle_propose._hints("--- a/x\n+++ b/x\n-a\n+b\n") == Hints(lines_changed=2)
+    assert lifecycle_propose._hints("") == Hints()
+
+
+def test_the_plan_adversary_declares_high_judgment_and_no_tier(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(
+        plan_response, build_response, review_response,
+        plan_alternative=PLAN_B, plan_arbitrate=CHOOSE_SECOND, plan_adversary=ATTACK_PROCEED,
+    )
+    lifecycle_propose.run(args(attacked(competitive(cartridge))), scripted)
+    assert declared(scripted, "plan_adversary") == [(Hints(judgment="high"), None)]
+
+
+def test_both_reviewers_and_the_arbiter_declare_the_patch_size_and_no_tier(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = runner(
+        plan_response, {**build_response, "patch": HEADERED_PATCH, "files_touched": TWO_FILES},
+        review_response, review_adversary=ADV_OBJECTS, arbitrate=ARBITRATION_SIDES_ADVERSARY,
+    )
+    lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+    assert declared(scripted, "review_charter") == [(Hints(files_changed=2, lines_changed=5, attempt=1), None)]
+    assert declared(scripted, "review_adversary") == [(Hints(files_changed=2, lines_changed=5, attempt=1), None)]
+    assert declared(scripted, "arbitrate")[0] == (SOLE_ARBITER, None)
+
+
+@pytest.mark.parametrize(
+    "charter, adversary",
+    [
+        ([INCIDENT_LITERAL, INCIDENT_LITERAL], ADV_APPROVES),
+        (None, [INCIDENT_LITERAL, INCIDENT_LITERAL]),
+    ],
+    ids=["charter_abstained", "adversary_abstained"],
+)
+def test_the_arbiter_called_for_a_sole_reviewer_declares_hints_and_no_tier(
+    cartridge, plan_response, build_response, review_response, charter, adversary
+) -> None:
+    scripted = runner(
+        plan_response, {**build_response, "patch": HEADERED_PATCH, "files_touched": TWO_FILES},
+        charter or review_response, review_adversary=adversary, arbitrate=ARBITRATION_SIDES_ADVERSARY,
+    )
+    lifecycle_propose.run(args(adjudicated(cartridge)), scripted)
+    assert declared(scripted, "arbitrate")[0] == (SOLE_ARBITER, None)
+
+
+def test_the_retry_review_declares_the_attempt_it_belongs_to(
+    cartridge, plan_response, build_response, review_response
+) -> None:
+    scripted = ScriptedRunner(
+        {
+            "plan": plan_response,
+            "build": [build_response, rebuilt(build_response, PATCH_ANSWERED)],
+            "review_charter": [REVISE, review_response],
+        }
+    )
+    lifecycle_propose.run(args(cartridge), scripted)
+    assert [hints.attempt for hints, _ in declared(scripted, "review_charter")] == [1, 2]
+
+
+def test_the_build_retry_after_an_invalid_patch_declares_hints_and_no_tier(
+    cartridge, plan_response, review_response
+) -> None:
+    placeholder = {
+        "patch": "--- a/src/a.py\n+++ b/src/a.py\n-old\n+new\n",
+        "summary": "placeholder",
+        "files_touched": ["a.py"],
+        "commands_run": [{"command": "echo hi", "output": "hi"}],
+    }
+    scripted = runner(plan_response, [placeholder, placeholder], review_response)
+    lifecycle_propose.run(args(cartridge), scripted)
+    first, second = roles(scripted, "build")
+    assert first["tier"] == "standard", "the first build call is not one of this ticket's sites"
+    assert (second["hints"], second["tier"]) == (Hints(lines_changed=2), None)
