@@ -26,6 +26,7 @@ from graphs.delivery import lifecycle_propose, phase_validate
 from graphs.ops import triage_quarantine
 from harness.epic import (
     EXIT_PAUSED,
+    _lifecycle_invocation,
     _ticket_amend_ramp,
     _trace_evidence,
     _unapproved,
@@ -2348,3 +2349,11 @@ def test_a_trim_that_fails_a_configured_check_is_refused_and_the_branch_is_untou
     assert result["phases"][0]["status"] == "complete"
     assert result["phases"][0]["trim"] == "trim: refused (coverage floor)"
     assert git("show", f"{_TRIM_BRANCH}:t2-bench.txt", cwd=repo) == "ok"
+
+
+def test_a_tasks_tier_map_rides_the_lifecycle_invocation_and_no_map_is_empty() -> None:
+    ctx = type("Ctx", (), {"date": "2026-09-24", "cartridge": {}})()
+    tiered = _lifecycle_invocation(ctx, {"id": "t1", "tier": {"build": "deep"}}, body="", fix_attempts=None)
+    plain = _lifecycle_invocation(ctx, {"id": "t2"}, body="", fix_attempts=None)
+    assert tiered.args["tier"] == {"build": "deep"}
+    assert plain.args["tier"] == {}

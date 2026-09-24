@@ -49,13 +49,25 @@ be manufacturing exactly the clean record the ledger exists to disbelieve.
 Every node after `build` is an optional role: a team that binds none of them
 gets the original single-reviewer loop, which is what optional means.
 
+**Elevation.** A ticket's `tier:` map, `{role: tier}`, arrives as `args["tier"]`
+and reaches every call this graph makes. A caller-named tier beats the profile
+default in the runner's resolver. Where a call site still passes a literal tier,
+the ticket's value wins only when it is higher: a ticket never lowers a literal.
+The one automatic escalation is the second build after a review `revise`, which
+asks one tier up and leaves a `tier escalation` evidence row. A ticket `tier:`
+for `build` overrides it. A third attempt is never escalated: third attempts
+landed nothing on 09-06.
+
+Next step, not in this repository: per-launch elevation,
+`cox route launch epic --elevate ROLE=TIER` (repeatable), lives in coxswain-tools.
+
 Deferred (see graphs/lifecycle-propose.md): intake queue, verification, retro.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from difflib import SequenceMatcher
 from typing import Any, Literal, NamedTuple
 
@@ -69,9 +81,9 @@ from graphs._contract import (
     review_tier,
 )
 from graphs.delivery.phase_validate import _PLACEHOLDER_MARKERS
-from runner.protocol import BudgetStop, NodeRunner, RunnerError
+from runner.protocol import BudgetStop, NodeResult, NodeRunner, RunnerError
 from runner.system_one import Answer
-from runner.tier_resolution import Hints
+from runner.tier_resolution import TIERS, Hints, rank
 
 __all__ = ["GRAPH_NAME", "review_is_placeholder", "run"]
 
@@ -641,6 +653,63 @@ def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int) -
     )
 
 
+def _tier_for(role: str, literal: str | None, ticket_tiers: Mapping[str, str]) -> str | None:
+    """The tier a call asks for: the ticket's, only when it is higher than the literal.
+
+    A ticket never lowers a literal. With no literal the ticket's tier is
+    named outright, which beats the profile default in the runner's resolver.
+    An unknown tier name raises ValueError from `rank`.
+    """
+    mapped = ticket_tiers.get(role)
+    if mapped is None:
+        return literal
+    if literal is None:
+        return mapped
+    return mapped if rank(mapped) > rank(literal) else literal
+
+
+def _escalate(tier: str) -> str:
+    """One tier up; the top tier stays where it is."""
+    return TIERS[min(rank(tier) + 1, len(TIERS) - 1)]
+
+
+class _Elevated:
+    """A runner whose every call carries the ticket's per-role tier, via `_tier_for`.
+
+    `run` takes exactly the protocol's parameters and no `**kwargs`: a runner
+    accepts nothing else, so anything extra would be a TypeError on a live call.
+    """
+
+    def __init__(self, inner: NodeRunner, ticket_tiers: Mapping[str, str]) -> None:
+        self._inner = inner
+        self._ticket_tiers = dict(ticket_tiers)
+
+    def run(
+        self,
+        *,
+        role: str,
+        tier: str | None = None,
+        hints: Hints | None = None,
+        schema: Mapping[str, Any],
+        prompt: str,
+        context: Sequence[str] = (),
+        thread: str | None = None,
+        budget_usd: float | None = None,
+        task: str | None = None,
+    ) -> NodeResult:
+        return self._inner.run(
+            role=role,
+            tier=_tier_for(role, tier, self._ticket_tiers),
+            hints=hints,
+            schema=schema,
+            prompt=prompt,
+            context=context,
+            thread=thread,
+            budget_usd=budget_usd,
+            task=task,
+        )
+
+
 def _resume_build(
     runner: NodeRunner,
     *,
@@ -650,6 +719,7 @@ def _resume_build(
     surfaces: list[str],
     stop: BudgetStop,
     continuations: int,
+    tier: str = "standard",
 ) -> tuple[dict[str, Any] | None, int, str, BudgetStop]:
     """Decide go/no-go on a budget stop and, on go, resume until one finishes
     or the cap refuses another.
@@ -665,7 +735,7 @@ def _resume_build(
         try:
             build = runner.run(
                 role="build",
-                tier="standard",
+                tier=tier,
                 thread=str(ticket),
                 task=str(ticket),
                 schema=BUILD_SCHEMA,
@@ -1442,6 +1512,12 @@ def _infra_result(
 
 def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     """Run the graph. Every input arrives as an argument — no clock, no disk."""
+    ticket_tiers = dict(args.get("tier") or {})
+    return _run(args, _Elevated(runner, ticket_tiers) if ticket_tiers else runner, ticket_tiers)
+
+
+def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str, str]) -> dict[str, Any]:
+    """The graph body; `runner` already carries the ticket's tiers."""
     cartridge = require_cartridge(args)
     run_id, date, ticket = require(args, "run_id", "date", "ticket")
     # The work item's own words travel with its id. Traced plan nodes spent
@@ -1731,6 +1807,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # Whether the round that produced the current `verdict` ended at handoff
     # (no reviewer has read this patch yet) rather than at a review verdict.
     prior_handoff = handoff is not None and not handoff.get("complete")
+    # Set when the second build asks a tier up. The runner takes no `reason`,
+    # so the escalation is told on the record, as an evidence row, not to the call.
+    escalation: str | None = None
 
     while verdict != "approve" and attempts <= fix_attempts and not review_quarantine and not frozen:
         # Every claim raised so far, not merely the last round's. Re-raising an
@@ -1739,10 +1818,17 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         standing |= _claims(adversary)
         critique = _critique(review, adversary, arbitration)
 
+        # Only the second build, and only after a review revise: not a handoff
+        # gap and never a third attempt. A ticket tier for build overrides it.
+        escalate = int(attempts) == 1 and verdict == "revise" and not prior_handoff and "build" not in ticket_tiers
+        retry_tier = _escalate("standard") if escalate else "standard"
+        if escalate:
+            escalation = f"escalated: attempt 2 after revise (standard -> {retry_tier})"
+
         try:
             retry = runner.run(
                 role="build",
-                tier="standard",
+                tier=retry_tier,
                 thread=str(ticket),
                 task=str(ticket),
                 schema=BUILD_SCHEMA,
@@ -1768,7 +1854,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         except BudgetStop as exc:
             resumed, continuations, reason, _stop = _resume_build(
                 runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
-                surfaces=surfaces, stop=exc, continuations=continuations,
+                surfaces=surfaces, stop=exc, continuations=continuations, tier=retry_tier,
             )
             if resumed is None:
                 # The retry spent the budget without returning a patch, and a
@@ -1917,6 +2003,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                         if attempts > 1
                         else []
                     ),
+                    *([{"check": "tier escalation", "output": escalation}] if escalation else []),
                     {"check": "changed lines", "output": str(facts["changed_lines"])},
                     # Only when the caller overrode the build budget: a row
                     # that always reads the default budget is a row nobody
