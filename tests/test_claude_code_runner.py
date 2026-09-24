@@ -19,6 +19,7 @@ from runner import RunnerError
 from runner.claude_code_runner import (
     ClaudeCodeRunner,
     _alt_model_for,
+    _init_facts,
     apply_reported_patch,
     files_touched_from_patch,
     is_safeguard_refusal,
@@ -740,6 +741,59 @@ def test_a_trace_dir_switches_to_stream_json_and_keeps_every_event(fake_claude, 
     assert runner.calls[-1]["commands_run"] == [{"command": "pytest -q", "output": "39 passed", "source": "trace"}]
     runner.run(role="build", schema=SCHEMA, prompt="again")
     assert (tmp_path / "trace" / "build-2.jsonl").is_file(), "one file per call, numbered per role"
+
+
+# NOT a capture: no recorded stream exists in the repo and none could be made here. Keys follow the
+# documented Claude Code system/init message. Replace with a real `--output-format stream-json` line.
+INIT = {"type": "system", "subtype": "init", "claude_code_version": "2.0.31", "model": "claude-haiku-4-5-20251001"}
+RESULT = {"type": "result", "subtype": "success", "is_error": False, "structured_output": {"ok": True}, "num_turns": 1}
+
+
+def _streamed(tmp_path: Path, fake_claude, events: list[dict], **profile) -> ClaudeCodeRunner:
+    script, _, _ = fake_claude
+    (tmp_path / "output.json").write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    return ClaudeCodeRunner({**PROFILE, **profile}, claude_bin=str(script), cwd=tmp_path, trace_dir=tmp_path / "trace")
+
+
+def test_init_facts_reads_version_and_model_and_gives_none_for_what_is_missing() -> None:
+    assert _init_facts(INIT) == ("2.0.31", "claude-haiku-4-5-20251001")
+    assert _init_facts({"model": "m"}) == (None, "m")
+    assert _init_facts({"claude_code_version": "1"}) == ("1", None)
+    assert _init_facts({"model": 3, "claude_code_version": ["x"]}) == (None, None)
+    assert _init_facts(None) == (None, None)
+
+
+def test_the_decision_carries_version_and_model_from_the_init_event(fake_claude, tmp_path) -> None:
+    runner = _streamed(tmp_path, fake_claude, [INIT, RESULT])
+    out = runner.run(role="build", tier="standard", schema=SCHEMA, prompt="go", thread="T-1", task="t9")
+    d = out.decision
+    assert (d.claude_code_version, d.model_id) == ("2.0.31", "claude-haiku-4-5-20251001")
+    assert (d.role, d.requested_tier, d.chosen_tier, d.reason) == ("build", "standard", "standard", "caller")
+    assert (d.ticket_key, d.outcome_key) == ("t9", ""), "the ticket is `task`, as in the ledger's task_id; a thread is not a ticket"
+    assert dict(out) == {"ok": True}, "the decision is an attribute, not a key"
+
+
+def test_a_tier_override_that_changes_the_tier_is_reason_override(fake_claude, tmp_path) -> None:
+    runner = _streamed(tmp_path, fake_claude, [INIT, RESULT], tier_overrides={"build": "cheap"})
+    d = runner.run(role="build", tier="standard", schema=SCHEMA, prompt="go").decision
+    assert (d.requested_tier, d.chosen_tier, d.reason) == ("standard", "cheap", "override")
+
+
+def test_an_override_to_the_tier_already_asked_for_is_reason_caller(fake_claude, tmp_path) -> None:
+    runner = _streamed(tmp_path, fake_claude, [INIT, RESULT], tier_overrides={"build": "standard"})
+    d = runner.run(role="build", tier="standard", schema=SCHEMA, prompt="go").decision
+    assert (d.chosen_tier, d.reason) == ("standard", "caller")
+
+
+def test_an_init_event_lacking_the_fields_gives_none_version_and_the_resolved_model(fake_claude, tmp_path) -> None:
+    runner = _streamed(tmp_path, fake_claude, [{"type": "system", "subtype": "init"}, RESULT])
+    d = runner.run(role="build", tier="standard", schema=SCHEMA, prompt="go").decision
+    assert d.claude_code_version is None and d.model_id == "sonnet"
+
+
+def test_json_mode_has_no_init_event_and_still_yields_a_decision(fake_claude, tmp_path) -> None:
+    d = runner_for(fake_claude, tmp_path).run(role="build", tier="deep", schema=SCHEMA, prompt="go").decision
+    assert d.claude_code_version is None and d.model_id == "opus" and d.reason == "caller"
 
 
 def test_a_stream_with_no_result_event_is_a_named_failure(fake_claude, tmp_path) -> None:
