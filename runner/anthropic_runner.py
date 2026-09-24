@@ -25,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from runner.decision_log import CallDecision
 from runner.protocol import NodeResult, RunnerError
 
 __all__ = ["AnthropicRunner", "load_provider_profile"]
@@ -50,6 +51,20 @@ def load_provider_profile(path: Path | str) -> dict[str, Any]:
     if not isinstance(profile, Mapping) or "tiers" not in profile:
         raise RunnerError(f"{path}: provider profile must be a mapping with a 'tiers' block")
     return dict(profile)
+
+
+def _decision(*, role: str, tier: str, model_id: str, task: str | None) -> CallDecision:
+    """No fallback here, so requested and chosen tier are the same. Ticket and outcome are the task, or empty."""
+    return CallDecision(
+        role=role,
+        requested_tier=tier,
+        chosen_tier=tier,
+        model_id=model_id,
+        reason="caller",
+        ticket_key=task or "",
+        outcome_key=task or "",
+        claude_code_version=None,
+    )
 
 
 class AnthropicRunner:
@@ -170,4 +185,8 @@ class AnthropicRunner:
 
         if not isinstance(data, dict):
             raise RunnerError(f"node '{role}' returned {type(data).__name__}, expected an object")
-        return NodeResult(data)
+        result = NodeResult(data)
+        result.decision = _decision(
+            role=role, tier=tier, model_id=getattr(response, "model", None) or model, task=task
+        )
+        return result
