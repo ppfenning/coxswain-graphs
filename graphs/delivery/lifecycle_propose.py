@@ -57,7 +57,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from difflib import SequenceMatcher
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from graphs._contract import (
     ContractViolation,
@@ -70,6 +70,7 @@ from graphs._contract import (
 )
 from graphs.delivery.phase_validate import _PLACEHOLDER_MARKERS
 from runner.protocol import BudgetStop, NodeRunner, RunnerError
+from runner.tier_resolution import Hints
 
 __all__ = ["GRAPH_NAME", "review_is_placeholder", "run"]
 
@@ -355,6 +356,22 @@ def patch_parses(patch: str) -> str | None:
     if not patch.endswith("\n"):
         return f"the patch was cut off at {name} hunk {hunk_index}; emit the complete patch"
     return None
+
+
+def _hints(
+    patch: str,
+    *,
+    attempt: int | None = None,
+    judgment: Literal["low", "normal", "high"] | None = None,
+) -> Hints:
+    """Call hints: files and added-plus-removed lines counted from `patch`, not asked of a model."""
+    chunks = _file_chunks(patch)
+    return Hints(
+        judgment=judgment,
+        files_changed=len(chunks) or None,
+        lines_changed=sum(_changed_in(chunk) for _, chunk in chunks or [("", patch)]) if patch.strip() else None,
+        attempt=attempt,
+    )
 
 
 def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
@@ -841,7 +858,7 @@ def _plan_attack(
     attack = dict(
         runner.run(
             role="plan_adversary",
-            tier="deep",
+            hints=Hints(judgment="high"),
             schema=PLAN_ATTACK_SCHEMA,
             context=context,
             prompt=(
@@ -1081,7 +1098,8 @@ def _reviewer_answer(
     runner: NodeRunner,
     *,
     role: str,
-    model_tier: str,
+    hints: Hints | None = None,
+    model_tier: str | None = None,  # review_entry still passes a literal tier; its own task drops it.
     schema: Mapping[str, Any],
     context: list[str],
     prompt: str,
@@ -1094,13 +1112,14 @@ def _reviewer_answer(
     caller's to decide what an abstention costs.
     """
     try:
-        first = dict(runner.run(role=role, tier=model_tier, schema=schema, context=context, prompt=prompt))
+        first = dict(runner.run(role=role, tier=model_tier, hints=hints, schema=schema, context=context, prompt=prompt))
         if not review_is_placeholder(first):
             return first, False
         second = dict(
             runner.run(
                 role=role,
                 tier=model_tier,
+                hints=hints,
                 schema=schema,
                 context=context,
                 prompt=(
@@ -1175,6 +1194,7 @@ def _review_round(
     facts: Mapping[str, Any],
     handoff: Mapping[str, Any] | None,
     tier: int,
+    attempt: int,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None, str, bool, bool]:
     """One full round of review, and the verdict it reaches.
 
@@ -1188,12 +1208,14 @@ def _review_round(
     sends back to build — a reviewer that abstains is not a verdict to rebuild
     against.
     """
-    # The model tier for reviews is decided here; the profile's `tiers` mapping
-    # turns "standard" into a model.
+    # The call declares its role and hints; the resolver picks the model tier.
+    patch = str(build.get("patch") or "")
+    review_hints = _hints(patch, attempt=attempt)
+    arbiter_hints = _hints(patch, attempt=attempt, judgment="high")
     review, charter_abstained = _reviewer_answer(
         runner,
         role="review_charter",
-        model_tier="standard",
+        hints=review_hints,
         schema=REVIEW_SCHEMA,
         context=context,
         prompt=(
@@ -1214,7 +1236,7 @@ def _review_round(
             adversary, adversary_abstained = _reviewer_answer(
                 runner,
                 role="review_adversary",
-                model_tier="standard",
+                hints=review_hints,
                 schema=ADVERSARY_SCHEMA,
                 context=context,
                 prompt=(
@@ -1249,7 +1271,7 @@ def _review_round(
                 sole_arbitration = dict(
                     runner.run(
                         role="arbitrate",
-                        tier="deep",
+                        hints=arbiter_hints,
                         schema=ARBITRATE_SCHEMA,
                         context=context,
                         prompt=(
@@ -1271,7 +1293,7 @@ def _review_round(
                 sole_arbitration = dict(
                     runner.run(
                         role="arbitrate",
-                        tier="deep",
+                        hints=arbiter_hints,
                         schema=ARBITRATE_SCHEMA,
                         context=context,
                         prompt=(
@@ -1297,7 +1319,7 @@ def _review_round(
             arbitration = dict(
                 runner.run(
                     role="arbitrate",
-                    tier="deep",
+                    hints=arbiter_hints,
                     schema=ARBITRATE_SCHEMA,
                     context=context,
                     prompt=(
@@ -1560,7 +1582,8 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     if invalid is not None:
         try:
             build = runner.run(
-                role="build", tier="standard", thread=str(ticket), task=str(ticket), schema=BUILD_SCHEMA,
+                role="build", hints=_hints(str(build.get("patch") or "")),
+                thread=str(ticket), task=str(ticket), schema=BUILD_SCHEMA,
                 context=context, budget_usd=build_budget_usd,
                 prompt=(
                     f"Carry out this plan and return the change as a unified diff.\n\n"
@@ -1617,6 +1640,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 facts=facts,
                 handoff=handoff,
                 tier=tier,
+                attempt=1,
             )
     except _NodeFailure as exc:
         return _infra_result(run_id=run_id, date=date, ticket=ticket, scope=scope, build=build, handoff=handoff, exc=exc)
@@ -1747,6 +1771,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 facts=facts,
                 handoff=handoff,
                 tier=tier,
+                attempt=int(attempts),
             )
         except _NodeFailure as exc:
             return _infra_result(run_id=run_id, date=date, ticket=ticket, scope=scope, build=build, handoff=handoff, exc=exc)
