@@ -530,6 +530,7 @@ def _lifecycle_invocation(
             "cartridge": ctx.cartridge,
             "surfaces": list(task.get("surfaces") or []),
             "patterns": list(task.get("patterns") or []),
+            "tier": dict(task.get("tier") or {}),
             **({"fix_attempts": fix_attempts} if fix_attempts is not None else {}),
             **({"build_budget_usd": task["budget_usd"]} if task.get("budget_usd") is not None else {}),
         },
