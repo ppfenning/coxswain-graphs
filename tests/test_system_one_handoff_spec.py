@@ -59,7 +59,7 @@ def test_agrees_on_a_false_pair():
     assert SPEC.agrees(_answer(0.1), {"complete": False}) is True
 
 
-def test_role_specs_holds_only_the_handoff_role():
+def test_role_specs_holds_the_handoff_and_review_prescreen_roles():
     specs = role_specs()
-    assert set(specs) == {"handoff"}
+    assert set(specs) == {"handoff", "review_charter"}
     assert isinstance(specs["handoff"], RoleSpec)
