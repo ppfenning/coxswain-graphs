@@ -847,7 +847,8 @@ def test_an_approved_build_whose_lint_fails_re_enters_the_fix_loop_with_the_lint
     assert git("show", "epic/demo-initiative/p1-foundations:t1-probe.txt", cwd=repo).strip() == "ok"
 
 
-def test_a_lint_only_failure_goes_through_the_style_pass_seat_not_a_second_build(repo, cart, tmp_path) -> None:
+def test_a_lint_only_failure_goes_through_the_style_pass_seat_not_a_second_build(repo, cart, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.epic._collected_ids", lambda _worktree: {"test_x.py::test_a"})
     cart["skills"]["style_pass"] = "acme-skills:style"
     cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
     runner = Repairing(_broken_probe(), repaired={})
@@ -913,8 +914,9 @@ def test_a_style_edit_that_drops_a_collected_test_is_refused_and_falls_back_to_a
     assert "test_thing.py" in landed
 
 
-def test_a_style_edit_commits_only_the_paths_it_names_never_a_check_byproduct(repo, cart, tmp_path) -> None:
+def test_a_style_edit_commits_only_the_paths_it_names_never_a_check_byproduct(repo, cart, tmp_path, monkeypatch) -> None:
     """Checks drop files into the worktree; an `add -A` after them would carry those to the merge."""
+    monkeypatch.setattr("harness.epic._collected_ids", lambda _worktree: {"test_x.py::test_a"})
     (repo / "check_bp.py").write_text(
         "import pathlib, sys\n"
         "pathlib.Path('byproduct.dat').write_text('x')\n"
@@ -941,7 +943,8 @@ def test_a_style_edit_commits_only_the_paths_it_names_never_a_check_byproduct(re
 _LINT_EDIT_STILL_BROKEN = _LINT_EDIT.replace("+ok", "+still broken")
 
 
-def test_a_task_gets_one_style_edit_then_a_reviewed_revise(repo, cart, tmp_path) -> None:
+def test_a_task_gets_one_style_edit_then_a_reviewed_revise(repo, cart, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.epic._collected_ids", lambda _worktree: {"test_x.py::test_a"})
     cart["skills"]["style_pass"] = "acme-skills:style"
     cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
     runner = Repairing(
@@ -957,6 +960,17 @@ def test_a_task_gets_one_style_edit_then_a_reviewed_revise(repo, cart, tmp_path)
 
 def test_no_measurable_coverage_floor_means_no_style_call_and_a_reviewed_revise(repo, cart, tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("harness.epic._collected_ids", lambda _worktree: None)
+    cart["skills"]["style_pass"] = "acme-skills:style"
+    cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
+    runner = Repairing(_broken_probe(), repaired={"t1-probe": new_file_patch("t1-probe.txt")})
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=initiative(two_phases=False))
+
+    assert not any(c["role"] == "style_pass" and "a configured check failed" in c["prompt"] for c in runner.calls)
+    assert next(t for t in result["tasks"] if t["id"] == "t1-probe")["refix"] == ["revise"]
+
+
+def test_an_empty_collection_is_as_unmeasurable_as_a_pytest_that_cannot_launch(repo, cart, tmp_path) -> None:
+    """The fixture repo has no tests, so pytest collects nothing and `set() <= anything` must not pass the floor."""
     cart["skills"]["style_pass"] = "acme-skills:style"
     cart["landing_areas"]["checks"] = [{"name": "lint", "cmd": f"{sys.executable} check.py"}]
     runner = Repairing(_broken_probe(), repaired={"t1-probe": new_file_patch("t1-probe.txt")})

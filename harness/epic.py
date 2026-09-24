@@ -1718,15 +1718,17 @@ def _run_phase(
 def _collected_ids(worktree: Path) -> set[str] | None:
     """`pytest --collect-only -q` in `worktree`, read back as node ids.
 
-    `None` when pytest itself could not launch (mirrors `run_checks`'s own
-    `FileNotFoundError`/`OSError` handling) — a missing interpreter is a
-    harness fault, not a reason to let the exception end the whole run.
+    `None` means unmeasurable: pytest could not launch (mirrors `run_checks`'s
+    own `FileNotFoundError`/`OSError` handling, a harness fault rather than a
+    reason to end the run), or it collected zero ids (a non-pytest repo, a
+    collection error, a test-less tree). An empty set is not a passing floor,
+    `set() <= anything` is true and would let any edit through untested.
     """
     try:
         proc = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q"], cwd=worktree, capture_output=True, text=True)
     except (FileNotFoundError, OSError):
         return None
-    return collected_ids(proc.stdout)
+    return collected_ids(proc.stdout) or None
 
 
 def _trim_phase(ctx: _Ctx, phase: str) -> str | None:
