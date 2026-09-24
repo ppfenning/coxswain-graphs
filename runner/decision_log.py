@@ -19,7 +19,8 @@ class CallDecision:
     """What was asked for, what was chosen, and which bound clipped it.
 
     The decision is a triple: model, effort, budget_usd. `clipped_by` names the
-    chair bound that reduced it, or None when nothing did.
+    chair bound that reduced it, or None when nothing did. `system_one_agreed` is
+    set only in shadow mode: whether the prediction matched the LLM node's answer.
     """
 
     role: str
@@ -35,6 +36,12 @@ class CallDecision:
     effort: str | None = None
     budget_usd: float | None = None
     clipped_by: str | None = None
+    system_one_backend: str | None = None
+    system_one_mode: str | None = None
+    system_one_answer: str | None = None
+    system_one_confidence: float | None = None
+    system_one_threshold: float | None = None
+    system_one_agreed: bool | None = None
 
 
 def to_row(decision: CallDecision) -> dict[str, Any]:
@@ -58,4 +65,10 @@ def from_row(row: Mapping[str, Any]) -> CallDecision:
         effort=row.get("effort"),
         budget_usd=row.get("budget_usd"),
         clipped_by=row.get("clipped_by"),
+        system_one_backend=row.get("system_one_backend"),
+        system_one_mode=row.get("system_one_mode"),
+        system_one_answer=row.get("system_one_answer"),
+        system_one_confidence=row.get("system_one_confidence"),
+        system_one_threshold=row.get("system_one_threshold"),
+        system_one_agreed=row.get("system_one_agreed"),
     )
