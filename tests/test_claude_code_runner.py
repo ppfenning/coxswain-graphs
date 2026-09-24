@@ -359,6 +359,7 @@ def test_the_builder_gets_a_scratch_worktree_and_runs_in_it(fake_claude, tmp_pat
     system = argv[argv.index("--system-prompt") + 1]
     assert "scratch checkout" in system and "git add -A && git diff --cached" in system
     assert "VERBATIM" in system, "the patch is transcribed from git, never authored"
+    assert "Read files with the Read tool" in system and "`verify:` commands" in system
     scratch = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir" and "agent-graphs-build-" in argv[i + 1]]
     assert scratch, "the scratch is readable by the node"
 

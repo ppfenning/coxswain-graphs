@@ -191,8 +191,13 @@ def run_checks(
     return results
 
 
-def checks_evidence(results: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+def checks_evidence(
+    results: Sequence[Mapping[str, Any]], *, prefix: str = "checks", always_tail: bool = False
+) -> list[dict[str, str]]:
     """Map check results to the `{check, output}` evidence-row shape.
+
+    `prefix` names the row family. `always_tail` keeps the output of a passing
+    result too, for a command whose output is the evidence itself.
 
     Verdict first, counts when parsed, exit code always — the same order a
     reader scans a CI summary in, and the same discipline as every other
@@ -213,9 +218,9 @@ def checks_evidence(results: Sequence[Mapping[str, Any]]) -> list[dict[str, str]
         else:
             body = captured
         tail = f"\ncmd: {result.get('cmd')}\n{_tail_lines(body)}"
-        carries_tail = not result.get("passed")
+        carries_tail = always_tail or not result.get("passed")
         output = summary + tail if carries_tail else summary
-        rows.append({"check": f"checks:{result['name']}", "output": output})
+        rows.append({"check": f"{prefix}:{result['name']}", "output": output})
     return rows
 
 
