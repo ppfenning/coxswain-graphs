@@ -16,8 +16,24 @@ import pytest
 from graphs._contract import ContractViolation
 from graphs.delivery import phase_validate
 from runner import ScriptedRunner
+from runner.tier_resolution import Hints
 
 _UNSET = object()
+
+
+class HintedRunner(ScriptedRunner):
+    """A `ScriptedRunner` that accepts `hints` and no tier, as `NodeRunner` allows.
+
+    `ScriptedRunner.run` requires a tier and has no `hints`, so this double
+    records `hints` on each call and records `tier` only if the caller passed one.
+    """
+
+    def run(self, *, role, hints=None, tier=None, **kwargs):
+        try:
+            return super().run(role=role, tier=tier, **kwargs)
+        finally:
+            recorded = {k: v for k, v in self.calls[-1].items() if k != "tier" or tier is not None}
+            self.calls[-1] = {**recorded, "hints": hints}
 
 
 def _fs_reader(worktree: str, rel: str) -> str | None:
@@ -99,7 +115,7 @@ def run(cart, responses=None, state=None, worktree=None, reader=_UNSET):
     `_fs_reader` whenever a worktree is given, and is omitted otherwise — pass
     `reader=None` explicitly to simulate the harness supplying no reader at all.
     """
-    runner = ScriptedRunner(responses or {"validate_chunk": CHUNK_OK, "validate_phase": PHASE_MET})
+    runner = HintedRunner(responses or {"validate_chunk": CHUNK_OK, "validate_phase": PHASE_MET})
     phase_state = copy.deepcopy(state or PHASE_STATE)
     if worktree is not None:
         for task in phase_state["tasks"]:
@@ -191,10 +207,50 @@ def test_it_proposes_nothing_because_it_is_advisory(cart) -> None:
     assert result["proposals"] == []
 
 
-def test_the_tiers_are_cheap_per_task_and_deep_once(cart) -> None:
+def test_every_call_declares_role_and_hints_and_no_tier(cart) -> None:
     _, runner = run(cart)
-    tiers = {call["role"]: call["tier"] for call in runner.calls}
-    assert tiers == {"validate_chunk": "standard", "validate_phase": "deep"}
+    assert all("tier" not in call and isinstance(call["hints"], Hints) for call in runner.calls)
+
+    chunk_hints = [c["hints"] for c in runner.calls if c["role"] == "validate_chunk"]
+    assert [(h.judgment, h.lines_changed, h.files_changed) for h in chunk_hints] == [
+        ("normal", 12, 1),
+        ("normal", 40, 1),
+    ], "tasks are asked in id order: t1-probe, then t2-bench"
+
+    (phase_hints,) = [c["hints"] for c in runner.calls if c["role"] == "validate_phase"]
+    assert (phase_hints.judgment, phase_hints.lines_changed, phase_hints.files_changed) == ("high", 52, 2)
+
+
+def test_the_follow_up_and_refusal_retry_calls_carry_hints_too(cart, tmp_path) -> None:
+    (tmp_path / "migrations").mkdir()
+    (tmp_path / "migrations" / "0007_add_col.sql").write_text("ALTER TABLE vendor ADD COLUMN drift_flag boolean;\n")
+    _, second_ask = run(
+        cart, {"validate_chunk": [CHUNK_NEEDS_EVIDENCE, CHUNK_OK], "validate_phase": PHASE_MET}, worktree=tmp_path
+    )
+    malformed = {"satisfied": False, "gaps": ["no migration"], "reasoning": "half", "defects": []}
+    _, refusal_retry = run(cart, {"validate_chunk": [malformed, CHUNK_OK], "validate_phase": PHASE_MET})
+
+    for runner, expected in ((second_ask, 3), (refusal_retry, 3)):
+        chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
+        assert len(chunk_calls) == expected
+        assert all("tier" not in c and c["hints"].judgment == "normal" for c in chunk_calls)
+        assert chunk_calls[1]["hints"] == chunk_calls[0]["hints"], "the extra ask is about the same task"
+
+
+def test_chunk_hints_carry_the_patch_size_and_none_when_absent() -> None:
+    task = {"change_facts": {"changed_lines": 40, "files_touched": ["a.py", "b.py"]}}
+    assert phase_validate._chunk_hints(task) == Hints(judgment="normal", lines_changed=40, files_changed=2)
+    assert phase_validate._chunk_hints({}) == Hints(judgment="normal")
+
+
+def test_phase_hints_sum_lines_and_count_distinct_files_and_none_when_absent() -> None:
+    tasks = [
+        {"change_facts": {"changed_lines": 40, "files_touched": ["a.py", "b.py"]}},
+        {"change_facts": {"changed_lines": 12, "files_touched": ["b.py"]}},
+        {},
+    ]
+    assert phase_validate._phase_hints(tasks) == Hints(judgment="high", lines_changed=52, files_changed=2)
+    assert phase_validate._phase_hints([{}]) == Hints(judgment="high")
 
 
 def test_the_validators_see_the_patch_itself(cart) -> None:
@@ -247,7 +303,7 @@ def test_a_placeholder_verdict_is_asked_again_rather_than_believed(cart) -> None
 
     # The retry is the same question, plus the plain statement that it is the last.
     assert "There is no later" in chunk_calls[1]["prompt"]
-    assert chunk_calls[1]["tier"] == chunk_calls[0]["tier"], "a retry is not a cheaper ask"
+    assert chunk_calls[1]["hints"] == chunk_calls[0]["hints"], "a retry is not a cheaper ask"
 
     # And the answer that counts is the one that is actually a verdict.
     assert all(v["satisfied"] for v in result["chunk_verdicts"])

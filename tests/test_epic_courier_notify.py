@@ -130,7 +130,7 @@ class Runner:
         self.calls: list[dict] = []
         self.lock = threading.Lock()
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         with self.lock:
             self.calls.append({"role": role, "prompt": prompt})
         if role == "plan":
