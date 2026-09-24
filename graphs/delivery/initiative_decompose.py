@@ -28,6 +28,7 @@ import yaml
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
 from graphs.delivery.ticket_lint import Problem, lint_tickets
 from runner.protocol import NodeRunner
+from runner.tier_resolution import Hints
 
 __all__ = ["GRAPH_NAME", "initiative_text", "resolve_surfaces", "run", "surface_problem"]
 
@@ -321,7 +322,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     decomposition = dict(
         runner.run(
             role="decompose",
-            tier="standard",
+            hints=Hints(judgment="high"),
             schema=DECOMPOSE_SCHEMA,
             context=context,
             prompt=(

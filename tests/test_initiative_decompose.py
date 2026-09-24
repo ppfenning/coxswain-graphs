@@ -12,6 +12,7 @@ import yaml
 from graphs._contract import ContractViolation
 from graphs.delivery import initiative_decompose
 from runner import ScriptedRunner
+from runner.tier_resolution import Hints
 
 DECOMPOSITION = {
     "phases": [{"id": "p1", "goal": "foundations"}, {"id": "p2", "goal": "cutover"}],
@@ -544,3 +545,37 @@ def test_duplicated_lint_entries_are_written_once(cart) -> None:
     action = initiative_decompose._item_action(task, landing="work", initiative_id=None)
     block = action.split("with frontmatter\n", 1)[1].rsplit("\nbody = ", 1)[0]
     assert yaml.safe_load(block)["lint"] == [lint_entry]
+
+
+# ── tier routing: decompose declares hints, the adversary names its tier ─────
+
+
+def test_the_decompose_call_declares_hints_and_no_tier(cart) -> None:
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": DECOMPOSITION, "review_adversary": ACCEPTED})
+    initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, runner)
+    call = next(c for c in runner.calls if c["role"] == "decompose")
+    assert call["tier"] is None
+    assert call["hints"] == Hints(judgment="high")
+
+
+def test_every_adversary_call_keeps_the_deep_literal(cart) -> None:
+    """Lifecycle's review_adversary is `standard`; decompose's stays `deep` by naming it."""
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    surface = {"task": "t1", "surface": "widget-thing", "replacement": "schema.py"}
+    reach = {"task": "t1", "surface": "~/scratch/notes.md", "replacement": "graphs/notes.py"}
+    scenarios = [
+        ("edge and unbuildable", ["widget-thing"], [{"repo": "graphs", "path": "graphs/schema.py"}], surface),
+        ("edge and lint refusal", ["~/scratch/notes.md"], [], reach),
+    ]
+    for name, surfaces, tree, correction in scenarios:
+        tasks = [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": surfaces}]
+        answers = {
+            "decompose": {**DECOMPOSITION, "tasks": tasks},
+            "review_adversary": [ACCEPTED, {"corrections": [correction], "summary": "ok"}],
+        }
+        runner = ScriptedRunner(answers)
+        initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": tree}, runner)
+        adversary = [c for c in runner.calls if c["role"] == "review_adversary"]
+        assert len(adversary) == 2, name
+        assert [c["tier"] for c in adversary] == ["deep", "deep"], name
