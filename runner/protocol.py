@@ -26,6 +26,7 @@ from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from runner.decision_log import CallDecision
+from runner.tier_resolution import Hints
 
 __all__ = ["BudgetStop", "Capability", "LimitStop", "NodeResult", "NodeRunner", "ProviderProfile", "RunnerError", "resolve_profile"]
 
@@ -146,7 +147,8 @@ class NodeRunner(Protocol):
         self,
         *,
         role: str,
-        tier: str,
+        tier: str | None = None,
+        hints: Hints | None = None,
         schema: Mapping[str, Any],
         prompt: str,
         context: Sequence[str] = (),
@@ -155,6 +157,9 @@ class NodeRunner(Protocol):
         task: str | None = None,
     ) -> NodeResult:
         """Execute one node.
+
+        `tier` may be None when the caller passes no tier. `hints` is a signal
+        for the resolver and is not a decision.
 
         `context` is a list of absolute paths to context packs, resolved by the
         cartridge. The runner reads them; the graph never does. That is the

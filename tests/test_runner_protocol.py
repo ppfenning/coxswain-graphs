@@ -1,7 +1,10 @@
+import inspect
+
 import pytest
 
 from runner.decision_log import CallDecision
-from runner.protocol import Capability, NodeResult, ProviderProfile, RunnerError, resolve_profile
+from runner.protocol import Capability, NodeResult, NodeRunner, ProviderProfile, RunnerError, resolve_profile
+from runner.tier_resolution import Hints
 
 CHEAP = ProviderProfile(
     capabilities={
@@ -102,6 +105,18 @@ def test_the_top_tier_missing_a_capability_refuses_instead_of_indexing_past_it()
         resolve_profile(
             BY_TIER, role="build", tier="deep", required=[Capability.RESUME]
         )
+
+
+def test_run_takes_an_optional_tier_and_optional_hints():
+    params = inspect.signature(NodeRunner.run).parameters
+    assert params["tier"].default is None
+    assert params["hints"].default is None
+
+    class Stub:
+        def run(self, *, role, tier=None, hints: Hints | None = None, schema, prompt, **_):
+            return NodeResult()
+
+    assert isinstance(Stub(), NodeRunner)
 
 
 def test_a_fresh_node_result_has_no_decision():
