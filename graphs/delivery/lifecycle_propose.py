@@ -70,6 +70,7 @@ from graphs._contract import (
 )
 from graphs.delivery.phase_validate import _PLACEHOLDER_MARKERS
 from runner.protocol import BudgetStop, NodeRunner, RunnerError
+from runner.system_one import Answer
 from runner.tier_resolution import Hints
 
 __all__ = ["GRAPH_NAME", "review_is_placeholder", "run"]
@@ -1211,6 +1212,30 @@ def should_skip_arbiter(charter_verdict: str, adversary_verdict: str) -> bool:
     return charter_verdict == "approve" and adversary_verdict == "approve"
 
 
+def review_depth(answer: Answer | None, threshold: float) -> Literal["cheap", "deep"]:
+    """cheap only for a confident approve; revise, reject, low confidence and no answer are all deep."""
+    confident_approve = answer is not None and answer.value == "approve" and answer.confidence >= threshold
+    return "cheap" if confident_approve else "deep"
+
+
+def _consult_prescreen(runner: NodeRunner, request: Mapping[str, Any]) -> tuple[Literal["cheap", "deep"], str] | None:
+    """Edge: the pre-screen's depth and its role's mode, or None when the runner has no pre-screen.
+
+    The depth is computed in shadow and in on alike; `_charter_judgment` decides which one acts on it.
+    """
+    consult = getattr(runner, "consult", None)
+    consulted = consult("review_charter", request) if callable(consult) else None
+    if consulted is None:
+        return None
+    answer, setting = consulted
+    return review_depth(answer, setting.threshold), setting.mode
+
+
+def _charter_judgment(prescreen: tuple[Literal["cheap", "deep"], str] | None) -> Literal["low"] | None:
+    """Only a live cheap depth lowers the charter reviewer's hints; shadow and deep leave today's call."""
+    return "low" if prescreen == ("cheap", "on") else None
+
+
 def _review_round(
     runner: NodeRunner,
     *,
@@ -1239,21 +1264,25 @@ def _review_round(
     patch = str(build.get("patch") or "")
     review_hints = _hints(patch, attempt=attempt)
     arbiter_hints = _hints(patch, attempt=attempt, judgment="high")
+    charter_prompt = (
+        "Review this change against the team's own written charter in your "
+        f"context.\n\nTask: {ticket}\nSummary: {build.get('summary')}\n"
+        f"Change facts: {facts}\n"
+        + (f"Handoff brief: {handoff.get('brief')}\n" if handoff else "")
+        + harness_verify_block(build)
+        + f"Patch:\n{build.get('patch')}\n\n"
+        "Cite the charter principle behind every finding."
+    )
+    # The pre-screen lowers only the charter reviewer's hints, and only in mode "on". The adversary
+    # keeps today's hints: its job is to disagree with the approve the pre-screen is confident about.
+    prescreen = _consult_prescreen(runner, {"role": "review_charter", "prompt": charter_prompt})
     review, charter_abstained = _reviewer_answer(
         runner,
         role="review_charter",
-        hints=review_hints,
+        hints=_hints(patch, attempt=attempt, judgment=_charter_judgment(prescreen)),
         schema=REVIEW_SCHEMA,
         context=context,
-        prompt=(
-            "Review this change against the team's own written charter in your "
-            f"context.\n\nTask: {ticket}\nSummary: {build.get('summary')}\n"
-            f"Change facts: {facts}\n"
-            + (f"Handoff brief: {handoff.get('brief')}\n" if handoff else "")
-            + harness_verify_block(build)
-            + f"Patch:\n{build.get('patch')}\n\n"
-            "Cite the charter principle behind every finding."
-        ),
+        prompt=charter_prompt,
     )
 
     # Tier 0 is the cheapest review, never the absence of one.
