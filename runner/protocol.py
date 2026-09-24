@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
+from runner.decision_log import CallDecision
+
 __all__ = ["BudgetStop", "Capability", "LimitStop", "NodeResult", "NodeRunner", "ProviderProfile", "RunnerError", "resolve_profile"]
 
 _TIERS = ("cheap", "standard", "deep")
@@ -78,7 +80,11 @@ class NodeResult(dict):
     Return shapes stay small. A node that hands the next node a large blob has
     moved the reasoning into the wrong place, and blows structured-output limits
     on a busy day.
+
+    `decision` is an attribute, not a key, so it never reaches structured output.
     """
+
+    decision: CallDecision | None = None
 
 
 class Capability(StrEnum):
