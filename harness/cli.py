@@ -536,12 +536,20 @@ def _run_graph(
             print(str(exc), file=sys.stderr)
             return 1
 
+        # States of tasks in other initiatives, from the same load as the items:
+        # a need on one is met only through this mapping.
+        foreign = initiative.get("foreign") or {}
         phase_name = args.phase_name
         if phase_name is None:
             phase_name = next(
-                (p for p in initiative["phases"] if workstore.ready_tasks(initiative["items"], phase=p)), None
+                (
+                    p
+                    for p in initiative["phases"]
+                    if workstore.ready_tasks(initiative["items"], phase=p, foreign=foreign)
+                ),
+                None,
             )
-        ready = workstore.ready_tasks(initiative["items"], phase=phase_name) if phase_name else []
+        ready = workstore.ready_tasks(initiative["items"], phase=phase_name, foreign=foreign) if phase_name else []
         if not ready:
             print(f"nothing ready in {initiative['id']}" + (f" phase {phase_name}" if phase_name else ""))
             return 0

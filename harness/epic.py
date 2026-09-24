@@ -1172,7 +1172,14 @@ def _run_phase(
 
     # A dropped task is terminal like a done one: it never gets rebuilt or
     # re-reviewed, and never blocks the phase behind it.
-    all_ready = [item for item in workstore.ready_tasks(_ready_view(items), phase=phase) if item.get("state") != "dropped"]
+    # A need on a task in another initiative is met by the state the load
+    # recorded under `initiative["foreign"]`; without it that task is never ready.
+    foreign = initiative.get("foreign") or {}
+    all_ready = [
+        item
+        for item in workstore.ready_tasks(_ready_view(items), phase=phase, foreign=foreign)
+        if item.get("state") != "dropped"
+    ]
 
     # A third run of the same task is refused outright rather than tried
     # again — quarantined here, plainly, never through `_quarantine_task`,
