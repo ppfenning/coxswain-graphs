@@ -344,3 +344,60 @@ def test_a_run_that_raises_after_creating_a_worktree_leaves_no_directory_and_no_
     assert not worktree.exists()
     assert str(worktree) not in fake.registered
     assert fake.remove_calls == [(worktree, worktree)]
+
+
+# ── phase: a need on a task in another initiative ───────────────────────────
+
+FOREIGN_NEED = "other-initiative/t9-upstream"
+
+
+class _Reached(Exception):
+    def __init__(self, tasks) -> None:
+        self.tasks = tasks
+
+
+def _phase_args(phase_name: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        graph="phase", initiative="demo", phase_name=phase_name, max_parallel=2, date="2026-09-24"
+    )
+
+
+def _run_phase_graph(monkeypatch, foreign_state: str, phase_name: str | None) -> list[str]:
+    """Drive the `phase` arm; return the ids it would have launched (empty if none)."""
+    initiative = {
+        "id": "demo",
+        "phases": ["p1"],
+        "items": [{"id": "t1", "phase": "p1", "state": "ready", "needs": [FOREIGN_NEED]}],
+        "foreign": {FOREIGN_NEED: foreign_state},
+    }
+    monkeypatch.setattr(cli.workstore, "read_initiative", lambda name: initiative)
+
+    def _launch(**kwargs):
+        raise _Reached(kwargs["tasks"])
+
+    monkeypatch.setattr(cli, "run_phase", _launch)
+    args = _phase_args(phase_name)
+    try:
+        code = cli._run_graph(
+            specs={"lifecycle": SimpleNamespace(run=None)},
+            parser=_FakeParser(args),
+            args=args,
+            cartridge={},
+            runner=None,
+            run_id="r1",
+        )
+    except _Reached as reached:
+        return [t["id"] for t in reached.tasks]
+    assert code == 0
+    return []
+
+
+@pytest.mark.parametrize("phase_name", ["p1", None])
+def test_phase_launches_a_task_whose_foreign_need_is_done(monkeypatch, phase_name) -> None:
+    assert _run_phase_graph(monkeypatch, "done", phase_name) == ["t1"]
+
+
+@pytest.mark.parametrize("phase_name", ["p1", None])
+def test_phase_leaves_a_task_unready_while_its_foreign_need_is_not_done(monkeypatch, capsys, phase_name) -> None:
+    assert _run_phase_graph(monkeypatch, "ready", phase_name) == []
+    assert "nothing ready in demo" in capsys.readouterr().out

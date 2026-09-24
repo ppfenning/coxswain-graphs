@@ -407,6 +407,42 @@ def test_the_happy_path_stacks_the_second_phase_on_the_first(repo, cart, tmp_pat
     assert not is_ancestor(repo, "epic/demo-initiative/p1-foundations", "main")
 
 
+# ── a need on a task in another initiative ──────────────────────────────────
+
+FOREIGN_NEED = "other-initiative/t9-upstream"
+
+
+def _one_task_needing_a_foreign_task(foreign_state: str) -> dict:
+    """One task whose only need lives in another initiative, in `foreign_state`."""
+    work = initiative(two_phases=False)
+    work["items"] = [
+        {**item, "needs": [FOREIGN_NEED]} if item["id"] == "t1-probe" else item
+        for item in work["items"]
+        if item["id"] != "t2-bench"
+    ]
+    return {**work, "foreign": {FOREIGN_NEED: foreign_state}}
+
+
+def test_a_task_whose_foreign_need_is_done_is_ready_and_built(repo, cart, tmp_path) -> None:
+    work = _one_task_needing_a_foreign_task("done")
+    patches = {"t1-probe": new_file_patch("t1-probe.txt")}
+    result, runner = drive(repo, cart, tmp_path, work=work, patches=patches)
+
+    assert [p["status"] for p in result["phases"]] == ["complete"]
+    assert result["totals"]["phases_partial"] == 0
+    assert any(c["role"] == "build" for c in runner.calls)
+    assert "epic/demo-initiative/p1-foundations--t1-probe" in branches(repo)
+
+
+def test_a_task_whose_foreign_need_is_not_done_stays_unready(repo, cart, tmp_path) -> None:
+    work = _one_task_needing_a_foreign_task("ready")
+    patches = {"t1-probe": new_file_patch("t1-probe.txt")}
+    _, runner = drive(repo, cart, tmp_path, work=work, patches=patches)
+
+    assert not any(c["role"] == "build" for c in runner.calls)
+    assert "epic/demo-initiative/p1-foundations--t1-probe" not in branches(repo)
+
+
 # ── cleanup on exit, work-shape.md §6/§8 ────────────────────────────────────
 
 
