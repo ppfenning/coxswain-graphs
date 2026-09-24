@@ -1,6 +1,7 @@
 import pytest
 
-from runner.protocol import Capability, ProviderProfile, RunnerError, resolve_profile
+from runner.decision_log import CallDecision
+from runner.protocol import Capability, NodeResult, ProviderProfile, RunnerError, resolve_profile
 
 CHEAP = ProviderProfile(
     capabilities={
@@ -101,3 +102,23 @@ def test_the_top_tier_missing_a_capability_refuses_instead_of_indexing_past_it()
         resolve_profile(
             BY_TIER, role="build", tier="deep", required=[Capability.RESUME]
         )
+
+
+def test_a_fresh_node_result_has_no_decision():
+    assert NodeResult({"a": 1}).decision is None
+
+
+def test_a_decision_rides_on_the_result_without_becoming_a_key():
+    decision = CallDecision(
+        role="plan",
+        requested_tier="cheap",
+        chosen_tier="cheap",
+        model_id="m",
+        reason="r",
+        ticket_key="T-1",
+        outcome_key="o-1",
+    )
+    result = NodeResult({"a": 1})
+    result.decision = decision
+    assert result == {"a": 1}
+    assert result.decision is decision
