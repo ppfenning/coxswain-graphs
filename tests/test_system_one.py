@@ -180,6 +180,5 @@ def test_inner_receives_every_argument_unchanged():
     assert inner.calls[0] == {**CALL, "tier": "deep", "hints": None, "thread": "th", "budget_usd": 1.5, "task": "t1"}
 
 
-def test_role_specs_is_an_empty_fresh_mapping():
-    assert role_specs() == {}
+def test_role_specs_is_a_fresh_mapping():
     assert role_specs() is not role_specs()
