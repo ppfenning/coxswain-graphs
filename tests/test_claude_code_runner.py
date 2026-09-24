@@ -965,7 +965,17 @@ def test_bash_is_pre_approved_for_the_checks_and_git_and_nothing_else(fake_claud
     argv = recorded(fake_claude)["argv"]
     i = argv.index("--allowedTools")
     allowed = argv[i + 1 : argv.index("--tools")]
-    assert allowed == ["Bash(pytest:*)", "Bash(ruff:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
+    assert allowed == [
+        "Bash(pytest:*)",
+        "Bash(ruff:*)",
+        "Bash(python -m pytest:*)",
+        "Bash(python3 -m pytest:*)",
+        "Bash(python -m ruff:*)",
+        "Bash(python3 -m ruff:*)",
+        "Bash(git status:*)",
+        "Bash(git diff:*)",
+        "Bash(git add:*)",
+    ]
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits", "edits are still accepted up front"
 
 
@@ -1537,6 +1547,39 @@ def test_the_permitted_list_is_the_list_that_is_enforced(fake_claude, tmp_path, 
     enforced = argv[argv.index("--allowedTools") + 1 : argv.index("--tools")]
     system = _system_prompt(record)
 
-    assert enforced == ["Bash(uv:*)", "Bash(ruff:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
+    assert enforced == [
+        "Bash(uv:*)",
+        "Bash(ruff:*)",
+        "Bash(python -m ruff:*)",
+        "Bash(python3 -m ruff:*)",
+        "Bash(git status:*)",
+        "Bash(git diff:*)",
+        "Bash(git add:*)",
+    ]
     for name in enforced:
         assert f"`{name[len('Bash('):-len(':*)')]}`" in system
+
+
+def test_python_tool_checks_also_permit_the_python_m_form(fake_claude, tmp_path, repo) -> None:
+    """Builders run `python -m pytest`; the first-word entry alone denied it every build."""
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.check_commands = ["ruff check .", "pytest -q"]
+    allowed = runner._allowed_bash()
+    for name in ("Bash(python -m pytest:*)", "Bash(python -m ruff:*)", "Bash(python3 -m pytest:*)", "Bash(python3 -m ruff:*)"):
+        assert name in allowed
+    runner.check_commands = ["uv run pytest"]
+    assert not any("-m" in name for name in runner._allowed_bash()), "only Python-tool checks gain the -m form"
+
+
+def test_the_builder_is_told_each_check_verbatim_and_that_compound_commands_are_denied(fake_claude, tmp_path, repo) -> None:
+    _, record, _ = fake_claude
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Write", "Edit", "Bash"]
+    runner.check_commands = ["ruff check .", "pytest -q"]
+    runner.run(role="build", schema=SCHEMA, prompt="build it")
+    system = _system_prompt(record)
+    for cmd in runner.check_commands:
+        assert f"`{cmd}`" in system
+    assert "`python -m pytest -q`" in system
+    assert "no `cd ... &&` prefix is needed" in system
+    assert "denied as a whole" in system
