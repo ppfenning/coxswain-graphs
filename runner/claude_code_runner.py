@@ -90,6 +90,8 @@ _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
 _PATCH_ROLES = frozenset({"build"})
 
 _DIFF_CMD = "git add -A && git diff --cached"
+# Checks led by one of these also run as `python -m <tool>`; builders reach for that form.
+_PY_TOOLS = frozenset({"pytest", "ruff"})
 
 
 def _capture_diff(scratch: Path) -> str:
@@ -578,7 +580,9 @@ class ClaudeCodeRunner:
         `_workspace` tells the node what is on it. Computing it twice is how a
         builder ends up discovering the boundary by hitting it.
         """
-        allowed = [f"Bash({cmd.split()[0]}:*)" for cmd in self.check_commands if cmd.split()]
+        firsts = [cmd.split()[0] for cmd in self.check_commands if cmd.split()]
+        allowed = [f"Bash({w}:*)" for w in firsts]
+        allowed += [f"Bash({py} -m {w}:*)" for w in firsts if w in _PY_TOOLS for py in ("python", "python3")]
         allowed += ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
         return list(dict.fromkeys(allowed))
 
@@ -617,11 +621,18 @@ class ClaudeCodeRunner:
             )
             if self.check_commands:
                 cmds = "; ".join(self.check_commands)
+                forms = " and ".join(
+                    f"`{c}` or `python -m {c}`" for c in self.check_commands if c.split()[:1] and c.split()[0] in _PY_TOOLS
+                )
                 lines.append(
                     f"The project's checks are exactly: `{cmds}`. Run them as written, from the scratch "
                     "root, and nothing else to test with: the environment is already set up, the "
                     "right interpreter and packages are on PATH for those commands, and probing for "
-                    "them (`which`, `--version`, `python -m ...`, `echo`) is a wasted turn every time. "
+                    "them (`which`, `--version`, `echo`) is a wasted turn every time. "
+                    f"{'Accepted forms: ' + forms + '. ' if forms else ''}"
+                    "Your working directory is already the scratch checkout, so no `cd ... &&` prefix is "
+                    "needed, and a compound command (`&&`, `;`, `|`) is denied as a whole: run each "
+                    "check on its own. "
                     "If a command as written fails to start, report that verbatim and stop. Run every "
                     "one of them before you produce the diff, a lint command as much as the tests: a "
                     "check you skip here fails after review and costs a whole rerun."
