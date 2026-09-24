@@ -42,6 +42,7 @@ from typing import Any
 
 from runner.decision_log import CallDecision
 from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
+from runner.tier_resolution import TIERS, Hints, Resolution, resolve
 
 # Per docs/design/vendor-axis.md §2: session resume on a budget stop, structured
 # output, and Bash/Read/Edit tool grants are real; 200_000 is Claude's published
@@ -433,6 +434,8 @@ class ClaudeCodeRunner:
         # A profile may reassign a role's tier — the vendor axis owning cost.
         # Extraction-shaped roles a graph asked "standard" for can run cheap here.
         self.tier_overrides = {str(k): str(v) for k, v in (self.profile.get("tier_overrides") or {}).items()}
+        # role -> tier applied when the caller names no tier; an override still beats it.
+        self.profile_defaults = {str(k): str(v) for k, v in (self.profile.get("defaults") or {}).items()}
         # A tool-computed map of the target repository, set by the harness. Shown
         # to roles that have tools, so they read it instead of drawing their own.
         self.repo_digest: str | None = None
@@ -480,6 +483,25 @@ class ClaudeCodeRunner:
             fh.write(json.dumps(row) + "\n")
 
     # ── resolution ──────────────────────────────────────────────────────────
+
+    def _resolve_tier(self, role: str, caller_tier: str | None, hints: Hints | None) -> Resolution:
+        """Override, then the caller's tier, then a profile default, then DEFAULT_TIER.
+
+        A tier the caller named outranks a profile default, so the defaults are
+        withheld from the resolver then; it has no slot for a caller's tier, which
+        rides in its `router_tier` slot and is reported as "caller". The resolver's
+        floor is the lowest tier, so a `cheap` override is not raised; DEFAULT_TIER
+        is applied only when nothing named a tier.
+        """
+        for named in (caller_tier, self.tier_overrides.get(role), self.profile_defaults.get(role)):
+            if named is not None and named not in TIERS:
+                self._model_for(named)
+                raise RunnerError(f"node '{role}': tier '{named}' is not one of {', '.join(TIERS)}")
+        defaults = {} if caller_tier is not None else self.profile_defaults
+        chosen = resolve(role, hints, self.tier_overrides, defaults, caller_tier, TIERS[0])
+        if chosen.reason == "floor":
+            return Resolution(DEFAULT_TIER, "floor")
+        return Resolution(chosen.tier, "caller") if chosen.reason == "router" else chosen
 
     def _model_for(self, tier: str) -> str:
         model = self.tiers.get(tier)
@@ -823,7 +845,8 @@ class ClaudeCodeRunner:
         self,
         *,
         role: str,
-        tier: str = DEFAULT_TIER,
+        tier: str | None = None,
+        hints: Hints | None = None,
         schema: Mapping[str, Any],
         prompt: str,
         context: Sequence[str] = (),
@@ -831,8 +854,9 @@ class ClaudeCodeRunner:
         budget_usd: float | None = None,
         task: str | None = None,
     ) -> NodeResult:
-        requested_tier = tier
-        tier = self.tier_overrides.get(role, tier)
+        requested_tier = tier or DEFAULT_TIER
+        resolution = self._resolve_tier(role, tier, hints)
+        tier = resolution.tier
         model = self._model_for(tier)
         body = self.role_skills.get(role)
         packs = [body, *context] if body else list(context)
@@ -1037,9 +1061,11 @@ class ClaudeCodeRunner:
             requested_tier=requested_tier,
             chosen_tier=tier,
             model_id=init_model or used_model,
-            reason="override" if tier != requested_tier else "caller",
+            reason=resolution.reason,
             ticket_key=task or "",
             outcome_key="",
             claude_code_version=version,
+            effort=self.effort.get(tier, "high"),
+            budget_usd=budget_usd,
         )
         return result

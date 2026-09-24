@@ -779,10 +779,10 @@ def test_a_tier_override_that_changes_the_tier_is_reason_override(fake_claude, t
     assert (d.requested_tier, d.chosen_tier, d.reason) == ("standard", "cheap", "override")
 
 
-def test_an_override_to_the_tier_already_asked_for_is_reason_caller(fake_claude, tmp_path) -> None:
+def test_an_override_to_the_tier_already_asked_for_is_still_reason_override(fake_claude, tmp_path) -> None:
     runner = _streamed(tmp_path, fake_claude, [INIT, RESULT], tier_overrides={"build": "standard"})
     d = runner.run(role="build", tier="standard", schema=SCHEMA, prompt="go").decision
-    assert (d.chosen_tier, d.reason) == ("standard", "caller")
+    assert (d.chosen_tier, d.reason) == ("standard", "override")
 
 
 def test_an_init_event_lacking_the_fields_gives_none_version_and_the_resolved_model(fake_claude, tmp_path) -> None:
@@ -1637,3 +1637,44 @@ def test_the_builder_is_told_each_check_verbatim_and_that_compound_commands_are_
     assert "`python -m pytest -q`" in system
     assert "no `cd ... &&` prefix is needed" in system
     assert "denied as a whole" in system
+
+
+# ── tier resolution: override, caller, profile default, floor ────────────────
+
+
+def _tier_run(fake_claude, tmp_path, profile=None, **call):
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, **(profile or {})}, claude_bin=str(script), cwd=tmp_path)
+    decision = runner.run(role="plan", schema=SCHEMA, prompt="go", **call).decision
+    argv = recorded(fake_claude)["argv"]
+    return decision, argv[argv.index("--model") + 1], argv[argv.index("--effort") + 1]
+
+
+def test_a_profile_default_beats_default_tier(fake_claude, tmp_path) -> None:
+    d, model, effort = _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "deep"}})
+    assert (d.chosen_tier, d.reason, model, effort) == ("deep", "profile_default", "opus", "xhigh")
+
+
+def test_a_tier_override_beats_a_profile_default(fake_claude, tmp_path) -> None:
+    d, model, _ = _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "deep"}, "tier_overrides": {"plan": "cheap"}})
+    assert (d.chosen_tier, d.reason, model) == ("cheap", "override", "haiku")
+
+
+def test_no_tier_and_no_default_lands_on_the_floor(fake_claude, tmp_path) -> None:
+    d, model, _ = _tier_run(fake_claude, tmp_path)
+    assert (d.requested_tier, d.chosen_tier, d.reason, model) == ("standard", "standard", "floor", "sonnet")
+
+
+def test_a_tier_the_caller_named_beats_a_profile_default(fake_claude, tmp_path) -> None:
+    d, model, _ = _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "cheap"}}, tier="deep")
+    assert (d.chosen_tier, d.reason, model) == ("deep", "caller", "opus")
+
+
+def test_an_explicit_budget_is_recorded_as_given_and_effort_comes_from_the_tier(fake_claude, tmp_path) -> None:
+    d, _, _ = _tier_run(fake_claude, tmp_path, tier="deep", budget_usd=0.5)
+    assert (d.budget_usd, d.effort, d.clipped_by) == (0.5, "xhigh", None)
+
+
+def test_a_profile_default_naming_an_unbound_tier_is_named(fake_claude, tmp_path) -> None:
+    with pytest.raises(RunnerError, match="no model for tier 'huge'"):
+        _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "huge"}})
