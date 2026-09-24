@@ -427,7 +427,9 @@ def _trace_evidence(calls: Sequence[Any], task: str, patch: str) -> list[dict[st
     return [*commands, {"check": "files_touched", "source": "trace", "output": "\n".join(files)}]
 
 
-def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) -> dict[str, Any]:
+def _build_task(
+    ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any], verify: Sequence[str] = ()
+) -> dict[str, Any]:
     """Apply one task's patch on a scratch branch off the phase branch, and check it.
 
     Returns the record whose evidence rows the gate will read. Whether the tests
@@ -499,7 +501,19 @@ def _build_task(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any]) 
         reason = quarantine_reason(results)
         if reason:
             record["quarantine"] = reason
+
+    # The ticket's own verification commands, run here because the builder's
+    # sandbox cannot. Their output is evidence for the reviewers; a failing one
+    # never quarantines, so its results stay out of `quarantine_reason`.
+    if verify:
+        ran = run_checks(worktree, [{"name": str(i), "cmd": cmd} for i, cmd in enumerate(verify, 1)])
+        record["verify"] = ran
+        record["evidence"].extend(checks_evidence(ran, prefix="verify", always_tail=True))
     return record
+
+
+def _verify_of(by_id: Mapping[str, Mapping[str, Any]], task: str) -> list[str]:
+    return [str(c) for c in (by_id.get(task) or {}).get("verify") or []]
 
 
 def _lifecycle_invocation(
@@ -570,6 +584,7 @@ def _style_fix(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any], b
         build_field["patch"] = folded + "\n"
     results = run_checks(worktree, ctx.checks)
     build["checks"] = results
+    # Only `checks:` rows are replaced; `verify:` rows stay as run before the style edit.
     build["evidence"] = [
         *(row for row in build["evidence"] if not str(row.get("check")).startswith("checks:")),
         {"check": "style_pass", "output": f"edit applied after approval, not reviewed: {', '.join(paths)}"},
@@ -651,7 +666,7 @@ def _refix(
         names = ", ".join(str(c["name"]) for c in build["checks"] if not c.get("passed"))
         remove_worktree(ctx.repo, ctx.task_worktree(phase, task))
         _git("-C", str(ctx.repo), "branch", "-D", ctx.scratch_branch(task))
-        build = _build_task(ctx, phase=phase, task=task, result=result)
+        build = _build_task(ctx, phase=phase, task=task, result=result, verify=_verify_of(by_id, task))
         build["evidence"].append(
             {"check": "fix loop re-entry", "output": f"revise after {names}: attempts spent {spent:g} of {limit + 1}"}
         )
@@ -1386,7 +1401,7 @@ def _run_phase(
             quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=refused, kind="refused"))
             continue
 
-        build = _build_task(ctx, phase=phase, task=task, result=result)
+        build = _build_task(ctx, phase=phase, task=task, result=result, verify=_verify_of(by_id, task))
         final, build = _refix(ctx, by_id, phase=phase, task=task, result=result, build=build)
         build["result"] = final
         built[task] = build
