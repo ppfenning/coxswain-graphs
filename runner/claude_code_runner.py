@@ -648,7 +648,10 @@ class ClaudeCodeRunner:
                 "Do not hand-write a diff, do not reformat what git printed, and do not commit. "
                 "Report the commands you actually ran and their real output; a command you did "
                 "not run is not evidence. The harness applies your patch itself, in a different "
-                "worktree, so leaving the scratch dirty is expected and correct."
+                "worktree, so leaving the scratch dirty is expected and correct. "
+                "Read files with the Read tool, not `head`, `cat` or `sed -n`; the harness runs "
+                "this ticket's `verify:` commands after your patch is applied and shows their "
+                "output to the reviewers, so do not try to run them yourself."
             )
             if self.check_commands:
                 cmds = "; ".join(self.check_commands)
