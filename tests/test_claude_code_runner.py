@@ -20,6 +20,7 @@ from runner.claude_code_runner import (
     ClaudeCodeRunner,
     _alt_model_for,
     _init_facts,
+    _run_verify,
     apply_reported_patch,
     files_touched_from_patch,
     is_safeguard_refusal,
@@ -480,6 +481,98 @@ def test_a_scratch_edit_is_marked_computed(fake_claude, tmp_path, repo) -> None:
     runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
     runner.run(role="build", schema=SCHEMA, prompt="go")
     assert runner.calls[-1]["patch_source"] == "computed"
+
+
+def test_run_verify_returns_a_row_per_command_with_output_and_exit_code_and_never_raises(tmp_path) -> None:
+    rows = _run_verify(tmp_path, ["echo one", "false"])
+    assert rows[0] == {"command": "echo one", "output": "one\n(exit 0)", "source": "harness_verify"}
+    assert rows[1]["output"].endswith("(exit 1)") and rows[1]["source"] == "harness_verify"
+    assert _run_verify(tmp_path, []) == []
+    assert _run_verify(tmp_path / "missing", ["echo x"])[0]["output"].startswith("could not start")
+
+
+def test_run_verify_names_a_timeout_instead_of_raising(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("runner.claude_code_runner._VERIFY_TIMEOUT_S", 0.2)
+    assert _run_verify(tmp_path, ["sleep 5"])[0]["output"] == "timed out after 0.2s"
+
+
+def test_run_verify_skips_commands_once_the_total_budget_is_spent(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("runner.claude_code_runner._VERIFY_TOTAL_S", 0.3)
+    rows = _run_verify(tmp_path, ["sleep 5", "echo never"])
+    assert rows[0]["output"].startswith("timed out after 0.")
+    assert rows[1] == {"command": "echo never", "output": "skipped: the 0.3s verify budget is spent", "source": "harness_verify"}
+
+
+def test_a_build_that_will_fail_reconciliation_is_not_verified(tmp_path, repo) -> None:
+    """A clean scratch with a reported patch that does not apply raises next, so no verify command should run."""
+    marker = tmp_path / "ran"
+    script = _reporting_claude(tmp_path, F_PATCH.replace("-one", "-absent"))
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo, runs_dir=tmp_path, run_id="r1")
+    runner.verify_by_task = {"t1": [f"touch {marker}"]}
+    with pytest.raises(RunnerError, match="patch_outside_scratch"):
+        runner.run(role="build", schema=SCHEMA, prompt="go", task="t1")
+    assert not marker.exists()
+
+
+def test_a_build_with_verify_commands_gets_their_rows_after_the_builders_own(fake_claude, tmp_path, repo) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": False, "total_cost_usd": 0.01, "num_turns": 1,
+                "structured_output": {"summary": "s", "commands_run": ["pytest -q"], "patch": ""}})
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.verify_by_task = {"t1": ["cat built.txt"]}
+    out = runner.run(role="build", schema=SCHEMA, prompt="go", task="t1")
+    assert out["commands_run"] == [
+        "pytest -q",
+        {"command": "cat built.txt", "output": "edited\n(exit 0)", "source": "harness_verify"},
+    ]
+    assert runner.calls[-1]["commands_run"] == [{"command": "pytest -q", "source": "self_report"}]
+
+
+def test_a_threaded_build_runs_its_verify_commands_in_the_thread_scratch(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.verify_by_task = {"t1": ["cat built.txt"]}
+    out = runner.run(role="build", schema=SCHEMA, prompt="go", thread="T-1", task="t1")
+    assert out["commands_run"][-1]["output"] == "edited\n(exit 0)"
+
+
+def test_a_verify_command_that_writes_leaves_nothing_in_the_threads_scratch_for_the_next_attempt(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.verify_by_task = {"t1": ["echo junk > artifact.txt", "echo more >> built.txt", "echo x > staged.txt && git add staged.txt"]}
+    first = runner.run(role="build", schema=SCHEMA, prompt="go", thread="T-1", task="t1")
+    scratch = runner._threads["T-1"]["scratch"]
+    assert [row["output"] for row in first["commands_run"]][-1].endswith("(exit 0)")
+    assert not (scratch / "artifact.txt").exists() and not (scratch / "staged.txt").exists()
+    assert (scratch / "built.txt").read_text(encoding="utf-8") == "edited\n"
+    second = runner.run(role="build", schema=SCHEMA, prompt="again", thread="T-1", task="t1")
+    assert "built.txt" in second["patch"]
+    assert not any(name in second["patch"] for name in ("artifact.txt", "staged.txt", "more"))
+
+
+def test_a_verify_run_is_reported_when_the_scratch_cannot_be_restored(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    runner.verify_by_task = {"t1": ["echo hi"]}
+    rows = runner._verify_rows(tmp_path, "t1", "a patch", "some output")
+    assert [row["command"] for row in rows] == ["echo hi", "restore scratch"]
+    assert "could not be restored" in rows[1]["output"]
+
+
+def test_a_threaded_transient_retry_verifies_only_the_attempt_that_stands(sequenced_claude, tmp_path, repo) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(SAFEGUARD, OK)
+    marker = tmp_path / "ran"
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
+    runner.verify_by_task = {"t1": [f"echo ran >> {marker}"]}
+    out = runner.run(role="build", schema=SCHEMA, prompt="go", thread="T", task="t1")
+    assert out["commands_run"][-1]["command"] == f"echo ran >> {marker}"
+    assert marker.read_text(encoding="utf-8") == "ran\n"
+
+
+def test_a_build_without_verify_commands_or_for_another_task_gets_no_rows(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    assert runner.verify_by_task == {}
+    assert "commands_run" not in runner.run(role="build", schema=SCHEMA, prompt="go", task="t1")
+    runner.verify_by_task = {"t2": ["echo other"]}
+    assert "commands_run" not in runner.run(role="build", schema=SCHEMA, prompt="go", task="t1")
 
 
 def test_a_reported_patch_that_does_not_apply_is_patch_outside_scratch(tmp_path, repo) -> None:

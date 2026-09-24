@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from test_epic_driver import cart, drive, initiative, repo  # noqa: F401
+from test_epic_driver import TASK_IDS, Runner, cart, drive, initiative, new_file_patch, repo  # noqa: F401
 
 from harness.checks import checks_evidence
 
@@ -25,6 +25,18 @@ def test_verify_commands_become_verify_rows_and_a_failure_is_not_a_quarantine(re
     assert rows["verify:1"].startswith("pass") and "one" in rows["verify:1"]
     assert rows["verify:2"].startswith("FAIL")
     assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+
+
+def test_the_harness_hands_each_tasks_verify_list_to_a_runner_that_can_use_it(repo, cart, tmp_path) -> None:  # noqa: F811
+    runner = Runner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+    runner.verify_by_task = {}
+    drive(repo, cart, tmp_path, runner=runner, work=_work(["echo one", "false"]))
+    assert runner.verify_by_task["t1-probe"] == ["echo one", "false"]
+
+
+def test_a_runner_without_the_attribute_is_left_alone(repo, cart, tmp_path) -> None:  # noqa: F811
+    _, runner = drive(repo, cart, tmp_path, work=_work(["echo one"]))
+    assert not hasattr(runner, "verify_by_task")
 
 
 def test_a_task_without_verify_has_no_verify_rows(repo, cart, tmp_path) -> None:  # noqa: F811
