@@ -38,6 +38,7 @@ from typing import Any
 
 from graphs._contract import ContractViolation, require, require_cartridge
 from runner.protocol import NodeRunner
+from runner.tier_resolution import Hints
 
 __all__ = ["GRAPH_NAME", "run"]
 
@@ -169,11 +170,34 @@ def _is_placeholder(verdict: Mapping[str, Any]) -> bool:
     return any(marker in text for marker in _PLACEHOLDER_MARKERS)
 
 
+def _chunk_hints(task: Mapping[str, Any]) -> Hints:
+    """Judgment "normal" plus the task's patch size; a size is None when the task carries none."""
+    facts = task.get("change_facts") or {}
+    lines, files = facts.get("changed_lines"), facts.get("files_touched")
+    return Hints(
+        judgment="normal",
+        lines_changed=lines if isinstance(lines, int) else None,
+        files_changed=len(files) if files is not None else None,
+    )
+
+
+def _phase_hints(tasks: Sequence[Mapping[str, Any]]) -> Hints:
+    """Judgment "high" plus the phase's summed lines and distinct files; None when no task carries a size."""
+    facts = [t.get("change_facts") or {} for t in tasks]
+    lines = [f["changed_lines"] for f in facts if isinstance(f.get("changed_lines"), int)]
+    files = {path for f in facts for path in f.get("files_touched") or []}
+    return Hints(
+        judgment="high",
+        lines_changed=sum(lines) if lines else None,
+        files_changed=len(files) if files else None,
+    )
+
+
 def _verdict(
     runner: NodeRunner,
     *,
     role: str,
-    tier: str,
+    hints: Hints,
     schema: Mapping[str, Any],
     context: list[str],
     prompt: str,
@@ -190,18 +214,18 @@ def _verdict(
     the caller's to decide, because a chunk verdict and a phase verdict do not
     have the same fallback available to them.
 
-    The retry is not cheaper and not easier: same role, same tier, same prompt,
+    The retry is not cheaper and not easier: same role, same hints, same prompt,
     plus the plain statement that this is the last ask. Asking again more gently
     would be asking a different question.
     """
-    first = dict(runner.run(role=role, tier=tier, schema=schema, context=context, prompt=prompt))
+    first = dict(runner.run(role=role, hints=hints, schema=schema, context=context, prompt=prompt))
     if not _is_placeholder(first):
         return first, False
 
     second = dict(
         runner.run(
             role=role,
-            tier=tier,
+            hints=hints,
             schema=schema,
             context=context,
             prompt=(
@@ -386,7 +410,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             raw_verdict, stalled = _verdict(
                 runner,
                 role="validate_chunk",
-                tier="standard",
+                hints=_chunk_hints(task),
                 schema=VALIDATE_CHUNK_SCHEMA,
                 context=context,
                 prompt=chunk_prompt,
@@ -418,7 +442,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 second_raw, second_stalled = _verdict(
                     runner,
                     role="validate_chunk",
-                    tier="standard",
+                    hints=_chunk_hints(task),
                     schema=VALIDATE_CHUNK_SCHEMA,
                     context=context,
                     prompt=_second_chunk_prompt(chunk_prompt, read_pairs, unread),
@@ -443,7 +467,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     retried = dict(
                         runner.run(
                             role="validate_chunk",
-                            tier="standard",
+                            hints=_chunk_hints(task),
                             schema=VALIDATE_CHUNK_SCHEMA,
                             context=context,
                             prompt=(
@@ -486,7 +510,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     phase_verdict, phase_stalled = _verdict(
         runner,
         role="validate_phase",
-        tier="deep",
+        hints=_phase_hints(tasks),
         schema=VALIDATE_PHASE_SCHEMA,
         context=context,
         prompt=(

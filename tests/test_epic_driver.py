@@ -206,7 +206,7 @@ class Runner:
     def _subject(self, prompt: str, candidates) -> str | None:
         return next((c for c in candidates if c in prompt), None)
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         with self.lock:
             self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
 
@@ -248,7 +248,7 @@ class CommandsRunner(Runner):
         super().__init__(patches)
         self.commands_run = commands_run or {}
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         result = super().run(
             role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd
         )
@@ -270,7 +270,7 @@ class BudgetStopArm(Runner):
         super().__init__(patches)
         self.stops = stops
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "work_state_arm" and self.stops in prompt:
             raise BudgetStop(role="work_state_arm", thread=None, session=None, spent_usd=0.0, detail="budget")
         return super().run(
@@ -286,7 +286,7 @@ class LimitStopArm(Runner):
         self.stops = stops
         self.detail = detail
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "work_state_arm" and self.stops in prompt:
             raise LimitStop(detail=self.detail)
         return super().run(
@@ -681,7 +681,7 @@ class RetriedCommandsRunner(CommandsRunner):
         super().__init__(patches, commands_run={"t1-probe": [{"command": "first", "output": "1", "source": "trace"}]})
         self._revised = False
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_charter" and "t1-probe" in prompt and not self._revised:
             self._revised = True
             with self.lock:
@@ -812,7 +812,7 @@ class Repairing(Runner):
         self.repaired = repaired
         self.style_edit = style_edit
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "build" and "failed its configured checks" in prompt:
             task = self._subject(prompt, TASK_IDS)
             with self.lock:
@@ -1182,7 +1182,7 @@ def test_a_frontmatter_change_forces_the_amendment_gated() -> None:
 class TriageAttemptRunner(Runner):
     """Like `Runner`, but scripts `role="triage"` with a `ticket_defect` classification."""
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "triage":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
@@ -1688,7 +1688,7 @@ def test_a_stale_branch_whose_diff_adds_a_line_still_blocks(repo, cart, tmp_path
 class Revising(Runner):
     """Reviews everything as `revise`, so the fix loop is the only thing running."""
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_charter":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -1866,7 +1866,7 @@ class RefusedRunner(Runner):
         super().__init__(patches, **kw)
         self.refused = refused
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_charter" and self.refused in prompt:
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -1899,7 +1899,7 @@ class ArbitrateFailsRunner(Runner):
     shape the ticket names: build complete, charter review ran, then
     arbitrate failed with a provider-side error."""
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_adversary":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -1941,7 +1941,7 @@ class ArbitrateBudgetStopRunner(Runner):
     pre-existing `no_work` path exactly like any other `RunnerError` from a
     non-build node did before this ticket."""
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_adversary":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -1977,7 +1977,7 @@ class AdversaryFailsRunner(Runner):
         super().__init__(patches, **kw)
         self.fails_for = fails_for
 
-    def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
         if role == "review_adversary":
             if self.fails_for in prompt:
                 raise RunnerError("provider-side safeguard error")
@@ -2148,7 +2148,7 @@ def test_a_task_at_the_attempt_cap_is_refused_and_its_sibling_still_lands(repo, 
     # proposal is itself refused — triage runs, but cannot turn this into a write,
     # and the task still ends up quarantined, plainly, for a person to decide.
     class TriageRejectRunner(Runner):
-        def run(self, *, role, tier, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+        def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
             if role == "triage":
                 with self.lock:
                     self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
