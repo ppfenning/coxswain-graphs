@@ -195,6 +195,23 @@ class FastPathRunner:
         self._settings = settings
         self._specs = specs
         self._backend = backend
+        self._consulted: dict[str, Answer] = {}
+
+    def consult(self, role: str, request: Mapping[str, Any]) -> tuple[Answer, RoleSetting] | None:
+        """Ask the decider ahead of the call, and remember the answer for that role's next `run`.
+
+        A call site that needs the answer before it declares its hints consults here. The next
+        `run` for the role reuses this answer, so the logged answer is the one the site acted on
+        and the decider is asked once. None when the role is off, has no spec, or the decider fails.
+        """
+        setting, spec = self._settings.get(role), self._specs.get(role)
+        if setting is None or spec is None or setting.mode not in ("shadow", "on"):
+            return None
+        answer = self._ask(spec, MappingProxyType(dict(request)))
+        if answer is None:
+            return None
+        self._consulted[role] = answer
+        return answer, setting
 
     def _ask(self, spec: RoleSpec, request: Mapping[str, Any]) -> Answer | None:
         try:
@@ -255,7 +272,8 @@ class FastPathRunner:
         setting, spec = self._settings.get(role), self._specs.get(role)
         if setting is None or spec is None or setting.mode not in ("shadow", "on"):
             return self._inner.run(**kwargs)
-        answer = self._ask(spec, MappingProxyType(kwargs))
+        consulted = self._consulted.pop(role, None)
+        answer = consulted if consulted is not None else self._ask(spec, MappingProxyType(kwargs))
         if answer is None:
             return self._inner.run(**kwargs)
         if setting.mode == "on" and answer.confidence >= setting.threshold:
