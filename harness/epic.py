@@ -699,7 +699,8 @@ def _unapproved(result: Mapping[str, Any]) -> str | None:
     stopped = str(loop.get("stopped") or "") or "the reviewers did not approve the build"
     attempts = loop.get("attempts")
     counted = f" after {attempts} build attempt{'s' if attempts != 1 else ''}" if attempts else ""
-    arbitration = result.get("arbitration") or {}
+    arbitration = result.get("arbitration")
+    arbitration = arbitration if isinstance(arbitration, Mapping) else {}
     if arbitration.get("verdict"):
         verdict = str(arbitration["verdict"])
         reasoning = str(arbitration.get("reasoning") or "").split(". ", 1)[0].split(".", 1)[0]
@@ -1634,7 +1635,8 @@ def _run_phase(
         verdicts = (built.get(task) or {}).get("result") or {}
         task_record["outcome"] = task_outcome(
             str((verdicts.get("review") or {}).get("verdict") or "") or None,
-            str((verdicts.get("arbitration") or {}).get("verdict") or "") or None,
+            # A skipped arbiter is recorded as a string, not a mapping.
+            str((verdicts.get("arbitration") if isinstance(verdicts.get("arbitration"), Mapping) else {}).get("verdict") or "") or None,
             task_record.get("quarantine"),
             # Merged AND quarantined only happens when `_execute`'s own
             # bookkeeping step failed after the code already landed — that is
