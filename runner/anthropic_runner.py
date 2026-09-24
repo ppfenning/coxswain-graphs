@@ -27,6 +27,7 @@ import yaml
 
 from runner.decision_log import CallDecision
 from runner.protocol import NodeResult, RunnerError
+from runner.tier_resolution import TIERS, Hints, Resolution, resolve
 
 __all__ = ["AnthropicRunner", "load_provider_profile"]
 
@@ -53,17 +54,49 @@ def load_provider_profile(path: Path | str) -> dict[str, Any]:
     return dict(profile)
 
 
-def _decision(*, role: str, tier: str, model_id: str, task: str | None) -> CallDecision:
-    """No fallback here, so requested and chosen tier are the same. Ticket and outcome are the task, or empty."""
+def _tier_map(profile: Mapping[str, Any], key: str) -> dict[str, str]:
+    """A role -> tier block of the profile. A tier outside TIERS is a profile fault, refused at construction."""
+    raw = profile.get(key) or {}
+    if not isinstance(raw, Mapping):
+        raise RunnerError(f"provider profile '{key}' must map a role to a tier")
+    bad = {str(role): str(tier) for role, tier in raw.items() if str(tier) not in TIERS}
+    if bad:
+        raise RunnerError(f"provider profile '{key}' names tiers outside {', '.join(TIERS)}: {bad}")
+    return {str(role): str(tier) for role, tier in raw.items()}
+
+
+def _as_caller(resolution: Resolution) -> Resolution:
+    """No router runs here: the caller's tier fills the resolver's `router_tier` slot, so that source is named `caller`."""
+    reason = resolution.reason
+    return Resolution(resolution.tier, "caller" + reason[len("router") :]) if reason.startswith("router") else resolution
+
+
+def _decision(
+    *,
+    role: str,
+    requested_tier: str,
+    resolution: Resolution,
+    model_id: str,
+    effort: str,
+    budget_usd: float | None,
+    task: str | None,
+) -> CallDecision:
+    """Requested tier is the caller's; chosen tier and reason are the resolver's. Nothing is clipped here.
+
+    `budget_usd` is the ceiling the caller granted. It is recorded, not enforced: the Messages API has no per-call spend ceiling.
+    """
     return CallDecision(
         role=role,
-        requested_tier=tier,
-        chosen_tier=tier,
+        requested_tier=requested_tier,
+        chosen_tier=resolution.tier,
         model_id=model_id,
-        reason="caller",
+        reason=resolution.reason,
         ticket_key=task or "",
         outcome_key=task or "",
         claude_code_version=None,
+        effort=effort,
+        budget_usd=budget_usd,
+        clipped_by=None,
     )
 
 
@@ -87,6 +120,13 @@ class AnthropicRunner:
         self.tiers = dict(self.profile.get("tiers") or {})
         if not self.tiers:
             raise RunnerError("provider profile declares no tiers")
+        self.tier_overrides = _tier_map(self.profile, "tier_overrides")
+        # unknown: the profile key for role -> tier defaults; assumed to be `defaults`. Nothing in the repo names it.
+        self.profile_defaults = _tier_map(self.profile, "defaults")
+        # unknown: where the floor comes from; assumed to be an optional profile `floor`, else the lowest tier.
+        self.floor = str(self.profile.get("floor") or TIERS[0])
+        if self.floor not in TIERS:
+            raise RunnerError(f"provider profile 'floor' must be one of {', '.join(TIERS)}, not '{self.floor}'")
         self.max_tokens = max_tokens
         self.extra_system = extra_system
         self._client = client or self._build_client()
@@ -131,23 +171,39 @@ class AnthropicRunner:
         self,
         *,
         role: str,
-        tier: str = DEFAULT_TIER,
+        tier: str | None = None,
+        hints: Hints | None = None,
         schema: Mapping[str, Any],
         prompt: str,
         context: Sequence[str] = (),
         thread: str | None = None,
         budget_usd: float | None = None,
         task: str | None = None,
+        # unknown: protocol.py declares no model or effort; optional keyword-only args stay compatible with it.
+        model: str | None = None,
+        effort: str | None = None,
     ) -> NodeResult:
         # `thread` is accepted for the protocol and ignored: each call here is
         # one stateless Messages request. Carrying history would be this
         # runner's own feature, and nothing in it is needed for correctness.
-        # `budget_usd` is accepted for the protocol and ignored the same way:
-        # the Messages API has no per-call spend ceiling to hand it to.
+        # `budget_usd` is recorded on the decision and otherwise ignored: the
+        # Messages API has no per-call spend ceiling to hand it to. `model`,
+        # `effort` and `budget_usd` arrive finished from above the runner and
+        # are used as given, never clipped here.
         # `task` is accepted for the protocol and ignored: this runner keeps
         # no call ledger for `_trace_evidence` to read, so there is nothing to
         # stamp it onto.
-        model = self._model_for(tier)
+        for name, value in (("model", model), ("effort", effort)):
+            if value is not None and not value.strip():
+                raise RunnerError(f"node '{role}' passed an empty {name}; pass None to leave it to the tier")
+        # A tier-less call takes DEFAULT_TIER as its own tier, as the Claude Code runner does.
+        requested_tier = tier or DEFAULT_TIER
+        # The resolver ranks tiers, so it only knows the tiers in TIERS; a profile may declare others but a call cannot ask for them.
+        if requested_tier not in TIERS:
+            raise RunnerError(f"node '{role}' asked for tier '{requested_tier}'; the tiers are {', '.join(TIERS)}")
+        resolution = _as_caller(resolve(role, hints, self.tier_overrides, self.profile_defaults, requested_tier, self.floor))
+        model_id = model if model is not None else self._model_for(resolution.tier)
+        effort_used = effort if effort is not None else TIER_EFFORT.get(resolution.tier, "high")
         # The bound skill body leads the system prompt: it is the role's craft,
         # and the context packs are the team's rules it applies them under.
         body = self.role_skills.get(role)
@@ -155,13 +211,13 @@ class AnthropicRunner:
         system = "\n\n".join(part for part in (self._read_context(packs), self.extra_system) if part)
 
         response = self._client.messages.create(
-            model=model,
+            model=model_id,
             max_tokens=self.max_tokens,
             system=system or None,
             messages=[{"role": "user", "content": prompt}],
             thinking={"type": "adaptive"},
             output_config={
-                "effort": TIER_EFFORT.get(tier, "high"),
+                "effort": effort_used,
                 "format": {"type": "json_schema", "schema": dict(schema)},
             },
         )
@@ -187,6 +243,12 @@ class AnthropicRunner:
             raise RunnerError(f"node '{role}' returned {type(data).__name__}, expected an object")
         result = NodeResult(data)
         result.decision = _decision(
-            role=role, tier=tier, model_id=getattr(response, "model", None) or model, task=task
+            role=role,
+            requested_tier=requested_tier,
+            resolution=resolution,
+            model_id=getattr(response, "model", None) or model_id,
+            effort=effort_used,
+            budget_usd=budget_usd,
+            task=task,
         )
         return result
