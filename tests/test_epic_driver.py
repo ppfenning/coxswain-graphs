@@ -1908,6 +1908,9 @@ def test_a_build_the_fix_loop_refused_is_quarantined_with_the_loop_s_own_reason(
 # ── a node failure mid-review writes the task record on the way out ────────
 
 
+ADVERSARY_DISAGREES = {"verdict": "revise", "objections": [], "strongest_objection": "disagrees"}
+
+
 class ArbitrateFailsRunner(Runner):
     """Charter and adversary both answer; arbitrate then raises — the exact
     shape the ticket names: build complete, charter review ran, then
@@ -1917,7 +1920,8 @@ class ArbitrateFailsRunner(Runner):
         if role == "review_adversary":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
-            return dict(APPROVE)
+            # The dangerous task's adversary disagrees with the approving charter: two approvals skip the arbiter.
+            return dict(ADVERSARY_DISAGREES if "t1-probe" in prompt else APPROVE)
         if role == "arbitrate":
             raise RunnerError("provider-side safeguard error")
         return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd)
@@ -1959,7 +1963,7 @@ class ArbitrateBudgetStopRunner(Runner):
         if role == "review_adversary":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
-            return dict(APPROVE)
+            return dict(ADVERSARY_DISAGREES if "t1-probe" in prompt else APPROVE)
         if role == "arbitrate":
             raise BudgetStop(role="arbitrate", thread=None, session=None, spent_usd=1.0, detail="budget ceiling hit")
         return super().run(role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd)

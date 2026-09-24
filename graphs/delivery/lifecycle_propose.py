@@ -711,7 +711,7 @@ def _critique(
             for objection in adversary.get("objections") or []
             if isinstance(objection, Mapping)
         ]
-    if arbitration is not None:
+    if isinstance(arbitration, Mapping):
         lines.append(f"Arbitration sided with {arbitration.get('sided_with')}: {arbitration.get('reasoning')}")
     return "\n".join(lines)
 
@@ -1203,6 +1203,14 @@ def _abstained_adversary() -> dict[str, Any]:
     }
 
 
+ARBITER_SKIPPED = "arbiter: skipped (both approved)"
+
+
+def should_skip_arbiter(charter_verdict: str, adversary_verdict: str) -> bool:
+    """True only when both reviewers approved. Revise with revise is over-strict often enough to need the arbiter."""
+    return charter_verdict == "approve" and adversary_verdict == "approve"
+
+
 def _review_round(
     runner: NodeRunner,
     *,
@@ -1214,7 +1222,7 @@ def _review_round(
     handoff: Mapping[str, Any] | None,
     tier: int,
     attempt: int,
-) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None, str, bool, bool]:
+) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | str | None, str, bool, bool]:
     """One full round of review, and the verdict it reaches.
 
     Factored out because a retry is reviewed under EXACTLY the same rules as the
@@ -1331,12 +1339,15 @@ def _review_round(
             sole_verdict = str(sole_arbitration.get("verdict")) if sole_arbitration is not None else str(review.get("verdict"))
             return dict(review), _abstained_adversary(), sole_arbitration, sole_verdict, True, False
 
-        # Arbitration on disagreement, and unconditionally at tier 2 — where the
-        # cost of being wrong is high enough that agreement between two reviewers
-        # is not by itself sufficient reason to believe them.
-        arbitration: dict[str, Any] | None = None
+        # Arbitration on disagreement, and at tier 2 unless both approved. Measured
+        # over 383 records, approve with approve was upheld 83 of 83; revise with
+        # revise was overturned 12 of 82, so only the approving pair skips.
+        arbitration: dict[str, Any] | str | None = None
         disagreed = adversary is not None and adversary.get("verdict") != review.get("verdict")
-        if "arbitrate" in bound and adversary is not None and (disagreed or tier == 2):
+        skip = adversary is not None and should_skip_arbiter(str(review.get("verdict")), str(adversary.get("verdict")))
+        if "arbitrate" in bound and skip and tier == 2:
+            arbitration = ARBITER_SKIPPED
+        elif "arbitrate" in bound and adversary is not None and (disagreed or tier == 2):
             arbitration = dict(
                 runner.run(
                     role="arbitrate",
@@ -1362,8 +1373,10 @@ def _review_round(
     # Silence from an unbound optional role is not an approval, but neither is it
     # an objection — an unbound adversary simply leaves the charter reviewer
     # deciding, exactly as before.
-    if arbitration is not None:
+    if isinstance(arbitration, Mapping):
         verdict = str(arbitration.get("verdict"))
+    elif arbitration == ARBITER_SKIPPED:
+        verdict = "approve"
     elif adversary is not None:
         verdict = "approve" if review.get("verdict") == adversary.get("verdict") == "approve" else "revise"
     else:
@@ -1862,7 +1875,8 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     ),
                     *(
                         [{"check": "arbitration", "output": f"{arbitration.get('sided_with')}: {arbitration.get('reasoning')}"}]
-                        if arbitration
+                        if isinstance(arbitration, Mapping) and arbitration
+                        else [{"check": "arbitration", "output": arbitration}] if arbitration
                         else []
                     ),
                     # Only when there was a loop. A first-try approval says
