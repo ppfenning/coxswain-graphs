@@ -107,14 +107,14 @@ def test_tier_1_adds_an_adversary(cart, plan_response, build_response) -> None:
     assert "review_adversary" in [c["role"] for c in scripted.calls]
 
 
-def test_tier_2_arbitrates_even_when_the_reviewers_agree(cart, plan_response, build_response) -> None:
-    """At tier 2, two reviewers agreeing is not by itself reason to believe them."""
+def test_tier_2_arbitrates_unless_both_reviewers_approve(cart, plan_response, build_response) -> None:
+    """At tier 2 only approve with approve skips the arbiter; test_arbiter_skip.py covers that."""
     bind(cart, "review_adversary", "arbitrate")
     result, scripted = run(
         cart,
         plan_response,
         build_response,
-        extra={"review_adversary": ADV_APPROVE, "arbitrate": ARB},
+        extra={"review_adversary": ADV_REJECT, "arbitrate": ARB},
         surfaces=["schema"],
     )
     assert result["review_tier"] == 2
@@ -138,22 +138,18 @@ def test_an_unarbitrated_disagreement_blocks_the_proposal(cart, plan_response, b
 
 
 def test_arbitration_has_the_last_word(cart, plan_response, build_response) -> None:
-    """At tier 2 the arbitrator runs on agreement — and can still overrule it.
-
-    This is the whole reason tier 2 arbitrates unconditionally: two reviewers
-    nodding at a migration is not evidence the migration is safe.
-    """
+    """At tier 2 the arbitrator runs on a split verdict and can still overrule the charter."""
     bind(cart, "review_adversary", "arbitrate")
     overruled = {"verdict": "reject", "sided_with": "adversary", "reasoning": "the objection holds"}
     result, _ = run(
         cart,
         plan_response,
         build_response,
-        extra={"review_adversary": ADV_APPROVE, "arbitrate": overruled},
+        extra={"review_adversary": ADV_REJECT, "arbitrate": overruled},
         surfaces=["migration"],
     )
     assert result["review_tier"] == 2
-    assert result["proposals"] == [], "both reviewers approved; the arbitrator still said no"
+    assert result["proposals"] == [], "the charter approved; the arbitrator still said no"
 
 
 def test_the_adversary_reasoning_becomes_evidence(cart, plan_response, build_response) -> None:

@@ -77,7 +77,7 @@ def _attempt_facts(attempt: Mapping[str, Any], last_commit: Any) -> dict[str, An
         "kind": attempt.get("kind"),
         "review": (attempt.get("review") or {}).get("verdict"),
         "adversary": (attempt.get("adversary") or {}).get("verdict"),
-        "arbitration": (attempt.get("arbitration") or {}).get("verdict"),
+        "arbitration": (attempt.get("arbitration") if isinstance(attempt.get("arbitration"), Mapping) else {}).get("verdict"),
         "stopped": (attempt.get("fix_loop") or {}).get("stopped"),
         "evidence": attempt.get("evidence", ()),
         "stale": _is_stale(attempt.get("ts"), last_commit),
@@ -148,7 +148,8 @@ def _objections(attempts: Sequence[Mapping[str, Any]]) -> list[str]:
         for objection in adversary.get("objections") or []:
             if isinstance(objection, Mapping):
                 texts.extend(str(objection[key]) for key in ("claim", "why_wrong") if objection.get(key))
-        arbitration = attempt.get("arbitration") or {}
+        arbitration = attempt.get("arbitration")
+        arbitration = arbitration if isinstance(arbitration, Mapping) else {}
         if arbitration.get("reasoning"):
             texts.append(str(arbitration["reasoning"]))
     return texts
