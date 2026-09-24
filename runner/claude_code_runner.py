@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from runner.decision_log import CallDecision
 from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
 
 # Per docs/design/vendor-axis.md §2: session resume on a budget stop, structured
@@ -371,6 +372,14 @@ def _effective_limit(shape_ceiling: float | None, node_cap: float | None) -> tup
     if shape_ceiling is None or node_cap < shape_ceiling:
         return node_cap, True
     return shape_ceiling, False
+
+
+def _init_facts(init: object) -> tuple[str | None, str | None]:
+    """(claude_code_version, model) from the stream's init event; None for each one missing."""
+    if not isinstance(init, Mapping):
+        return None, None
+    version, model = init.get("claude_code_version"), init.get("model")
+    return (version if isinstance(version, str) else None, model if isinstance(model, str) else None)
 
 
 class ClaudeCodeRunner:
@@ -768,10 +777,12 @@ class ClaudeCodeRunner:
             events.append(event)
             if event.get("type") == "result":
                 last = event
+        init = next((e for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
         if last is None:
             raise RunnerError(f"node '{role}': no result event in the stream (trace at {path})")
         last["trace"] = str(path)
         last["commands_run"] = trace_commands(events)
+        last["init"] = init
         return last
 
     # ── execution ───────────────────────────────────────────────────────────
@@ -820,6 +831,7 @@ class ClaudeCodeRunner:
         budget_usd: float | None = None,
         task: str | None = None,
     ) -> NodeResult:
+        requested_tier = tier
         tier = self.tier_overrides.get(role, tier)
         model = self._model_for(tier)
         body = self.role_skills.get(role)
@@ -1018,4 +1030,16 @@ class ClaudeCodeRunner:
             "commands_run": call.get("commands_run", self_reported_commands(data)),
         }
         self._append_call_ledger(self.calls[-1], ok=True)
-        return NodeResult(data)
+        version, init_model = _init_facts(payload.get("init"))
+        result = NodeResult(data)
+        result.decision = CallDecision(
+            role=role,
+            requested_tier=requested_tier,
+            chosen_tier=tier,
+            model_id=init_model or used_model,
+            reason="override" if tier != requested_tier else "caller",
+            ticket_key=task or "",
+            outcome_key="",
+            claude_code_version=version,
+        )
+        return result
