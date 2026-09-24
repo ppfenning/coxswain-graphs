@@ -7,6 +7,7 @@ import pytest
 from graphs._contract import ContractViolation
 from graphs.ops import triage_propose
 from runner import ScriptedRunner
+from runner.tier_resolution import Hints
 
 CLASSIFY = {"symptom_key": "late_landing", "runbook_entry": "rb-01", "confidence": "high"}
 VERIFY_ACTIONABLE = {
@@ -37,11 +38,13 @@ def test_runs_end_to_end_and_emits_proposals_with_evidence(cartridge) -> None:
     assert result["proposals"][0]["evidence"] == [{"check": "list objects at prefix", "output": "0 objects"}]
 
 
-def test_classify_is_cheap_and_verify_is_deep(cartridge) -> None:
+def test_both_calls_declare_role_and_hints_and_no_tier(cartridge) -> None:
     scripted = runner()
     triage_propose.run(args(cartridge), scripted)
-    tiers = {call["role"]: call["tier"] for call in scripted.calls}
-    assert tiers == {"triage_classify": "cheap", "evidence_verify": "deep"}
+    by_role = {call["role"]: call for call in scripted.calls}
+    assert {role: call["tier"] for role, call in by_role.items()} == {"triage_classify": None, "evidence_verify": None}
+    assert by_role["triage_classify"]["hints"] == Hints(judgment="low")
+    assert by_role["evidence_verify"]["hints"] == Hints(judgment="high")
 
 
 def test_overflow_is_counted_and_deferred_never_dropped(cartridge) -> None:

@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from runner.protocol import NodeResult, RunnerError
+from runner.tier_resolution import Hints
 
 __all__ = ["ScriptedRunner"]
 
@@ -37,7 +38,8 @@ class ScriptedRunner:
         self,
         *,
         role: str,
-        tier: str,
+        tier: str | None = None,
+        hints: Hints | None = None,
         schema: Mapping[str, Any],
         prompt: str,
         context: Sequence[str] = (),
@@ -48,9 +50,8 @@ class ScriptedRunner:
         # `task` is not recorded on `.calls` — this double replays graphs whose
         # existing assertions read that dict verbatim, and stamping `task_id`
         # onto a call record is `ClaudeCodeRunner`'s own contract, not this one's.
-        self.calls.append(
-            {"role": role, "tier": tier, "prompt": prompt, "context": list(context), "thread": thread, "budget_usd": budget_usd}
-        )
+        record = {"role": role, "tier": tier, "prompt": prompt, "context": list(context), "thread": thread, "budget_usd": budget_usd}
+        self.calls.append({**record, "hints": hints} if hints is not None else record)
         queued = self._responses.get(role)
         if not queued:
             raise RunnerError(

@@ -19,6 +19,7 @@ from typing import Any
 
 from graphs._contract import ContractViolation, proposal, require, require_cartridge
 from runner.protocol import NodeRunner
+from runner.tier_resolution import Hints
 
 __all__ = ["GRAPH_NAME", "run"]
 
@@ -160,7 +161,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     for index, alert in enumerate(fetched):
         classification = runner.run(
             role="triage_classify",
-            tier="cheap",
+            hints=Hints(judgment="low"),
             schema=CLASSIFY_SCHEMA,
             context=context,
             prompt=(
@@ -177,7 +178,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 
         verification = runner.run(
             role="evidence_verify",
-            tier="deep",
+            hints=Hints(judgment="high"),
             schema=VERIFY_SCHEMA,
             context=context,
             prompt=(
