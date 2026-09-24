@@ -57,6 +57,66 @@ def test_a_handoff_with_only_measured_gaps_comes_back_complete_and_discharged() 
     assert len(result["discharged"]) == 2
 
 
+def test_the_handoff_prompt_says_harness_verify_rows_are_not_builder_claims() -> None:
+    seen: list[str] = []
+
+    class Spy(ScriptedRunner):
+        def run(self, **kwargs):
+            seen.append(kwargs["prompt"])
+            return super().run(**kwargs)
+
+    build = {
+        "patch": "diff --git a/x b/x\n--- a/x\n+++ b/x\n+line\n",
+        "files_touched": ["x"],
+        "commands_run": [{"command": "echo one", "output": "one\n(exit 0)", "source": "harness_verify"}],
+    }
+    spy = Spy({"handoff": {"complete": True, "blocking": False, "missing": [], "brief": "ok"}})
+    lifecycle_propose._handoff(
+        spy, context=[], ticket="T", plan={}, build=build, facts=lifecycle_propose._change_facts(build)
+    )
+    assert "'source': 'harness_verify'" in seen[0]
+    assert "Rows with source harness_verify were run by the harness" in seen[0]
+
+
+VERIFY_ROW = {"command": "tool --dry-run", "output": "would write 3 rows\n(exit 0)", "source": "harness_verify"}
+
+
+def test_both_reviewer_prompts_quote_the_harness_verify_rows_verbatim() -> None:
+    build = {
+        "patch": "diff --git a/x b/x\n--- a/x\n+++ b/x\n+line\n",
+        "summary": "s",
+        "files_touched": ["x"],
+        "commands_run": [{"command": "pytest -q", "output": "1 passed"}, VERIFY_ROW],
+    }
+    scripted = ScriptedRunner({
+        "review_charter": {"verdict": "approve", "findings": [], "rationale": "ok"},
+        "review_adversary": {"verdict": "approve", "objections": [], "strongest_objection": "none"},
+    })
+    lifecycle_propose._review_round(
+        scripted, context=[], bound={"review_charter": 1, "review_adversary": 1}, ticket="T", build=build,
+        facts=lifecycle_propose._change_facts(build), handoff={"brief": "a brief that drops the rows"}, tier=1, attempt=1,
+    )
+    prompts = {call["role"]: call["prompt"] for call in scripted.calls}
+    assert set(prompts) == {"review_charter", "review_adversary"}
+    for prompt in prompts.values():
+        assert "$ tool --dry-run\nwould write 3 rows\n(exit 0)" in prompt
+        assert "not builder claims" in prompt
+        assert "pytest -q" not in prompt
+
+
+def test_a_build_without_harness_rows_adds_nothing_to_the_reviewer_prompts() -> None:
+    assert lifecycle_propose.harness_verify_block({"commands_run": [{"command": "pytest -q", "output": "1 passed"}]}) == ""
+    assert lifecycle_propose.harness_verify_block({}) == ""
+
+
+def test_a_harness_verify_row_never_discharges_a_handoff_complaint() -> None:
+    failing = {**VERIFY_ROW, "output": "boom\n(exit 1)"}
+    facts = lifecycle_propose.measured_facts({"commands_run": [failing]}, {})
+    assert not [key for key in facts if key.startswith(("verify", "pytest"))]
+    complaint = "the dry-run exited nonzero, so verification did not pass"
+    assert lifecycle_propose.prune_missing([complaint], facts) == ([complaint], [])
+
+
 def test_a_size_overrun_is_a_disclosed_deviation_not_a_missing_item() -> None:
     handoff_response = {"complete": True, "blocking": False, "missing": [], "brief": "ships clean"}
     scripted = ScriptedRunner({"handoff": handoff_response})

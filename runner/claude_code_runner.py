@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -90,6 +91,9 @@ _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
 # transcribes the diff git computes. The scratch is thrown away afterwards —
 # the harness still applies the patch itself, in a worktree it owns.
 _PATCH_ROLES = frozenset({"build"})
+_VERIFY_TIMEOUT_S = 120
+_VERIFY_TOTAL_S = 300
+_VERIFY_TAIL_LINES = 40
 
 _DIFF_CMD = "git add -A && git diff --cached"
 # Checks led by one of these also run as `python -m <tool>`; builders reach for that form.
@@ -152,6 +156,48 @@ def apply_reported_patch(scratch: Path, patch: str) -> bool:
     except OSError:
         return False
     return True
+
+
+def _run_verify(scratch: Path, commands: Sequence[str]) -> list[dict[str, str]]:
+    """Run each `verify:` command in the scratch: one row per command, never a raise."""
+    rows: list[dict[str, str]] = []
+    deadline = time.monotonic() + _VERIFY_TOTAL_S
+    for cmd in commands:
+        timeout = min(_VERIFY_TIMEOUT_S, deadline - time.monotonic())
+        if timeout <= 0:
+            output = f"skipped: the {_VERIFY_TOTAL_S}s verify budget is spent"
+            rows.append({"command": cmd, "output": output, "source": "harness_verify"})
+            continue
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=scratch, capture_output=True, text=True, timeout=timeout)
+            tail = "\n".join(((proc.stdout or "") + (proc.stderr or "")).splitlines()[-_VERIFY_TAIL_LINES:])
+            output = f"{tail}\n(exit {proc.returncode})"
+        except subprocess.TimeoutExpired:
+            output = f"timed out after {timeout:g}s"
+        except OSError as exc:
+            output = f"could not start: {exc}"
+        rows.append({"command": cmd, "output": output, "source": "harness_verify"})
+    return rows
+
+
+def _snapshot(scratch: Path) -> str | None:
+    """The scratch's index as a tree id, or None: what `_capture_diff` just staged, before a verify command can touch it."""
+    try:
+        proc = subprocess.run("git write-tree", shell=True, capture_output=True, text=True, cwd=scratch)
+    except OSError:
+        return None
+    return proc.stdout.strip() or None if proc.returncode == 0 else None
+
+
+def _restore(scratch: Path, tree: str | None) -> bool:
+    """Put the scratch back to `tree`: index, tracked files and untracked files. False when it could not."""
+    if not tree:
+        return False
+    cmd = f"git read-tree {tree} && git checkout-index -a -f && git clean -fdq"
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=scratch).returncode == 0
+    except OSError:
+        return False
 
 
 def recover_diff(scratch: Path, computed: str, stdout: str) -> tuple[str, str]:
@@ -454,6 +500,10 @@ class ClaudeCodeRunner:
         # how to run the tests — the wrong interpreter, `which pytest`,
         # `--version`, `echo hello`. The harness knows; the builder is told.
         self.check_commands: list[str] = []
+        # task id -> that ticket's `verify:` commands, set by the harness. A
+        # build call runs them in its own scratch after the patch lands, so the
+        # in-graph reviewers see their output instead of the builder's claims.
+        self.verify_by_task: dict[str, list[str]] = {}
         # Threads: one Claude Code session and one scratch tree per continuity
         # hint, so plan, build and a retry run on the same instance and the
         # retry edits a tree it already edited. Closed by the harness when the
@@ -844,6 +894,22 @@ class ClaudeCodeRunner:
         except subprocess.TimeoutExpired as exc:
             raise RunnerError(f"node '{role}' did not finish within {self.timeout}s") from exc
 
+    def _verify_rows(self, scratch: Path, task: str | None, patch: str, stdout: str | None) -> list[dict[str, str]]:
+        """Verify a build that will reach reconciliation, then restore the scratch: a thread's scratch outlives this call.
+
+        An empty diff or empty output raises next, so neither is verified. Without the restore, a file a
+        verify command wrote would be staged by the next attempt's `_capture_diff` into the builder's patch.
+        """
+        commands = self.verify_by_task.get(task or "", [])
+        if not commands or not patch or not (stdout or "").strip():
+            return []
+        tree = _snapshot(scratch)
+        rows = _run_verify(scratch, commands)
+        if not _restore(scratch, tree):
+            note = "the scratch could not be restored; files a verify command wrote may remain in it"
+            rows.append({"command": "restore scratch", "output": note, "source": "harness_verify"})
+        return rows
+
     def run(
         self,
         *,
@@ -870,6 +936,7 @@ class ClaudeCodeRunner:
         # how a budget disappears; one retry is how a transient classifier
         # misfire stops costing a finished task its run.
         computed_patch, has_scratch, patch_source = "", False, "computed"
+        verified: list[dict[str, str]] = []
         attempt_model = model
         first_call_id = str(uuid.uuid4())
         retry_extra: dict[str, Any] = {}
@@ -900,6 +967,7 @@ class ClaudeCodeRunner:
                         computed_patch, patch_source = recover_diff(
                             scratch, _capture_diff(scratch), (proc.stdout or "").strip()
                         )
+                        verified = self._verify_rows(scratch, task, computed_patch, proc.stdout)
 
             stdout = (proc.stdout or "").strip()
             if not stdout:
@@ -1038,6 +1106,11 @@ class ClaudeCodeRunner:
         # fails the patch_empty gate must still hold its slot or the retry
         # overwrites the failed attempt's own trace file.
         self.calls.append(call)
+        reported_commands = self_reported_commands(data)
+        if thread and role in _PATCH_ROLES and has_scratch:
+            # After the retry loop, so only the attempt that stands is verified. The unthreaded
+            # scratch is gone by now and is verified inside the loop instead.
+            verified = self._verify_rows(state["scratch"], task, computed_patch, stdout)
         if role in _PATCH_ROLES and has_scratch:
             patch, reason = reconcile_patch(str(data.get("patch") or ""), computed_patch)
             if reason:
@@ -1050,11 +1123,13 @@ class ClaudeCodeRunner:
                 self._append_call_ledger(call, ok=False, error=message)
                 raise RunnerError(message)
             data = {**data, "patch": patch}
+            if verified:
+                data = {**data, "commands_run": [*(data.get("commands_run") or []), *verified]}
         self.calls[-1] = {
             **call,
             **({"patch_source": patch_source} if has_scratch and role in _PATCH_ROLES else {}),
             "files_touched": files_touched_from_patch(str(data.get("patch") or "")),
-            "commands_run": call.get("commands_run", self_reported_commands(data)),
+            "commands_run": call.get("commands_run", reported_commands),
         }
         self._append_call_ledger(self.calls[-1], ok=True)
         version, init_model = _init_facts(payload.get("init"))

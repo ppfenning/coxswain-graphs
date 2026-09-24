@@ -399,6 +399,22 @@ def _change_facts(build: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def harness_verify_block(build: Mapping[str, Any]) -> str:
+    """The `harness_verify` rows, quoted verbatim for a reviewer prompt; "" when there are none."""
+    rows = [
+        entry
+        for entry in build.get("commands_run") or []
+        if isinstance(entry, Mapping) and entry.get("source") == "harness_verify"
+    ]
+    if not rows:
+        return ""
+    quoted = "\n".join(f"$ {row.get('command')}\n{row.get('output')}" for row in rows)
+    return (
+        "Harness-run verify evidence: the harness ran these commands in the build's own scratch "
+        "after the patch. They are not builder claims. Quoted verbatim:\n" + quoted + "\n"
+    )
+
+
 def measured_facts(build: Mapping[str, Any], change_facts: Mapping[str, Any]) -> dict[str, str]:
     """The facts the harness itself established, keyed for `prune_missing` to cite.
 
@@ -959,6 +975,9 @@ def _handoff(
                     "the ticket binds source lines only — test lines are reported "
                     "here, never a missing item.\n"
                     f"Commands run (with their real output): {build.get('commands_run')}\n"
+                    "Rows with source harness_verify were run by the harness in the build's own "
+                    "scratch after the patch, not by the builder; they are the ticket's verify: evidence. "
+                    "Both reviewers receive them verbatim.\n"
                     f"Patch ({len(patch)} chars, {'complete' if len(patch) <= PATCH_PREVIEW_CHARS else 'head shown'}):\n"
                     f"{patch[:PATCH_PREVIEW_CHARS]}\n\n"
                     "List anything missing, and compress the rest into the smallest "
@@ -1223,6 +1242,7 @@ def _review_round(
             f"context.\n\nTask: {ticket}\nSummary: {build.get('summary')}\n"
             f"Change facts: {facts}\n"
             + (f"Handoff brief: {handoff.get('brief')}\n" if handoff else "")
+            + harness_verify_block(build)
             + f"Patch:\n{build.get('patch')}\n\n"
             "Cite the charter principle behind every finding."
         ),
@@ -1244,6 +1264,7 @@ def _review_round(
                     "what the first reviewer accepted too easily.\n\n"
                     f"Task: {ticket}\nChange facts: {facts}\n"
                     f"First reviewer said: {review.get('verdict')} — {review.get('rationale')}\n"
+                    f"{harness_verify_block(build)}"
                     f"Patch:\n{build.get('patch')}\n\n"
                     "State your strongest objection plainly, even if you end up approving."
                 ),

@@ -1246,6 +1246,8 @@ def _run_phase(
     ready = [item for item in all_ready if len(attempts_by_id[str(item["id"])]) < ATTEMPT_CAP]
 
     by_id = {str(item["id"]): item for item in items}
+    if hasattr(ctx.runner, "verify_by_task"):
+        ctx.runner.verify_by_task = {**ctx.runner.verify_by_task, **{t: _verify_of(by_id, t) for t in by_id}}
     results: list[dict[str, Any]] = []
 
     # Resume: a task whose earlier run already produced an approved patch is
