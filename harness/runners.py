@@ -67,10 +67,16 @@ def _decider(config: SystemOneConfig, profile: Mapping[str, Any]) -> DecisionRun
     constructor = _BACKENDS.get(config.backend)
     if constructor is None:
         raise ValueError(f"system_one.backend {config.backend!r} is unknown; known: {', '.join(sorted(_BACKENDS))}")
-    env_var = profile.get("auth_env", "ANTHROPIC_API_KEY")
-    api_key = os.environ.get(env_var, "")
-    if config.backend in _NEEDS_KEY and not api_key:
-        raise _Unavailable(f"${env_var} (the profile's auth_env) is not set")
+    # A hosted backend's key comes from its own `system_one.key_env`, never the provider's
+    # `auth_env`: the provider's key must not be sent to a third party's API.
+    api_key = ""
+    if config.backend in _NEEDS_KEY:
+        env_var = profile["system_one"].get("key_env")
+        if not isinstance(env_var, str) or not env_var:
+            raise _Unavailable(f"system_one.key_env names no environment variable for backend {config.backend}")
+        api_key = os.environ.get(env_var, "")
+        if not api_key:
+            raise _Unavailable(f"${env_var} (system_one.key_env) is not set")
     try:
         return constructor(config.model, api_key, profile["system_one"])
     except ImportError as error:

@@ -25,7 +25,8 @@ class _Real:
 def stubs(monkeypatch):
     monkeypatch.setattr(anthropic_runner, "AnthropicRunner", _Real)
     monkeypatch.setitem(runners._BACKENDS, "jev", _Decider)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-key")
+    monkeypatch.setenv("JEV_KEY", "k")
 
 
 def _profile(tmp_path, block=None, **extra):
@@ -38,7 +39,7 @@ def _profile(tmp_path, block=None, **extra):
 
 
 def _block(**over):
-    return {"backend": "jev", "model": "jev-2.1", "roles": {"handoff": ROLE}} | over
+    return {"backend": "jev", "model": "jev-2.1", "key_env": "JEV_KEY", "roles": {"handoff": ROLE}} | over
 
 
 def _build(path):
@@ -67,10 +68,16 @@ def test_a_shadow_role_wraps_the_real_runner_with_the_decider(tmp_path) -> None:
     assert (runner._decider.model, runner._decider.key) == ("jev-2.1", "k")
 
 
-def test_the_key_comes_from_the_profiles_auth_env(tmp_path, monkeypatch) -> None:
+def test_the_key_comes_from_system_one_key_env(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("MY_KEY", "other")
-    runner = _build(_profile(tmp_path, _block(), auth_env="MY_KEY"))
+    runner = _build(_profile(tmp_path, _block(key_env="MY_KEY")))
     assert runner._decider.key == "other"
+
+
+def test_a_hosted_backend_never_gets_the_providers_auth_env_key(tmp_path, capsys) -> None:
+    block = {k: v for k, v in _block().items() if k != "key_env"}
+    assert type(_build(_profile(tmp_path, block, auth_env="ANTHROPIC_API_KEY"))) is _Real
+    assert _off_line(capsys) == "system-one: off (system_one.key_env names no environment variable for backend jev)\n"
 
 
 def test_a_claude_code_profile_is_wrapped_too(tmp_path) -> None:
@@ -130,9 +137,9 @@ def _off_line(capsys) -> str:
 
 
 def test_a_missing_key_leaves_the_runner_unwrapped_and_says_why(tmp_path, monkeypatch, capsys) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.delenv("JEV_KEY")
     assert type(_build(_profile(tmp_path, _block()))) is _Real
-    assert _off_line(capsys) == "system-one: off ($ANTHROPIC_API_KEY (the profile's auth_env) is not set)\n"
+    assert _off_line(capsys) == "system-one: off ($JEV_KEY (system_one.key_env) is not set)\n"
 
 
 def test_an_import_error_from_the_backend_is_unavailable(tmp_path, monkeypatch, capsys) -> None:
@@ -173,7 +180,7 @@ def test_knn_local_with_an_empty_examples_file_is_unavailable(tmp_path, capsys) 
 
 
 def test_the_reason_goes_to_the_notes_channel_when_one_is_given(tmp_path, monkeypatch) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.delenv("JEV_KEY")
     lines: list[str] = []
     real = _Real({})
     profile = yaml.safe_load(_profile(tmp_path, _block()).read_text(encoding="utf-8"))
