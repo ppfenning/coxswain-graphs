@@ -149,3 +149,61 @@ def test_a_malformed_profile_block_is_refused_at_construction_and_names_its_key(
 def test_without_explicit_values_effort_follows_the_tier_and_budget_is_none():
     decision = _run(_Stub(), tier="cheap").decision
     assert (decision.effort, decision.budget_usd, decision.clipped_by) == ("low", None, None)
+
+
+CLASSES_PROFILE = {"classes": {"reason": ["c-first", "c-second"], "frontier": ["c-front"]}}
+
+
+def test_a_class_resolves_to_the_first_entry_of_its_list_and_is_recorded_as_the_chosen_tier():
+    stub = _Stub()
+    decision = _run(stub, CLASSES_PROFILE, tier="reason").decision
+    assert stub.calls[0]["model"] == "c-first"
+    assert (decision.chosen_tier, decision.reason) == ("reason", "caller")
+
+
+def test_frontier_keeps_its_class_and_takes_the_deep_effort():
+    stub = _Stub()
+    decision = _run(stub, CLASSES_PROFILE, tier="frontier").decision
+    assert (stub.calls[0]["model"], decision.chosen_tier, decision.effort) == ("c-front", "frontier", "xhigh")
+
+
+def test_a_legacy_tier_resolves_through_its_class_when_the_profile_lists_it():
+    stub = _Stub()
+    decision = _run(stub, CLASSES_PROFILE, tier="standard").decision
+    assert (decision.chosen_tier, stub.calls[0]["model"]) == ("reason", "c-first")
+
+
+def test_a_profile_without_classes_uses_the_tiers_map_for_a_class_name():
+    assert _chosen({}, tier="reason") == ("standard", "caller", "m-std")
+
+
+def test_a_class_missing_from_the_classes_map_falls_back_to_the_tiers_map():
+    assert _chosen(CLASSES_PROFILE, tier="extract") == ("cheap", "caller", "m-cheap")
+
+
+def test_an_explicit_model_beats_the_class_entry_and_the_tier_is_not_rewritten():
+    stub = _Stub()
+    decision = _run(stub, CLASSES_PROFILE, tier="reason", model="m-x").decision
+    assert (stub.calls[0]["model"], decision.chosen_tier) == ("m-x", "standard")
+
+
+def test_a_class_name_is_accepted_as_a_profile_default():
+    assert _chosen({"defaults": {"r": "judge"}}, tier="cheap")[:2] == ("deep", "profile_default")
+
+
+@pytest.mark.parametrize("classes", ["x", {"reason": "c-first"}])
+def test_a_malformed_classes_block_is_refused_at_construction(classes):
+    with pytest.raises(RunnerError, match="classes"):
+        AnthropicRunner({**PROFILE, "classes": classes}, client=_Stub())
+
+
+def test_the_runner_imports_neither_cartridges_nor_the_core_router():
+    import ast
+
+    import runner.anthropic_runner as module
+
+    with open(module.__file__, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    names = [alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names]
+    names += [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
+    assert not [name for name in names if name.split(".")[0] == "cartridges" or name.startswith("core.router")]
