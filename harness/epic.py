@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import json
+import logging
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -83,6 +85,8 @@ from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import LimitStop, RunnerError
 
 __all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
+
+_log = logging.getLogger(__name__)
 
 LIFECYCLE = "lifecycle"
 VALIDATE = "validate"
@@ -694,7 +698,7 @@ def _refix(
         result = retried[0]
         result.setdefault("initiative", ctx.initiative_id)
         result.setdefault("phase", phase)
-        save_result(result, runs_dir=ctx.runs_dir, run_id=ctx.run_id, phase=phase, task=task)
+        _save_result(ctx, result, phase=phase, task=task)
         spent += float((result.get("fix_loop") or {}).get("attempts") or 1)
         routes.append("revise")
         names = ", ".join(str(c["name"]) for c in build["checks"] if not c.get("passed"))
@@ -1098,6 +1102,32 @@ def _fenced(ctx: _Ctx) -> str | None:
     return f"stale epoch: this driver holds epoch {ctx.epoch}, lease '{name}' is at epoch {held} or has expired"
 
 
+def _task_record_mirror(
+    store: Store | None, result: Mapping[str, Any], run_id: str, phase: str, task: str, ts: str
+) -> tuple[str, str, str, dict[str, Any], str] | None:
+    """Arguments for `Store.record_task_record`, or None with no store to mirror into.
+
+    The record is the JSON round trip the file gets, so the row equals the saved file.
+    """
+    if store is None:
+        return None
+    return (run_id, phase, task, json.loads(json.dumps(dict(result), default=str)), ts)
+
+
+def _save_result(ctx: _Ctx, result: Mapping[str, Any], *, phase: str, task: str) -> None:
+    """Save the result file, then mirror it into the store. The file stays authoritative.
+
+    A mirror failure is a warning, never a failed run. The file write is outside the try.
+    """
+    save_result(result, runs_dir=ctx.runs_dir, run_id=ctx.run_id, phase=phase, task=task)
+    try:
+        args = _task_record_mirror(ctx.store, result, ctx.run_id, phase, task, _now())
+        if args is not None and ctx.store is not None and _fenced(ctx) is None:
+            ctx.store.record_task_record(*args)
+    except Exception as exc:
+        _log.warning("task record for %s/%s/%s not mirrored into the store: %r", ctx.run_id, phase, task, exc)
+
+
 def _record_phase(ctx: _Ctx, record: Mapping[str, Any]) -> None:
     if ctx.store is not None and _fenced(ctx) is None:
         row = {**record, "run_id": f"{ctx.run_id}:{record['phase']}", "ts": _now(), "principal": PRINCIPAL}
@@ -1485,7 +1515,7 @@ def _run_phase(
         # without these two fields on the saved record, neither command can find it.
         result.setdefault("initiative", ctx.initiative_id)
         result.setdefault("phase", phase)
-        save_result(result, runs_dir=ctx.runs_dir, run_id=ctx.run_id, phase=phase, task=str(result.get("ticket")))
+        _save_result(ctx, result, phase=phase, task=str(result.get("ticket")))
 
     built: dict[str, dict[str, Any]] = {}
     surviving: list[str] = []
