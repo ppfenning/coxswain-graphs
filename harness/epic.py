@@ -49,7 +49,7 @@ from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
 from core import ledger, workstore
-from core.manifest import build_manifest, gate_diff, record_run
+from core.manifest import append_ledger, build_manifest, gate_diff
 from core.workstore import WorkStoreError, record_attempt
 
 from graphs._contract import proposal
@@ -792,12 +792,15 @@ def run_epic(
     `keep_worktrees` is set. The primitives live in `harness.worktree`; this
     only decides which one to call.
 
-    With a `store`, the run is also recorded there: phases, tasks, attempts, gate
-    decisions and ledger rows. With an `epoch` as well, every leader-only write first
-    asserts that epoch against the lease `lease_name` and is refused when it is stale.
+    The `store` is required: the run is recorded there as phases, tasks, attempts, gate
+    decisions and ledger rows, and no per-phase manifest file is written. With an
+    `epoch`, every leader-only write first asserts that epoch against the lease
+    `lease_name` and is refused when it is stale.
     """
-    if epoch is not None and store is None:
-        raise ValueError("epoch fences writes against the store's lease, so it needs a store")
+    if store is None:
+        raise ValueError(
+            "the epic driver needs a store: phases, tasks, attempts, gate decisions and ledger rows are recorded there"
+        )
     repo = Path(repo)
     ctx: _Ctx | None = None
     try:
@@ -1842,9 +1845,9 @@ def _run_phase(
     stale = _fenced(ctx)
     if stale is not None:
         return _stale_phase(record, stale)
-    record_run(manifest, runs_dir=ctx.runs_dir, ledger_path=ctx.ledger_path)
+    append_ledger(manifest, ledger_path=ctx.ledger_path)
     if ctx.store is not None:
-        # Ledger rows are built in `core.manifest.record_run`; the store copies this phase's rows back by run id.
+        # Ledger rows are built in `core.manifest.append_ledger`; the store copies this phase's rows back by run id.
         for row in ledger.read(ctx.ledger_path):
             if row.get("run_id") == manifest["run_id"]:
                 ctx.store.record_ledger(row, epoch=ctx.epoch)

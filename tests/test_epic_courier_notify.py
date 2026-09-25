@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
 from harness import courier_adapter
 from harness.epic import run_epic
+from harness.store_migrate import open_store
+from harness.store_write import Store
 from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import RunnerError
 
@@ -163,6 +166,7 @@ SPECS = {
 
 def drive(repo, cart, tmp_path, *, runner, work):
     return run_epic(
+        store=Store(open_store("sqlite:///:memory:", datetime.now(UTC).isoformat())),
         initiative=work,
         repo=repo,
         cartridge=cart,
