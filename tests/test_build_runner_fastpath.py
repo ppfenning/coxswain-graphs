@@ -5,7 +5,9 @@ import runner.anthropic_runner as anthropic_runner
 from harness import runners
 from harness.runners import build_runner
 from runner import ScriptedRunner
+from runner.openai_compatible_runner import OpenAICompatibleRunner
 from runner.system_one import FastPathRunner
+from tests.fake_openai_server import FakeOpenAIServer
 
 ROLE = {"mode": "shadow", "threshold": 0.9}
 OFF = {"handoff": {"mode": "off", "threshold": 0.5}}
@@ -265,17 +267,17 @@ def test_runner_anthropic_builds_the_anthropic_runner(tmp_path) -> None:
 
 
 def test_a_registered_entry_point_is_built_with_the_profile_and_the_keywords(tmp_path, monkeypatch) -> None:
-    calls = _entry_points(monkeypatch, _FakeEntryPoint("other", None), _FakeEntryPoint("openai-compatible", _Recorder))
+    calls = _entry_points(monkeypatch, _FakeEntryPoint("other", None), _FakeEntryPoint("plugin-runner", _Recorder))
     built = build_runner(
         scripted=None,
-        provider_profile=_profile(tmp_path, runner="openai-compatible"),
+        provider_profile=_profile(tmp_path, runner="plugin-runner"),
         role_skills={"plan": "p.md"},
         workdir=tmp_path / "w",
         repo=tmp_path / "r",
     )
     assert calls == [{"group": "coxswain.runners"}]
     assert type(built) is _Recorder
-    assert built.profile["runner"] == "openai-compatible"
+    assert built.profile["runner"] == "plugin-runner"
     assert built.kwargs == {"role_skills": {"plan": "p.md"}, "workdir": tmp_path / "w", "repo": tmp_path / "r"}
 
 
@@ -286,20 +288,50 @@ def test_a_built_in_name_never_consults_entry_points(tmp_path, monkeypatch) -> N
 
 
 def test_an_entry_point_runner_is_wrapped_by_the_fast_path(tmp_path, monkeypatch) -> None:
-    _entry_points(monkeypatch, _FakeEntryPoint("openai-compatible", _Recorder))
-    built = _build(_profile(tmp_path, _block(), runner="openai-compatible"))
+    _entry_points(monkeypatch, _FakeEntryPoint("plugin-runner", _Recorder))
+    built = _build(_profile(tmp_path, _block(), runner="plugin-runner"))
     assert isinstance(built, FastPathRunner)
     assert type(built._inner) is _Recorder
 
 
-@pytest.mark.parametrize("name", ["nonesuch", "openai-compatible"])
+@pytest.mark.parametrize("name", ["nonesuch", "plugin-runner"])
 def test_an_unregistered_name_raises_naming_the_group_and_never_falls_back(tmp_path, monkeypatch, name) -> None:
     _entry_points(monkeypatch)
     monkeypatch.setattr(anthropic_runner, "AnthropicRunner", lambda *a, **k: pytest.fail("fell back to anthropic"))
     message = (
-        f"runner {name!r} is not registered: built in are claude-code and anthropic; "
+        f"runner {name!r} is not registered: built in are claude-code, anthropic, openai-compatible; "
         "others register by entry point under coxswain.runners (ppfenning/coxswain-plugins)"
     )
     with pytest.raises(ValueError) as raised:
         _build(_profile(tmp_path, runner=name))
     assert str(raised.value) == message
+
+
+def test_an_openai_compatible_profile_builds_that_runner_and_not_the_anthropic_one(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1")
+    runner = _build(_profile(tmp_path, runner="openai-compatible", endpoint_env="LOCAL_LLM_BASE_URL"))
+    assert type(runner) is OpenAICompatibleRunner
+    assert not isinstance(runner, _Real)
+
+
+def test_an_unknown_runner_name_still_raises_and_lists_openai_compatible(tmp_path, monkeypatch) -> None:
+    _entry_points(monkeypatch)
+    with pytest.raises(ValueError, match=r"openai-compatible.*coxswain\.runners"):
+        _build(_profile(tmp_path, runner="nonesuch"))
+
+
+def test_a_local_oss_profile_reaches_the_chat_completions_endpoint(tmp_path, monkeypatch) -> None:
+    profile = {
+        "profile": "local-oss",
+        "runner": "openai-compatible",
+        "endpoint_env": "LOCAL_LLM_BASE_URL",
+        "capabilities": {"structured_output": False, "tool_use": False, "vision": False},
+        "tiers": {"cheap": "local/qwen2.5-7b-instruct"},
+    }
+    path = tmp_path / "local-oss.yaml"
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    with FakeOpenAIServer(["hello"]) as server:
+        monkeypatch.setenv("LOCAL_LLM_BASE_URL", server.base_url)
+        out = _build(path).run(role="r", tier="cheap", schema=None, prompt="hi")
+    assert out["text"] == "hello"
+    assert [r["path"] for r in server.requests] == ["/v1/chat/completions"]
