@@ -187,6 +187,19 @@ def test_open_store_leaves_the_store_at_the_newest_real_migration(store_conn):
     assert check_version(store_conn) == (newest, newest)
 
 
+def test_a_store_migrated_from_version_two_reads_an_existing_run_with_host_null(conn):
+    real = default_modules()
+    assert migrate(conn, NOW, real[:2]) == 2
+    conn.execute("INSERT INTO runs (run_id, status) VALUES ('r1', 'done')")
+    assert migrate(conn, NOW, real) == 3
+    assert conn.query_all("SELECT run_id, status, host FROM runs") == [("r1", "done", None)]
+
+
+def test_a_fresh_store_is_at_version_three_and_runs_has_a_host_column(store_conn):
+    assert check_version(store_conn) == (3, 3)
+    assert store_conn.query_all("SELECT host FROM runs") == []
+
+
 # SQLite only: the same check through a file path, which is how production opens its store.
 def test_open_store_on_a_file_leaves_the_store_at_the_newest_real_migration(tmp_path):
     c = open_store(f"sqlite:///{tmp_path / 'x.db'}", NOW)
