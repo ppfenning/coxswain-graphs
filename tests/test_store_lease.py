@@ -12,7 +12,6 @@ from harness.store_lease import (
     release,
     renew,
 )
-from harness.store_migrate import open_store
 
 T0 = "2026-09-24T00:00:00Z"
 T10 = "2026-09-24T00:00:10Z"
@@ -22,14 +21,12 @@ NAME = "chair"
 
 
 @pytest.fixture
-def conn():
-    c = open_store("sqlite:///:memory:", T0)
-    yield c
-    c.close()
+def conn(store_conn):
+    return store_conn
 
 
 def _epoch(conn):
-    row = conn.query_one("SELECT epoch FROM leases WHERE name = ?", (NAME,))
+    row = conn.query_one(f"SELECT epoch FROM leases WHERE name = {conn.dialect.placeholder}", (NAME,))
     return None if row is None else row[0]
 
 
@@ -122,8 +119,9 @@ def test_assert_epoch_false_for_unknown_name_and_after_expiry(conn):
 def test_a_lost_insert_race_is_a_refusal_not_an_error(conn):
     # The row appears between the failed UPDATE and the INSERT: simulate by
     # inserting a live row held by another holder, then acquiring as someone else.
+    marks = ", ".join([conn.dialect.placeholder] * 5)
     conn.execute(
-        "INSERT INTO leases (name, holder, epoch, heartbeat_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+        f"INSERT INTO leases (name, holder, epoch, heartbeat_at, expires_at) VALUES ({marks})",
         (NAME, "rival", 1, T0, T40),
     )
     assert acquire(conn, NAME, "a", T10, 30) == LeaseResult(False, 1, "rival")

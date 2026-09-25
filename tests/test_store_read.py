@@ -18,7 +18,7 @@ NOW = "2026-09-24T00:00:00Z"
 
 def put(conn, table, **row):
     cols = list(row)
-    marks = ", ".join("?" for _ in cols)
+    marks = ", ".join(conn.dialect.placeholder for _ in cols)
     conn.execute(f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({marks})", tuple(row.values()))
 
 
@@ -30,9 +30,7 @@ def call(conn, call_id, run_id, seq, role, alias, tier, cost, inp, cache, out, t
     )  # fmt: skip
 
 
-@pytest.fixture
-def conn():
-    c = open_store("sqlite:///:memory:", NOW)
+def seed(c):
     put(c, "runs", run_id="r1", principal="pat", status="done", started_at="2026-09-24T01:00:00Z", graph_id="g1")
     put(c, "runs", run_id="r2", principal="pat", status="done", started_at="2026-09-24T02:00:00Z")
     call(c, "c1", "r1", 1, "plan", "sonnet", "mid", 0.5, 1000, 250, 100, turns=2, decision_json=json_text({"why": "x"}))
@@ -49,7 +47,18 @@ def conn():
     put(c, "graph_nodes", graph_id="g1", node_id="b", ord=1, role="build")
     put(c, "graph_nodes", graph_id="g1", node_id="a", ord=0, role="plan", default_tier="mid")
     put(c, "graph_edges", graph_id="g1", src="a", dst="b")
-    yield c
+    return c
+
+
+@pytest.fixture
+def conn(store_conn):
+    return seed(store_conn)
+
+
+@pytest.fixture
+def sqlite_conn():
+    c = open_store("sqlite:///:memory:", NOW)
+    yield seed(c)
     c.close()
 
 
@@ -127,6 +136,7 @@ def test_run_graph_is_none_without_a_graph_id_or_a_registration(conn):
     assert read.run_graph(conn, "nope") is None
 
 
+# SQLite only, down to the WAL tests: connect_readonly opens a file path with mode=ro, which Postgres has no analogue for.
 def test_connect_readonly_accepts_a_current_database(tmp_path):
     url = f"sqlite:///{tmp_path / 'cox.db'}"
     open_store(url, NOW).close()
@@ -294,6 +304,7 @@ def test_connect_readonly_closes_a_postgres_connection_that_is_at_the_wrong_vers
     assert fake.closed
 
 
+# SQLite only: a file path opened read-only.
 def test_connect_readonly_refuses_a_newer_database(tmp_path):
     url = f"sqlite:///{tmp_path / 'cox.db'}"
     c = open_store(url, NOW)
@@ -336,8 +347,9 @@ def sent_by_each_reader(conn, monkeypatch):
     return per_reader
 
 
-def test_every_reader_sends_portable_queries_with_one_sqlite_placeholder_per_parameter(conn, monkeypatch):
-    per_reader = sent_by_each_reader(conn, monkeypatch)
+def test_every_reader_sends_portable_queries_with_one_sqlite_placeholder_per_parameter(sqlite_conn, monkeypatch):
+    # SQLite only: it asserts the `?` placeholder, which Postgres never sends.
+    per_reader = sent_by_each_reader(sqlite_conn, monkeypatch)
     assert all(queries for queries in per_reader)
     for sql, params in (q for queries in per_reader for q in queries):
         assert forbidden_constructs(sql) == ()
