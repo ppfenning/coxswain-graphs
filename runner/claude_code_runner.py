@@ -37,6 +37,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -359,6 +360,30 @@ def trace_commands(trace: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     return commands
 
 
+def call_summary(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Tool counts, the ten most-read basenames, whole-file reads (a Read with no `limit`), and the result's subtype and error flag."""
+    blocks = [
+        block
+        for event in events
+        if isinstance(event, Mapping) and event.get("type") == "assistant" and isinstance(event.get("message"), Mapping)
+        for block in event["message"].get("content") or []
+        if isinstance(block, Mapping) and block.get("type") == "tool_use"
+    ]
+    reads = [
+        block["input"] if isinstance(block.get("input"), Mapping) else {}
+        for block in blocks
+        if block.get("name") == "Read"
+    ]
+    result = next((e for e in events if isinstance(e, Mapping) and e.get("type") == "result"), {})
+    return {
+        "tool_uses": dict(Counter(str(block.get("name")) for block in blocks)),
+        "reads": dict(Counter(str(r.get("file_path") or "").rsplit("/", 1)[-1] for r in reads).most_common(10)),
+        "whole_file_reads": sum(1 for r in reads if r.get("limit") is None),
+        "result": result.get("subtype"),
+        "is_error": bool(result.get("is_error")),
+    }
+
+
 def self_reported_commands(data: Mapping[str, Any]) -> list[dict[str, str]]:
     """The model's own account of what it ran — kept only when no trace exists to derive it."""
     reported = data.get("commands_run")
@@ -404,6 +429,7 @@ def _call_fields(
         "output_tokens": int(usage.get("output_tokens") or 0),
         **({"trace": payload["trace"]} if payload.get("trace") else {}),
         **({"commands_run": payload["commands_run"]} if "commands_run" in payload else {}),
+        **({"summary": payload["summary"]} if "summary" in payload else {}),
     }
 
 
@@ -1010,6 +1036,7 @@ class ClaudeCodeRunner:
             raise RunnerError(f"node '{role}': no result event in the stream (trace at {path})")
         last["trace"] = str(path)
         last["commands_run"] = trace_commands(events)
+        last["summary"] = call_summary(events)
         last["init"] = init
         return last
 
