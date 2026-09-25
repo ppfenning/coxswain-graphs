@@ -580,13 +580,11 @@ class ClaudeCodeRunner:
         # AGENT_GRAPHS_TRACE_DIR or by the harness. Without it a 44-turn build
         # is a number; with it, it is a list of what each turn did.
         self.trace_dir: Path | None = Path(trace_dir).expanduser() if trace_dir else None
-        # Where the per-call ledger lives: `<runs_dir>/<run_id>.calls.jsonl`, one
-        # line per call, appended as it returns — success or `RunnerError` alike.
-        # Learned the way trace_dir is, so a run that dies mid-node still leaves
-        # a record of what it spent instead of only what a survivor remembers.
+        # The run's output directory, learned the way trace_dir is. There is no per-call
+        # ledger file any more; the store row is the record of each call.
         self.runs_dir: Path | None = Path(runs_dir).expanduser() if runs_dir else None
         self.run_id: str | None = run_id
-        # Also record every finished call in the run-record store. None leaves the file ledger as the only record.
+        # Record every finished call in the run-record store, success or `RunnerError` alike. None records nothing.
         self.store = store
         self._store_seq = 0
         self._store_lock = threading.Lock()
@@ -644,7 +642,7 @@ class ClaudeCodeRunner:
         return decision if tagged is None else tagged
 
     def _record_to_store(self, call: Mapping[str, Any], *, ok: bool) -> None:
-        """Write one finished call to the store. A store error is warned about and never fails the call."""
+        """Write one finished call to the store. A store error is logged at error level and never fails the call."""
         if self.store is None or not self.run_id:
             return
         from harness.store_write import split_phase_id  # here, not at the top: harness imports this module
@@ -664,20 +662,11 @@ class ClaudeCodeRunner:
                 phase_id=phase_id or None,
             )
         except Exception as exc:
-            _log.warning("store write failed for call %s: %s", call.get("id"), exc)
+            _log.error("store write failed for call %s: %s", call.get("id"), exc)
 
     def _append_call_ledger(self, call: Mapping[str, Any], *, ok: bool, error: str | None = None) -> None:
-        """One JSON line per call, written as it returns — never a rewrite, never buffered."""
+        """Record a call as it returns. The store row is the only record; `error` is kept for callers and not stored."""
         self._record_to_store(call, ok=ok)
-        if not self.runs_dir or not self.run_id:
-            return
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
-        row = {**call, "ts": datetime.now(UTC).isoformat(), "ok": ok}
-        if error is not None:
-            row["error"] = error
-        path = self.runs_dir / f"{self.run_id}.calls.jsonl"
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row) + "\n")
 
     # ── resolution ──────────────────────────────────────────────────────────
 

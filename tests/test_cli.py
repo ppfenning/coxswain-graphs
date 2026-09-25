@@ -114,7 +114,6 @@ def test_a_raise_inside_the_dispatched_graph_writes_no_usage_file_and_still_prin
     args.worktree_root = str(tmp_path)
 
     def _boom(**kwargs):
-        (tmp_path / f"{run_id}.calls.jsonl").write_text(json.dumps(_ONE_CALL) + "\n", encoding="utf-8")
         kwargs["store"].record_call(_ONE_CALL, run_id=run_id, seq=1)
         raise RuntimeError("boom")
 
@@ -461,9 +460,27 @@ class _StoreRunner(ScriptedRunner):
         return result
 
 
-def _store_run(monkeypatch, tmp_path, *, profile_url=None, graph=lambda runner: 0):
+class _TraceRunner(_StoreRunner):
+    """Writes a per-call trace file the way ClaudeCodeRunner does, and records its path in the call's detail."""
+
+    trace_dir = None
+
+    def run(self, **kwargs):
+        result = ScriptedRunner.run(self, **kwargs)
+        call_id = f"call-{len(self.calls)}"
+        trace = self.trace_dir / f"{kwargs['role']}-{len(self.calls)}.jsonl"
+        trace.parent.mkdir(parents=True, exist_ok=True)
+        trace.write_text('{"type":"system"}\nnot json\n{"type":"result"}\n', encoding="utf-8")
+        call = {"id": call_id, "role": kwargs["role"], "model": "claude-x", "ok": True, "trace": str(trace)}
+        self.store.record_call({**call, "ts": "2026-09-25T07:20:00+00:00"}, run_id=self.run_id, seq=len(self.calls))
+        return result
+
+
+def _store_run(monkeypatch, tmp_path, *, profile_url=None, graph=lambda runner: 0, runner_cls=_StoreRunner):
     """Stage `main` over a scripted runner; `graph(runner)` stands in for the dispatched graph."""
-    runner = _StoreRunner({"plan": {}, "build": {}, "review": {}})
+    runner = runner_cls({"plan": {}, "build": {}, "review": {}})
+    if runner_cls is _TraceRunner:
+        runner.trace_dir = tmp_path / "runS-trace"
     args = _Args(tmp_path, "runS")
     args.worktree_root = str(tmp_path)
     if profile_url is not None:
@@ -861,3 +878,65 @@ def test_main_installs_the_handler_for_the_run_and_puts_the_previous_one_back(mo
 
     assert seen == [cli._exit_on_sigterm]
     assert signal.getsignal(signal.SIGTERM) is before
+
+
+# ── trace compaction at run end ──────────────────────────────────────────────
+
+
+def test_trace_helpers_read_the_path_and_the_events_from_literals() -> None:
+    assert cli._trace_path('{"trace": "/a/b.jsonl"}') == Path("/a/b.jsonl")
+    assert cli._trace_path({"trace": "/a/b.jsonl"}) == Path("/a/b.jsonl")
+    assert [cli._trace_path(d) for d in (None, "{", "[]", {"trace": ""}, {"x": 1})] == [None] * 5
+    assert cli._read_events('{"a": 1}\nnot json\n\n[2]\n{"b": 2}\n') == [{"a": 1}, {"b": 2}]
+
+
+def test_a_run_compacts_its_trace_files_into_the_trace_store_and_removes_the_trace_dir(monkeypatch, tmp_path) -> None:
+    pytest.importorskip("zstandard")
+    from harness import store_traces
+
+    seen = []
+
+    def graph(runner) -> int:
+        _three_calls(runner)
+        seen.append(sorted(p.name for p in (tmp_path / "runS-trace").iterdir()))  # the live views' contract
+        return 0
+
+    _store_run(monkeypatch, tmp_path, graph=graph, runner_cls=_TraceRunner)
+
+    assert cli.main([]) == 0
+
+    assert seen == [["build-2.jsonl", "plan-1.jsonl", "review-3.jsonl"]]
+    assert not (tmp_path / "runS-trace").exists()
+    for call_id in ("call-1", "call-2", "call-3"):
+        assert store_traces.read_call(tmp_path / "traces", "runS", call_id) == [{"type": "system"}, {"type": "result"}]
+    assert (tmp_path / "traces" / "2026" / "09" / "25" / "runS.jsonl.zst").is_file()
+
+
+def test_a_failing_append_leaves_the_files_and_the_exit_code_unchanged(monkeypatch, tmp_path, capsys) -> None:
+    from harness import store_traces
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(store_traces, "append_call", boom)
+    _store_run(monkeypatch, tmp_path, graph=_three_calls, runner_cls=_TraceRunner)
+
+    assert cli.main([]) == 0
+
+    assert len(list((tmp_path / "runS-trace").iterdir())) == 3
+    assert capsys.readouterr().err.count("traces: could not compact") == 3
+
+
+def test_without_zstandard_compaction_warns_once_and_leaves_the_files(monkeypatch, tmp_path, capsys) -> None:
+    from harness import store_traces
+
+    def unavailable(*args, **kwargs):
+        raise store_traces.TracesUnavailable("reading or writing traces needs zstandard")
+
+    monkeypatch.setattr(store_traces, "append_call", unavailable)
+    _store_run(monkeypatch, tmp_path, graph=_three_calls, runner_cls=_TraceRunner)
+
+    assert cli.main([]) == 0
+
+    assert len(list((tmp_path / "runS-trace").iterdir())) == 3
+    assert capsys.readouterr().err.count("traces: not compacted") == 1
