@@ -150,6 +150,7 @@ def plan_moves(
 
 
 def load_calls(calls_dir: Path) -> list[Call]:
+    """Rows without an `id` (written before calls carried one) are skipped: their traces match no call and fall back to the file's day."""
     return [
         Call(
             run_id=path.name[: -len(CALLS_SUFFIX)],
@@ -160,6 +161,7 @@ def load_calls(calls_dir: Path) -> list[Call]:
         )
         for path in sorted(Path(calls_dir).glob(f"*{CALLS_SUFFIX}"))
         for row in _json_lines(path)
+        if "id" in row and "ts" in row
     ]
 
 
