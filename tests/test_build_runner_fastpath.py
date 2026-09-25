@@ -125,7 +125,63 @@ def test_a_bad_role_setting_raises_naming_the_role(tmp_path) -> None:
         _build(_profile(tmp_path, _block(roles={"handoff": {"mode": "loud", "threshold": 0.5}})))
 
 
-def test_a_missing_key_raises_naming_the_variable(tmp_path, monkeypatch) -> None:
+def _off_line(capsys) -> str:
+    return capsys.readouterr().err
+
+
+def test_a_missing_key_leaves_the_runner_unwrapped_and_says_why(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY")
-    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
-        _build(_profile(tmp_path, _block()))
+    assert type(_build(_profile(tmp_path, _block()))) is _Real
+    assert _off_line(capsys) == "system-one: off ($ANTHROPIC_API_KEY (the profile's auth_env) is not set)\n"
+
+
+def test_an_import_error_from_the_backend_is_unavailable(tmp_path, monkeypatch, capsys) -> None:
+    def missing(model, key, block):
+        raise ImportError("sdk is not installed")
+
+    monkeypatch.setitem(runners._BACKENDS, "jev", missing)
+    assert type(_build(_profile(tmp_path, _block()))) is _Real
+    assert _off_line(capsys) == "system-one: off (sdk is not installed)\n"
+
+
+def _knn(tmp_path, **over):
+    return _profile(tmp_path, _block(backend="knn-local", model="knn-1") | over)
+
+
+def test_knn_local_without_examples_is_unavailable(tmp_path, capsys) -> None:
+    assert type(_build(_knn(tmp_path))) is _Real
+    assert _off_line(capsys) == "system-one: off (system_one.examples names no examples file for backend knn-local)\n"
+
+
+def test_knn_local_with_a_missing_examples_file_is_unavailable(tmp_path, capsys) -> None:
+    missing = tmp_path / "none.jsonl"
+    assert type(_build(_knn(tmp_path, examples=str(missing)))) is _Real
+    assert _off_line(capsys) == f"system-one: off (examples file {missing} does not exist)\n"
+
+
+def test_knn_local_with_an_empty_examples_file_is_unavailable(tmp_path, capsys) -> None:
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("\n", encoding="utf-8")
+    assert type(_build(_knn(tmp_path, examples=str(empty)))) is _Real
+    assert _off_line(capsys) == f"system-one: off (examples file {empty} is empty)\n"
+
+
+def test_the_reason_goes_to_the_notes_channel_when_one_is_given(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    lines: list[str] = []
+    real = _Real({})
+    profile = yaml.safe_load(_profile(tmp_path, _block()).read_text(encoding="utf-8"))
+    assert runners._with_fast_path(real, profile, lines.append) is real
+    assert len(lines) == 1 and lines[0].startswith("system-one: off (")
+
+
+def test_a_malformed_block_still_raises_and_says_nothing(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    with pytest.raises(ValueError, match="model"):
+        _build(_profile(tmp_path, _block(model="jev-latest")))
+    assert _off_line(capsys) == ""
+
+
+def test_an_available_backend_still_wraps_and_says_nothing(tmp_path, capsys) -> None:
+    assert isinstance(_build(_profile(tmp_path, _block())), FastPathRunner)
+    assert _off_line(capsys) == ""

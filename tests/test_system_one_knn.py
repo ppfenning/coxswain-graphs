@@ -212,6 +212,7 @@ def test_build_runner_wraps_the_real_runner_for_backend_knn_local_with_no_api_ke
     assert isinstance(runner._decider, KnnDecider)
 
 
-def test_build_runner_needs_the_examples_path_for_knn_local(tmp_path, wired) -> None:
-    with pytest.raises(ValueError, match=r"system_one\.examples"):
-        build_runner(scripted=None, provider_profile=_profile(tmp_path, examples=None))
+def test_build_runner_leaves_knn_local_off_without_the_examples_path(tmp_path, wired, capsys) -> None:
+    runner = build_runner(scripted=None, provider_profile=_profile(tmp_path, examples=None))
+    assert type(runner) is _Real
+    assert capsys.readouterr().err.startswith("system-one: off (system_one.examples")
