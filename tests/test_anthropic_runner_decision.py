@@ -148,6 +148,16 @@ def test_a_malformed_profile_block_is_refused_at_construction_and_names_its_key(
         AnthropicRunner({**PROFILE, **block}, client=_Stub())
 
 
+def test_a_class_named_floor_is_accepted_and_raises_a_lower_call():
+    got = _chosen({"floor": "reason"}, tier="cheap")
+    assert got == ("standard", "caller raised to floor", "m-std")
+
+
+def test_a_garbage_floor_message_names_both_vocabularies():
+    with pytest.raises(RunnerError, match="cheap, standard, deep or extract, reason, judge, frontier"):
+        AnthropicRunner({**PROFILE, "floor": "bogus"}, client=_Stub())
+
+
 def test_without_explicit_values_effort_follows_the_tier_and_budget_is_none():
     decision = _run(_Stub(), tier="cheap").decision
     assert (decision.effort, decision.budget_usd, decision.clipped_by) == ("low", None, None)

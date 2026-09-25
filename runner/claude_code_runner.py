@@ -588,9 +588,9 @@ class ClaudeCodeRunner:
         is applied only when nothing named a tier.
         """
         for named in (caller_tier, self.tier_overrides.get(role), self.profile_defaults.get(role)):
-            if named is not None and named not in TIERS:
+            if named is not None and to_class(named) is None:
                 self._model_for(named)
-                raise RunnerError(f"node '{role}': tier '{named}' is not one of {', '.join(TIERS)}")
+                raise RunnerError(f"node '{role}': tier '{named}' is not one of {', '.join(TIERS)} or {', '.join(CLASSES)}")
         defaults = {} if caller_tier is not None else self.profile_defaults
         chosen = resolve(role, hints, self.tier_overrides, defaults, caller_tier, TIERS[0])
         if chosen.reason == "floor":

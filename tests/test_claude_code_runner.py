@@ -1776,6 +1776,37 @@ def test_a_profile_default_naming_an_unbound_tier_is_named(fake_claude, tmp_path
         _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "huge"}})
 
 
+BY_TIER = {"scope_epic": "cheap", "build": "standard", "arbitrate": "deep"}
+BY_CLASS = {"scope_epic": "extract", "build": "reason", "arbitrate": "judge"}
+BOUND = {"classes": {"extract": "haiku", "reason": "sonnet", "judge": "opus"}}
+
+
+def _role_run(fake_claude, tmp_path, role, profile):
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, **BOUND, **profile}, claude_bin=str(script), cwd=tmp_path)
+    decision = runner.run(role=role, schema=SCHEMA, prompt="go").decision
+    argv = recorded(fake_claude)["argv"]
+    return decision.chosen_tier, decision.reason, argv[argv.index("--model") + 1], argv[argv.index("--effort") + 1]
+
+
+@pytest.mark.parametrize("role", sorted(BY_TIER))
+@pytest.mark.parametrize("key", ["defaults", "tier_overrides"])
+def test_a_class_named_profile_resolves_like_the_tier_named_one(fake_claude, tmp_path, role, key) -> None:
+    by_tier = _role_run(fake_claude, tmp_path, role, {key: BY_TIER})
+    by_class = _role_run(fake_claude, tmp_path, role, {key: BY_CLASS})
+    assert by_class == by_tier
+
+
+def test_a_caller_may_name_a_class(fake_claude, tmp_path) -> None:
+    d, model, _ = _tier_run(fake_claude, tmp_path, BOUND, tier="judge")
+    assert (d.chosen_tier, d.reason, model) == ("judge", "caller", "opus")
+
+
+def test_a_garbage_name_still_raises_and_names_both_vocabularies(fake_claude, tmp_path) -> None:
+    with pytest.raises(RunnerError, match="cheap, standard, deep or extract, reason, judge, frontier"):
+        _tier_run(fake_claude, tmp_path, {"tiers": {"cheap": "h", "standard": "s", "deep": "d", "bogus": "b"}, "defaults": {"plan": "bogus"}})
+
+
 # ── the profile `classes` map ────────────────────────────────────────────────
 
 CLASSES_PROFILE = {"classes": {"extract": ["haiku", "haiku-2"], "reason": "sonnet", "judge": ["opus", "opus-2"]}}
