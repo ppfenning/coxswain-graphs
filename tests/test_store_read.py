@@ -152,7 +152,7 @@ def test_connect_readonly_refuses_an_older_database_in_one_line(tmp_path):
     c.close()
     with pytest.raises(read.StoreVersionError) as err:
         read.connect_readonly(url)
-    assert str(err.value) == "store is at schema version 1, older than the 4 this code expects"
+    assert str(err.value) == "store is at schema version 1, older than the 5 this code expects"
 
 
 def test_connect_readonly_refuses_an_empty_database(tmp_path):
@@ -277,7 +277,7 @@ class FakeCursor:
         self.raw.sent.append((sql, tuple(params)))
         replies = (
             ("information_schema", [(1,)]),
-            ("MAX(version)", [(4,)]),
+            ("MAX(version)", [(5,)]),
             ("FROM graphs", [("g1", "review", "1", "g1", "t", "{}")]),
             ("LEFT JOIN", [(1, 0.5, 1, 10, 5, 3)]),
         )
@@ -308,11 +308,11 @@ def test_connect_readonly_closes_a_postgres_connection_that_is_at_the_wrong_vers
 def test_connect_readonly_refuses_a_newer_database(tmp_path):
     url = f"sqlite:///{tmp_path / 'cox.db'}"
     c = open_store(url, NOW)
-    put(c, "schema_version", version=5, applied_at=NOW, description="future")
+    put(c, "schema_version", version=6, applied_at=NOW, description="future")
     c.close()
     with pytest.raises(read.StoreVersionError) as err:
         read.connect_readonly(url)
-    assert str(err.value) == "store is at schema version 5, newer than the 4 this code expects"
+    assert str(err.value) == "store is at schema version 6, newer than the 5 this code expects"
 
 
 READERS = (

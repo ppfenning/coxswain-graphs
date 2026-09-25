@@ -95,6 +95,34 @@ def test_the_columns_come_from_the_ddl_including_the_alter_columns():
     assert "schema_version" not in by_name
 
 
+def test_every_listed_table_carries_every_column_the_migrated_store_has():
+    conn = open_store("sqlite:///:memory:", T0)
+    try:
+        listed = {n: set(cols) for n, cols, _ in sc.tables()}
+        live = {n: {r[1] for r in conn.query_all(f"PRAGMA table_info({n})")} for n in listed}
+        assert listed == live
+    finally:
+        conn.close()
+
+
+def test_the_attempts_cause_columns_are_copied_including_null(src_url, dst_url):
+    src = open_store(src_url, T0)
+    try:
+        put(src, "attempts", {"run_id": "r1", "task_id": "t1", "seq": 2, "cause": "flake", "cause_why": "retry passed"})
+        put(src, "attempts", {"run_id": "r1", "task_id": "t1", "seq": 3, "cause": None, "cause_why": None})
+    finally:
+        src.close()
+    sc.copy(src_url, dst_url, T0)
+    dst = open_store(dst_url, T0)
+    try:
+        assert dst.query_all("SELECT seq, cause, cause_why FROM attempts WHERE seq IN (2, 3) ORDER BY seq") == [
+            (2, "flake", "retry passed"),
+            (3, None, None),
+        ]
+    finally:
+        dst.close()
+
+
 def test_the_runs_host_column_is_copied_including_null(src_url, dst_url):
     src = open_store(src_url, T0)
     try:

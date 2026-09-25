@@ -232,10 +232,13 @@ def test_gate_rows_number_the_decisions_and_flatten_flags():
 
 def test_every_builder_emits_exactly_the_tables_columns(conn):
     migrated = {"graph_id", "node_id"}
+    unwritten = {"cause", "cause_why"}
     assert set(run_row(RUN)) == cols(conn, "runs")
     assert set(phase_row(PHASE)) == cols(conn, "phases")
     assert set(task_row("r", "p", "t", "s", "u")) == cols(conn, "tasks")
-    assert set(attempt_row("r", "t", 0, "p", "k", None, "ts")) == cols(conn, "attempts")
+    # Exact difference: once the writer fills cause and cause_why, this fails and `unwritten` must go.
+    assert cols(conn, "attempts") - set(attempt_row("r", "t", 0, "p", "k", None, "ts")) == unwritten
+    assert set(attempt_row("r", "t", 0, "p", "k", None, "ts")) <= cols(conn, "attempts")
     assert set(call_row(CALL, run_id="r", seq=0)) == cols(conn, "node_calls") - migrated
     assert set(ledger_row({})) == cols(conn, "ledger")
     assert set(gate_rows("r", "p", [GATE])[0]) == cols(conn, "gate_decisions")
