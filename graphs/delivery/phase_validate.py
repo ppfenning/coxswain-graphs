@@ -37,12 +37,21 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from graphs._contract import ContractViolation, require, require_cartridge
+from runner.decision_log import RouterDecision
+from runner.decision_source import DecisionSource, NoDecisionSource, ask
 from runner.protocol import NodeRunner
 from runner.tier_resolution import Hints
 
 __all__ = ["GRAPH_NAME", "run"]
 
 GRAPH_NAME = "phase-validate"
+
+
+def _decision(source: DecisionSource, role: str, hints: Hints | None) -> dict[str, RouterDecision]:
+    """`router_decision` kwarg for a runner call; empty when the source has no decision, so it defaults to None."""
+    decision = ask(source, role, hints)
+    return {} if decision is None else {"router_decision": decision}
+
 
 VALIDATE_CHUNK_SCHEMA = {
     "type": "object",
@@ -201,6 +210,7 @@ def _verdict(
     schema: Mapping[str, Any],
     context: list[str],
     prompt: str,
+    source: DecisionSource,
 ) -> tuple[dict[str, Any], bool]:
     """One verdict, and one retry if the node returns a note to itself instead.
 
@@ -218,7 +228,16 @@ def _verdict(
     plus the plain statement that this is the last ask. Asking again more gently
     would be asking a different question.
     """
-    first = dict(runner.run(role=role, hints=hints, schema=schema, context=context, prompt=prompt))
+    first = dict(
+        runner.run(
+            role=role,
+            hints=hints,
+            schema=schema,
+            context=context,
+            prompt=prompt,
+            **_decision(source, role, hints),
+        )
+    )
     if not _is_placeholder(first):
         return first, False
 
@@ -228,6 +247,7 @@ def _verdict(
             hints=hints,
             schema=schema,
             context=context,
+            **_decision(source, role, hints),
             prompt=(
                 f"{prompt}\n\n"
                 "Your previous answer described itself as provisional — a placeholder, "
@@ -371,6 +391,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "honest — but it is the driver's job to notice that before invoking this"
         )
 
+    source: DecisionSource = args.get("decision_source") or NoDecisionSource()
     context = list(cartridge.get("context") or [])
     phase = dict(phase_state.get("phase") or {})
     tasks = sorted(
@@ -414,6 +435,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 schema=VALIDATE_CHUNK_SCHEMA,
                 context=context,
                 prompt=chunk_prompt,
+                source=source,
             )
             # The epic driver invokes this graph once for the whole phase; a
             # raise here would lose every sibling's verdict to one task's
@@ -446,6 +468,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     schema=VALIDATE_CHUNK_SCHEMA,
                     context=context,
                     prompt=_second_chunk_prompt(chunk_prompt, read_pairs, unread),
+                    source=source,
                 )
                 base_verdict = _harness_fault_verdict(second_raw) if second_stalled else second_raw
                 verdict_is_harness_fault = second_stalled
@@ -470,6 +493,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                             hints=_chunk_hints(task),
                             schema=VALIDATE_CHUNK_SCHEMA,
                             context=context,
+                            **_decision(source, "validate_chunk", _chunk_hints(task)),
                             prompt=(
                                 f"{chunk_prompt}\n\n"
                                 f"Your refusal names no defect: {malformation}. A defect "
@@ -513,6 +537,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         hints=_phase_hints(tasks),
         schema=VALIDATE_PHASE_SCHEMA,
         context=context,
+        source=source,
         prompt=(
             "THE PHASE'S GOAL, which is what you are judging against:\n"
             f"{phase.get('goal')}\n\n"

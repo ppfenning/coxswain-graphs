@@ -27,6 +27,8 @@ import yaml
 
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
 from graphs.delivery.ticket_lint import Problem, lint_tickets
+from runner.decision_log import RouterDecision
+from runner.decision_source import DecisionSource, NoDecisionSource, ask
 from runner.protocol import NodeRunner
 from runner.tier_resolution import Hints
 
@@ -45,6 +47,13 @@ def _looks_like_a_surface(entry: str) -> bool:
     return "/" in body or bool(re.search(r"\.[A-Za-z0-9]{1,5}$", body)) or body.isupper()
 
 GRAPH_NAME = "initiative-decompose"
+
+
+def _decision(source: DecisionSource, role: str, hints: Hints | None) -> dict[str, RouterDecision]:
+    """`router_decision` kwarg for a runner call; empty when the source has no decision, so it defaults to None."""
+    decision = ask(source, role, hints)
+    return {} if decision is None else {"router_decision": decision}
+
 
 DECOMPOSE_SCHEMA = {
     "type": "object",
@@ -317,12 +326,15 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "a team that has not bound it cannot decompose an initiative"
         )
 
+    source = args.get("decision_source") or NoDecisionSource()
     context = list(cartridge.get("context") or [])
 
+    decompose_hints = Hints(judgment="high")
     decomposition = dict(
         runner.run(
             role="decompose",
-            hints=Hints(judgment="high"),
+            hints=decompose_hints,
+            **_decision(source, "decompose", decompose_hints),
             schema=DECOMPOSE_SCHEMA,
             context=context,
             prompt=(
@@ -353,6 +365,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             runner.run(
                 role="review_adversary",
                 tier="deep",
+                **_decision(source, "review_adversary", None),
                 schema=EDGE_CHALLENGE_SCHEMA,
                 context=context,
                 prompt=(
@@ -387,6 +400,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 runner.run(
                     role="review_adversary",
                     tier="deep",
+                    **_decision(source, "review_adversary", None),
                     schema=UNBUILDABLE_SCHEMA,
                     context=context,
                     prompt=(
@@ -421,6 +435,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             runner.run(
                 role="review_adversary",
                 tier="deep",
+                **_decision(source, "review_adversary", None),
                 schema=UNBUILDABLE_SCHEMA,
                 context=context,
                 prompt=(
