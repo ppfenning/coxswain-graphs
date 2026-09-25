@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from harness.store_dialect import Connection, insert_ignore, json_text
+from harness.store_dialect import Connection, insert_ignore, json_text, upsert
 
 Row = dict[str, Any]
 
@@ -21,6 +21,7 @@ _KEYS: dict[str, tuple[str, ...]] = {
     "runs": ("run_id",),
     "phases": ("run_id", "phase_id"),
     "tasks": ("run_id", "task_id"),
+    "task_records": ("run_id", "phase_id", "task_id"),
     "attempts": ("run_id", "task_id", "seq"),
     "node_calls": ("call_id",),
     "ledger": ("row_hash",),
@@ -86,6 +87,11 @@ def _rest(src: Mapping[str, Any], known: Sequence[str]) -> Row | None:
     return extra or None
 
 
+def _params(row: Row) -> list[Any]:
+    """Row values in column order, with each non-None *_json value encoded as text."""
+    return [json_text(v) if c.endswith("_json") and v is not None else v for c, v in row.items()]
+
+
 def split_phase_id(run_id: str) -> tuple[str, str]:
     """Split 'run:phase' at the first colon. A run-level id has phase '', never None: phase_id is a key column."""
     run, _, phase = run_id.partition(":")
@@ -122,6 +128,16 @@ def phase_row(record: Mapping[str, Any]) -> Row:
 
 def task_row(run_id: str, phase_id: str, task_id: str, state: str, updated_at: str) -> Row:
     return {"run_id": run_id, "phase_id": phase_id, "task_id": task_id, "state": state, "updated_at": updated_at}
+
+
+def task_record_row(run_id: str, phase_id: str, task_id: str, record: Mapping[str, Any], updated_at: str) -> Row:
+    return {
+        "run_id": run_id,
+        "phase_id": phase_id,
+        "task_id": task_id,
+        "record_json": dict(record),
+        "updated_at": updated_at,
+    }
 
 
 def attempt_row(run_id: str, task_id: str, seq: int, phase_id: str, kind: str, reason: str | None, ts: str) -> Row:
@@ -202,10 +218,8 @@ class Store:
     conn: Connection
 
     def _insert(self, table: str, row: Row) -> int:
-        columns = list(row)
-        sql = insert_ignore(self.conn.dialect, table, columns, _KEYS[table])
-        params = [json_text(v) if c.endswith("_json") and v is not None else v for c, v in row.items()]
-        return self.conn.execute(sql, params)
+        sql = insert_ignore(self.conn.dialect, table, list(row), _KEYS[table])
+        return self.conn.execute(sql, _params(row))
 
     def record_run(
         self,
@@ -230,6 +244,14 @@ class Store:
         self, run_id: str, phase_id: str, task_id: str, state: str, updated_at: str, epoch: int | None = None
     ) -> int:
         return self._insert("tasks", task_row(run_id, phase_id, task_id, state, updated_at))
+
+    def record_task_record(
+        self, run_id: str, phase_id: str, task_id: str, record: Mapping[str, Any], updated_at: str
+    ) -> int:
+        """Save a task's record, replacing record_json and updated_at when the key is already there."""
+        row = task_record_row(run_id, phase_id, task_id, record, updated_at)
+        sql = upsert(self.conn.dialect, "task_records", list(row), _KEYS["task_records"])
+        return self.conn.execute(sql, _params(row))
 
     def record_attempt(
         self,
