@@ -34,7 +34,7 @@ from core.cartridge import CartridgeError
 from core.manifest import build_manifest, record_run
 
 from graphs._contract import ContractViolation
-from harness import CORE_SCHEMA, store_traces
+from harness import CORE_SCHEMA, run_lease, store_traces
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, run_checks
 from harness.digest import build_digest
@@ -46,6 +46,7 @@ from harness.resolve import overlay_path, resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
 from harness.store_dialect import default_url
 from harness.store_graphs import derive_definition, register
+from harness.store_lease import acquire, release
 from harness.store_migrate import open_store
 from harness.store_read import calls as node_calls
 from harness.store_read import cost_by_model, run_summary
@@ -288,6 +289,7 @@ def _provider_profile_scope(path: Path | str) -> str:
 
 _PHASE_PRINCIPAL = "phase(lifecycle-propose)"
 _COS_PRINCIPAL = "coxswain(dispatch)"
+_LEASE_TTL = 120  # seconds; the heartbeat renews every 30
 
 
 def _read_profile(path: Path | str) -> Mapping[str, Any]:
@@ -365,6 +367,23 @@ def _begin_store_run(
         print(f"store: cannot use {url.split(':', 1)[0]} store: {' '.join(str(exc).split())}", file=sys.stderr)
         return None
     return store
+
+
+def _refuse_start(store: Store, run_id: str, status: str, code: int) -> int:
+    """Stamp a run that never started and close its store; `code` is its exit."""
+    _finish_store_run(store, run_id, datetime.now(UTC).isoformat(), status)
+    store.conn.close()
+    return code
+
+
+def _end_lease(store: Store, heartbeat: run_lease.Heartbeat, name: str, holder: str, epoch: int) -> None:
+    """Stop renewing, then expire the lease. Warns on any fault and never raises; an unreleased lease expires."""
+    heartbeat.stop()
+    try:
+        if not release(store.conn, name, holder, epoch):
+            print(f"lease: {name} was not released: it is no longer held by {holder}", file=sys.stderr)
+    except Exception as exc:
+        print(f"lease: could not release {name}: {' '.join(str(exc).split())}", file=sys.stderr)
 
 
 def _finish_store_run(store: Store, run_id: str, ended_at: str, status: str) -> None:
@@ -574,6 +593,11 @@ def _exit_on_sigterm(signum: int, frame: object) -> None:
     raise SystemExit(143)
 
 
+def _terminated(exc: BaseException) -> bool:
+    """True for the exit `_exit_on_sigterm` raises."""
+    return isinstance(exc, SystemExit) and exc.code == 143
+
+
 def _stop_children_until_quiet(deadline_s: float = 30.0, poll_s: float = 0.1) -> None:
     """Keep stopping children until no worker thread is left, so a node retry cannot outlive the run."""
     end = time.monotonic() + deadline_s
@@ -633,55 +657,106 @@ def _main(argv: list[str] | None) -> int:
 
     # The run's record is opened before any runner exists: a run whose record
     # cannot be kept must not start. `now` is read here, at the edge, and handed down.
-    store = _begin_store_run(args, specs, cartridge, run_id, datetime.now(UTC).isoformat())
+    started_at = datetime.now(UTC).isoformat()
+    store = _begin_store_run(args, specs, cartridge, run_id, started_at)
     if store is None:
         return 1
 
-    runner = build_runner(
-        scripted=args.scripted,
-        provider_profile=args.provider_profile,
-        role_skills=role_skill_bodies(cartridge, skill_index),
-        workdir=args.workdir,
-        repo=args.repo,
+    # One live run per prefix. A refusal is recorded as this run's end and stops it before any graph.
+    name = run_lease.lease_name(run_id)
+    try:
+        lease = acquire(store.conn, name, run_id, started_at, _LEASE_TTL)
+    except Exception as exc:
+        print(f"lease: cannot acquire {name}: {' '.join(str(exc).split())}", file=sys.stderr)
+        return _refuse_start(store, run_id, "error", 1)
+    if not lease.ok:
+        print(f"run: {lease.holder} holds {name}; refusing to start {run_id}", file=sys.stderr)
+        return _refuse_start(store, run_id, "refused", 2)
+
+    # The heartbeat renews on its own connection from the moment the lease is held, so a slow
+    # setup cannot eat the ttl. The epoch fence, not this thread, stops a run that lost the lease.
+    heartbeat = run_lease.Heartbeat(
+        _storage_url(_read_profile(args.provider_profile), args.runs_dir),
+        name,
+        run_id,
+        lease.epoch,
+        clock=lambda: datetime.now(UTC).isoformat(),
     )
 
-    # A runner that still keeps a per-call ledger needs to know where and under
-    # what name. Nothing here reads that ledger any more; usage comes from the store.
-    if hasattr(runner, "runs_dir"):
-        runner.runs_dir = Path(args.runs_dir)
-    if hasattr(runner, "run_id"):
-        runner.run_id = run_id
-    if hasattr(runner, "store"):
-        runner.store = store
-    if hasattr(runner, "node_cap_usd"):
-        runner.node_cap_usd = args.node_cap_usd
+    # Setup can raise, or take a SIGTERM, between the lease and the run's own `finally`. That exit
+    # still stamps the run and frees the lease, or a relaunch would be refused by a run that is gone.
+    try:
+        heartbeat.start()
+        runner = build_runner(
+            scripted=args.scripted,
+            provider_profile=args.provider_profile,
+            role_skills=role_skill_bodies(cartridge, skill_index),
+            workdir=args.workdir,
+            repo=args.repo,
+        )
 
-    # A runner whose nodes can read the world gets a tool-computed map of it
-    # first, so no node pays turns to draw one. The epic driver refreshes it per
-    # phase; this is the single-graph case.
-    if args.repo and hasattr(runner, "repo_digest"):
-        runner.repo_digest = build_digest(Path(args.repo)) or None
-    if hasattr(runner, "check_commands"):
-        checks = (cartridge.get("landing_areas") or {}).get("checks") or []
-        runner.check_commands = [str(c.get("cmd")) for c in checks if isinstance(c, dict) and c.get("cmd")]
+        # A runner that still keeps a per-call ledger needs to know where and under
+        # what name. Nothing here reads that ledger any more; usage comes from the store.
+        if hasattr(runner, "runs_dir"):
+            runner.runs_dir = Path(args.runs_dir)
+        if hasattr(runner, "run_id"):
+            runner.run_id = run_id
+        if hasattr(runner, "store"):
+            runner.store = store
+        if hasattr(runner, "node_cap_usd"):
+            runner.node_cap_usd = args.node_cap_usd
 
-    # `lifecycle` is the only graph this file ever creates a worktree for
-    # (the check arm and the post-gate apply arm inside `_run_graph`, both via
-    # `_lifecycle_worktree`); `epic`, `phase` and `cos` never reach that code,
-    # so there is nothing here for them to clean up.
-    worktree = _lifecycle_worktree(args, cartridge, run_id) if args.graph == "lifecycle" else None
+        # A runner whose nodes can read the world gets a tool-computed map of it
+        # first, so no node pays turns to draw one. The epic driver refreshes it per
+        # phase; this is the single-graph case.
+        if args.repo and hasattr(runner, "repo_digest"):
+            runner.repo_digest = build_digest(Path(args.repo)) or None
+        if hasattr(runner, "check_commands"):
+            checks = (cartridge.get("landing_areas") or {}).get("checks") or []
+            runner.check_commands = [str(c.get("cmd")) for c in checks if isinstance(c, dict) and c.get("cmd")]
+
+        # `lifecycle` is the only graph this file ever creates a worktree for
+        # (the check arm and the post-gate apply arm inside `_run_graph`, both via
+        # `_lifecycle_worktree`); `epic`, `phase` and `cos` never reach that code,
+        # so there is nothing here for them to clean up.
+        worktree = _lifecycle_worktree(args, cartridge, run_id) if args.graph == "lifecycle" else None
+    except BaseException as exc:
+        _finish_store_run(store, run_id, datetime.now(UTC).isoformat(), "error")
+        if _terminated(exc):
+            _stop_children_until_quiet()
+        _end_lease(store, heartbeat, name, run_id, lease.epoch)
+        store.conn.close()
+        raise
 
     # Anything that leaves `_run_graph` without returning (a parser error, a raise) is "error".
     status = "error"
+    # Set only by a SIGTERM exit. The edge's one flag: the `finally` must quiet the workers before it frees the lease.
+    terminated = False
     try:
         code = _run_graph(
-            specs=specs, parser=parser, args=args, cartridge=cartridge, runner=runner, run_id=run_id, store=store
+            specs=specs,
+            parser=parser,
+            args=args,
+            cartridge=cartridge,
+            runner=runner,
+            run_id=run_id,
+            store=store,
+            epoch=lease.epoch,
+            lease_name=name,
         )
         status = "ok" if code == 0 else "failed"
         return code
+    except SystemExit as exc:
+        terminated = _terminated(exc)
+        raise
     finally:
         # First, so the run's end is on record even if a later step here raises.
         _finish_store_run(store, run_id, datetime.now(UTC).isoformat(), status)
+        # On SIGTERM the prefix stays held until the run's own workers are quiet, so a
+        # successor never starts beside them. `main` repeats this wait; by then it finds none.
+        if terminated:
+            _stop_children_until_quiet()
+        _end_lease(store, heartbeat, name, run_id, lease.epoch)
         # Every exit below — success, a caught exception's `return 1`, or
         # anything left to raise past this point — prints the run's totals from
         # the store, which holds every call recorded so far. Guarded like
@@ -730,6 +805,8 @@ def _run_graph(
     runner: Any,
     run_id: str,
     store: Store | None = None,
+    epoch: int | None = None,
+    lease_name: str | None = None,
 ) -> int:
     if args.graph == "epic":
         # The whole initiative. The driver gates and records PER PHASE — phase
@@ -768,6 +845,8 @@ def _run_graph(
             fix_attempts=args.fix_attempts,
             resume_from=args.resume_from,
             store=store,
+            epoch=epoch,
+            lease_name=lease_name,
         )
         totals = result.get("totals") or {}
         print(
