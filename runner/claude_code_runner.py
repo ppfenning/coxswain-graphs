@@ -28,6 +28,7 @@ to change rather than whatever the repository happens to have checked out.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -41,7 +42,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from runner.decision_log import CallDecision
+from runner.decision_log import CallDecision, RouterDecision, joined_reasons
 from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
 from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class, to_tier
 
@@ -57,6 +58,8 @@ CAPABILITIES: Mapping[str, Any] = {
 }
 
 __all__ = ["DEFAULT_TIER", "TIER_EFFORT", "ClaudeCodeRunner"]
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_TIER = "standard"
 
@@ -429,6 +432,40 @@ def _init_facts(init: object) -> tuple[str | None, str | None]:
     return (version if isinstance(version, str) else None, model if isinstance(model, str) else None)
 
 
+_ROUTER_MODES = {"off": "off", "shadow": "shadow", "on": "on", True: "on", False: "off", None: "off"}
+
+
+def _router_mode(raw: object) -> tuple[str, str | None]:
+    """The profile `router` value as off, shadow or on, plus a warning to log, if any.
+
+    YAML 1.1 loads an unquoted `on` as True and `off` as False, so the booleans map too.
+    """
+    mode = _ROUTER_MODES.get(raw) if isinstance(raw, (str, bool)) or raw is None else None
+    if mode is None:
+        return "off", f"profile router {raw!r} is not off, shadow or on; acting as 'off'"
+    if mode == "on":
+        return "on", "profile router 'on' is not implemented; acting as 'shadow'"
+    return mode, None
+
+
+def _router_fields(mode: str, decision: RouterDecision | None) -> dict[str, Any]:
+    """The CallDecision router fields for a supplied decision; empty unless the mode records.
+
+    `router_tier` is the supplied decision's chosen_class. It is not the resolver's
+    `router_tier` slot that `_resolve_tier` fills with the caller's tier.
+    """
+    if mode == "off" or decision is None:
+        return {}
+    return {
+        "router_tier": decision.chosen_class,
+        "router_reason": joined_reasons(decision),
+        "router_model": decision.model,
+        "router_effort": decision.effort,
+        "router_budget_usd": decision.budget_usd,
+        "router_clipped_by": decision.clipped_by,
+    }
+
+
 class ClaudeCodeRunner:
     """Runs nodes as headless Claude Code sessions with structured output."""
 
@@ -484,6 +521,11 @@ class ClaudeCodeRunner:
         self.tier_overrides = {str(k): str(v) for k, v in (self.profile.get("tier_overrides") or {}).items()}
         # role -> tier applied when the caller names no tier; an override still beats it.
         self.profile_defaults = {str(k): str(v) for k, v in (self.profile.get("defaults") or {}).items()}
+        # off, shadow or on. Only records a supplied decision; it never changes what runs.
+        # Warned once per runner, not once per node.
+        self.router_mode, router_warning = _router_mode(self.profile.get("router"))
+        if router_warning is not None:
+            _log.warning(router_warning)
         # A tool-computed map of the target repository, set by the harness. Shown
         # to roles that have tools, so they read it instead of drawing their own.
         self.repo_digest: str | None = None
@@ -941,6 +983,7 @@ class ClaudeCodeRunner:
         thread: str | None = None,
         budget_usd: float | None = None,
         task: str | None = None,
+        router_decision: RouterDecision | None = None,
     ) -> NodeResult:
         requested_tier = tier or DEFAULT_TIER
         resolution = self._resolve_tier(role, tier, hints)
@@ -1155,6 +1198,8 @@ class ClaudeCodeRunner:
         self._append_call_ledger(self.calls[-1], ok=True)
         version, init_model = _init_facts(payload.get("init"))
         result = NodeResult(data)
+        # Only this success path builds a CallDecision. A call that raises RunnerError,
+        # BudgetStop or LimitStop records no decision, so its router_decision is dropped too.
         result.decision = CallDecision(
             role=role,
             requested_tier=requested_tier,
@@ -1166,5 +1211,6 @@ class ClaudeCodeRunner:
             claude_code_version=version,
             effort=effort,
             budget_usd=budget_usd,
+            **_router_fields(self.router_mode, router_decision),
         )
         return result
