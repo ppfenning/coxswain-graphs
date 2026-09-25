@@ -209,3 +209,97 @@ def test_a_malformed_block_still_raises_and_says_nothing(tmp_path, monkeypatch, 
 def test_an_available_backend_still_wraps_and_says_nothing(tmp_path, capsys) -> None:
     assert isinstance(_build(_profile(tmp_path, _block())), FastPathRunner)
     assert _off_line(capsys) == ""
+
+
+class _Recorder:
+    def __init__(self, profile, **kwargs):
+        self.profile, self.kwargs = profile, kwargs
+
+
+class _FakeEntryPoint:
+    def __init__(self, name, factory):
+        self.name, self._factory = name, factory
+
+    def load(self):
+        return self._factory
+
+
+def _entry_points(monkeypatch, *found):
+    calls: list[dict] = []
+
+    def fake(**selector):
+        calls.append(selector)
+        return list(found)
+
+    monkeypatch.setattr(runners.importlib.metadata, "entry_points", fake)
+    return calls
+
+
+def test_runner_claude_code_builds_a_claude_code_runner_with_the_keywords(tmp_path, monkeypatch) -> None:
+    import runner.claude_code_runner as claude_code_runner
+
+    monkeypatch.setattr(claude_code_runner, "ClaudeCodeRunner", _Recorder)
+    monkeypatch.setenv("AGENT_GRAPHS_TRACE_DIR", "/traces")
+    built = build_runner(
+        scripted=None,
+        provider_profile=_profile(tmp_path, runner="claude-code"),
+        role_skills={"build": "b.md"},
+        workdir=tmp_path / "w",
+        repo=tmp_path / "r",
+    )
+    assert type(built) is _Recorder
+    assert built.kwargs == {
+        "role_skills": {"build": "b.md"},
+        "cwd": tmp_path / "w",
+        "repo_dir": tmp_path / "r",
+        "trace_dir": "/traces",
+    }
+
+
+def test_no_runner_key_builds_the_anthropic_runner(tmp_path) -> None:
+    assert type(_build(_profile(tmp_path))) is _Real
+
+
+def test_runner_anthropic_builds_the_anthropic_runner(tmp_path) -> None:
+    assert type(_build(_profile(tmp_path, runner="anthropic"))) is _Real
+
+
+def test_a_registered_entry_point_is_built_with_the_profile_and_the_keywords(tmp_path, monkeypatch) -> None:
+    calls = _entry_points(monkeypatch, _FakeEntryPoint("other", None), _FakeEntryPoint("openai-compatible", _Recorder))
+    built = build_runner(
+        scripted=None,
+        provider_profile=_profile(tmp_path, runner="openai-compatible"),
+        role_skills={"plan": "p.md"},
+        workdir=tmp_path / "w",
+        repo=tmp_path / "r",
+    )
+    assert calls == [{"group": "coxswain.runners"}]
+    assert type(built) is _Recorder
+    assert built.profile["runner"] == "openai-compatible"
+    assert built.kwargs == {"role_skills": {"plan": "p.md"}, "workdir": tmp_path / "w", "repo": tmp_path / "r"}
+
+
+def test_a_built_in_name_never_consults_entry_points(tmp_path, monkeypatch) -> None:
+    calls = _entry_points(monkeypatch, _FakeEntryPoint("anthropic", _Recorder))
+    assert type(_build(_profile(tmp_path, runner="anthropic"))) is _Real
+    assert calls == []
+
+
+def test_an_entry_point_runner_is_wrapped_by_the_fast_path(tmp_path, monkeypatch) -> None:
+    _entry_points(monkeypatch, _FakeEntryPoint("openai-compatible", _Recorder))
+    built = _build(_profile(tmp_path, _block(), runner="openai-compatible"))
+    assert isinstance(built, FastPathRunner)
+    assert type(built._inner) is _Recorder
+
+
+@pytest.mark.parametrize("name", ["nonesuch", "openai-compatible"])
+def test_an_unregistered_name_raises_naming_the_group_and_never_falls_back(tmp_path, monkeypatch, name) -> None:
+    _entry_points(monkeypatch)
+    monkeypatch.setattr(anthropic_runner, "AnthropicRunner", lambda *a, **k: pytest.fail("fell back to anthropic"))
+    message = (
+        f"runner {name!r} is not registered: built in are claude-code and anthropic; "
+        "others register by entry point under coxswain.runners (ppfenning/coxswain-plugins)"
+    )
+    with pytest.raises(ValueError) as raised:
+        _build(_profile(tmp_path, runner=name))
+    assert str(raised.value) == message
