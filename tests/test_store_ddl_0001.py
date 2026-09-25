@@ -3,8 +3,8 @@ import re
 import pytest
 
 import harness.store_ddl_0001 as ddl
-from harness.store_dialect import POSTGRES, SQLITE, forbidden_constructs
-from harness.store_migrate import check_version, migrate, open_store
+from harness.store_dialect import POSTGRES, SQLITE, connect, forbidden_constructs
+from harness.store_migrate import check_version, migrate
 
 NOW = "2026-09-24T00:00:00Z"
 
@@ -87,7 +87,8 @@ JSON_COLUMNS = ["decision_json", "detail_json", "detail_json", "record_json", "r
 
 @pytest.fixture
 def conn():
-    c = open_store("sqlite:///:memory:", NOW)
+    c = connect("sqlite:///:memory:")
+    migrate(c, NOW, [ddl])
     yield c
     c.close()
 
