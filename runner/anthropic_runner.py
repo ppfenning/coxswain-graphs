@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -26,7 +27,7 @@ from typing import Any
 
 import yaml
 
-from runner.decision_log import CallDecision
+from runner.decision_log import CallDecision, RouterDecision, joined_reasons
 from runner.protocol import NodeResult, RunnerError
 from runner.tier_resolution import TIERS, Hints, Resolution, resolve, to_class
 
@@ -42,6 +43,9 @@ DEFAULT_TIER = "standard"
 # want it to think less about a hard case it happens to hit.
 TIER_EFFORT = {"cheap": "low", "standard": "high", "deep": "xhigh"}
 
+ROUTER_MODES = ("off", "shadow", "on")
+ROUTER_ON_WARNING = "provider profile router 'on' is not implemented in this runner; acting as shadow"
+
 
 def load_provider_profile(path: Path | str) -> dict[str, Any]:
     """Read a provider profile. The vendor axis, isolated to one file."""
@@ -53,6 +57,18 @@ def load_provider_profile(path: Path | str) -> dict[str, Any]:
     if not isinstance(profile, Mapping) or "tiers" not in profile:
         raise RunnerError(f"{path}: provider profile must be a mapping with a 'tiers' block")
     return dict(profile)
+
+
+def _router_mode(profile: Mapping[str, Any]) -> str:
+    """The profile `router` key; absent means off. Refuses an unknown value rather than falling back to off.
+
+    YAML 1.1 loads an unquoted `off` as False and `on` as True, so a bool reads as that mode.
+    """
+    raw = profile.get("router", "off")
+    mode = ("on" if raw else "off") if isinstance(raw, bool) else raw
+    if mode not in ROUTER_MODES:
+        raise RunnerError(f"provider profile 'router' must be one of {', '.join(ROUTER_MODES)}, not '{mode}'")
+    return str(mode)
 
 
 def _tier_map(profile: Mapping[str, Any], key: str) -> dict[str, str]:
@@ -97,8 +113,11 @@ def _decision(
     effort: str,
     budget_usd: float | None,
     task: str | None,
+    router_decision: RouterDecision | None = None,
 ) -> CallDecision:
     """Requested tier is the caller's; chosen tier and reason are the resolver's. Nothing is clipped here.
+
+    A supplied `router_decision` is copied onto the `router_*` fields as given; it never changes what was chosen.
 
     `budget_usd` is the ceiling the caller granted. It is recorded, not enforced: the Messages API has no per-call spend ceiling.
     """
@@ -114,6 +133,12 @@ def _decision(
         effort=effort,
         budget_usd=budget_usd,
         clipped_by=None,
+        router_tier=router_decision.chosen_class if router_decision else None,
+        router_reason=joined_reasons(router_decision) if router_decision else None,
+        router_model=router_decision.model if router_decision else None,
+        router_effort=router_decision.effort if router_decision else None,
+        router_budget_usd=router_decision.budget_usd if router_decision else None,
+        router_clipped_by=router_decision.clipped_by if router_decision else None,
     )
 
 
@@ -145,6 +170,7 @@ class AnthropicRunner:
         self.floor = str(self.profile.get("floor") or TIERS[0])
         if self.floor not in TIERS:
             raise RunnerError(f"provider profile 'floor' must be one of {', '.join(TIERS)}, not '{self.floor}'")
+        self.router_mode = _router_mode(self.profile)
         self.max_tokens = max_tokens
         self.extra_system = extra_system
         self._client = client or self._build_client()
@@ -200,6 +226,8 @@ class AnthropicRunner:
         # unknown: protocol.py declares no model or effort; optional keyword-only args stay compatible with it.
         model: str | None = None,
         effort: str | None = None,
+        # unknown: protocol.py does not declare this either. The caller's shadow decision is recorded, never computed here.
+        router_decision: RouterDecision | None = None,
     ) -> NodeResult:
         # `thread` is accepted for the protocol and ignored: each call here is
         # one stateless Messages request. Carrying history would be this
@@ -226,6 +254,10 @@ class AnthropicRunner:
         # When a class chose the model, the class is what the decision records as the chosen tier.
         recorded = replace(resolution, tier=resolution.chosen_class) if class_model and model is None else resolution
         effort_used = effort if effort is not None else TIER_EFFORT.get(resolution.tier, "high")
+        # The default warnings filter shows this once per process, not once per runner.
+        if self.router_mode == "on" and router_decision is not None:
+            warnings.warn(ROUTER_ON_WARNING, RuntimeWarning, stacklevel=1)
+        shadow = router_decision if self.router_mode in ("shadow", "on") else None
         # The bound skill body leads the system prompt: it is the role's craft,
         # and the context packs are the team's rules it applies them under.
         body = self.role_skills.get(role)
@@ -272,5 +304,6 @@ class AnthropicRunner:
             effort=effort_used,
             budget_usd=budget_usd,
             task=task,
+            router_decision=shadow,
         )
         return result
