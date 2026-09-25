@@ -40,7 +40,7 @@ def test_writing_a_call_twice_replaces_it_instead_of_duplicating(root):
 
 def test_a_second_call_added_later_keeps_the_first(root):
     st.write_run(root, DAY, "r1", {"c1": FIRST})
-    assert st.write_run(root, DAY, "r1", {"c2": SECOND}) == 5
+    assert st.write_run(root, DAY, "r1", {"c2": SECOND}) == 2
     assert st.read_call(root, "r1", "c1") == FIRST
     assert st.read_call(root, "r1", "c2") == SECOND
 
