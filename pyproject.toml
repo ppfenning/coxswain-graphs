@@ -20,7 +20,7 @@ shell = ["agent-cartridges"]
 # without it, which is the point: CI never needs a key.
 live = ["anthropic>=0.40"]
 # The trace store (harness/store_traces.py) imports zstandard lazily and names this extra when it is missing.
-traces = ["zstandard>=0.23"]
+traces = ["zstandard>=0.23", "pyarrow>=15"]
 # The Postgres driver; harness/store_dialect.py imports it lazily.
 postgres = ["psycopg[binary]>=3"]
 dev = ["pytest>=8", "ruff==0.16.6"]
