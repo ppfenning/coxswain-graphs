@@ -159,6 +159,12 @@ def test_knn_local_with_a_missing_examples_file_is_unavailable(tmp_path, capsys)
     assert _off_line(capsys) == f"system-one: off (examples file {missing} does not exist)\n"
 
 
+def test_knn_local_expands_a_tilde_in_the_examples_path(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert type(_build(_knn(tmp_path, examples="~/none.jsonl"))) is _Real
+    assert _off_line(capsys) == f"system-one: off (examples file {tmp_path}/none.jsonl does not exist)\n"
+
+
 def test_knn_local_with_an_empty_examples_file_is_unavailable(tmp_path, capsys) -> None:
     empty = tmp_path / "empty.jsonl"
     empty.write_text("\n", encoding="utf-8")
