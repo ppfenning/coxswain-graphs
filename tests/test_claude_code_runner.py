@@ -14,6 +14,7 @@ import stat
 from pathlib import Path
 
 import pytest
+import yaml
 
 from runner import RunnerError
 from runner.claude_code_runner import (
@@ -30,6 +31,7 @@ from runner.claude_code_runner import (
     self_reported_commands,
     trace_commands,
 )
+from runner.decision_log import RouterDecision
 from runner.protocol import BudgetStop, Capability, ProviderProfile, resolve_profile
 from runner.scripted import ScriptedRunner
 
@@ -1810,3 +1812,82 @@ def test_a_safeguard_refusal_retries_on_the_next_classes_entry(sequenced_claude,
     runner = ClaudeCodeRunner({**PROFILE, **CLASSES_PROFILE}, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
     runner.run(role="arbitrate", schema=SCHEMA, prompt="decide", tier="deep")
     assert [row["model"] for row in _ledger_lines(tmp_path, "r1")] == ["opus", "opus-2"]
+
+
+# ── a supplied shadow router decision is recorded, never obeyed ─────────────
+
+
+ROUTER_FIELDS = ("router_tier", "router_reason", "router_model", "router_effort", "router_budget_usd", "router_clipped_by")
+
+
+def _shadow_decision() -> RouterDecision:
+    return RouterDecision(
+        chosen_class="cheap",
+        model="haiku-elsewhere",
+        effort="low",
+        budget_usd=0.25,
+        reasons=("small diff", "no risky surface"),
+        clipped_by=("chair_budget",),
+    )
+
+
+def _router_run(fake_claude, tmp_path, mode, decision):
+    script, _, _ = fake_claude
+    profile = PROFILE if mode is None else {**PROFILE, "router": mode}
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path)
+    return runner.run(role="plan", tier="deep", schema=SCHEMA, prompt="go", router_decision=decision).decision
+
+
+def test_shadow_fills_the_router_fields_and_leaves_the_run_class_and_model_alone(fake_claude, tmp_path) -> None:
+    decision = _router_run(fake_claude, tmp_path, "shadow", _shadow_decision())
+    assert decision.router_tier == "cheap"
+    assert decision.router_reason == "small diff; no risky surface"
+    assert decision.router_model == "haiku-elsewhere"
+    assert decision.router_effort == "low"
+    assert decision.router_budget_usd == 0.25
+    assert decision.router_clipped_by == ("chair_budget",)
+    assert decision.chosen_tier == "judge"
+    assert decision.model_id == "opus"
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--model") + 1] == "opus"
+
+
+@pytest.mark.parametrize("mode", [None, "off"])
+def test_off_leaves_the_router_fields_none(fake_claude, tmp_path, mode) -> None:
+    decision = _router_run(fake_claude, tmp_path, mode, _shadow_decision())
+    assert [getattr(decision, f) for f in ROUTER_FIELDS] == [None] * len(ROUTER_FIELDS)
+
+
+def test_on_warns_once_per_runner_and_acts_as_shadow(fake_claude, tmp_path, caplog) -> None:
+    shadow = _router_run(fake_claude, tmp_path, "shadow", _shadow_decision())
+    script, _, _ = fake_claude
+    with caplog.at_level("WARNING", logger="runner.claude_code_runner"):
+        runner = ClaudeCodeRunner({**PROFILE, "router": "on"}, claude_bin=str(script), cwd=tmp_path)
+        decisions = [
+            runner.run(role="plan", tier="deep", schema=SCHEMA, prompt="go", router_decision=_shadow_decision()).decision
+            for _ in range(2)
+        ]
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        "profile router 'on' is not implemented; acting as 'shadow'"
+    ]
+    for decision in decisions:
+        assert [getattr(decision, f) for f in ROUTER_FIELDS] == [getattr(shadow, f) for f in ROUTER_FIELDS]
+        assert (decision.chosen_tier, decision.model_id) == ("judge", "opus")
+
+
+@pytest.mark.parametrize(("text", "mode"), [("router: on", "on"), ("router: off", "off"), ("router: shadow", "shadow"), ("{}", "off")])
+def test_a_yaml_profile_router_value_reaches_its_mode(tmp_path, text, mode) -> None:
+    profile = {**PROFILE, **yaml.safe_load(text)}
+    assert ClaudeCodeRunner(profile, claude_bin="claude", cwd=tmp_path).router_mode == mode
+
+
+def test_an_unrecognised_router_value_warns_and_acts_as_off(tmp_path, caplog) -> None:
+    with caplog.at_level("WARNING", logger="runner.claude_code_runner"):
+        runner = ClaudeCodeRunner({**PROFILE, "router": "shadw"}, claude_bin="claude", cwd=tmp_path)
+    assert runner.router_mode == "off"
+    assert [r.getMessage() for r in caplog.records] == ["profile router 'shadw' is not off, shadow or on; acting as 'off'"]
+
+
+def test_a_call_with_no_decision_leaves_the_router_fields_none(fake_claude, tmp_path) -> None:
+    decision = _router_run(fake_claude, tmp_path, "shadow", None)
+    assert [getattr(decision, f) for f in ROUTER_FIELDS] == [None] * len(ROUTER_FIELDS)
