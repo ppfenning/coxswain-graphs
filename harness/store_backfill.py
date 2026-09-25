@@ -27,6 +27,12 @@ A usage file is imported only for a run with no call lines. A call with no id ge
 Ledger rows go in exactly as the driver writes them, so a row the driver already stored is
 recognised by its hash and skipped. The source key `schema` therefore stays in row_json and the
 schema_tag column stays NULL, as it does for live writes.
+
+Task record files `<runs_dir>/<run>/tasks/<phase>/<task>.json`, the layout of `result_path` in
+harness/resume.py, are upserted into task_records, so a rerun leaves the same rows. updated_at is the
+caller's `task_records_updated_at` or the file's mtime. A file that is not a JSON object is skipped with
+a warning and named in `malformed_task_records`. Task_records is not in TABLES: its counts are two
+report keys, not a per-table dict, so `balanced` and `archive_imported` are unaffected.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ import argparse
 import json
 import shutil
 import sys
+import warnings
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -64,6 +71,8 @@ STAMPED_KEY = "runs_stamped_ended"
 STAMPED_STATUS = "backfilled"
 SKIPPED_KEY = "skipped_files"
 MALFORMED_KEY = "malformed_run_files"
+TASK_RECORDS_KEY = "task_records_imported"
+MALFORMED_TASK_RECORDS_KEY = "malformed_task_records"
 NEVER_RECORDED_STATUS = "never_recorded"
 
 
@@ -201,6 +210,16 @@ def parse_attempts(task_id: str, attempts: Any) -> tuple[list[Row], int]:
     return rows, len(built) - len(rows)
 
 
+def parse_task_record(doc: Any) -> dict[str, Any] | None:
+    """A task record is a JSON object. Anything else is not one."""
+    return doc if isinstance(doc, dict) else None
+
+
+def task_record_paths(runs_dir: Path | str) -> list[tuple[Path, str, str, str]]:
+    """`(path, run_id, phase, task)` for each `<runs_dir>/<run_id>/tasks/<phase>/<task>.json`, sorted."""
+    return [(p, p.parts[-4], p.parts[-2], p.stem) for p in sorted(Path(runs_dir).glob("*/tasks/*/*.json"))]
+
+
 # ── report ───────────────────────────────────────────────────────────────────
 
 
@@ -211,7 +230,7 @@ def new_report() -> Report:
 def balanced(report: Report) -> bool:
     """True when every table has seen minus malformed equal to inserted plus already present. An empty report is not.
 
-    Only the per-table dicts are import counts. `runs_stamped_ended`, `skipped_files` and `malformed_run_files` are not.
+    Only the per-table dicts are import counts. `runs_stamped_ended`, `skipped_files`, `malformed_run_files` and the task record keys are not.
     """
     tables = [t for t in report.values() if isinstance(t, dict)]
     return bool(tables) and all(t["seen"] - t["malformed"] == t["inserted"] + t["already_present"] for t in tables)
@@ -359,6 +378,24 @@ def _mtime_iso(mtime: float) -> str:
     return datetime.fromtimestamp(mtime, UTC).isoformat()
 
 
+def _import_task_records(store: Store, runs_dir: Path, updated_at: str | None) -> tuple[int, list[str]]:
+    """Upsert each task record file. Returns the count written and `<file>: <reason>` for each one skipped."""
+    written = 0
+    malformed: list[str] = []
+    for path, run_id, phase, task in task_record_paths(runs_dir):
+        record = parse_task_record(_load(path))
+        if record is None:
+            name = path.relative_to(runs_dir).as_posix()
+            warnings.warn(f"task record skipped, not a JSON object: {name}", stacklevel=2)
+            malformed.append(f"{name}: not a JSON object")
+            continue
+        stamp = updated_at if updated_at is not None else _mtime_iso(path.stat().st_mtime)
+        with store.conn.transaction():
+            store.record_task_record(run_id, phase, task, record, stamp)
+        written += 1
+    return written, malformed
+
+
 def _ended_at(latest_ts: str | None, mtime: float) -> str:
     """The latest call ts when the run has calls, else the usage file's mtime as ISO UTC."""
     return latest_ts if latest_ts is not None else _mtime_iso(mtime)
@@ -377,10 +414,17 @@ def _stamp_ended(store: Store, runs_dir: Path) -> int:
     return stamped
 
 
-def backfill(store: Store, runs_dir: Path | str, work_dir: Path | str, ledger_path: Path | str) -> Report:
+def backfill(
+    store: Store,
+    runs_dir: Path | str,
+    work_dir: Path | str,
+    ledger_path: Path | str,
+    task_records_updated_at: str | None = None,
+) -> Report:
     """Import everything under the three paths, then stamp ended the runs that have a usage file.
 
     A second run inserts nothing: every row counts as already present, and no run is stamped twice.
+    Task records are upserted, stamped `task_records_updated_at` or else each file's mtime.
     """
     report = new_report()
     skipped = [p for p in run_files(runs_dir) if is_non_record(p.name)]
@@ -389,8 +433,16 @@ def backfill(store: Store, runs_dir: Path | str, work_dir: Path | str, ledger_pa
     _import_calls(store, report, files)
     _import_ledger(store, report, Path(ledger_path))
     _import_attempts(store, report, Path(work_dir))
+    task_records, bad_task_records = _import_task_records(store, Path(runs_dir), task_records_updated_at)
     stamped = _stamp_ended(store, Path(runs_dir))
-    return {**report, STAMPED_KEY: stamped, SKIPPED_KEY: len(skipped), MALFORMED_KEY: malformed}
+    return {
+        **report,
+        STAMPED_KEY: stamped,
+        SKIPPED_KEY: len(skipped),
+        MALFORMED_KEY: malformed,
+        TASK_RECORDS_KEY: task_records,
+        MALFORMED_TASK_RECORDS_KEY: bad_task_records,
+    }
 
 
 def archive_imported(files: Sequence[Path | str], archive_dir: Path | str, report: Report) -> list[Path]:
