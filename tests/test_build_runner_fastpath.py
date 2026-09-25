@@ -12,6 +12,8 @@ OFF = {"handoff": {"mode": "off", "threshold": 0.5}}
 
 
 class _Decider:
+    needs_key = True
+
     def __init__(self, model, key, block=None):
         self.model, self.key = model, key
 
@@ -24,7 +26,7 @@ class _Real:
 @pytest.fixture(autouse=True)
 def stubs(monkeypatch):
     monkeypatch.setattr(anthropic_runner, "AnthropicRunner", _Real)
-    monkeypatch.setitem(runners._BACKENDS, "jev", _Decider)
+    monkeypatch.setattr(runners, "_backend", lambda name: _Decider if name == "jev" else None)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-key")
     monkeypatch.setenv("JEV_KEY", "k")
 
@@ -112,9 +114,46 @@ def test_scripted_is_never_wrapped_whatever_the_profile_says(tmp_path) -> None:
     assert type(runner) is ScriptedRunner
 
 
-def test_an_unknown_backend_raises_naming_the_field(tmp_path) -> None:
-    with pytest.raises(ValueError, match=r"system_one\.backend 'nope'"):
-        _build(_profile(tmp_path, _block(backend="nope")))
+def test_an_unregistered_backend_leaves_the_runner_unwrapped_and_says_so(tmp_path, capsys) -> None:
+    assert type(_build(_profile(tmp_path, _block(backend="nope")))) is _Real
+    assert _off_line(capsys) == (
+        "system-one: off (system_one.backend 'nope' is not registered; "
+        "install the plugin that provides it (entry-point group coxswain.system_one))\n"
+    )
+
+
+def test_a_backend_without_needs_key_gets_an_empty_key_and_needs_no_key_env(tmp_path, monkeypatch) -> None:
+    class Local:
+        def __init__(self, model, key, block):
+            self.model, self.key = model, key
+
+    monkeypatch.setattr(runners, "_backend", lambda name: Local)
+    block = {k: v for k, v in _block().items() if k != "key_env"}
+    runner = _build(_profile(tmp_path, block))
+    assert isinstance(runner, FastPathRunner)
+    assert runner._decider.key == ""
+
+
+class _EntryPoint:
+    def __init__(self, name, target):
+        self.name, self._target = name, target
+
+    def load(self):
+        return self._target
+
+
+def test_backend_loads_the_registered_entry_point_and_returns_none_for_an_unknown_name(monkeypatch) -> None:
+    monkeypatch.undo()
+    seen = []
+
+    def fake_entry_points(**kwargs):
+        seen.append(kwargs)
+        return [_EntryPoint("jev", _Decider)]
+
+    monkeypatch.setattr(runners.importlib.metadata, "entry_points", fake_entry_points)
+    assert runners._backend("jev") is _Decider
+    assert runners._backend("nope") is None
+    assert seen[0] == {"group": "coxswain.system_one"}
 
 
 def test_a_bad_model_id_raises_naming_the_field(tmp_path) -> None:
@@ -146,37 +185,9 @@ def test_an_import_error_from_the_backend_is_unavailable(tmp_path, monkeypatch, 
     def missing(model, key, block):
         raise ImportError("sdk is not installed")
 
-    monkeypatch.setitem(runners._BACKENDS, "jev", missing)
+    monkeypatch.setattr(runners, "_backend", lambda name: missing)
     assert type(_build(_profile(tmp_path, _block()))) is _Real
     assert _off_line(capsys) == "system-one: off (sdk is not installed)\n"
-
-
-def _knn(tmp_path, **over):
-    return _profile(tmp_path, _block(backend="knn-local", model="knn-1") | over)
-
-
-def test_knn_local_without_examples_is_unavailable(tmp_path, capsys) -> None:
-    assert type(_build(_knn(tmp_path))) is _Real
-    assert _off_line(capsys) == "system-one: off (system_one.examples names no examples file for backend knn-local)\n"
-
-
-def test_knn_local_with_a_missing_examples_file_is_unavailable(tmp_path, capsys) -> None:
-    missing = tmp_path / "none.jsonl"
-    assert type(_build(_knn(tmp_path, examples=str(missing)))) is _Real
-    assert _off_line(capsys) == f"system-one: off (examples file {missing} does not exist)\n"
-
-
-def test_knn_local_expands_a_tilde_in_the_examples_path(tmp_path, monkeypatch, capsys) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    assert type(_build(_knn(tmp_path, examples="~/none.jsonl"))) is _Real
-    assert _off_line(capsys) == f"system-one: off (examples file {tmp_path}/none.jsonl does not exist)\n"
-
-
-def test_knn_local_with_an_empty_examples_file_is_unavailable(tmp_path, capsys) -> None:
-    empty = tmp_path / "empty.jsonl"
-    empty.write_text("\n", encoding="utf-8")
-    assert type(_build(_knn(tmp_path, examples=str(empty)))) is _Real
-    assert _off_line(capsys) == f"system-one: off (examples file {empty} is empty)\n"
 
 
 def test_the_reason_goes_to_the_notes_channel_when_one_is_given(tmp_path, monkeypatch) -> None:
