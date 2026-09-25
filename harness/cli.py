@@ -51,6 +51,7 @@ from harness.store_migrate import open_store
 from harness.store_read import calls as node_calls
 from harness.store_read import cost_by_model, run_summary
 from harness.store_write import Store
+from harness.traces_url import have_pyarrow, redact_url, resolve_traces_root
 from harness.worktree import apply_patch, create_worktree, keep_worktree, remove_worktree
 from runner.protocol import RunnerError
 
@@ -307,6 +308,12 @@ def _storage_url(profile: Mapping[str, Any], runs_dir: Path | str) -> str:
     return url if isinstance(url, str) and url else default_url(runs_dir)
 
 
+def _traces_url(profile: Mapping[str, Any], runs_dir: Path | str) -> str | None:
+    """The profile's `traces_url`; None when absent, which leaves the root at `<runs_dir>/traces`."""
+    url = profile.get("traces_url")
+    return url if isinstance(url, str) and url else None
+
+
 def _principal(graph: str, specs: Mapping[str, GraphSpec], *, docket: str | None) -> str:
     """The run's principal, named as the manifest names it. `epic` is the driver's own constant."""
     if graph == "epic":
@@ -418,32 +425,59 @@ def _read_events(text: str) -> list[dict[str, Any]]:
     return events
 
 
-def _compact_traces(store: Store, run_id: str, runs_dir: Path) -> None:
-    """Move this run's per-call trace files into the trace store, deleting each file only after its append returns.
+def _compact_traces(store: Store, run_id: str, runs_dir: Path, traces_url: str | None = None) -> None:
+    """Write this run's trace files as one Parquet file; delete them only once write_run's row count equals the events read.
 
-    Warns and never raises: a failure on one file leaves that file, and a missing zstandard skips the lot.
+    Warns and never raises. Any failure leaves every loose file, so a rerun rewrites the same Parquet file.
     """
     try:
         rows = node_calls(store.conn, run_id)
     except Exception as exc:
         print(f"traces: could not read the calls of {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
         return
+    calls: dict[str, list[dict[str, Any]]] = {}
+    files: list[Path] = []
+    day = ""
     for row in rows:
-        call_id, ts = row["call_id"], row["ts"]
         path = _trace_path(row["detail_json"])
         if path is None or not path.is_file():
             continue
         try:
-            events = _read_events(path.read_text(encoding="utf-8"))
-            store_traces.append_call(runs_dir / "traces", str(ts)[:10], run_id, str(call_id), events)
-            path.unlink()
-        except store_traces.TracesUnavailable as exc:
+            calls[str(row["call_id"])] = _read_events(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"traces: could not compact {path}: {' '.join(str(exc).split())}", file=sys.stderr)
+            continue
+        files.append(path)
+        day = day or str(row["ts"])[:10]
+    try:
+        if not calls:
+            return
+        if not have_pyarrow():
+            print("traces: not compacted, writing traces as Parquet needs pyarrow: install the traces extra", file=sys.stderr)
+            return
+        try:
+            root = resolve_traces_root(traces_url, runs_dir, os.environ)
+            written = store_traces.write_run(root, day, run_id, calls)
+        except store_traces.ParquetUnavailable as exc:
             print(f"traces: not compacted, {exc}", file=sys.stderr)
             return
         except Exception as exc:
-            print(f"traces: could not compact {path}: {' '.join(str(exc).split())}", file=sys.stderr)
-    with contextlib.suppress(OSError):
-        (runs_dir / f"{run_id}-trace").rmdir()  # only succeeds on an empty directory
+            reason = " ".join(str(exc).split())
+            shown = reason.replace(traces_url, redact_url(traces_url)) if traces_url else reason
+            print(f"traces: could not compact {run_id}: {shown}", file=sys.stderr)
+            return
+        expected = sum(len(events) for events in calls.values())
+        if written != expected:
+            print(f"traces: not compacted, {run_id} wrote {written} rows for {expected} events", file=sys.stderr)
+            return
+        for path in files:
+            try:
+                path.unlink()
+            except OSError as exc:
+                print(f"traces: could not remove {path}: {' '.join(str(exc).split())}", file=sys.stderr)
+    finally:
+        with contextlib.suppress(OSError):
+            (runs_dir / f"{run_id}-trace").rmdir()  # only succeeds on an empty directory
 
 
 def _usage_line(summary: Mapping[str, Any] | None, models: Sequence[Mapping[str, Any]]) -> str | None:
@@ -769,7 +803,12 @@ def _main(argv: list[str] | None) -> int:
             close()
         # Compaction only reads the store and moves files, so it never changes the exit code.
         try:
-            _compact_traces(store, run_id, Path(args.runs_dir))
+            _compact_traces(
+                store,
+                run_id,
+                Path(args.runs_dir),
+                _traces_url(_read_profile(args.provider_profile), args.runs_dir),
+            )
         except Exception as exc:
             print(f"traces: compaction failed: {' '.join(str(exc).split())}", file=sys.stderr)
         store.conn.close()
