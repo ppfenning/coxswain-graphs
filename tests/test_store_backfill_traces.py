@@ -59,6 +59,13 @@ def test_plan_moves_matches_on_run_and_final_file_name():
     assert plan[b] == bf.Move("2026-01-02", "r2", "r2-build-1", False)
 
 
+def test_load_calls_skips_a_row_written_before_calls_had_an_id(tmp_path):
+    (tmp_path / "r0.calls.jsonl").write_text(
+        '{"role": "build", "ts": "2026-09-10T00:00:00+00:00"}\n{"id": "c9", "role": "build", "ts": "2026-09-10T00:01:00+00:00"}\n'
+    )
+    assert [c.id for c in bf.load_calls(tmp_path)] == ["c9"]
+
+
 def test_loaders_read_the_fixture_tree(tree):
     loose, calls = tree
     assert [(t.run_id, t.role, t.index) for t in bf.find_trace_files(loose)] == [
