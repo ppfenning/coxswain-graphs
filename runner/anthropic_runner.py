@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ import yaml
 
 from runner.decision_log import CallDecision
 from runner.protocol import NodeResult, RunnerError
-from runner.tier_resolution import TIERS, Hints, Resolution, resolve
+from runner.tier_resolution import TIERS, Hints, Resolution, resolve, to_class
 
 __all__ = ["AnthropicRunner", "load_provider_profile"]
 
@@ -59,16 +60,32 @@ def _tier_map(profile: Mapping[str, Any], key: str) -> dict[str, str]:
     raw = profile.get(key) or {}
     if not isinstance(raw, Mapping):
         raise RunnerError(f"provider profile '{key}' must map a role to a tier")
-    bad = {str(role): str(tier) for role, tier in raw.items() if str(tier) not in TIERS}
+    bad = {str(role): str(tier) for role, tier in raw.items() if to_class(str(tier)) is None}
     if bad:
-        raise RunnerError(f"provider profile '{key}' names tiers outside {', '.join(TIERS)}: {bad}")
+        raise RunnerError(f"provider profile '{key}' names tiers outside {', '.join(TIERS)} or the capability classes: {bad}")
     return {str(role): str(tier) for role, tier in raw.items()}
 
 
 def _as_caller(resolution: Resolution) -> Resolution:
     """No router runs here: the caller's tier fills the resolver's `router_tier` slot, so that source is named `caller`."""
     reason = resolution.reason
-    return Resolution(resolution.tier, "caller" + reason[len("router") :]) if reason.startswith("router") else resolution
+    if not reason.startswith("router"):
+        return resolution
+    return Resolution(resolution.tier, "caller" + reason[len("router") :], resolution.chosen_class)
+
+
+def _classes_map(profile: Mapping[str, Any]) -> dict[str, list[Any]]:
+    """The optional profile `classes` block: class name -> models, first entry preferred."""
+    raw = profile.get("classes") or {}
+    if not isinstance(raw, Mapping) or not all(isinstance(models, list) for models in raw.values()):
+        raise RunnerError("provider profile 'classes' must map a capability class to a list of models")
+    return {str(name): list(models) for name, models in raw.items()}
+
+
+def _class_model(classes: Mapping[str, Sequence[Any]], chosen_class: str | None) -> str | None:
+    """First model listed for the class; None when the class has no entry, so the tiers map answers."""
+    models = classes.get(chosen_class) if chosen_class else None
+    return str(models[0]) if models else None
 
 
 def _decision(
@@ -120,6 +137,7 @@ class AnthropicRunner:
         self.tiers = dict(self.profile.get("tiers") or {})
         if not self.tiers:
             raise RunnerError("provider profile declares no tiers")
+        self.classes = _classes_map(self.profile)
         self.tier_overrides = _tier_map(self.profile, "tier_overrides")
         # unknown: the profile key for role -> tier defaults; assumed to be `defaults`. Nothing in the repo names it.
         self.profile_defaults = _tier_map(self.profile, "defaults")
@@ -198,11 +216,15 @@ class AnthropicRunner:
                 raise RunnerError(f"node '{role}' passed an empty {name}; pass None to leave it to the tier")
         # A tier-less call takes DEFAULT_TIER as its own tier, as the Claude Code runner does.
         requested_tier = tier or DEFAULT_TIER
-        # The resolver ranks tiers, so it only knows the tiers in TIERS; a profile may declare others but a call cannot ask for them.
-        if requested_tier not in TIERS:
-            raise RunnerError(f"node '{role}' asked for tier '{requested_tier}'; the tiers are {', '.join(TIERS)}")
+        # A call may name a legacy tier or a capability class; a profile may declare other tiers but a call cannot ask for them.
+        if to_class(requested_tier) is None:
+            raise RunnerError(f"node '{role}' asked for tier '{requested_tier}'; the tiers are {', '.join(TIERS)} or a capability class")
         resolution = _as_caller(resolve(role, hints, self.tier_overrides, self.profile_defaults, requested_tier, self.floor))
-        model_id = model if model is not None else self._model_for(resolution.tier)
+        # The resolver's class picks the model from the profile `classes` map; no class entry falls back to the tiers map.
+        class_model = _class_model(self.classes, resolution.chosen_class)
+        model_id = model if model is not None else class_model or self._model_for(resolution.tier)
+        # When a class chose the model, the class is what the decision records as the chosen tier.
+        recorded = replace(resolution, tier=resolution.chosen_class) if class_model and model is None else resolution
         effort_used = effort if effort is not None else TIER_EFFORT.get(resolution.tier, "high")
         # The bound skill body leads the system prompt: it is the role's craft,
         # and the context packs are the team's rules it applies them under.
@@ -245,7 +267,7 @@ class AnthropicRunner:
         result.decision = _decision(
             role=role,
             requested_tier=requested_tier,
-            resolution=resolution,
+            resolution=recorded,
             model_id=getattr(response, "model", None) or model_id,
             effort=effort_used,
             budget_usd=budget_usd,
