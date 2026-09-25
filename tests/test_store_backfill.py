@@ -513,3 +513,12 @@ def test_archive_refuses_a_missing_source_or_an_existing_target_and_moves_nothin
         archive_imported([tree / "runs" / "absent.json"], archive, balanced_report)
     assert all(f.exists() for f in files)
     assert [p.name for p in archive.iterdir()] == [files[-1].name]
+
+
+def test_an_oldest_launch_file_with_only_at_is_still_a_launch(store, tree):
+    runs = tree / "runs"
+    (runs / "run-o.launched.json").write_text(json.dumps({"at": TS}))
+    report = run(store, tree)
+    row = store.conn.query_one("SELECT status, launched_by, launched_at FROM runs WHERE run_id = 'run-o'")
+    assert tuple(row) == ("never_recorded", None, TS)
+    assert counts(report, "runs")[3] == 0
