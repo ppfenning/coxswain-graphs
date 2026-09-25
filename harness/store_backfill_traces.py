@@ -1,16 +1,26 @@
-"""Repack loose per-call trace files into the day-partitioned trace store.
+"""Repack traces into one Parquet file per run under a trace store root.
 
-Usage: python -m harness.store_backfill_traces LOOSE_ROOT CALLS_DIR NEW_ROOT [--archive DIR]
+Usage: python -m harness.store_backfill_traces TRACES_ROOT [--loose-root DIR] [--calls-dir DIR]
 
-LOOSE_ROOT holds <run_id>-trace/<role>-<n>.jsonl, one stream event per line and no
-timestamps. Day and call id come from CALLS_DIR/<run_id>.calls.jsonl, matched on the
-run and the final file name of each call's "trace" key. A trace with no call is
-imported as <run_id>-<role>-<n>, dated by file modification time.
+Two sources feed a run. LOOSE_ROOT holds <run_id>-trace/<role>-<n>.jsonl, one stream event per
+line and no timestamps. Day and call id come from CALLS_DIR/<run_id>.calls.jsonl, matched on the
+run and the final file name of each call's "trace" key. A trace with no call is imported as
+<run_id>-<role>-<n>, dated by file modification time. TRACES_ROOT may also hold legacy
+YYYY/MM/DD/<run_id>.jsonl.zst day files. Both sources of one run merge into one Parquet file,
+dated by the earliest source day, or by the day of a Parquet file the run already has.
 
-Wrong belief to avoid: an empty trace file is not "present". It writes no rows, so a
-rerun could never see it. It is counted as seen and left unimported, which fails the run.
-Sources are moved to the archive only after they read back with the same event count.
-Nothing is ever deleted.
+Sources move to TRACES_ROOT/archive/, keeping their YYYY/MM/DD path, only after the Parquet file
+reads back with the same event count for every call. Readers list YYYY/MM/DD only, so archive/ is
+never read. Nothing is ever deleted. On a mismatch the sources stay and the Parquet file is kept.
+A call whose events differ between two sources is a conflict: nothing is written or moved.
+
+Wrong belief to avoid: "write_run replaces by call_id, so a rerun is safe". It replaces only inside
+the one file at its day path, and readers join every day's file for a run. A rerun after a partial
+archive would date the run by the sources left and write a second file, doubling every call. So an
+existing Parquet file pins the day.
+
+An empty trace file writes no rows. It verifies at zero events and is archived with its run, so a
+rerun finds nothing left to do.
 """
 
 from __future__ import annotations
@@ -20,16 +30,20 @@ import json
 import re
 import shutil
 import sys
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import reduce
 from pathlib import Path
 from typing import Any
 
 from harness import store_traces
+from harness.traces_url import TracesRoot, have_pyarrow, redact_url, resolve_traces_root
 
 TRACE_DIR_SUFFIX = "-trace"
 CALLS_SUFFIX = ".calls.jsonl"
+ARCHIVE_DIR = "archive"
 _NAME = re.compile(r"^(?P<role>.+)-(?P<index>\d+)\.jsonl$")
 
 
@@ -59,14 +73,60 @@ class Move:
 
 
 @dataclass(frozen=True)
+class Source:
+    path: Path
+    archive_rel: Path
+
+
+@dataclass(frozen=True)
+class RunSources:
+    """Everything one run will write. `expected` is the event count each call must read back with."""
+
+    run_id: str
+    day: str
+    calls: dict[str, list[dict[str, Any]]]
+    expected: dict[str, int]
+    sources: tuple[Source, ...]
+    conflicts: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class Mismatch:
+    run_id: str
+    expected: int
+    got: int
+
+
+@dataclass(frozen=True)
+class Conflict:
+    run_id: str
+    call_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Report:
-    seen: int
-    appended: int
-    present: int
-    unmatched: int
-    archived: int
+    runs: int = 0
+    sources: int = 0
+    empty: int = 0
+    rows: int = 0
+    archived: int = 0
+    blocked: int = 0
+    src_bytes: int = 0
+    dst_bytes: int = 0
+    mismatches: tuple[Mismatch, ...] = ()
+    conflicts: tuple[Conflict, ...] = ()
+    unavailable: bool = False
+
+
+@dataclass(frozen=True)
+class RunResult:
+    run: RunSources
+    rows: int
     src_bytes: int
     dst_bytes: int
+    archived: int
+    blocked: int
+    mismatch: Mismatch | None
 
 
 def parse_trace_name(name: str) -> tuple[str, int] | None:
@@ -113,6 +173,24 @@ def find_trace_files(loose_root: Path) -> list[TraceFile]:
     ]
 
 
+def _dated(root: Path, name: str) -> list[Path]:
+    """Files <root>/YYYY/MM/DD/<name> in date order. archive/ and stray directories never match."""
+    return [
+        path
+        for path in sorted(Path(root).glob(f"*/*/*/{name}"))
+        if all(part.isdigit() for part in path.relative_to(root).parts[:3])
+    ]
+
+
+def find_legacy_files(root: Path) -> list[Path]:
+    return _dated(root, f"*{store_traces.SUFFIX}")
+
+
+def parquet_days(root: Path, run_id: str) -> list[str]:
+    """Days that already hold <run_id>.parquet, earliest first."""
+    return ["-".join(p.relative_to(root).parts[:3]) for p in _dated(root, f"{run_id}{store_traces.PARQUET_SUFFIX}")]
+
+
 def _json_lines(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
@@ -121,49 +199,136 @@ def read_events(path: Path) -> list[dict[str, Any]]:
     return _json_lines(path)
 
 
-def already_present(root: Path, run_id: str, call_id: str) -> bool:
-    return bool(store_traces.read_call(root, run_id, call_id))
+def loose_run(move: Move, path: Path, events: list[dict[str, Any]]) -> RunSources:
+    """An empty file contributes no call but still expects zero events, so it archives with its run."""
+    rel = store_traces.day_dir(Path(), move.day) / f"{move.run_id}{TRACE_DIR_SUFFIX}" / path.name
+    calls = {move.call_id: events} if events else {}
+    return RunSources(move.run_id, move.day, calls, {move.call_id: len(events)}, (Source(path, rel),))
 
 
-def _import_one(new_root: Path, move: Move, path: Path) -> tuple[str, int]:
-    events = read_events(path)
-    if not events:
-        return "empty", 0
-    if already_present(new_root, move.run_id, move.call_id):
-        return "present", len(events)
-    store_traces.append_call(new_root, move.day, move.run_id, move.call_id, events)
-    return "appended", len(events)
+def legacy_run(path: Path, rows: Sequence[dict[str, Any]]) -> RunSources:
+    """One legacy day file. Its date is the directory it sits in; each call's events come back in seq order."""
+    calls = {
+        call_id: [r["event"] for r in sorted((r for r in rows if r["call_id"] == call_id), key=lambda r: r["seq"])]
+        for call_id in sorted({r["call_id"] for r in rows})
+    }
+    rel = Path(*path.parts[-4:])
+    return RunSources(
+        path.name.removesuffix(store_traces.SUFFIX),
+        "-".join(path.parts[-4:-1]),
+        calls,
+        {call_id: len(events) for call_id, events in calls.items()},
+        (Source(path, rel),),
+    )
 
 
-def _archive_one(new_root: Path, archive: Path, move: Move, path: Path, n_events: int) -> bool:
-    if len(store_traces.read_call(new_root, move.run_id, move.call_id)) != n_events:
-        return False
-    dest = archive / path.parent.name / path.name
-    if dest.exists():
-        return False
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(path, dest)
-    return True
+def _combine(a: RunSources, b: RunSources) -> RunSources:
+    """A call both hold counts once when its events are equal and is a conflict when they differ."""
+    shared = a.calls.keys() & b.calls.keys()
+    differ = frozenset(c for c in shared if a.calls[c] != b.calls[c])
+    return RunSources(
+        a.run_id,
+        min(a.day, b.day),
+        {**a.calls, **b.calls},
+        {
+            c: b.expected[c] if c in shared else a.expected.get(c, 0) + b.expected.get(c, 0)
+            for c in a.expected.keys() | b.expected.keys()
+        },
+        a.sources + b.sources,
+        a.conflicts | b.conflicts | differ,
+    )
 
 
-def import_all(
-    loose_root: Path, calls_dir: Path, new_root: Path, archive: Path | None, mtime_day: Callable[[Path], str]
+def group_by_run(runs: Sequence[RunSources]) -> dict[str, RunSources]:
+    return {
+        run_id: reduce(_combine, [r for r in runs if r.run_id == run_id]) for run_id in sorted({r.run_id for r in runs})
+    }
+
+
+def _local_dir(root: TracesRoot) -> Path:
+    from pyarrow.fs import LocalFileSystem
+
+    if not isinstance(root.fs, LocalFileSystem):
+        raise ValueError(f"backfill needs a local traces root, got {redact_url(root.path)}")
+    return Path(root.path)
+
+
+def _archive(base: Path, sources: Sequence[Source]) -> int:
+    """Move each source under base/archive/. Moves nothing if any destination is taken. Returns the count moved."""
+    dests = [base / ARCHIVE_DIR / s.archive_rel for s in sources]
+    if any(d.exists() for d in dests):
+        return 0
+    for source, dest in zip(sources, dests, strict=True):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(source.path, dest)
+    return len(sources)
+
+
+def _convert(traces: TracesRoot, base: Path, run: RunSources) -> RunResult:
+    src_bytes = sum(s.path.stat().st_size for s in run.sources)
+    if run.conflicts:
+        return RunResult(run, 0, src_bytes, 0, 0, 0, None)
+    day = next(iter(parquet_days(base, run.run_id)), run.day)
+    rows = store_traces.write_run(traces, day, run.run_id, run.calls) if run.calls else 0
+    seen = Counter(r["call_id"] for r in store_traces.iter_run(traces, run.run_id))
+    got = {call_id: seen[call_id] for call_id in run.expected}
+    verified = got == run.expected
+    moved = _archive(base, run.sources) if verified else 0
+    parquet = Path(store_traces.run_parquet(traces.path, day, run.run_id))
+    return RunResult(
+        run,
+        rows,
+        src_bytes,
+        parquet.stat().st_size if parquet.exists() else 0,
+        moved,
+        len(run.sources) - moved if verified else 0,
+        None if verified else Mismatch(run.run_id, sum(run.expected.values()), sum(got.values())),
+    )
+
+
+def _read_legacy(paths: Sequence[Path]) -> list[tuple[Path, list[dict[str, Any]]]] | None:
+    """Rows of every legacy file, or None when zstandard is missing and they cannot be read."""
+    try:
+        return [(p, list(store_traces.read_legacy_file(p))) for p in paths]
+    except store_traces.TracesUnavailable:
+        return None
+
+
+def _unavailable(why: str) -> Report:
+    print(f"warning: {why}; nothing converted, every source left in place", file=sys.stderr)
+    return Report(unavailable=True)
+
+
+def backfill(
+    root: str | TracesRoot,
+    loose_root: Path | None,
+    calls_dir: Path | None,
+    mtime_day: Callable[[Path], str],
 ) -> Report:
-    files = find_trace_files(loose_root)
-    plan = plan_moves(load_calls(calls_dir), files, mtime_day)
-    src_bytes = sum(f.path.stat().st_size for f in files)
-    outcomes = [(f, plan[f], *_import_one(new_root, plan[f], f.path)) for f in files]
-    landed = [(f, m, n) for f, m, outcome, n in outcomes if outcome in ("appended", "present")]
-    archived = sum(_archive_one(new_root, archive, m, f.path, n) for f, m, n in landed) if archive is not None else 0
-    dst_files = {store_traces.run_file(new_root, m.day, m.run_id) for _, m, _ in landed}
+    """Convert loose traces and legacy day files to one Parquet file per run. A str root resolves with an empty env."""
+    if not have_pyarrow():
+        return _unavailable("pyarrow is not installed")
+    traces = root if isinstance(root, TracesRoot) else resolve_traces_root(root, Path("."), {})
+    base = _local_dir(traces)
+    legacy = _read_legacy(find_legacy_files(base))
+    if legacy is None:
+        return _unavailable("zstandard is not installed, so legacy day files cannot be read")
+    files = find_trace_files(loose_root) if loose_root is not None else []
+    plan = plan_moves(load_calls(calls_dir) if calls_dir is not None else [], files, mtime_day)
+    loose = [(plan[f], f.path, read_events(f.path)) for f in files]
+    runs = group_by_run([legacy_run(p, rows) for p, rows in legacy] + [loose_run(m, p, ev) for m, p, ev in loose])
+    results = [_convert(traces, base, run) for run in runs.values()]
     return Report(
-        seen=len(files),
-        appended=sum(1 for *_, outcome, _n in outcomes if outcome == "appended"),
-        present=sum(1 for *_, outcome, _n in outcomes if outcome == "present"),
-        unmatched=sum(1 for _, m, *_ in outcomes if not m.matched),
-        archived=archived,
-        src_bytes=src_bytes,
-        dst_bytes=sum(p.stat().st_size for p in dst_files if p.exists()),
+        runs=len(results),
+        sources=sum(len(r.run.sources) for r in results),
+        empty=sum(1 for _, _, ev in loose if not ev) + sum(1 for _, rows in legacy if not rows),
+        rows=sum(r.rows for r in results),
+        archived=sum(r.archived for r in results),
+        blocked=sum(r.blocked for r in results),
+        src_bytes=sum(r.src_bytes for r in results),
+        dst_bytes=sum(r.dst_bytes for r in results),
+        mismatches=tuple(r.mismatch for r in results if r.mismatch is not None),
+        conflicts=tuple(Conflict(r.run.run_id, tuple(sorted(r.run.conflicts))) for r in results if r.run.conflicts),
     )
 
 
@@ -173,15 +338,25 @@ def file_mtime_day(path: Path) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m harness.store_backfill_traces", description=__doc__.splitlines()[0])
-    ap.add_argument("loose_root", type=Path, help="directory of <run_id>-trace directories")
-    ap.add_argument("calls_dir", type=Path, help="directory of <run_id>.calls.jsonl files")
-    ap.add_argument("new_root", type=Path, help="trace store root to write")
-    ap.add_argument("--archive", type=Path, default=None, help="move verified sources here; never deletes")
+    ap.add_argument("traces_root", help="local trace store root; Parquet is written here and sources archived under it")
+    ap.add_argument("--loose-root", type=Path, default=None, help="directory of <run_id>-trace directories")
+    ap.add_argument("--calls-dir", type=Path, default=None, help="directory of <run_id>.calls.jsonl files")
     args = ap.parse_args(argv)
-    report = import_all(args.loose_root, args.calls_dir, args.new_root, args.archive, file_mtime_day)
+    try:
+        report = backfill(args.traces_root, args.loose_root, args.calls_dir, file_mtime_day)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"traces_root: {redact_url(args.traces_root)}")
     for name, value in vars(report).items():
-        print(f"{name}: {value}")
-    return 0 if report.seen == report.appended + report.present else 1
+        if name not in ("mismatches", "conflicts"):
+            print(f"{name}: {value}")
+    for m in report.mismatches:
+        print(f"mismatch: run {m.run_id} expected {m.expected} events, read back {m.got}")
+    for c in report.conflicts:
+        print(f"conflict: run {c.run_id} calls {', '.join(c.call_ids)} differ between sources; nothing written")
+    failed = report.mismatches or report.conflicts or report.blocked or report.unavailable
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
