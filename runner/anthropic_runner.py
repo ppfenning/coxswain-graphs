@@ -29,7 +29,7 @@ import yaml
 
 from runner.decision_log import CallDecision, RouterDecision, joined_reasons
 from runner.protocol import NodeResult, RunnerError
-from runner.tier_resolution import TIERS, Hints, Resolution, resolve, to_class
+from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class
 
 __all__ = ["AnthropicRunner", "load_provider_profile"]
 
@@ -168,8 +168,8 @@ class AnthropicRunner:
         self.profile_defaults = _tier_map(self.profile, "defaults")
         # unknown: where the floor comes from; assumed to be an optional profile `floor`, else the lowest tier.
         self.floor = str(self.profile.get("floor") or TIERS[0])
-        if self.floor not in TIERS:
-            raise RunnerError(f"provider profile 'floor' must be one of {', '.join(TIERS)}, not '{self.floor}'")
+        if to_class(self.floor) is None:
+            raise RunnerError(f"provider profile 'floor' must be one of {', '.join(TIERS)} or {', '.join(CLASSES)}, not '{self.floor}'")
         self.router_mode = _router_mode(self.profile)
         self.max_tokens = max_tokens
         self.extra_system = extra_system
