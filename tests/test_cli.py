@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import signal
 import sqlite3
+import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -13,6 +17,7 @@ from typing import ClassVar
 import pytest
 
 import harness.cli as cli
+from harness.invoke import Invocation, invoke_graphs
 from runner.scripted import ScriptedRunner
 
 
@@ -604,3 +609,112 @@ def test_the_parser_takes_result_out_and_defaults_it_to_none() -> None:
 
     assert parser.parse_args(base).result_out is None
     assert parser.parse_args([*base, "--result-out", "x.json"]).result_out == "x.json"
+
+
+def test_the_sigterm_handler_ignores_a_repeat_stops_children_and_exits_143(monkeypatch) -> None:
+    stopped = []
+    monkeypatch.setattr(cli, "_terminate_children", lambda: stopped.append(True))
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            cli._exit_on_sigterm(signal.SIGTERM, None)
+        ignored = signal.getsignal(signal.SIGTERM)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert excinfo.value.code == 143
+    assert ignored is signal.SIG_IGN
+    assert stopped == [True]
+
+
+def test_child_pids_reads_every_threads_children_file(tmp_path) -> None:
+    (tmp_path / "1").mkdir()
+    (tmp_path / "2").mkdir()
+    (tmp_path / "1" / "children").write_text("12 13 ", encoding="ascii")
+    (tmp_path / "2" / "children").write_text("14\n", encoding="ascii")
+
+    assert cli._child_pids(tmp_path) == [12, 13, 14]
+    assert cli._child_pids(tmp_path / "absent") == []
+
+
+def test_a_real_sigterm_during_a_fan_out_stamps_the_end_stops_the_node_and_drops_the_queue(
+    monkeypatch, tmp_path
+) -> None:
+    started, children = [], []
+
+    def node(args, runner):
+        started.append(args["run_id"])
+        child = subprocess.Popen(["sleep", "30"])
+        children.append(child)
+        os.kill(os.getpid(), signal.SIGTERM)
+        child.wait()
+        time.sleep(0.3)
+        return {"proposals": []}
+
+    def fan_out(runner) -> int:
+        invocations = [Invocation(id=f"t{i}", graph="g", args={}) for i in range(3)]
+        invoke_graphs(invocations, specs={"g": SimpleNamespace(run=node)}, runner=runner, run_id="runS", max_parallel=1)
+        return 0
+
+    _store_run(monkeypatch, tmp_path, graph=fan_out)
+    finish = cli._finish_store_run
+
+    def finish_under_a_repeat_sigterm(*args) -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+        finish(*args)
+
+    monkeypatch.setattr(cli, "_finish_store_run", finish_under_a_repeat_sigterm)
+    before = signal.getsignal(signal.SIGTERM)
+    start = time.monotonic()
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([])
+
+    assert excinfo.value.code == 143
+    assert time.monotonic() - start < 10
+    assert children[0].returncode == -signal.SIGTERM
+    assert started == ["runS:t0"]
+    assert not cli._workers_alive()
+    assert _rows(tmp_path / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("error", 1)]
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_an_early_return_before_the_run_starts_still_restores_the_handler(monkeypatch, tmp_path) -> None:
+    _store_run(monkeypatch, tmp_path)
+
+    def refuse(*a, **k):
+        raise cli.CartridgeError("no cartridge")
+
+    monkeypatch.setattr(cli, "resolve_cartridge", refuse)
+    before = signal.getsignal(signal.SIGTERM)
+
+    assert cli.main([]) == 1
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_a_run_ended_by_sigterm_stamps_ended_at_with_status_error_and_restores_the_handler(
+    monkeypatch, tmp_path
+) -> None:
+    def terminated(runner):
+        raise SystemExit(143)
+
+    _store_run(monkeypatch, tmp_path, graph=terminated)
+    before = signal.getsignal(signal.SIGTERM)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([])
+
+    assert excinfo.value.code == 143
+    assert _rows(tmp_path / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("error", 1)]
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_main_installs_the_handler_for_the_run_and_puts_the_previous_one_back(monkeypatch, tmp_path) -> None:
+    seen = []
+    _store_run(monkeypatch, tmp_path, graph=lambda runner: seen.append(signal.getsignal(signal.SIGTERM)) or 0)
+    before = signal.getsignal(signal.SIGTERM)
+
+    assert cli.main([]) == 0
+
+    assert seen == [cli._exit_on_sigterm]
+    assert signal.getsignal(signal.SIGTERM) is before
