@@ -48,8 +48,11 @@ from harness.store_write import (
 
 TABLES = ("runs", "phases", "gate_decisions", "node_calls", "ledger", "attempts")
 _COUNTS = ("seen", "inserted", "already_present", "malformed")
+_USAGE_SUFFIX = ".usage.json"
 
-Report = dict[str, dict[str, int]]
+Report = dict[str, dict[str, int] | int]
+STAMPED_KEY = "runs_stamped_ended"
+STAMPED_STATUS = "backfilled"
 
 
 class ArchiveRefused(RuntimeError):
@@ -162,10 +165,12 @@ def new_report() -> Report:
 
 
 def balanced(report: Report) -> bool:
-    """True when every table has seen minus malformed equal to inserted plus already present. An empty report is not."""
-    return bool(report) and all(
-        t["seen"] - t["malformed"] == t["inserted"] + t["already_present"] for t in report.values()
-    )
+    """True when every table has seen minus malformed equal to inserted plus already present. An empty report is not.
+
+    Only the per-table dicts are import counts. `runs_stamped_ended` is a plain int and is not checked here.
+    """
+    tables = [t for t in report.values() if isinstance(t, dict)]
+    return bool(tables) and all(t["seen"] - t["malformed"] == t["inserted"] + t["already_present"] for t in tables)
 
 
 def _tally(report: Report, table: str, **counts: int) -> None:
@@ -278,15 +283,40 @@ def _import_attempts(store: Store, report: Report, work_dir: Path) -> None:
         _import(store, report, "attempts", rows, malformed=bad)
 
 
+def _mtime_iso(mtime: float) -> str:
+    return datetime.fromtimestamp(mtime, UTC).isoformat()
+
+
+def _ended_at(latest_ts: str | None, mtime: float) -> str:
+    """The latest call ts when the run has calls, else the usage file's mtime as ISO UTC."""
+    return latest_ts if latest_ts is not None else _mtime_iso(mtime)
+
+
+def _stamp_ended(store: Store, runs_dir: Path) -> int:
+    """Stamp every run with a null ended_at and a usage file. A run with no usage file may still be running: left null."""
+    mark = store.conn.dialect.placeholder
+    stamped = 0
+    with store.conn.transaction():
+        for (run_id,) in store.conn.query_all("SELECT run_id FROM runs WHERE ended_at IS NULL ORDER BY run_id"):
+            usage = runs_dir / f"{run_id}{_USAGE_SUFFIX}"
+            if usage.is_file():
+                latest = store.conn.query_one(f"SELECT MAX(ts) FROM node_calls WHERE run_id = {mark}", [run_id])[0]
+                stamped += store.finish_run(run_id, _ended_at(latest, usage.stat().st_mtime), STAMPED_STATUS)
+    return stamped
+
+
 def backfill(store: Store, runs_dir: Path | str, work_dir: Path | str, ledger_path: Path | str) -> Report:
-    """Import everything under the three paths. A second run inserts nothing: every row counts as already present."""
+    """Import everything under the three paths, then stamp ended the runs that have a usage file.
+
+    A second run inserts nothing: every row counts as already present, and no run is stamped twice.
+    """
     report = new_report()
     files = run_files(runs_dir)
     _import_records(store, report, files)
     _import_calls(store, report, files)
     _import_ledger(store, report, Path(ledger_path))
     _import_attempts(store, report, Path(work_dir))
-    return report
+    return {**report, STAMPED_KEY: _stamp_ended(store, Path(runs_dir))}
 
 
 def archive_imported(files: Sequence[Path | str], archive_dir: Path | str, report: Report) -> list[Path]:
