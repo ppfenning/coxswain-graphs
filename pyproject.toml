@@ -19,10 +19,6 @@ shell = ["agent-cartridges"]
 # The live runner. Everything else — graphs, tests, the scripted runner — works
 # without it, which is the point: CI never needs a key.
 live = ["anthropic>=0.40"]
-# The Jev decider for the system-one fast path. Optional: nothing imports it unless configured.
-system-one-jev = ["typesafe-sdk>=0.7.1"]
-# The local knn decider. Optional: nothing imports sentence-transformers unless the backend is configured.
-system-one-local = ["sentence-transformers>=3"]
 # The trace store (harness/store_traces.py) imports zstandard lazily and names this extra when it is missing.
 traces = ["zstandard>=0.23"]
 # The Postgres driver; harness/store_dialect.py imports it lazily.

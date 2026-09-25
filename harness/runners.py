@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import sys
@@ -20,36 +21,22 @@ class _Unavailable(Exception):
     """The block is valid but its backend cannot be served now. The message is the one-line reason."""
 
 
-def _jev(model: str, api_key: str, block: Mapping[str, Any]) -> DecisionRunner:
-    from runner.system_one_jev import JevDecider
-
-    return JevDecider(model, api_key)
+ENTRY_POINT_GROUP = "coxswain.system_one"
 
 
-def _knn_local(model: str, api_key: str, block: Mapping[str, Any]) -> DecisionRunner:
-    """Reads `examples` (a path), `k` (default 5), `device` (cpu or cuda) and `embedding_model` from the block."""
-    from runner.system_one_knn import DEFAULT_EMBEDDING_MODEL, load_knn_decider
+def _backend(name: str) -> Callable[[str, str, Mapping[str, Any]], DecisionRunner] | None:
+    """The decider constructor a plugin registers under `name` in the entry-point group, or None.
 
-    if not block.get("examples"):
-        raise _Unavailable("system_one.examples names no examples file for backend knn-local")
-    examples = Path(block["examples"]).expanduser()
-    if not examples.is_file():
-        raise _Unavailable(f"examples file {examples} does not exist")
-    if not examples.read_text(encoding="utf-8").strip():
-        raise _Unavailable(f"examples file {examples} is empty")
-    return load_knn_decider(
-        examples,
-        block.get("k", 5),
-        device=block.get("device", "cpu"),
-        model_name=block.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
-    )
-
-
-# Backend name to decider constructor, given the model, the api key and the whole `system_one` block.
-# A new backend is one entry here.
-_BACKENDS: dict[str, Callable[[str, str, Mapping[str, Any]], DecisionRunner]] = {"jev": _jev, "knn-local": _knn_local}
-# Backends that call a hosted API. The others run locally and need no key.
-_NEEDS_KEY = frozenset({"jev"})
+    A constructor takes the model, the api key and the whole `system_one` block. One that calls a
+    hosted API sets `needs_key = True` and is given the key from `system_one.key_env`.
+    """
+    for entry in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
+        if entry.name == name:
+            try:
+                return entry.load()
+            except ImportError as error:
+                raise _Unavailable(str(error)) from error
+    return None
 
 
 def _active_config(profile: Mapping[str, Any]) -> SystemOneConfig | None:
@@ -64,13 +51,16 @@ def _active_config(profile: Mapping[str, Any]) -> SystemOneConfig | None:
 
 
 def _decider(config: SystemOneConfig, profile: Mapping[str, Any]) -> DecisionRunner:
-    constructor = _BACKENDS.get(config.backend)
+    constructor = _backend(config.backend)
     if constructor is None:
-        raise ValueError(f"system_one.backend {config.backend!r} is unknown; known: {', '.join(sorted(_BACKENDS))}")
+        raise _Unavailable(
+            f"system_one.backend {config.backend!r} is not registered; "
+            f"install the plugin that provides it (entry-point group {ENTRY_POINT_GROUP})"
+        )
     # A hosted backend's key comes from its own `system_one.key_env`, never the provider's
     # `auth_env`: the provider's key must not be sent to a third party's API.
     api_key = ""
-    if config.backend in _NEEDS_KEY:
+    if getattr(constructor, "needs_key", False):
         env_var = profile["system_one"].get("key_env")
         if not isinstance(env_var, str) or not env_var:
             raise _Unavailable(f"system_one.key_env names no environment variable for backend {config.backend}")
