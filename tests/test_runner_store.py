@@ -64,20 +64,15 @@ def test_a_call_leaves_one_row_carrying_the_init_events_version_and_model(tmp_pa
     assert _rows(conn) == [("run-1", "p3-write", "build", 1, "2.0.31", "claude-haiku-4-5-20251001", "reason")]
 
 
-def _case(root: Path, name: str, **kwargs: Any) -> list[dict]:
-    """Run one call in its own directory and return its file ledger lines, minus the values that vary per call."""
-    out = root / name
-    out.mkdir()
-    _go(_claude(out, [INIT, RESULT], run_id=RUN, **kwargs))
-    lines = (out / "runs" / f"{RUN}.calls.jsonl").read_text().splitlines()
-    return [{k: v for k, v in json.loads(line).items() if k not in ("id", "ts", "trace")} for line in lines]
-
-
-def test_with_no_store_no_row_is_written_and_the_file_output_is_unchanged(tmp_path, conn) -> None:
-    bare = _case(tmp_path, "bare")
+def test_with_no_store_no_row_is_written_and_a_call_writes_no_calls_file(tmp_path, conn) -> None:
+    (tmp_path / "bare").mkdir()
+    (tmp_path / "stored").mkdir()
+    _go(_claude(tmp_path / "bare", [INIT, RESULT], run_id=RUN))
     assert _rows(conn) == []
-    assert _case(tmp_path, "stored", store=Store(conn)) == bare and len(bare) == 1
+    _go(_claude(tmp_path / "stored", [INIT, RESULT], run_id=RUN, store=Store(conn)))
     assert len(_rows(conn)) == 1
+    assert not list(tmp_path.rglob("*.calls.jsonl"))
+    assert list((tmp_path / "stored" / "trace").glob("build-*.jsonl")), "the per-call trace file is still written"
 
 
 def test_a_runner_error_call_still_leaves_a_row_with_ok_zero(tmp_path, conn) -> None:

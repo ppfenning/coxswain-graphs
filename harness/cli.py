@@ -34,7 +34,7 @@ from core.cartridge import CartridgeError
 from core.manifest import build_manifest, record_run
 
 from graphs._contract import ContractViolation
-from harness import CORE_SCHEMA
+from harness import CORE_SCHEMA, store_traces
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, run_checks
 from harness.digest import build_digest
@@ -47,6 +47,7 @@ from harness.runners import build_runner
 from harness.store_dialect import default_url
 from harness.store_graphs import derive_definition, register
 from harness.store_migrate import open_store
+from harness.store_read import calls as node_calls
 from harness.store_read import cost_by_model, run_summary
 from harness.store_write import Store
 from harness.worktree import apply_patch, create_worktree, keep_worktree, remove_worktree
@@ -374,6 +375,58 @@ def _finish_store_run(store: Store, run_id: str, ended_at: str, status: str) -> 
         print(f"store: could not record the end of {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
 
 
+def _trace_path(detail: Any) -> Path | None:
+    """The trace file a call's `detail_json` names, or None when it names none. Accepts the JSON text or a decoded object."""
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except json.JSONDecodeError:
+            return None
+    trace = detail.get("trace") if isinstance(detail, dict) else None
+    return Path(trace) if isinstance(trace, str) and trace else None
+
+
+def _read_events(text: str) -> list[dict[str, Any]]:
+    """The JSON-object lines of a trace file's text; a blank, malformed or non-object line is skipped."""
+    events = []
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _compact_traces(store: Store, run_id: str, runs_dir: Path) -> None:
+    """Move this run's per-call trace files into the trace store, deleting each file only after its append returns.
+
+    Warns and never raises: a failure on one file leaves that file, and a missing zstandard skips the lot.
+    """
+    try:
+        rows = node_calls(store.conn, run_id)
+    except Exception as exc:
+        print(f"traces: could not read the calls of {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
+        return
+    for row in rows:
+        call_id, ts = row["call_id"], row["ts"]
+        path = _trace_path(row["detail_json"])
+        if path is None or not path.is_file():
+            continue
+        try:
+            events = _read_events(path.read_text(encoding="utf-8"))
+            store_traces.append_call(runs_dir / "traces", str(ts)[:10], run_id, str(call_id), events)
+            path.unlink()
+        except store_traces.TracesUnavailable as exc:
+            print(f"traces: not compacted, {exc}", file=sys.stderr)
+            return
+        except Exception as exc:
+            print(f"traces: could not compact {path}: {' '.join(str(exc).split())}", file=sys.stderr)
+    with contextlib.suppress(OSError):
+        (runs_dir / f"{run_id}-trace").rmdir()  # only succeeds on an empty directory
+
+
 def _usage_line(summary: Mapping[str, Any] | None, models: Sequence[Mapping[str, Any]]) -> str | None:
     """The run's totals as one log line; None when the run recorded no calls.
 
@@ -639,6 +692,11 @@ def _main(argv: list[str] | None) -> int:
         close = getattr(runner, "close", None)
         if callable(close):
             close()
+        # Compaction only reads the store and moves files, so it never changes the exit code.
+        try:
+            _compact_traces(store, run_id, Path(args.runs_dir))
+        except Exception as exc:
+            print(f"traces: compaction failed: {' '.join(str(exc).split())}", file=sys.stderr)
         store.conn.close()
         # Cleanup runs last — quarantine, a caught exception's `return 1`, or
         # anything still raising past this point — so a run never leaves its
