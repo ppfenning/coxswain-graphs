@@ -382,10 +382,25 @@ def branch_action(reused: bool, head_moved: bool, has_own_commits: bool) -> str:
     return "block" if has_own_commits else "recreate"
 
 
-def _phase_branch_has_unlanded_commits(ctx: _Ctx, phase: str) -> bool:
-    """Patch-id semantics: a `+` line from `git cherry` is a commit not yet landed on the default branch."""
-    ok, out = _git("-C", str(ctx.repo), "cherry", ctx.default_ref, ctx.phase_branch(phase))
-    return ok and any(line.startswith("+") for line in out.splitlines())
+def _task_of(subject: str) -> str | None:
+    head, sep, task = subject.partition(": ")
+    return task if sep and head.startswith("epic ") else None
+
+
+def unlanded(cherry_lines: Sequence[str], done_tasks: set[str]) -> list[str]:
+    """Subjects of `git cherry -v` `+` lines that are neither a done task's commit nor one of our merges.
+
+    A landing can rewrite a done task's patch, so its patch-id no longer matches main's.
+    A task literally named `merge ...` reads as a merge commit.
+    """
+    subjects = [line.split(" ", 2)[2] if line.count(" ") >= 2 else "" for line in cherry_lines if line.startswith("+ ")]
+    return [s for s in subjects if (t := _task_of(s)) is None or not (t in done_tasks or t.startswith("merge "))]
+
+
+def _phase_branch_has_unlanded_commits(ctx: _Ctx, phase: str, done_tasks: set[str]) -> bool:
+    """Patch-id semantics, less commits of tasks the work store already calls done."""
+    ok, out = _git("-C", str(ctx.repo), "cherry", "-v", ctx.default_ref, ctx.phase_branch(phase))
+    return ok and bool(unlanded(out.splitlines(), done_tasks))
 
 
 def _rebase(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str]:
@@ -1210,7 +1225,8 @@ def _run_phase(
     # Decided before a single task builds: a reused branch behind its base is
     # either recreated (nothing of its own to lose) or blocked (something is).
     head_moved = reused and _parent_head_moved(ctx, phase, base_ref)
-    has_own_commits = head_moved and _phase_branch_has_unlanded_commits(ctx, phase)
+    done_tasks = {str(i["id"]) for i in items if i.get("state") == "done"}
+    has_own_commits = head_moved and _phase_branch_has_unlanded_commits(ctx, phase, done_tasks)
     action = branch_action(reused, head_moved, has_own_commits)
 
     if action == "block":
