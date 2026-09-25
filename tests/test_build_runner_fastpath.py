@@ -12,7 +12,7 @@ OFF = {"handoff": {"mode": "off", "threshold": 0.5}}
 
 
 class _Decider:
-    def __init__(self, model, key):
+    def __init__(self, model, key, block=None):
         self.model, self.key = model, key
 
 
