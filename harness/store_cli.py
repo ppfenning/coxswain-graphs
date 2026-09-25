@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from harness.cli import REPO_ROOT, _read_profile, _storage_url
+from harness.cli import _read_profile, _storage_url
 from harness.store_cli_lease import lease_acquire, lease_release, lease_renew
 from harness.store_dialect import Connection, StoreDriverMissing
 from harness.store_landed import mark_landed
@@ -66,11 +66,12 @@ def _common(parser: argparse.ArgumentParser, *, top: bool) -> None:
     def default(value: Any) -> Any:
         return value if top else argparse.SUPPRESS
 
-    parser.add_argument("--store-url", default=default(None), help="default: profile storage_url, else cox.db in the runs dir")
-    parser.add_argument("--runs-dir", default=default(REPO_ROOT / "runs"))
+    parser.add_argument("--store-url", default=default(None), help="database URL; required unless --runs-dir is given")
+    parser.add_argument("--runs-dir", default=default(None), help="directory holding cox.db; required when --store-url is not given")
     parser.add_argument(
         "--provider-profile",
-        default=default(REPO_ROOT.parent / "agent-cartridges" / "providers" / "anthropic-default.yaml"),
+        default=default(None),
+        help="optional; its storage_url is used when --store-url is not given, else cox.db in --runs-dir",
     )
 
 
@@ -145,8 +146,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args = build_parser().parse_args(sys.argv[1:] if argv is None else list(argv))
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else EXIT_BAD_INPUT
+    if not args.store_url and args.runs_dir is None:
+        return _fail("--store-url or --runs-dir is required")
     now = _now()
-    url = resolve_store_url(args.store_url, _read_profile(args.provider_profile), args.runs_dir)
+    profile = {} if args.provider_profile is None else _read_profile(args.provider_profile)
+    url = resolve_store_url(args.store_url, profile, args.runs_dir)
     try:
         conn = open_store(url, now)
     except _OPEN_ERRORS as exc:
