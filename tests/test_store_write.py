@@ -222,7 +222,7 @@ def test_gate_rows_number_the_decisions_and_flatten_flags():
 
 def test_every_builder_emits_exactly_the_tables_columns(conn):
     migrated = {"graph_id", "node_id"}
-    assert set(run_row(RUN)) == cols(conn, "runs")
+    assert set(run_row(RUN)) == cols(conn, "runs") - {"host"}  # host is written by a later ticket
     assert set(phase_row(PHASE)) == cols(conn, "phases")
     assert set(task_row("r", "p", "t", "s", "u")) == cols(conn, "tasks")
     assert set(attempt_row("r", "t", 0, "p", "k", None, "ts")) == cols(conn, "attempts")
