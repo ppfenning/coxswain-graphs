@@ -513,6 +513,32 @@ def test_a_non_path_entry_in_surfaces_is_dropped_to_lint(cart) -> None:
     assert task["lint"] == ["dropped from surfaces: widget-thing", f"dropped from surfaces: {advisory}"]
 
 
+def _decompose_for(cart, repo: str, surfaces: list[str]) -> dict:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": surfaces}],
+    }
+    return initiative_decompose.run(
+        {"run_id": "r", "date": "2026-08-30", "cartridge": cart, "idea": "x", "repo": repo},
+        ScriptedRunner({"decompose": decomposition}),
+    )
+
+
+def test_a_graphs_ticket_naming_its_own_new_files_carries_no_cross_repo_lint(cart) -> None:
+    result = _decompose_for(cart, "graphs", ["graphs/schema.py", "harness/new_module.py"])
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert "lint" not in task or not any(entry.startswith("cross_repo") for entry in task["lint"])
+
+
+def test_a_tools_ticket_naming_a_graphs_file_carries_a_cross_repo_lint_entry(cart) -> None:
+    result = _decompose_for(cart, "coxswain-tools", ["harness/cli.py"])
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert task["lint"] == [
+        "cross_repo: names harness/cli.py, which lives in graphs "
+        "(paste the code the build needs into the ticket: a build reads only its own repository)"
+    ]
+
+
 def test_a_title_carrying_a_colon_round_trips_through_yaml(cart) -> None:
     title = "Pure steward core: evidence-bar check and proposal rendering for the ceiling case"
     decomposition = {
