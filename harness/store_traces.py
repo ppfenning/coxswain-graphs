@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import sys
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from harness.trace_columns import COLUMNS, events_of, to_rows
 from harness.traces_url import TracesRoot, have_pyarrow, resolve_traces_root
@@ -185,3 +187,45 @@ def write_run(root: TracesRoot, day: str, run_id: str, calls: Mapping[str, list[
     table = _table([r for r in kept if r["call_id"] not in calls] + new)
     _put(root, path, table)
     return table.num_rows
+
+
+def parse_argv(argv: Sequence[str]) -> tuple[str, str] | None:
+    """(root, run_id) for exactly `dump <root> <run_id>`, else None."""
+    return (argv[1], argv[2]) if len(argv) == 3 and argv[0] == "dump" else None
+
+
+def dump_lines(rows: list[dict[str, Any]]) -> list[str]:
+    """One JSON object per row in call_id, seq order. Keys follow COLUMNS; `event` stays a JSON string."""
+    names = [name for name, _ in COLUMNS]
+    ordered = sorted(rows, key=lambda r: (r["call_id"], r["seq"]))
+    return [json.dumps({name: row[name] for name in names}, ensure_ascii=False) for row in ordered]
+
+
+def main(argv: Sequence[str], env: Mapping[str, str], out: TextIO, err: TextIO) -> int:
+    """Exit 0 rows printed, 2 bad arguments or no pyarrow, 3 no Parquet file, 1 unreadable. Errors never print the root."""
+    parsed = parse_argv(argv)
+    if parsed is None:
+        err.write("usage: python -m harness.store_traces dump <root> <run_id>\n")
+        return 2
+    root, run_id = parsed
+    if not have_pyarrow():
+        err.write("the traces extra is not installed\n")
+        return 2
+    try:
+        resolved = resolve_traces_root(root, Path("."), env)
+    except ValueError:
+        err.write(f"cannot resolve the traces root for run {run_id}\n")
+        return 2
+    try:
+        rows = _from_parquet(resolved, run_id)
+    except OSError:
+        err.write(f"cannot read traces for run {run_id}\n")
+        return 1
+    if rows is None:
+        return 3
+    out.write("".join(f"{line}\n" for line in dump_lines(rows)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:], os.environ, sys.stdout, sys.stderr))
