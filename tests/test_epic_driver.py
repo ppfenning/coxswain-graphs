@@ -313,6 +313,8 @@ def drive(
     keep_worktrees=False, specs=None, **extra,
 ):
     runner = runner or Runner(patches if patches is not None else {t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+    if "store" not in extra:
+        extra["store"] = Store(open_store("sqlite:///:memory:", datetime.now(UTC).isoformat()))
     result = run_epic(
         initiative=work if work is not None else initiative(),
         repo=repo,
@@ -494,10 +496,15 @@ def test_keep_worktrees_moves_the_run_dir_under_kept_run_id_instead_of_deleting_
     assert "epic-keep" not in git("worktree", "list", cwd=repo)
 
 
-def test_every_phase_records_its_own_manifest_and_ledger_rows(repo, cart, tmp_path) -> None:
-    drive(repo, cart, tmp_path)
-    written = sorted(p.name for p in (tmp_path / "runs").glob("*.json"))
-    assert written == ["epic-1:p1-foundations.json", "epic-1:p2-rollout.json"]
+def test_every_phase_records_its_own_store_rows_and_ledger_rows_but_no_manifest_file(
+    repo, cart, tmp_path, store
+) -> None:
+    drive(repo, cart, tmp_path, store=store)
+    assert list((tmp_path / "runs").glob("*.json")) == []
+    assert store.total_rows("phases") == 2
+    assert store.total_rows("gate_decisions") > 0
+    task_records = sorted(p.name for p in (tmp_path / "runs" / "epic-1" / "tasks").glob("*/*.json"))
+    assert task_records == [f"{t}.json" for t in TASK_IDS]
 
     rows = ledger.read(tmp_path / "ledger.jsonl")
     assert {row["principal"] for row in rows} == {"epic-swarm(lifecycle-propose)"}
@@ -1145,7 +1152,8 @@ def test_an_apply_arms_budgetstop_quarantines_the_task_as_infra_and_the_run_ends
 
     # The sibling task still merged into the phase stack, and the run wrote a phase record and exited normally.
     assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
-    assert (tmp_path / "runs" / "epic-1:p1-foundations.json").exists()
+    assert (tmp_path / "ledger.jsonl").exists()
+    assert not (tmp_path / "runs" / "epic-1:p1-foundations.json").exists()
 
 
 def test_a_successful_arm_call_is_unchanged(repo, cart, tmp_path) -> None:
@@ -2504,7 +2512,9 @@ def test_a_two_task_phase_leaves_one_phase_row_two_task_rows_and_its_attempt(rep
     assert tuple(attempt) == ("epic-1", "p1-foundations", 0, "unverified")
 
 
-def test_each_phase_row_carries_the_content_of_its_manifest_file(repo, cart, tmp_path, store) -> None:
+def test_each_phase_row_carries_its_manifest_record_and_no_manifest_file_is_written(
+    repo, cart, tmp_path, store
+) -> None:
     drive(repo, cart, tmp_path, work=initiative(), store=store)
 
     rows = store.conn.query_all("SELECT phase_id, record_json FROM phases")
@@ -2512,11 +2522,9 @@ def test_each_phase_row_carries_the_content_of_its_manifest_file(repo, cart, tmp
     for phase_id, record_json in rows:
         record = json.loads(record_json)
         assert record["manifest"] == f"epic-1:{phase_id}"
-        files = list((tmp_path / "runs").glob(f"*{phase_id}*"))
-        assert len(files) == 1, files
-        on_disk = json.loads(files[0].read_text())
-        assert record["manifest_record"] == on_disk
-        assert set(on_disk) == {
+        assert list((tmp_path / "runs").glob(f"*{phase_id}*.json")) == []
+        assert record["manifest_record"]["run_id"] == f"epic-1:{phase_id}"
+        assert set(record["manifest_record"]) == {
             "cartridge_sha", "cartridge_team", "gate_diffs", "human_minutes", "overlay_sha", "principal",
             "proposals", "provider_profile", "run_id", "totals", "ts",
         }
@@ -2631,4 +2639,29 @@ def test_with_no_epoch_no_fence_is_checked_even_when_a_store_is_given(repo, cart
 
 def test_an_epoch_without_a_store_is_refused_up_front(repo, cart, tmp_path) -> None:
     with pytest.raises(ValueError, match="needs a store"):
-        drive(repo, cart, tmp_path, epoch=1)
+        drive(repo, cart, tmp_path, store=None, epoch=1)
+
+
+def test_a_driver_without_a_store_is_refused_at_construction(repo, cart, tmp_path) -> None:
+    with pytest.raises(ValueError, match="the epic driver needs a store"):
+        drive(repo, cart, tmp_path, store=None)
+    assert not (tmp_path / "ledger.jsonl").exists()
+    assert not (tmp_path / "runs").exists()
+
+
+def test_a_quarantined_task_still_gets_its_attempt_in_its_frontmatter_with_no_manifest_file(
+    repo, cart, tmp_path
+) -> None:
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text("---\nid: demo-initiative\ntitle: demo\n---\n\nmake the join measurable\n")
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    runner = Runner({"t1-probe": new_file_patch("t1-probe.txt", "broken")})
+    drive(repo, cart, tmp_path, runner=runner, work=workstore.read_initiative(wi))
+
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    assert len(item["attempts"]) == 1
+    assert list((tmp_path / "runs").glob("*.json")) == []
