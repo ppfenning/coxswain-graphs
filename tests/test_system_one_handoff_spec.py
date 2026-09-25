@@ -18,10 +18,10 @@ def _answer(yes: float) -> Answer:
     return Answer("noul", "yes" if yes >= 0.5 else "no", {"yes": yes, "no": 1 - yes}, max(yes, 1 - yes))
 
 
-def test_build_returns_a_noul_with_plan_and_change_facts_verbatim():
+def test_build_returns_a_noul_with_plan_summary_and_change_facts_verbatim():
     question, state = SPEC.build({"prompt": PROMPT})
     assert isinstance(question, Noul)
-    assert state == {"plan": PLAN, "change_facts": FACTS}
+    assert state == {"plan": PLAN, "summary": "did it\nFiles: ['a.py']", "change_facts": FACTS}
 
 
 def test_criteria_ask_nothing_that_needs_arithmetic():
