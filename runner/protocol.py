@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
-from runner.decision_log import CallDecision
+from runner.decision_log import CallDecision, RouterDecision
 from runner.tier_resolution import Hints
 
 __all__ = ["BudgetStop", "Capability", "LimitStop", "NodeResult", "NodeRunner", "ProviderProfile", "RunnerError", "resolve_profile"]
@@ -155,6 +155,7 @@ class NodeRunner(Protocol):
         thread: str | None = None,
         budget_usd: float | None = None,
         task: str | None = None,
+        router_decision: RouterDecision | None = None,
     ) -> NodeResult:
         """Execute one node.
 
@@ -178,5 +179,8 @@ class NodeRunner(Protocol):
 
         `task` names the task id this call belongs to, for a runner that keeps
         a call ledger to stamp onto its own record. A runner may ignore it.
+
+        `router_decision` is the caller's shadow decision. A runner may ignore
+        it. It is not a command.
         """
         ...

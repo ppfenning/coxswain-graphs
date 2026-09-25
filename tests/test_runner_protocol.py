@@ -119,6 +119,11 @@ def test_run_takes_an_optional_tier_and_optional_hints():
     assert isinstance(Stub(), NodeRunner)
 
 
+def test_run_takes_an_optional_router_decision():
+    params = inspect.signature(NodeRunner.run).parameters
+    assert params["router_decision"].default is None
+
+
 def test_a_fresh_node_result_has_no_decision():
     assert NodeResult({"a": 1}).decision is None
 
