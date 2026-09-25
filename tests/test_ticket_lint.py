@@ -183,3 +183,63 @@ def test_problem_severity_distinguishes_refusal_from_advisory():
     assert Problem("t1", "coupling", "d", "f").severity == "refusal"
     assert Problem("t1", "grant", "d", "f").severity == "advisory"
     assert Problem("t1", "size", "d", "f").severity == "advisory"
+    assert Problem("t1", "cross_repo", "d", "f").severity == "advisory"
+
+
+_TOOLS_TREE = [{"path": "agent_tools/run_store.py", "repo": "tools"}]
+
+
+def test_a_tools_ticket_naming_a_graphs_file_gets_one_cross_repo_advisory():
+    problems = lint_tickets([_task(body="edit harness/cli.py to add the flag")], _TOOLS_TREE, [], "tools")
+    assert [(p.rule, p.severity, p.detail) for p in problems] == [
+        ("cross_repo", "advisory", "names harness/cli.py, which lives in graphs")
+    ]
+
+
+def test_a_tools_ticket_naming_its_own_package_gets_no_cross_repo_advisory():
+    assert lint_tickets([_task(body="edit agent_tools/run_store.py")], _TOOLS_TREE, [], "tools") == []
+
+
+def test_docs_and_tests_paths_never_count_as_cross_repo():
+    tasks = [_task(body="see tests/test_x.py and docs/x.md", surfaces=["tests/test_x.py", "docs/x.md"])]
+    assert lint_tickets(tasks, _TOOLS_TREE, [], "tools") == []
+
+
+def test_a_backticked_comma_terminated_token_still_names_the_other_repo():
+    problems = lint_tickets([_task(body="change `runner/protocol.py`, then stop")], _TOOLS_TREE, [], "tools")
+    assert [p.detail for p in problems] == ["names runner/protocol.py, which lives in graphs"]
+
+
+def test_a_surface_naming_another_repo_is_flagged_once():
+    problems = lint_tickets([_task(body="core/x.py", surfaces=["core/x.py"])], _TOOLS_TREE, [], "tools")
+    assert [p.detail for p in problems] == ["names core/x.py, which lives in cartridges"]
+
+
+def test_a_graphs_ticket_naming_a_new_file_under_its_own_roots_gets_no_cross_repo_advisory():
+    tree = [{"path": "graphs/delivery/ticket_lint.py", "repo": "graphs"}]
+    tasks = [_task(body="create harness/x.py and runner/y.py", surfaces=["graphs/ops/z.py"])]
+    assert lint_tickets(tasks, tree, [], "graphs") == []
+
+
+def test_the_target_repo_name_alone_marks_its_roots_as_own():
+    tasks = [_task(body="create harness/x.py; see agent_tools/a.py")]
+    assert [p.detail for p in lint_tickets(tasks, [], [], "~/repos/coxswain-graphs")] == [
+        "names agent_tools/a.py, which lives in tools"
+    ]
+
+
+def test_an_unknown_target_with_no_tree_is_silent():
+    assert lint_tickets([_task(body="edit harness/cli.py")], [], [], "") == []
+
+
+def test_a_trailing_colon_or_quote_is_stripped_from_the_named_path():
+    problems = lint_tickets([_task(body='see harness/cli.py: and "runner/protocol.py"')], _TOOLS_TREE, [], "tools")
+    assert [p.detail for p in problems] == [
+        "names harness/cli.py, which lives in graphs",
+        "names runner/protocol.py, which lives in graphs",
+    ]
+
+
+def test_a_cross_repo_root_the_tree_lists_is_the_repositorys_own():
+    tree = [{"path": "graphs/delivery/ticket_lint.py", "repo": "graphs"}]
+    assert lint_tickets([_task(body="edit graphs/delivery/ticket_lint.py")], tree, [], "graphs") == []
