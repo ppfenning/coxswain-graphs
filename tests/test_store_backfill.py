@@ -3,11 +3,15 @@
 #   store from a URL: harness.store_migrate.open_store(url, now); an absolute sqlite path is sqlite:////abs.
 #   launch record name: not fixed by the ticket; the importer takes <run>.launch.json or <run>.json, told apart by content.
 import json
+import os
 
 import pytest
 
 from harness.store_backfill import (
+    TABLES,
     ArchiveRefused,
+    _ended_at,
+    _mtime_iso,
     archive_imported,
     backfill,
     balanced,
@@ -171,9 +175,17 @@ def test_attempt_seq_counts_earlier_attempts_of_the_same_run_only():
     assert parse_attempts("t1", "nope") == ([], 1)
 
 
+def test_the_ended_at_is_the_latest_call_ts_else_the_file_mtime_in_utc():
+    assert _mtime_iso(0.0) == "1970-01-01T00:00:00+00:00"
+    assert _ended_at("2026-09-24T13:58:06+00:00", 0.0) == "2026-09-24T13:58:06+00:00"
+    assert _ended_at(None, 0.0) == "1970-01-01T00:00:00+00:00"
+
+
 def test_balanced_needs_every_table_to_add_up():
     ok = {"runs": {"seen": 3, "inserted": 1, "already_present": 1, "malformed": 1}}
     assert balanced(ok)
+    assert balanced({**ok, "runs_stamped_ended": 4})
+    assert not balanced({"runs_stamped_ended": 4})
     assert not balanced({**ok, "phases": {"seen": 2, "inserted": 1, "already_present": 0, "malformed": 0}})
     assert not balanced({})
 
@@ -190,7 +202,7 @@ def test_a_fixture_tree_imports_to_the_expected_row_counts(store, tree):
     assert counts(report, "ledger") == (3, 3, 0, 0)
     assert counts(report, "attempts") == (3, 3, 0, 0)
     assert balanced(report)
-    assert {t: store.total_rows(t) for t in report} == {
+    assert {t: store.total_rows(t) for t in TABLES} == {
         "runs": 2,
         "phases": 2,
         "gate_decisions": 4,
@@ -215,7 +227,7 @@ def test_the_launch_record_lands_on_its_run_and_a_run_with_call_lines_and_usage_
 def test_a_second_run_inserts_nothing_and_reports_every_row_as_present(store, tree):
     run(store, tree)
     again = run(store, tree)
-    assert [again[t]["inserted"] for t in again] == [0] * 6
+    assert [again[t]["inserted"] for t in TABLES] == [0] * 6
     assert counts(again, "node_calls") == (5, 0, 5, 0)
     assert counts(again, "attempts") == (3, 0, 3, 0)
     assert balanced(again)
@@ -259,6 +271,59 @@ def test_main_exits_non_zero_when_a_row_is_neither_inserted_nor_present(tree, mo
     argv = [str(tree / "runs"), str(tree / "work"), str(tree / "ledger.jsonl"), default_url(tree)]
     assert main(argv) == 1
     assert json.loads(capsys.readouterr().out)["runs"]["inserted"] == 0
+
+
+# ── stamping ended runs ──────────────────────────────────────────────────────
+
+
+def ended(store, run_id):
+    return store.conn.query_one("SELECT ended_at, status FROM runs WHERE run_id = ?", [run_id])
+
+
+def test_a_run_with_a_usage_file_and_calls_is_stamped_at_its_latest_call_ts(store, tree):
+    late = "2026-09-25T01:00:00+00:00"
+    calls = [call("a1"), call("a2", ts=late)]
+    (tree / "runs" / "run-a.calls.jsonl").write_text("\n".join(json.dumps(c) for c in calls) + "\n")
+    report = run(store, tree)
+    assert ended(store, "run-a") == (late, "backfilled")
+    assert report["runs_stamped_ended"] == 2
+    assert balanced(report)
+
+
+def test_a_run_with_a_usage_file_and_no_calls_is_stamped_at_the_file_mtime(store, tree):
+    usage = tree / "runs" / "run-c.usage.json"
+    (tree / "runs" / "run-c.json").write_text(json.dumps({**RECORD, "run_id": "run-c"}))
+    usage.write_text(json.dumps({"run_id": "run-c", "calls": []}))
+    os.utime(usage, (86400.0, 86400.0))
+    run(store, tree)
+    assert ended(store, "run-c") == ("1970-01-02T00:00:00+00:00", "backfilled")
+
+
+def test_a_run_without_a_usage_file_stays_null(store, tree):
+    (tree / "runs" / "run-b.usage.json").unlink()
+    report = run(store, tree)
+    assert ended(store, "run-b") == (None, None)
+    assert ended(store, "run-a")[1] == "backfilled"
+    assert report["runs_stamped_ended"] == 1
+
+
+def test_a_second_backfill_stamps_nothing_new(store, tree):
+    run(store, tree)
+    before = store.conn.query_all("SELECT run_id, ended_at, status FROM runs ORDER BY run_id")
+    again = run(store, tree)
+    assert again["runs_stamped_ended"] == 0
+    assert store.conn.query_all("SELECT run_id, ended_at, status FROM runs ORDER BY run_id") == before
+    assert balanced(again)
+
+
+def test_a_run_already_ended_keeps_its_own_ended_at_and_status(store, tree):
+    run(store, tree)
+    store.finish_run("run-a", "2020-01-01T00:00:00+00:00", "completed")
+    store.conn.execute("UPDATE runs SET ended_at = NULL, status = NULL WHERE run_id = 'run-b'")
+    report = run(store, tree)
+    assert ended(store, "run-a") == ("2020-01-01T00:00:00+00:00", "completed")
+    assert ended(store, "run-b")[1] == "backfilled"
+    assert report["runs_stamped_ended"] == 1
 
 
 # ── archive ──────────────────────────────────────────────────────────────────
