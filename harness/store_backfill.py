@@ -33,6 +33,11 @@ harness/resume.py, are upserted into task_records, so a rerun leaves the same ro
 caller's `task_records_updated_at` or the file's mtime. A file that is not a JSON object is skipped with
 a warning and named in `malformed_task_records`. Task_records is not in TABLES: its counts are two
 report keys, not a per-table dict, so `balanced` and `archive_imported` are unaffected.
+
+Attempts with a null cause get the rule in harness/cause_rule.py applied to kind and reason, or `unknown`
+when it matches nothing. No model is called. Only nulls are written, so a rerun fills nothing and a cause
+set by the driver or a human stays. cause_why stays null. The report gains one flat key per cause,
+`cause_filled_<cause>`, counting the rows filled; flat so `balanced` does not read them as import counts.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from harness.cause_rule import CAUSES, classify_cause
 from harness.store_migrate import open_store
 from harness.store_write import (
     _KEYS,
@@ -74,6 +80,7 @@ MALFORMED_KEY = "malformed_run_files"
 TASK_RECORDS_KEY = "task_records_imported"
 MALFORMED_TASK_RECORDS_KEY = "malformed_task_records"
 NEVER_RECORDED_STATUS = "never_recorded"
+CAUSE_FILLED_PREFIX = "cause_filled_"
 
 
 class ArchiveRefused(RuntimeError):
@@ -208,6 +215,16 @@ def parse_attempts(task_id: str, attempts: Any) -> tuple[list[Row], int]:
     built = [_attempt(task_id, attempts, i) for i in range(len(attempts))]
     rows = [row for row in built if row is not None]
     return rows, len(built) - len(rows)
+
+
+def derive_cause(kind: str | None, reason: str | None) -> str:
+    """The rule's cause for an attempt, `unknown` when no rule matches. A null kind or reason reads as empty."""
+    return classify_cause(kind or "", reason or "") or "unknown"
+
+
+def cause_report(counts: dict[str, int]) -> dict[str, int]:
+    """One `cause_filled_<cause>` key per cause, 0 for a cause nothing was filled with."""
+    return {f"{CAUSE_FILLED_PREFIX}{c}": counts.get(c, 0) for c in CAUSES}
 
 
 def parse_task_record(doc: Any) -> dict[str, Any] | None:
@@ -414,6 +431,26 @@ def _stamp_ended(store: Store, runs_dir: Path) -> int:
     return stamped
 
 
+def _fill_causes(store: Store) -> dict[str, int]:
+    """Set cause on every attempt whose cause is null, by rule. Rows filled per cause.
+
+    The `cause IS NULL` guard in the UPDATE means a cause set elsewhere is never overwritten.
+    Store.set_attempt_cause is not used: it would write cause_why and overwrite.
+    """
+    mark = store.conn.dialect.placeholder
+    update = f"UPDATE attempts SET cause = {mark} WHERE run_id = {mark} AND task_id = {mark} AND seq = {mark} AND cause IS NULL"
+    filled: dict[str, int] = {}
+    with store.conn.transaction():
+        pending = store.conn.query_all(
+            "SELECT run_id, task_id, seq, kind, reason FROM attempts WHERE cause IS NULL ORDER BY run_id, task_id, seq"
+        )
+        for run_id, task_id, seq, kind, reason in pending:
+            cause = derive_cause(kind, reason)
+            changed = store.conn.execute(update, (cause, run_id, task_id, seq))
+            filled = {**filled, cause: filled.get(cause, 0) + changed}
+    return filled
+
+
 def backfill(
     store: Store,
     runs_dir: Path | str,
@@ -435,8 +472,10 @@ def backfill(
     _import_attempts(store, report, Path(work_dir))
     task_records, bad_task_records = _import_task_records(store, Path(runs_dir), task_records_updated_at)
     stamped = _stamp_ended(store, Path(runs_dir))
+    caused = cause_report(_fill_causes(store))
     return {
         **report,
+        **caused,
         STAMPED_KEY: stamped,
         SKIPPED_KEY: len(skipped),
         MALFORMED_KEY: malformed,
