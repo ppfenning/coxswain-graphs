@@ -1,4 +1,4 @@
-"""main() leaves usage.json on disk on every exit path, not only the happy one."""
+"""main() prints the run's totals from the store on every exit path and writes no usage file."""
 
 from __future__ import annotations
 
@@ -101,15 +101,21 @@ def _patch_common(monkeypatch, args: _Args, runner) -> _FakeWorktrees:
     return fake_worktrees
 
 
-def test_a_raise_inside_the_dispatched_graph_still_leaves_usage_json(monkeypatch, tmp_path) -> None:
+_ONE_CALL = {"id": "c1", "role": "build", "model": "claude-x", "cost_usd": 1.0, "turns": 1, "ok": True}
+_ONE_CALL_LINE = "  usage   : 1 node call(s), 1 turns, $1.0 — claude-x: 1 call(s) $1.0"
+
+
+def test_a_raise_inside_the_dispatched_graph_writes_no_usage_file_and_still_prints_totals(
+    monkeypatch, tmp_path, capsys
+) -> None:
     run_id = "runX"
     runner = SimpleNamespace(calls=[])
     args = _Args(tmp_path, run_id)
     args.worktree_root = str(tmp_path)
 
     def _boom(**kwargs):
-        row = {"role": "build", "model": "claude-x", "cost_usd": 1.0, "turns": 1, "ok": True}
-        (tmp_path / f"{run_id}.calls.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        (tmp_path / f"{run_id}.calls.jsonl").write_text(json.dumps(_ONE_CALL) + "\n", encoding="utf-8")
+        kwargs["store"].record_call(_ONE_CALL, run_id=run_id, seq=1)
         raise RuntimeError("boom")
 
     _patch_common(monkeypatch, args, runner)
@@ -118,8 +124,8 @@ def test_a_raise_inside_the_dispatched_graph_still_leaves_usage_json(monkeypatch
     with pytest.raises(RuntimeError):
         cli.main([])
 
-    written = json.loads((tmp_path / f"{run_id}.usage.json").read_text(encoding="utf-8"))
-    assert written["summary"]["calls"] == 1
+    assert not (tmp_path / f"{run_id}.usage.json").exists()
+    assert _ONE_CALL_LINE in capsys.readouterr().out
 
 
 def test_node_cap_usd_threads_from_the_flag_to_the_constructed_runner(monkeypatch, tmp_path) -> None:
@@ -135,30 +141,39 @@ def test_node_cap_usd_threads_from_the_flag_to_the_constructed_runner(monkeypatc
     assert runner.node_cap_usd == 1.5
 
 
-def test_close_runs_after_record_usage_so_a_clearing_close_still_leaves_full_usage(monkeypatch, tmp_path) -> None:
+def test_close_runs_after_the_totals_print_and_no_usage_file_is_written(monkeypatch, tmp_path, capsys) -> None:
     run_id = "runY"
+    order: list[str] = []
 
     class _Runner:
         def __init__(self) -> None:
-            self.calls = [{"role": "build", "model": "claude-x", "cost_usd": 1.0, "turns": 1, "ok": True}]
+            self.calls = [_ONE_CALL]
             self.closed = False
 
         def close(self) -> None:
+            order.append("close")
             self.closed = True
             self.calls = []
+
+    def _graph(**kwargs):
+        kwargs["store"].record_call(_ONE_CALL, run_id=run_id, seq=1)
+        return 0
 
     runner = _Runner()
     args = _Args(tmp_path, run_id)
     args.worktree_root = str(tmp_path)
     _patch_common(monkeypatch, args, runner)
-    monkeypatch.setattr(cli, "_run_graph", lambda **k: 0)
+    monkeypatch.setattr(cli, "_run_graph", _graph)
+    real_usage_line = cli._usage_line
+    monkeypatch.setattr(cli, "_usage_line", lambda s, m: order.append("usage") or real_usage_line(s, m))
 
     result = cli.main([])
 
     assert result == 0
     assert runner.closed is True
-    written = json.loads((tmp_path / f"{run_id}.usage.json").read_text(encoding="utf-8"))
-    assert written["summary"]["calls"] == 1
+    assert order == ["usage", "close"]
+    assert not (tmp_path / f"{run_id}.usage.json").exists()
+    assert _ONE_CALL_LINE in capsys.readouterr().out
 
 
 def test_keep_worktrees_flag_defaults_to_off_and_is_settable() -> None:
@@ -432,7 +447,16 @@ class _StoreRunner(ScriptedRunner):
 
     def run(self, **kwargs):
         result = super().run(**kwargs)
-        call = {"id": f"call-{len(self.calls)}", "role": kwargs["role"], "ok": True}
+        call = {
+            "id": f"call-{len(self.calls)}",
+            "role": kwargs["role"],
+            "model": "claude-x",
+            "cost_usd": 0.25,
+            "turns": 2,
+            "input_total": 10,
+            "cache_read_tokens": 5,
+            "ok": True,
+        }
         self.store.record_call(call, run_id=self.run_id, seq=len(self.calls))
         return result
 
@@ -492,6 +516,125 @@ def test_a_run_leaves_a_runs_row_joined_to_its_graph_and_a_node_call_per_scripte
         ("runS", "review"),
     ]
     assert _rows(db, "SELECT ended_at IS NOT NULL FROM runs") == [(1,)]
+
+
+_THREE_CALLS_LINE = (
+    "  usage   : 3 node call(s), 6 turns, $0.75 — claude-x: 3 call(s) $0.75, 50% of input was cache reads"
+)
+
+
+def test_a_scripted_run_writes_no_usage_file_and_prints_totals_equal_to_the_sum_of_its_calls(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    _store_run(monkeypatch, tmp_path, graph=_three_calls)
+
+    assert cli.main([]) == 0
+
+    assert list(tmp_path.glob("*.usage.json")) == []
+    assert _rows(tmp_path / "cox.db", "SELECT COUNT(*), SUM(cost_usd), SUM(turns) FROM node_calls") == [(3, 0.75, 6)]
+    assert _THREE_CALLS_LINE in capsys.readouterr().out.splitlines()
+
+
+def test_a_budget_stop_return_still_prints_the_totals(monkeypatch, tmp_path, capsys) -> None:
+    def stop_after_three(runner) -> int:
+        _three_calls(runner)
+        return 1
+
+    _store_run(monkeypatch, tmp_path, graph=stop_after_three)
+
+    assert cli.main([]) == 1
+
+    assert list(tmp_path.glob("*.usage.json")) == []
+    assert _THREE_CALLS_LINE in capsys.readouterr().out.splitlines()
+
+
+def test_usage_line_is_one_literal_string_one_entry_per_alias_and_none_for_a_run_with_no_calls() -> None:
+    summary = {"calls": 3, "turns": 5, "cost_usd": 0.6000000000000001, "input_total": 30, "cache_read_tokens": 10}
+    models = [
+        {"model_alias": "a", "tier": "light", "calls": 1, "cost_usd": 0.1},
+        {"model_alias": "a", "tier": "heavy", "calls": 1, "cost_usd": 0.3},
+        {"model_alias": "b", "tier": "light", "calls": 1, "cost_usd": 0.2},
+    ]
+    assert cli._usage_line(summary, models) == (
+        "  usage   : 3 node call(s), 5 turns, $0.6 — a: 2 call(s) $0.4, b: 1 call(s) $0.2, 33% of input was cache reads"
+    )
+    assert cli._usage_line({**summary, "input_total": 0, "cache_read_tokens": 0}, models).endswith("$0.2")
+    assert cli._usage_line({**summary, "calls": 0}, []) is None
+    assert cli._usage_line(None, []) is None
+
+
+def test_undercount_note_names_the_gap_only_when_the_runner_made_more_calls_than_the_store_holds() -> None:
+    assert cli._undercount_note("r", 1, 2) == "store: holds 1 of the 2 call(s) r made; the usage totals undercount"
+    assert cli._undercount_note("r", 2, 2) is None
+    assert cli._undercount_note("r", 3, 2) is None
+
+
+def test_a_call_the_store_never_got_is_warned_about_beside_the_totals(monkeypatch, tmp_path, capsys) -> None:
+    run_id = "runU"
+    runner = SimpleNamespace(calls=[_ONE_CALL, {**_ONE_CALL, "id": "c2"}])
+    args = _Args(tmp_path, run_id)
+    args.worktree_root = str(tmp_path)
+    _patch_common(monkeypatch, args, runner)
+
+    def _graph(**kwargs):
+        kwargs["store"].record_call(_ONE_CALL, run_id=run_id, seq=1)
+        return 0
+
+    monkeypatch.setattr(cli, "_run_graph", _graph)
+
+    assert cli.main([]) == 0
+
+    out, err = capsys.readouterr()
+    assert _ONE_CALL_LINE in out
+    assert "store: holds 1 of the 2 call(s) runU made; the usage totals undercount" in err
+
+
+@pytest.mark.parametrize("outcome", ["returns", "raises"])
+def test_a_store_read_that_fails_warns_and_keeps_the_exit_close_conn_close_and_cleanup(
+    monkeypatch, tmp_path, capsys, outcome
+) -> None:
+    run_id = "runF"
+    worktree = tmp_path / run_id
+    seen: dict[str, object] = {}
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    runner = _Runner()
+    args = _Args(tmp_path, run_id)
+    args.worktree_root = str(tmp_path)
+    fake = _patch_common(monkeypatch, args, runner)
+
+    def _graph(**kwargs):
+        seen["store"] = kwargs["store"]
+        fake.register(worktree)
+        if outcome == "raises":
+            raise RuntimeError("the graph's own error")
+        return 3
+
+    def _locked(conn, run_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cli, "_run_graph", _graph)
+    monkeypatch.setattr(cli, "run_summary", _locked)
+
+    if outcome == "raises":
+        with pytest.raises(RuntimeError, match="the graph's own error"):
+            cli.main([])
+    else:
+        assert cli.main([]) == 3
+
+    assert runner.closed is True
+    with pytest.raises(sqlite3.ProgrammingError):
+        seen["store"].conn.raw.execute("SELECT 1")
+    assert not worktree.exists()
+    assert fake.remove_calls == [(worktree, worktree)]
+    assert "store: could not read the usage of runF: database is locked" in capsys.readouterr().err
 
 
 def test_a_failed_return_and_a_raise_each_stamp_the_run_ended(monkeypatch, tmp_path) -> None:
