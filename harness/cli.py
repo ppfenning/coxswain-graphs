@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -339,7 +340,12 @@ def _register_graph(conn: Any, specs: Mapping[str, GraphSpec], graph: str, now: 
 
 
 def _begin_store_run(
-    args: argparse.Namespace, specs: Mapping[str, GraphSpec], cartridge: Mapping[str, Any], run_id: str, now: str
+    args: argparse.Namespace,
+    specs: Mapping[str, GraphSpec],
+    cartridge: Mapping[str, Any],
+    run_id: str,
+    now: str,
+    host: str,
 ) -> Store | None:
     """Open the run-record store, register the graph and write the run row; None (after one line) if any of it fails."""
     url = _storage_url(_read_profile(args.provider_profile), args.runs_dir)
@@ -367,7 +373,7 @@ def _begin_store_run(
             "graph_id": graph_id,
         }
         store = Store(conn)
-        store.record_run(record, launch)
+        store.record_run(record, launch, host=host)
     except Exception as exc:
         if conn is not None:
             conn.close()
@@ -692,7 +698,8 @@ def _main(argv: list[str] | None) -> int:
     # The run's record is opened before any runner exists: a run whose record
     # cannot be kept must not start. `now` is read here, at the edge, and handed down.
     started_at = datetime.now(UTC).isoformat()
-    store = _begin_store_run(args, specs, cartridge, run_id, started_at)
+    host = socket.gethostname()
+    store = _begin_store_run(args, specs, cartridge, run_id, started_at, host)
     if store is None:
         return 1
 

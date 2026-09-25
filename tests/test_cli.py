@@ -670,6 +670,33 @@ def test_a_failed_return_and_a_raise_each_stamp_the_run_ended(monkeypatch, tmp_p
     assert _rows(other / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("error", 1)]
 
 
+def test_the_runs_row_carries_the_hostname_taken_once_at_run_start(monkeypatch, tmp_path) -> None:
+    taken: list[str] = []
+
+    def _hostname() -> str:
+        taken.append("stub-host-1")
+        return "stub-host-1"
+
+    monkeypatch.setattr(cli.socket, "gethostname", _hostname)
+    _store_run(monkeypatch, tmp_path, graph=_three_calls)
+
+    assert cli.main([]) == 0
+
+    assert _rows(tmp_path / "cox.db", "SELECT host FROM runs WHERE run_id = 'runS'") == [("stub-host-1",)]
+    assert taken == ["stub-host-1"]
+
+
+def test_the_runs_row_host_is_not_taken_from_the_launch_record(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AGENT_GRAPHS_LAUNCHED_BY", "launch-host")
+    monkeypatch.setattr(cli.socket, "gethostname", lambda: "stub-host-2")
+    _store_run(monkeypatch, tmp_path)
+
+    assert cli.main([]) == 0
+
+    sql = "SELECT host, launched_by FROM runs WHERE run_id = 'runS'"
+    assert _rows(tmp_path / "cox.db", sql) == [("stub-host-2", "launch-host")]
+
+
 @pytest.mark.parametrize("bad_url", ["sqlite:///{tmp}/no/such/dir/x.db", "mysql://user@host/db"])
 def test_an_unopenable_store_url_exits_nonzero_before_any_node_runs(monkeypatch, tmp_path, capsys, bad_url) -> None:
     launched: list[int] = []
