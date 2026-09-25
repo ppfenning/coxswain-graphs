@@ -15,7 +15,12 @@ record (`launched_by` and `at`, no run_id) named `<run>.launched.json`, `<run>.l
 `attempts` list of each task file. Task files are read with `core.workstore.read_item`, the loader
 the driver uses. A launch record is folded into its run row and is not a table of its own.
 An epic run has only phase records. A launch with no run record builds its run row from the launch
-and the run's earliest phase record, or from the launch alone when there is none.
+and the run's earliest phase record. A launch with no run record, phase record, call lines or usage
+file builds its run row from the launch alone, with status `never_recorded`: the run died before it
+recorded anything. Such runs were already imported before that status existed; a rerun labels them.
+Ceiling, policy, chair and leader files and dot-files are not records. They are skipped and counted
+in `skipped_files`. Each malformed runs-directory file is named, with its reason, in
+`malformed_run_files`.
 A usage file is imported only for a run with no call lines. A call with no id gets the id
 `legacy:<run>:<seq>`, seq being its 0-based position in its file, so a rerun inserts nothing new.
 
@@ -54,9 +59,12 @@ TABLES = ("runs", "phases", "gate_decisions", "node_calls", "ledger", "attempts"
 _COUNTS = ("seen", "inserted", "already_present", "malformed")
 _USAGE_SUFFIX = ".usage.json"
 
-Report = dict[str, dict[str, int] | int]
+Report = dict[str, dict[str, int] | int | list[str]]
 STAMPED_KEY = "runs_stamped_ended"
 STAMPED_STATUS = "backfilled"
+SKIPPED_KEY = "skipped_files"
+MALFORMED_KEY = "malformed_run_files"
+NEVER_RECORDED_STATUS = "never_recorded"
 
 
 class ArchiveRefused(RuntimeError):
@@ -88,6 +96,27 @@ def _record(doc: Any) -> dict[str, Any] | None:
     diffs = doc.get("gate_diffs")
     good_diffs = diffs is None or (isinstance(diffs, list) and all(isinstance(d, dict) for d in diffs))
     return doc if isinstance(doc.get("run_id"), str) and doc["run_id"] and good_diffs else None
+
+
+def malformed_reason(doc: Any) -> str:
+    """Why a runs-directory document that is neither launch, run nor phase record was refused."""
+    if doc is None:
+        return "not readable JSON"
+    if not isinstance(doc, dict):
+        return "not a JSON object"
+    if not (isinstance(doc.get("run_id"), str) and doc["run_id"]):
+        return "no run_id"
+    return "gate_diffs is not a list of objects" if _record(doc) is None else "unrecognised record"
+
+
+def is_non_record(name: str) -> bool:
+    """Ceilings, policies, chair, leader and dot-files: never a run record."""
+    return (
+        name.startswith(".")
+        or name.endswith(".ceiling.json")
+        or (name.startswith("policy.") and name.endswith(".json"))
+        or name in ("chair.json", "leader.json")
+    )
 
 
 def is_launch(doc: Any) -> bool:
@@ -153,8 +182,9 @@ def _attempt(task_id: str, attempts: Sequence[Any], index: int) -> Row | None:
     if not isinstance(entry, dict):
         return None
     run, phase, kind, ts = (_text(entry.get(k)) for k in ("run", "phase", "kind", "ts"))
-    if not (run and phase and kind and ts):
+    if not (run and phase and ts):
         return None
+    kind = kind or "unknown"  # the older attempt format carries no kind
     # seq counts the earlier attempts of the same run, as the driver's _next_attempt_seq does.
     seq = sum(1 for e in attempts[:index] if isinstance(e, dict) and e.get("run") == entry["run"])
     return attempt_row(run, task_id, seq, phase, kind, entry.get("reason"), ts)
@@ -181,7 +211,7 @@ def new_report() -> Report:
 def balanced(report: Report) -> bool:
     """True when every table has seen minus malformed equal to inserted plus already present. An empty report is not.
 
-    Only the per-table dicts are import counts. `runs_stamped_ended` is a plain int and is not checked here.
+    Only the per-table dicts are import counts. `runs_stamped_ended`, `skipped_files` and `malformed_run_files` are not.
     """
     tables = [t for t in report.values() if isinstance(t, dict)]
     return bool(tables) and all(t["seen"] - t["malformed"] == t["inserted"] + t["already_present"] for t in tables)
@@ -241,15 +271,26 @@ def run_files(runs_dir: Path | str) -> list[Path]:
     return sorted(p for p in Path(runs_dir).iterdir() if p.is_file() and p.name.endswith((".json", ".jsonl")))
 
 
-def _import_records(store: Store, report: Report, files: Sequence[Path]) -> None:
-    docs = {p: _load(p) for p in files if p.name.endswith(".json") and not p.name.endswith(".usage.json")}
+def _label_never_recorded(store: Store, run_id: str) -> None:
+    """Label a launch-only run imported by an earlier backfill with a null status."""
+    mark = store.conn.dialect.placeholder
+    sql = f"UPDATE runs SET status = {mark} WHERE run_id = {mark} AND status IS NULL AND ended_at IS NULL"
+    store.conn.execute(sql, (NEVER_RECORDED_STATUS, run_id))
+
+
+def _import_records(store: Store, report: Report, files: Sequence[Path]) -> list[str]:
+    """Import run, phase and launch records. Returns `<file>: <reason>` for each malformed file."""
+    docs = {p: _load(p) for p in files if p.name.endswith(".json") and not p.name.endswith(_USAGE_SUFFIX)}
+    # A run that left call lines or a usage file recorded something, so it is not never_recorded.
+    recorded = {_cut(p.name, s) for p in files for s in (".calls.jsonl", _USAGE_SUFFIX) if p.name.endswith(s)}
+    malformed: list[str] = []
     launches = {_launch_key(p.name): d for p, d in docs.items() if is_launch(d)}
     phases: dict[str, list[Any]] = {}
     for doc in docs.values():
         if parse_phase(doc) is not None:
             phases.setdefault(split_phase_id(doc["run_id"])[0], []).append(doc)
     used: set[str] = set()
-    for doc in (d for d in docs.values() if not is_launch(d)):
+    for path, doc in ((p, d) for p, d in docs.items() if not is_launch(d)):
         run = parse_run(doc, launches.get(doc.get("run_id") if isinstance(doc, dict) else None))
         phase = None if run is not None else parse_phase(doc)
         if run is not None:
@@ -260,11 +301,17 @@ def _import_records(store: Store, report: Report, files: Sequence[Path]) -> None
             _import(store, report, "phases", [phase[0]])
             _import(store, report, "gate_decisions", phase[1])
         else:
+            malformed.append(f"{path.name}: {malformed_reason(doc)}")
             _import(store, report, "runs", [], malformed=1)
-    for run_id, launch in sorted(launches.items()):
-        if run_id not in used:
-            record = synth_run_record(run_id, phases.get(run_id, []))
-            _import(store, report, "runs", [run_row(record, launch)])
+    for run_id, launch in sorted((r, d) for r, d in launches.items() if r not in used):
+        if phases.get(run_id) or run_id in recorded:
+            _import(store, report, "runs", [run_row(synth_run_record(run_id, phases.get(run_id, [])), launch)])
+        else:
+            launch_only = {"launched_by": launch.get("launched_by"), "at": launch.get("at"), "graph_id": None}
+            row = {**run_row({"run_id": run_id}, launch_only), "status": NEVER_RECORDED_STATUS}
+            _import(store, report, "runs", [row])
+            _label_never_recorded(store, run_id)
+    return malformed
 
 
 def _import_calls(store: Store, report: Report, files: Sequence[Path]) -> None:
@@ -334,12 +381,14 @@ def backfill(store: Store, runs_dir: Path | str, work_dir: Path | str, ledger_pa
     A second run inserts nothing: every row counts as already present, and no run is stamped twice.
     """
     report = new_report()
-    files = run_files(runs_dir)
-    _import_records(store, report, files)
+    skipped = [p for p in run_files(runs_dir) if is_non_record(p.name)]
+    files = [p for p in run_files(runs_dir) if not is_non_record(p.name)]
+    malformed = _import_records(store, report, files)
     _import_calls(store, report, files)
     _import_ledger(store, report, Path(ledger_path))
     _import_attempts(store, report, Path(work_dir))
-    return {**report, STAMPED_KEY: _stamp_ended(store, Path(runs_dir))}
+    stamped = _stamp_ended(store, Path(runs_dir))
+    return {**report, STAMPED_KEY: stamped, SKIPPED_KEY: len(skipped), MALFORMED_KEY: malformed}
 
 
 def archive_imported(files: Sequence[Path | str], archive_dir: Path | str, report: Report) -> list[Path]:
