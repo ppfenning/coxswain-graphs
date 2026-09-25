@@ -81,6 +81,8 @@ from graphs._contract import (
     review_tier,
 )
 from graphs.delivery.phase_validate import _PLACEHOLDER_MARKERS
+from runner.decision_log import RouterDecision
+from runner.decision_source import DecisionSource, ask
 from runner.protocol import BudgetStop, NodeResult, NodeRunner, RunnerError
 from runner.system_one import Answer
 from runner.tier_resolution import TIERS, Hints, rank
@@ -707,6 +709,51 @@ class _Elevated:
             thread=thread,
             budget_usd=budget_usd,
             task=task,
+        )
+
+
+class _Asking:
+    """A runner whose every call carries the source's decision for its role and hints.
+
+    The decision is a shadow value: `tier` and every other argument pass through
+    untouched. A None decision is left off the call, so a runner written before
+    `router_decision` existed still accepts it.
+    """
+
+    def __init__(self, inner: NodeRunner, source: DecisionSource) -> None:
+        self._inner = inner
+        self._source = source
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def run(
+        self,
+        *,
+        role: str,
+        tier: str | None = None,
+        hints: Hints | None = None,
+        schema: Mapping[str, Any],
+        prompt: str,
+        context: Sequence[str] = (),
+        thread: str | None = None,
+        budget_usd: float | None = None,
+        task: str | None = None,
+        router_decision: RouterDecision | None = None,
+    ) -> NodeResult:
+        decision = ask(self._source, role, hints)
+        extra = {"router_decision": decision} if decision is not None else {}
+        return self._inner.run(
+            role=role,
+            tier=tier,
+            hints=hints,
+            schema=schema,
+            prompt=prompt,
+            context=context,
+            thread=thread,
+            budget_usd=budget_usd,
+            task=task,
+            **extra,
         )
 
 
@@ -1510,10 +1557,17 @@ def _infra_result(
     }
 
 
-def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
-    """Run the graph. Every input arrives as an argument — no clock, no disk."""
+def run(
+    args: Mapping[str, Any], runner: NodeRunner, decision_source: DecisionSource | None = None
+) -> dict[str, Any]:
+    """Run the graph. Every input arrives as an argument — no clock, no disk.
+
+    `decision_source`, when given, is asked at every runner call. Without one
+    no call carries a router decision.
+    """
     ticket_tiers = dict(args.get("tier") or {})
-    return _run(args, _Elevated(runner, ticket_tiers) if ticket_tiers else runner, ticket_tiers)
+    asking = runner if decision_source is None else _Asking(runner, decision_source)
+    return _run(args, _Elevated(asking, ticket_tiers) if ticket_tiers else asking, ticket_tiers)
 
 
 def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str, str]) -> dict[str, Any]:
