@@ -12,10 +12,14 @@ driver, running the lifecycle graph once per ready task, concurrently.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
+import signal
 import sys
+import threading
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -446,7 +450,65 @@ def _lifecycle_worktree(args: argparse.Namespace, cartridge: Mapping[str, Any], 
     return Path(str(root)).expanduser() / run_id
 
 
+def _child_pids(tasks: Path = Path("/proc/self/task")) -> list[int]:
+    """This process's direct children, from every thread's Linux `children` file; empty where /proc has none."""
+
+    def read(path: Path) -> str:
+        try:
+            return path.read_text(encoding="ascii")
+        except OSError:
+            return ""
+
+    return sorted({int(pid) for path in tasks.glob("*/children") for pid in read(path).split()})
+
+
+def _terminate_children() -> None:
+    for pid in _child_pids():
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+
+
+def _workers_alive() -> bool:
+    return any(t.is_alive() and not t.daemon for t in threading.enumerate() if t is not threading.main_thread())
+
+
+def _exit_on_sigterm(signum: int, frame: object) -> None:
+    """Ignore further SIGTERMs, stop in-flight nodes, and exit 143 (128 + SIGTERM) through `_main`'s `finally`."""
+    # Ignored first, so a supervisor's repeat SIGTERM cannot cut the `finally` that stamps `ended_at`.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    # Fan-out nodes run `subprocess.run` in worker threads, which never see this exception,
+    # so their children are stopped here rather than by `subprocess.run`'s own cleanup.
+    _terminate_children()
+    raise SystemExit(143)
+
+
+def _stop_children_until_quiet(deadline_s: float = 30.0, poll_s: float = 0.1) -> None:
+    """Keep stopping children until no worker thread is left, so a node retry cannot outlive the run."""
+    end = time.monotonic() + deadline_s
+    while _workers_alive() and time.monotonic() < end:
+        _terminate_children()
+        time.sleep(poll_s)
+
+
 def main(argv: list[str] | None = None) -> int:
+    # Python's default SIGTERM action is to die without running any `finally`,
+    # which would leave the run's `ended_at` unset. Only the main thread may
+    # install a handler; the previous one is put back on every way out.
+    if threading.current_thread() is not threading.main_thread():
+        return _main(argv)
+    previous = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    try:
+        return _main(argv)
+    except SystemExit as exc:
+        # `ended_at` is already stamped; interpreter exit would otherwise wait on fan-out workers.
+        if exc.code == 143:
+            _stop_children_until_quiet()
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _main(argv: list[str] | None) -> int:
     specs = discover()
     parser = _build_parser(specs)
     args = parser.parse_args(argv)
