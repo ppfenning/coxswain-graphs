@@ -13,6 +13,7 @@ from typing import Any
 from runner import ScriptedRunner
 from runner.system_one import ConfigError, DecisionRunner, FastPathRunner, SystemOneConfig, parse_system_one_block
 from runner.system_one_specs import role_specs
+from runner.system_one_tier import TierDecider
 
 __all__ = ["RUNNER_ENTRY_POINT_GROUP", "build_runner"]
 
@@ -24,12 +25,25 @@ class _Unavailable(Exception):
 ENTRY_POINT_GROUP = "coxswain.system_one"
 
 
-def _backend(name: str) -> Callable[[str, str, Mapping[str, Any]], DecisionRunner] | None:
-    """The decider constructor a plugin registers under `name` in the entry-point group, or None.
+def _model_tier(model: str, api_key: str, block: Mapping[str, Any], *, runner: Any) -> DecisionRunner:
+    """Ask the live runner's own tier. `model` is only the label the decision log records."""
+    return TierDecider(runner, block.get("tier", "cheap"))
+
+
+_model_tier.wants_runner = True  # type: ignore[attr-defined]
+
+_BUILTIN_BACKENDS: Mapping[str, Callable[..., DecisionRunner]] = {"model-tier": _model_tier}
+
+
+def _backend(name: str) -> Callable[..., DecisionRunner] | None:
+    """The decider constructor for `name`: a built-in, else one a plugin registers in the entry-point group, or None.
 
     A constructor takes the model, the api key and the whole `system_one` block. One that calls a
-    hosted API sets `needs_key = True` and is given the key from `system_one.key_env`.
+    hosted API sets `needs_key = True` and is given the key from `system_one.key_env`. One that
+    sets `wants_runner = True` is also given the live runner as `runner=`.
     """
+    if name in _BUILTIN_BACKENDS:
+        return _BUILTIN_BACKENDS[name]
     for entry in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
         if entry.name == name:
             try:
@@ -50,7 +64,7 @@ def _active_config(profile: Mapping[str, Any]) -> SystemOneConfig | None:
     return None if all(s.mode == "off" for s in config.roles.values()) else config
 
 
-def _decider(config: SystemOneConfig, profile: Mapping[str, Any]) -> DecisionRunner:
+def _decider(config: SystemOneConfig, profile: Mapping[str, Any], real: Any) -> DecisionRunner:
     constructor = _backend(config.backend)
     if constructor is None:
         raise _Unavailable(
@@ -67,8 +81,9 @@ def _decider(config: SystemOneConfig, profile: Mapping[str, Any]) -> DecisionRun
         api_key = os.environ.get(env_var, "")
         if not api_key:
             raise _Unavailable(f"${env_var} (system_one.key_env) is not set")
+    extra = {"runner": real} if getattr(constructor, "wants_runner", False) else {}
     try:
-        return constructor(config.model, api_key, profile["system_one"])
+        return constructor(config.model, api_key, profile["system_one"], **extra)
     except ImportError as error:
         raise _Unavailable(str(error)) from error
 
@@ -109,7 +124,7 @@ def _with_fast_path(real: Any, profile: Mapping[str, Any], notes: Callable[[str]
     if config is None:
         return real
     try:
-        decider = _decider(config, profile)
+        decider = _decider(config, profile, real)
     except _Unavailable as unavailable:
         notes(f"system-one: off ({unavailable})")
         return real

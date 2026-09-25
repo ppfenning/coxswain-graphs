@@ -30,11 +30,12 @@ def _between(text: str, start: str, end: str) -> str:
 
 
 def _handoff_build(request: Mapping[str, Any]) -> tuple[Noul, Mapping[str, str]]:
-    """The handoff request carries plan and facts only inside `prompt`; slice them out unchanged."""
+    """The handoff request carries plan, summary and facts only inside `prompt`; slice them out unchanged."""
     prompt = str(request["prompt"])
     plan = _between(prompt, "\nPlan: ", "\nSummary: ")
+    summary = _between(prompt, "\nSummary: ", "\nChange facts: ")
     facts = _between(prompt, "\nChange facts: ", "\nThe facts listed under Change facts")
-    return Noul(_HANDOFF_CRITERIA), {"plan": plan, "change_facts": facts}
+    return Noul(_HANDOFF_CRITERIA), {"plan": plan, "summary": summary, "change_facts": facts}
 
 
 def _handoff_render(answer: Answer) -> Mapping[str, Any]:
