@@ -42,8 +42,8 @@ def test_task_records_has_the_listed_columns_and_composite_key():
         c.close()
 
 
-def test_a_fresh_store_reaches_version_four(store_conn):
-    assert check_version(store_conn) == (4, 4)
+def test_a_fresh_store_reaches_the_newest_version(store_conn):
+    assert check_version(store_conn) == (5, 5)
     assert store_conn.query_all("SELECT run_id FROM task_records") == []
 
 
@@ -61,7 +61,7 @@ def test_a_database_at_version_three_applies_only_0004():
     try:
         assert migrate(c, NOW1, default_modules()[:3]) == 3
         c.execute("INSERT INTO runs (run_id) VALUES ('r1')")
-        assert migrate(c, NOW2, default_modules()) == 4
+        assert migrate(c, NOW2, default_modules()[:4]) == 4
         assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[3:] == [(4, NOW2)]
         assert c.query_all("SELECT run_id FROM runs") == [("r1",)]
         assert c.query_all("SELECT COUNT(*) FROM task_records") == [(0,)]
@@ -73,8 +73,8 @@ def test_applying_again_is_a_no_op():
     c = open_store("sqlite:///:memory:", NOW1)
     try:
         insert(c, "t1", {"n": 1})
-        assert migrate(c, NOW2, default_modules()) == 4
-        assert c.query_all("SELECT version FROM schema_version ORDER BY version") == [(1,), (2,), (3,), (4,)]
+        assert migrate(c, NOW2, default_modules()) == 5
+        assert c.query_all("SELECT version FROM schema_version ORDER BY version") == [(1,), (2,), (3,), (4,), (5,)]
         assert c.query_all("SELECT COUNT(*) FROM task_records") == [(1,)]
     finally:
         c.close()

@@ -36,8 +36,8 @@ def conn():
 
 
 def test_an_empty_database_reaches_the_newest_version(conn):
-    assert check_version(conn) == (4, 4)
-    assert conn.query_one("SELECT MAX(version) FROM schema_version") == (4,)
+    assert check_version(conn) == (5, 5)
+    assert conn.query_one("SELECT MAX(version) FROM schema_version") == (5,)
 
 
 @pytest.mark.parametrize("table", sorted(COLUMNS))
