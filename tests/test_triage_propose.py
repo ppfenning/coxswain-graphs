@@ -7,6 +7,7 @@ import pytest
 from graphs._contract import ContractViolation
 from graphs.ops import triage_propose
 from runner import ScriptedRunner
+from runner.decision_log import RouterDecision
 from runner.tier_resolution import Hints
 
 CLASSIFY = {"symptom_key": "late_landing", "runbook_entry": "rb-01", "confidence": "high"}
@@ -99,3 +100,50 @@ def test_writes_nothing_anywhere(cartridge, tmp_path) -> None:
     before = set(tmp_path.rglob("*"))
     triage_propose.run(args(cartridge), runner())
     assert set(tmp_path.rglob("*")) == before
+
+
+DECISION = RouterDecision(
+    chosen_class="fast", model="m", effort="low", budget_usd=0.5, reasons=("cheap role",), clipped_by=()
+)
+
+
+class DecidedRunner(ScriptedRunner):
+    """A `ScriptedRunner` that accepts `router_decision` and records it, None when the caller passed none."""
+
+    def run(self, *, router_decision=None, **kwargs):
+        try:
+            return super().run(**kwargs)
+        finally:
+            self.calls[-1] = {**self.calls[-1], "router_decision": router_decision}
+
+
+def decided_runner() -> DecidedRunner:
+    return DecidedRunner({"triage_classify": CLASSIFY, "evidence_verify": VERIFY_ACTIONABLE})
+
+
+def test_every_call_receives_the_decision_the_source_gives_for_its_role_and_hints(cartridge) -> None:
+    asked = []
+
+    def source(role, hints):
+        asked.append((role, hints))
+        return DECISION
+
+    scripted = decided_runner()
+    triage_propose.run(args(cartridge, alerts=alerts(1), decision_source=source), scripted)
+    assert [c["router_decision"] for c in scripted.calls] == [DECISION, DECISION]
+    assert asked == [("triage_classify", Hints(judgment="low")), ("evidence_verify", Hints(judgment="high"))]
+
+
+def test_the_default_source_passes_no_decision(cartridge) -> None:
+    scripted = decided_runner()
+    triage_propose.run(args(cartridge, alerts=alerts(1)), scripted)
+    assert [c["router_decision"] for c in scripted.calls] == [None, None]
+
+
+def test_a_source_that_raises_does_not_fail_the_node(cartridge) -> None:
+    def source(role, hints):
+        raise RuntimeError("router down")
+
+    scripted = decided_runner()
+    triage_propose.run(args(cartridge, alerts=alerts(1), decision_source=source), scripted)
+    assert [c["router_decision"] for c in scripted.calls] == [None, None]
