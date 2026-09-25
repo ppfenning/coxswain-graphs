@@ -43,7 +43,7 @@ from typing import Any
 
 from runner.decision_log import CallDecision
 from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
-from runner.tier_resolution import TIERS, Hints, Resolution, resolve
+from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class, to_tier
 
 # Per docs/design/vendor-axis.md §2: session resume on a budget stop, structured
 # output, and Bash/Read/Edit tool grants are real; 200_000 is Claude's published
@@ -449,7 +449,9 @@ class ClaudeCodeRunner:
         self.profile = dict(profile)
         self.capabilities = dict(CAPABILITIES)
         self.tiers = dict(self.profile.get("tiers") or {})
-        if not self.tiers:
+        # class -> ordered models. When present it decides the model; `tiers` is the legacy fallback.
+        self.classes = dict(self.profile.get("classes") or {})
+        if not self.tiers and not self.classes:
             raise RunnerError("provider profile declares no tiers")
         raw_tools = self.profile.get("tools") or {}
         if not isinstance(raw_tools, Mapping):
@@ -551,14 +553,31 @@ class ClaudeCodeRunner:
         chosen = resolve(role, hints, self.tier_overrides, defaults, caller_tier, TIERS[0])
         if chosen.reason == "floor":
             return Resolution(DEFAULT_TIER, "floor")
-        return Resolution(chosen.tier, "caller") if chosen.reason == "router" else chosen
+        return Resolution(chosen.tier, "caller", chosen.chosen_class) if chosen.reason == "router" else chosen
 
-    def _model_for(self, tier: str) -> str:
-        model = self.tiers.get(tier)
-        if not model:
-            known = ", ".join(sorted(self.tiers))
-            raise RunnerError(f"provider profile has no model for tier '{tier}'; it declares: {known}")
+    def _model_for(self, name: str) -> str:
+        """First model bound to a class (or tier name); the `tiers` map when the profile has no `classes`."""
+        if self.classes:
+            # A class the profile does not bind falls to the floor: the lowest class's model.
+            model = self.classes.get(to_class(name) or name) or self.classes.get(CLASSES[0])
+            if not model:
+                known = ", ".join(sorted(self.classes))
+                raise RunnerError(f"provider profile has no model for class '{name}'; it declares: {known}")
+        else:
+            tier = to_tier(name) if name in CLASSES else name
+            model = self.tiers.get(tier)
+            if not model:
+                known = ", ".join(sorted(self.tiers))
+                raise RunnerError(f"provider profile has no model for tier '{tier}'; it declares: {known}")
         return str(model[0]) if isinstance(model, list) else str(model)
+
+    def _alt_model(self, cls: str, tier: str, model: str) -> str:
+        """The next model in the class's ordered list, or in the tier's when the profile has no `classes`."""
+        return _alt_model_for(self.classes, cls, model) if self.classes else _alt_model_for(self.tiers, tier, model)
+
+    def _effort_for(self, cls: str) -> str:
+        """A class-keyed effort entry, else the legacy tier name's entry, else high."""
+        return self.effort.get(cls) or self.effort.get(to_tier(cls), "high")
 
     def _bounds_row(self, role: str | None, model: str) -> Mapping[str, Any] | None:
         """The bounds file's row for (role, model), loaded and cached once."""
@@ -776,7 +795,7 @@ class ClaudeCodeRunner:
         lines.append("</workspace>")
         return "\n".join(lines)
 
-    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None, spent_usd: float = 0.0) -> list[str]:
+    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None, spent_usd: float = 0.0, effort: str | None = None) -> list[str]:
         argv = [
             self.claude_bin,
             "-p",
@@ -787,7 +806,7 @@ class ClaudeCodeRunner:
             "--model",
             model,
             "--effort",
-            self.effort.get(tier, "high"),
+            effort or self.effort.get(tier, "high"),
             "--json-schema",
             json.dumps(dict(schema)),
             *_ISOLATION,
@@ -865,7 +884,7 @@ class ClaudeCodeRunner:
     def _invoke(
         self, *, role: str, tier: str, model: str, tools: Sequence[str], schema: Mapping[str, Any], prompt: str,
         packs: Sequence[str], scratch: Path | None, patches: bool, session: Sequence[str], budget_usd: float | None = None,
-        spent_usd: float = 0.0,
+        spent_usd: float = 0.0, effort: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         system = "\n\n".join(
             part for part in (self._read_context(packs), self._workspace(scratch, patches=patches), self.extra_system) if part
@@ -876,7 +895,7 @@ class ClaudeCodeRunner:
             system, prompt = (redirect_paths(text, self.repo_dir, scratch) for text in (system, prompt))
         argv = self._argv(
             model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role,
-            session=session, budget_usd=budget_usd, spent_usd=spent_usd,
+            session=session, budget_usd=budget_usd, spent_usd=spent_usd, effort=effort,
         )
         try:
             return subprocess.run(
@@ -926,7 +945,9 @@ class ClaudeCodeRunner:
         requested_tier = tier or DEFAULT_TIER
         resolution = self._resolve_tier(role, tier, hints)
         tier = resolution.tier
-        model = self._model_for(tier)
+        cls = resolution.chosen_class
+        model = self._model_for(cls)
+        effort = self._effort_for(cls)
         body = self.role_skills.get(role)
         packs = [body, *context] if body else list(context)
         tools = self.tools.get(role, [])
@@ -949,7 +970,7 @@ class ClaudeCodeRunner:
                 proc = self._invoke(
                     role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
-                    spent_usd=state.get("spent_usd", 0.0),
+                    spent_usd=state.get("spent_usd", 0.0), effort=effort,
                 )
                 if role in _PATCH_ROLES and state.get("scratch"):
                     has_scratch = True
@@ -960,7 +981,7 @@ class ClaudeCodeRunner:
                 with self._scratch(role) as scratch:
                     proc = self._invoke(
                         role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
-                        scratch=scratch, patches=True, session=(), budget_usd=budget_usd,
+                        scratch=scratch, patches=True, session=(), budget_usd=budget_usd, effort=effort,
                     )
                     if role in _PATCH_ROLES and scratch:
                         has_scratch = True
@@ -1042,10 +1063,10 @@ class ClaudeCodeRunner:
             # names why on the ledger; a plain reasoning-extraction misfire
             # keeps retrying the same model exactly as before.
             if is_safeguard_refusal(payload):
-                attempt_model = _alt_model_for(self.tiers, tier, used_model)
+                attempt_model = self._alt_model(cls, tier, used_model)
                 retry_extra = {"retry_of": call_id, "reason": "safeguard_refusal"}
             elif is_max_structured_output_retries(payload):
-                attempt_model = _alt_model_for(self.tiers, tier, used_model)
+                attempt_model = self._alt_model(cls, tier, used_model)
                 retry_extra = {"retry_of": call_id, "reason": "structured_output"}
 
             # Keep the failed attempt's trace. The retry writes to the same
@@ -1137,13 +1158,13 @@ class ClaudeCodeRunner:
         result.decision = CallDecision(
             role=role,
             requested_tier=requested_tier,
-            chosen_tier=tier,
+            chosen_tier=cls,
             model_id=init_model or used_model,
             reason=resolution.reason,
             ticket_key=task or "",
             outcome_key="",
             claude_code_version=version,
-            effort=self.effort.get(tier, "high"),
+            effort=effort,
             budget_usd=budget_usd,
         )
         return result
