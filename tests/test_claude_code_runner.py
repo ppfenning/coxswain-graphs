@@ -28,6 +28,7 @@ from runner.claude_code_runner import (
     _run_verify,
     _version_violations,
     apply_reported_patch,
+    call_summary,
     files_touched_from_patch,
     is_safeguard_refusal,
     next_spent,
@@ -1099,6 +1100,30 @@ def test_trace_commands_with_no_bash_calls_returns_nothing() -> None:
         {"type": "result", "subtype": "success"},
     ]
     assert trace_commands(trace) == []
+
+
+def test_call_summary_counts_tools_reads_and_takes_the_result_flags() -> None:
+    def use(tool_id: str, name: str, **tool_input: object) -> dict:
+        return {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_id, "name": name, "input": tool_input}]}}
+
+    events = [
+        {"type": "system", "subtype": "init"},
+        use("a", "Read", file_path="/r/pkg/f.py"),
+        use("b", "Read", file_path="/r/pkg/g.py", limit=40),
+        use("c", "Bash", command="pytest -q"),
+        {"type": "result", "subtype": "success", "is_error": False},
+    ]
+    assert call_summary(events) == {
+        "tool_uses": {"Read": 2, "Bash": 1},
+        "reads": {"f.py": 1, "g.py": 1},
+        "whole_file_reads": 1,
+        "result": "success",
+        "is_error": False,
+    }
+
+
+def test_call_summary_of_an_empty_stream_has_no_result_and_no_error() -> None:
+    assert call_summary([]) == {"tool_uses": {}, "reads": {}, "whole_file_reads": 0, "result": None, "is_error": False}
 
 
 def test_self_reported_commands_tags_the_models_own_list() -> None:

@@ -64,6 +64,16 @@ def test_a_call_leaves_one_row_carrying_the_init_events_version_and_model(tmp_pa
     assert _rows(conn) == [("run-1", "p3-write", "build", 1, "2.0.31", "claude-haiku-4-5-20251001", "reason")]
 
 
+def test_a_call_records_the_stream_summary_in_the_call_dict_and_in_detail_json(tmp_path, conn) -> None:
+    read = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/a/b.py"}}]}}
+    runner = _claude(tmp_path, [INIT, read, RESULT], store=Store(conn), run_id=RUN)
+    _go(runner)
+    expected = {"tool_uses": {"Read": 1}, "reads": {"b.py": 1}, "whole_file_reads": 1, "result": "success", "is_error": False}
+    assert runner.calls[-1]["summary"] == expected
+    (detail,) = conn.query_all("SELECT detail_json FROM node_calls")[0]
+    assert (json.loads(detail) if isinstance(detail, str) else detail)["summary"] == expected
+
+
 def test_with_no_store_no_row_is_written_and_a_call_writes_no_calls_file(tmp_path, conn) -> None:
     (tmp_path / "bare").mkdir()
     (tmp_path / "stored").mkdir()
