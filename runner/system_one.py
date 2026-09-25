@@ -8,6 +8,7 @@ that raises never fails the node: the inner runner runs as if the fast path were
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -16,6 +17,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from runner.protocol import NodeResult, NodeRunner
 from runner.tier_resolution import Hints
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "Answer",
@@ -196,6 +199,7 @@ class FastPathRunner:
         self._specs = specs
         self._backend = backend
         self._consulted: dict[str, Answer] = {}
+        self._warned_unpersisted = False
 
     def consult(self, role: str, request: Mapping[str, Any]) -> tuple[Answer, RoleSetting] | None:
         """Ask the decider ahead of the call, and remember the answer for that role's next `run`.
@@ -245,6 +249,20 @@ class FastPathRunner:
         except Exception:
             return None
 
+    def _run_tagging(self, kwargs: Mapping[str, Any], spec: RoleSpec, setting: RoleSetting, answer: Answer) -> NodeResult:
+        """Run the inner runner with its `tag_decision` hook set, so the tag lands before its ledger write."""
+        self._inner.tag_decision = lambda result: getattr(self._tagged(result, spec, setting, answer), "decision", None)
+        try:
+            return self._inner.run(**kwargs)
+        finally:
+            self._inner.tag_decision = None
+
+    def _warn_unpersisted(self) -> None:
+        """Say once that this inner runner cannot persist a shadow decision. Never guess a call entry for it."""
+        if not self._warned_unpersisted:
+            _log.warning("system_one: %s has no tag_decision hook, so shadow decisions are not persisted", type(self._inner).__name__)
+            self._warned_unpersisted = True
+
     def run(
         self,
         *,
@@ -280,8 +298,13 @@ class FastPathRunner:
             fast = self._rendered(spec, answer)
             if fast is not None:
                 return fast
-        result = self._inner.run(**kwargs)
         if setting.mode == "on":
-            return result
+            return self._inner.run(**kwargs)
+        if hasattr(self._inner, "tag_decision"):
+            return self._run_tagging(kwargs, spec, setting, answer)
+        result = self._inner.run(**kwargs)
         tagged = self._tagged(result, spec, setting, answer)
-        return result if tagged is None else tagged
+        if tagged is None:
+            return result
+        self._warn_unpersisted()
+        return tagged

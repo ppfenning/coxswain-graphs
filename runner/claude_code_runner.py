@@ -34,15 +34,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from runner.decision_log import REASON_SEPARATOR, CallDecision, RouterDecision, joined_reasons
+from runner.decision_log import REASON_SEPARATOR, CallDecision, RouterDecision, joined_reasons, to_row
 from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
 from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class, to_tier
 
@@ -604,6 +605,34 @@ class ClaudeCodeRunner:
         # One row per node: what it cost and how many turns it took. Read by
         # whoever wants to know what a run spent; never by a graph.
         self.calls: list[dict[str, Any]] = []
+        # Holds `tag_decision` per thread: `invoke_graphs` shares this runner across a thread pool.
+        self._local = threading.local()
+
+    @property
+    def tag_decision(self) -> Callable[[NodeResult], CallDecision | None] | None:
+        """The calling thread's hook, set by a shadow-mode FastPathRunner around one call.
+
+        It tags the decision before the ledger write, because `record_usage` lets the
+        ledger row win over `calls`. It is thread-local: another thread's call never sees it.
+        """
+        return getattr(self._local, "tag_decision", None)
+
+    @tag_decision.setter
+    def tag_decision(self, hook: Callable[[NodeResult], CallDecision | None] | None) -> None:
+        self._local.tag_decision = hook
+
+    def _tagged_decision(self, decision: CallDecision, data: Mapping[str, Any]) -> CallDecision:
+        """The hook's tagged decision, or `decision` unchanged when no hook is set or it fails."""
+        if self.tag_decision is None:
+            return decision
+        probe = NodeResult(data)
+        probe.decision = decision
+        try:
+            tagged = self.tag_decision(probe)
+        except Exception as exc:
+            _log.warning("system_one: tagging the %s decision failed, recorded untagged: %s", decision.role, exc)
+            return decision
+        return decision if tagged is None else tagged
 
     def _append_call_ledger(self, call: Mapping[str, Any], *, ok: bool, error: str | None = None) -> None:
         """One JSON line per call, written as it returns — never a rewrite, never buffered."""
@@ -1230,18 +1259,10 @@ class ClaudeCodeRunner:
             data = {**data, "patch": patch}
             if verified:
                 data = {**data, "commands_run": [*(data.get("commands_run") or []), *verified]}
-        self.calls[-1] = {
-            **call,
-            **({"patch_source": patch_source} if has_scratch and role in _PATCH_ROLES else {}),
-            "files_touched": files_touched_from_patch(str(data.get("patch") or "")),
-            "commands_run": call.get("commands_run", reported_commands),
-        }
-        self._append_call_ledger(self.calls[-1], ok=True)
         version, init_model = _init_facts(payload.get("init"))
-        result = NodeResult(data)
         # Only this success path builds a CallDecision. A call that raises RunnerError,
         # BudgetStop or LimitStop records no decision, so its router_decision is dropped too.
-        result.decision = CallDecision(
+        decision = self._tagged_decision(CallDecision(
             role=role,
             requested_tier=requested_tier,
             chosen_tier=cls,
@@ -1255,5 +1276,15 @@ class ClaudeCodeRunner:
             effort=effort,
             budget_usd=budget_usd,
             **_router_fields(self.router_mode, router_decision),
-        )
+        ), data)
+        self.calls[-1] = {
+            **call,
+            **({"patch_source": patch_source} if has_scratch and role in _PATCH_ROLES else {}),
+            "files_touched": files_touched_from_patch(str(data.get("patch") or "")),
+            "commands_run": call.get("commands_run", reported_commands),
+            "decision": to_row(decision),
+        }
+        self._append_call_ledger(self.calls[-1], ok=True)
+        result = NodeResult(data)
+        result.decision = decision
         return result

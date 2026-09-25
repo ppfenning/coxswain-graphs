@@ -33,7 +33,7 @@ from runner.claude_code_runner import (
     self_reported_commands,
     trace_commands,
 )
-from runner.decision_log import RouterDecision
+from runner.decision_log import RouterDecision, to_row
 from runner.protocol import BudgetStop, Capability, ProviderProfile, resolve_profile
 from runner.scripted import ScriptedRunner
 
@@ -308,6 +308,107 @@ def test_usage_is_recorded_per_call_and_summarised(fake_claude, tmp_path) -> Non
     out = record_usage(runner, runs_dir=tmp_path / "runs", run_id="r1")
     assert out == summary
     assert json.loads((tmp_path / "runs" / "r1.usage.json").read_text())["summary"]["calls"] == 2
+
+
+def test_a_successful_call_records_its_decision_row_in_calls(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    result = runner.run(role="plan", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["decision"] == to_row(result.decision)
+    assert runner.calls[-1]["decision"]["role"] == "plan"
+
+
+def test_a_shadow_tagged_decision_reaches_the_ledger_and_usage_json(fake_claude, tmp_path) -> None:
+    from harness.runners import _DelegatingFastPath
+    from harness.usage import record_usage
+    from runner.system_one import Answer, Noul, RoleSetting, RoleSpec
+
+    class Decider:
+        def decide(self, question, state):
+            return Answer("noul", "yes", {"yes": 0.9}, 0.9)
+
+    spec = RoleSpec(build=lambda req: (Noul("ok?"), {}), render=lambda a: {"ok": True}, agrees=lambda a, r: r["ok"] is True)
+    inner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path / "runs", run_id="r1")
+    fast = _DelegatingFastPath(inner, Decider(), {"plan": RoleSetting("shadow", 0.8)}, {"plan": spec}, backend="jev-1.13.0")
+    fast.run(role="plan", schema=SCHEMA, prompt="go")
+    fast.run(role="plan", schema=SCHEMA, prompt="go")
+    assert inner.tag_decision is None, "the hook is cleared after each call"
+    ledger = [json.loads(line) for line in (tmp_path / "runs" / "r1.calls.jsonl").read_text().splitlines()]
+    assert [row["decision"]["system_one_agreed"] for row in ledger] == [True, True]
+    record_usage(fast, runs_dir=tmp_path / "runs", run_id="r1")
+    calls = json.loads((tmp_path / "runs" / "r1.usage.json").read_text())["calls"]
+    assert [(c["decision"]["system_one_agreed"], c["decision"]["system_one_backend"]) for c in calls] == [(True, "jev-1.13.0")] * 2
+
+
+def test_overlapping_shadow_calls_on_a_shared_runner_each_keep_their_own_tag(fake_claude, tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from harness.runners import _DelegatingFastPath
+    from harness.usage import record_usage
+    from runner.system_one import Answer, Noul, RoleSetting, RoleSpec
+
+    class Decider:
+        def decide(self, question, state):
+            return Answer("noul", "yes", {"yes": 0.9}, 0.9)
+
+    def spec(agrees: bool) -> RoleSpec:
+        return RoleSpec(build=lambda req: (Noul("ok?"), {}), render=lambda a: {"ok": True}, agrees=lambda a, r: agrees)
+
+    # Each fake claude waits until both have started, so the two calls overlap for certain.
+    starts = tmp_path / "starts"
+    starts.mkdir()
+    real, _, _ = fake_claude
+    slow = tmp_path / "slow-claude"
+    slow.write_text(
+        f"#!/bin/sh\ntouch {starts}/$$\nn=0\n"
+        f"while [ $(ls {starts} | wc -l) -lt 2 ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n"
+        f"exec {real} \"$@\"\n",
+        encoding="utf-8",
+    )
+    slow.chmod(slow.stat().st_mode | stat.S_IXUSR)
+    inner = ClaudeCodeRunner(PROFILE, claude_bin=str(slow), cwd=tmp_path, runs_dir=tmp_path / "runs", run_id="r1")
+    settings = {"plan": RoleSetting("shadow", 0.8), "review": RoleSetting("shadow", 0.8)}
+    fast = _DelegatingFastPath(inner, Decider(), settings, {"plan": spec(True), "review": spec(False)}, backend="jev-1.13.0")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {role: pool.submit(fast.run, role=role, schema=SCHEMA, prompt="go") for role in ("plan", "review")}
+        results = {role: future.result() for role, future in futures.items()}
+    assert len(list(starts.iterdir())) == 2
+    assert {role: r.decision.system_one_agreed for role, r in results.items()} == {"plan": True, "review": False}
+    ledger = [json.loads(line) for line in (tmp_path / "runs" / "r1.calls.jsonl").read_text().splitlines()]
+    assert {row["role"]: row["decision"]["system_one_agreed"] for row in ledger} == {"plan": True, "review": False}
+    record_usage(fast, runs_dir=tmp_path / "runs", run_id="r1")
+    calls = json.loads((tmp_path / "runs" / "r1.usage.json").read_text())["calls"]
+    assert {c["role"]: c["decision"]["system_one_agreed"] for c in calls} == {"plan": True, "review": False}
+
+
+def test_the_tag_hook_is_per_thread(fake_claude, tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    runner = runner_for(fake_claude, tmp_path)
+    runner.tag_decision = lambda result: None
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(lambda: runner.tag_decision).result() is None
+    assert runner.tag_decision is not None
+
+
+def test_a_raising_tag_hook_records_the_untagged_decision(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+
+    def boom(result):
+        raise RuntimeError("tagger down")
+
+    runner.tag_decision = boom
+    result = runner.run(role="plan", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["decision"]["system_one_agreed"] is None
+    assert result.decision.role == "plan"
+
+
+def test_a_failed_call_records_no_decision_row(fake_claude, tmp_path) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": True, "result": "Not logged in"})
+    runner = runner_for(fake_claude, tmp_path)
+    with pytest.raises(RunnerError):
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    assert all("decision" not in call for call in runner.calls)
 
 
 def test_a_runner_with_nothing_to_count_records_nothing(tmp_path) -> None:

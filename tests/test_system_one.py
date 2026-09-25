@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from runner.decision_log import CallDecision
+from runner.decision_log import CallDecision, to_row
 from runner.protocol import NodeResult
 from runner.system_one import (
     Answer,
@@ -182,3 +182,56 @@ def test_inner_receives_every_argument_unchanged():
 
 def test_role_specs_is_a_fresh_mapping():
     assert role_specs() is not role_specs()
+
+
+class Hooked:
+    """An inner runner that honours `tag_decision` as ClaudeCodeRunner does: tag, then record its own entry."""
+
+    def __init__(self, decision: CallDecision | None = DECISION) -> None:
+        self.calls: list[dict] = []
+        self.tag_decision = None
+        self.result = NodeResult({"verdict": "yes"})
+        self.result.decision = decision
+
+    def run(self, **kwargs):
+        decision = self.result.decision
+        if decision is not None and self.tag_decision is not None:
+            decision = self.tag_decision(self.result) or decision
+        self.calls.append({"role": kwargs["role"], **({} if decision is None else {"decision": to_row(decision)})})
+        self.result.decision = decision
+        return self.result
+
+
+def test_a_shadow_tagged_call_carries_its_tag_into_the_inner_runners_own_entry():
+    inner = Hooked()
+    result = runner("shadow", Decider(), inner).run(**CALL)
+    row = inner.calls[-1]["decision"]
+    assert row["system_one_agreed"] is True and row["system_one_mode"] == "shadow"
+    assert row == to_row(result.decision)
+    assert inner.tag_decision is None
+
+
+def test_a_result_with_no_decision_adds_no_decision_key():
+    inner = Hooked(decision=None)
+    runner("shadow", Decider(), inner).run(**CALL)
+    assert "decision" not in inner.calls[-1]
+
+
+def test_an_inner_runner_without_the_hook_is_never_written_to_and_warns_once(caplog):
+    inner = Inner()
+    inner.calls.append({"role": "another-call"})
+    fast = runner("shadow", Decider(), inner)
+    with caplog.at_level("WARNING", logger="runner.system_one"):
+        results = [fast.run(**CALL), fast.run(**CALL)]
+    assert [r.decision.system_one_agreed for r in results] == [True, True]
+    assert inner.calls[0] == {"role": "another-call"}, "no guessing which entry is this call's"
+    assert [r.getMessage() for r in caplog.records] == ["system_one: Inner has no tag_decision hook, so shadow decisions are not persisted"]
+
+
+def test_untagged_rows_are_ignored_by_the_shadow_report():
+    from runner.system_one_report import report
+
+    untagged = to_row(DECISION)
+    tagged = {**untagged, "system_one_mode": "shadow", "system_one_agreed": True, "system_one_confidence": 0.9}
+    summary = report([untagged, untagged, tagged], None, {"r": 0.8})["r"]
+    assert (summary.shadow_calls, summary.skipped) == (1, 0)
