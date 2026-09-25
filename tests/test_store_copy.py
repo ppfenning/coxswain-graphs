@@ -91,6 +91,24 @@ def test_the_columns_come_from_the_ddl_including_the_alter_columns():
     assert "schema_version" not in by_name
 
 
+def test_the_runs_host_column_is_copied_including_null(src_url, dst_url):
+    src = open_store(src_url, T0)
+    try:
+        put(src, "runs", {"run_id": "rh1", "host": "build-host-1"})
+        put(src, "runs", {"run_id": "rh2", "host": None})
+    finally:
+        src.close()
+    sc.copy(src_url, dst_url, T0)
+    dst = open_store(dst_url, T0)
+    try:
+        assert dst.query_all("SELECT run_id, host FROM runs WHERE run_id IN ('rh1', 'rh2') ORDER BY run_id") == [
+            ("rh1", "build-host-1"),
+            ("rh2", None),
+        ]
+    finally:
+        dst.close()
+
+
 def test_every_source_row_lands_in_the_destination(src_url, dst_url):
     report = sc.copy(src_url, dst_url, T0)
     assert report["node_calls"] == {"source": 2, "copied": 2, "present": 0}

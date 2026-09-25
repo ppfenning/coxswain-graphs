@@ -11,6 +11,10 @@ VERSION = 3
 DESCRIPTION = "runs gains host, the host the run was launched from"
 
 
+# Table and TEXT column that the ALTER appends to a migration 0001 table.
+_ADDED: tuple[tuple[str, str], ...] = (("runs", "host"),)
+
+
 def statements(dialect: Dialect) -> tuple[str, ...]:
     """The same ALTER on both dialects."""
-    return ("ALTER TABLE runs ADD COLUMN host TEXT",)
+    return tuple(f"ALTER TABLE {t} ADD COLUMN {c} TEXT" for t, c in _ADDED)
