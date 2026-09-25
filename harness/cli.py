@@ -720,7 +720,7 @@ def _run_graph(
         )
         for entry in result.get("quarantined") or []:
             print(f"  quarantined {entry.get('grain')}: {entry.get('id')} — {entry.get('reason')}", file=sys.stderr)
-        print(f"  manifests: {args.runs_dir} (one per phase, under {run_id}:<phase>)")
+        print(f"  phases   : recorded in the run store under {run_id}")
         print(f"  ledger   : {args.ledger}")
         for line in result.get("exit_summary") or []:
             print(f"  {line}", file=sys.stderr)
