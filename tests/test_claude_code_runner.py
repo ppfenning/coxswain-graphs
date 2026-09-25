@@ -16,6 +16,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+from harness.store_migrate import open_store
+from harness.store_read import calls as store_calls
+from harness.store_write import Store
 from runner import RunnerError
 from runner.claude_code_runner import (
     ClaudeCodeRunner,
@@ -74,6 +77,13 @@ def fake_claude(tmp_path: Path):
 
     set_output({"type": "result", "is_error": False, "structured_output": {"ok": True}, "total_cost_usd": 0.01, "num_turns": 1})
     return script, record, set_output
+
+
+@pytest.fixture
+def conn():
+    c = open_store("sqlite:///:memory:", "2026-09-24T00:00:00Z")
+    yield c
+    c.close()
 
 
 def runner_for(fake_claude, tmp_path: Path, **kwargs) -> ClaudeCodeRunner:
@@ -317,7 +327,7 @@ def test_a_successful_call_records_its_decision_row_in_calls(fake_claude, tmp_pa
     assert runner.calls[-1]["decision"]["role"] == "plan"
 
 
-def test_a_shadow_tagged_decision_reaches_the_ledger_and_usage_json(fake_claude, tmp_path) -> None:
+def test_a_shadow_tagged_decision_reaches_the_ledger_and_usage_json(fake_claude, tmp_path, conn) -> None:
     from harness.runners import _DelegatingFastPath
     from harness.usage import record_usage
     from runner.system_one import Answer, Noul, RoleSetting, RoleSpec
@@ -327,19 +337,19 @@ def test_a_shadow_tagged_decision_reaches_the_ledger_and_usage_json(fake_claude,
             return Answer("noul", "yes", {"yes": 0.9}, 0.9)
 
     spec = RoleSpec(build=lambda req: (Noul("ok?"), {}), render=lambda a: {"ok": True}, agrees=lambda a, r: r["ok"] is True)
-    inner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path / "runs", run_id="r1")
+    inner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path / "runs", run_id="r1", store=Store(conn))
     fast = _DelegatingFastPath(inner, Decider(), {"plan": RoleSetting("shadow", 0.8)}, {"plan": spec}, backend="jev-1.13.0")
     fast.run(role="plan", schema=SCHEMA, prompt="go")
     fast.run(role="plan", schema=SCHEMA, prompt="go")
     assert inner.tag_decision is None, "the hook is cleared after each call"
-    ledger = [json.loads(line) for line in (tmp_path / "runs" / "r1.calls.jsonl").read_text().splitlines()]
+    ledger = _ledger_lines(conn, "r1")
     assert [row["decision"]["system_one_agreed"] for row in ledger] == [True, True]
     record_usage(fast, runs_dir=tmp_path / "runs", run_id="r1")
     calls = json.loads((tmp_path / "runs" / "r1.usage.json").read_text())["calls"]
     assert [(c["decision"]["system_one_agreed"], c["decision"]["system_one_backend"]) for c in calls] == [(True, "jev-1.13.0")] * 2
 
 
-def test_overlapping_shadow_calls_on_a_shared_runner_each_keep_their_own_tag(fake_claude, tmp_path) -> None:
+def test_overlapping_shadow_calls_on_a_shared_runner_each_keep_their_own_tag(fake_claude, tmp_path, conn) -> None:
     from concurrent.futures import ThreadPoolExecutor
 
     from harness.runners import _DelegatingFastPath
@@ -365,7 +375,9 @@ def test_overlapping_shadow_calls_on_a_shared_runner_each_keep_their_own_tag(fak
         encoding="utf-8",
     )
     slow.chmod(slow.stat().st_mode | stat.S_IXUSR)
-    inner = ClaudeCodeRunner(PROFILE, claude_bin=str(slow), cwd=tmp_path, runs_dir=tmp_path / "runs", run_id="r1")
+    inner = ClaudeCodeRunner(
+        PROFILE, claude_bin=str(slow), cwd=tmp_path, runs_dir=tmp_path / "runs", run_id="r1", store=Store(conn)
+    )
     settings = {"plan": RoleSetting("shadow", 0.8), "review": RoleSetting("shadow", 0.8)}
     fast = _DelegatingFastPath(inner, Decider(), settings, {"plan": spec(True), "review": spec(False)}, backend="jev-1.13.0")
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -373,7 +385,7 @@ def test_overlapping_shadow_calls_on_a_shared_runner_each_keep_their_own_tag(fak
         results = {role: future.result() for role, future in futures.items()}
     assert len(list(starts.iterdir())) == 2
     assert {role: r.decision.system_one_agreed for role, r in results.items()} == {"plan": True, "review": False}
-    ledger = [json.loads(line) for line in (tmp_path / "runs" / "r1.calls.jsonl").read_text().splitlines()]
+    ledger = _ledger_lines(conn, "r1")
     assert {row["role"]: row["decision"]["system_one_agreed"] for row in ledger} == {"plan": True, "review": False}
     record_usage(fast, runs_dir=tmp_path / "runs", run_id="r1")
     calls = json.loads((tmp_path / "runs" / "r1.usage.json").read_text())["calls"]
@@ -680,12 +692,14 @@ def test_a_build_without_verify_commands_or_for_another_task_gets_no_rows(fake_c
     assert "commands_run" not in runner.run(role="build", schema=SCHEMA, prompt="go", task="t1")
 
 
-def test_a_reported_patch_that_does_not_apply_is_patch_outside_scratch(tmp_path, repo) -> None:
+def test_a_reported_patch_that_does_not_apply_is_patch_outside_scratch(tmp_path, repo, conn) -> None:
     script = _reporting_claude(tmp_path, F_PATCH.replace("-one", "-absent"))
-    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo, runs_dir=tmp_path, run_id="r1")
+    runner = ClaudeCodeRunner(
+        PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo, runs_dir=tmp_path, run_id="r1", store=Store(conn)
+    )
     with pytest.raises(RunnerError, match="patch_outside_scratch"):
         runner.run(role="build", schema=SCHEMA, prompt="go")
-    assert "patch_outside_scratch" in _ledger_lines(tmp_path, "r1")[0]["error"]
+    assert [row["ok"] for row in _ledger_lines(conn, "r1")] == [False]
 
 
 def test_apply_reported_patch_applies_a_valid_diff_and_refuses_a_bad_one(repo) -> None:
@@ -1147,57 +1161,84 @@ def test_files_touched_from_patch_strips_mnemonic_prefixes_too() -> None:
 # ── the per-call ledger ──────────────────────────────────────────────────────
 
 
-def _ledger_lines(tmp_path: Path, run_id: str) -> list[dict]:
-    return [json.loads(line) for line in (tmp_path / f"{run_id}.calls.jsonl").read_text(encoding="utf-8").splitlines()]
+def _ledger_lines(conn, run_id: str) -> list[dict]:
+    """The run's calls as the store holds them, shaped like the file ledger's rows were."""
+    return [
+        {
+            **(r["detail_json"] or {}),
+            "id": r["call_id"],
+            "model": r["model_alias"],
+            "ok": bool(r["ok"]),
+            "role": r["role"],
+            "cost_usd": r["cost_usd"],
+            "decision": r["decision_json"],
+        }
+        for r in store_calls(conn, run_id)
+    ]
 
 
-def test_a_successful_call_appends_one_line_to_the_calls_ledger(fake_claude, tmp_path) -> None:
-    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+def test_a_successful_call_records_one_row_and_writes_no_calls_file(fake_claude, tmp_path, conn) -> None:
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
     runner.run(role="plan", schema=SCHEMA, prompt="go")
-    rows = _ledger_lines(tmp_path, "r1")
+    rows = _ledger_lines(conn, "r1")
     assert len(rows) == 1
-    assert rows[0]["ok"] is True and "error" not in rows[0]
+    assert rows[0]["ok"] is True
     assert rows[0]["role"] == runner.calls[-1]["role"] and rows[0]["cost_usd"] == runner.calls[-1]["cost_usd"]
+    assert not list(tmp_path.glob("*.calls.jsonl"))
 
 
-def test_a_runner_error_still_appends_a_line_before_raising(fake_claude, tmp_path) -> None:
+def test_a_runner_error_still_records_a_row_before_raising(fake_claude, tmp_path, conn) -> None:
     _, _, set_output = fake_claude
     set_output({"is_error": True, "result": "Not logged in · Please run /login"})
-    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
     with pytest.raises(RunnerError, match="Not logged in"):
         runner.run(role="plan", schema=SCHEMA, prompt="go")
-    rows = _ledger_lines(tmp_path, "r1")
-    assert len(rows) == 1
-    assert rows[0]["ok"] is False and "Not logged in" in rows[0]["error"]
+    assert [row["ok"] for row in _ledger_lines(conn, "r1")] == [False]
 
 
-def test_a_non_object_answer_still_appends_a_line_before_raising(fake_claude, tmp_path) -> None:
+def test_a_non_object_answer_still_records_a_row_before_raising(fake_claude, tmp_path, conn) -> None:
     _, _, set_output = fake_claude
     set_output({"is_error": False, "structured_output": [1, 2, 3]})
-    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
     with pytest.raises(RunnerError, match="expected an object"):
         runner.run(role="plan", schema=SCHEMA, prompt="go")
-    rows = _ledger_lines(tmp_path, "r1")
-    assert len(rows) == 1
-    assert rows[0]["ok"] is False and "expected an object" in rows[0]["error"]
+    assert [row["ok"] for row in _ledger_lines(conn, "r1")] == [False]
 
 
-def test_prose_with_no_structured_output_still_appends_a_line_before_raising(fake_claude, tmp_path) -> None:
+def test_prose_with_no_structured_output_still_records_a_row_before_raising(fake_claude, tmp_path, conn) -> None:
     _, _, set_output = fake_claude
     set_output({"is_error": False, "structured_output": None, "result": "I could not decide."})
-    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
     with pytest.raises(RunnerError, match="not JSON"):
         runner.run(role="plan", schema=SCHEMA, prompt="go")
-    rows = _ledger_lines(tmp_path, "r1")
-    assert len(rows) == 1
-    assert rows[0]["ok"] is False and "not JSON" in rows[0]["error"]
+    assert [row["ok"] for row in _ledger_lines(conn, "r1")] == [False]
 
 
-def test_two_calls_append_two_lines_not_one_overwritten_line(fake_claude, tmp_path) -> None:
-    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1")
+def test_two_calls_record_two_rows(fake_claude, tmp_path, conn) -> None:
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
     runner.run(role="plan", schema=SCHEMA, prompt="go")
     runner.run(role="plan", schema=SCHEMA, prompt="again")
-    assert len(_ledger_lines(tmp_path, "r1")) == 2
+    assert len(_ledger_lines(conn, "r1")) == 2
+
+
+def test_the_trace_file_exists_after_the_call_for_the_live_views(fake_claude, tmp_path, conn) -> None:
+    """The CLI compacts trace files only at run end; until then `cox runs top` and `detail` read them."""
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn), trace_dir=tmp_path / "trace")
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    (row,) = _ledger_lines(conn, "r1")
+    assert Path(row["trace"]).is_file() and Path(row["trace"]).parent == tmp_path / "trace"
+
+
+def test_a_failing_store_write_logs_an_error_naming_the_call(fake_claude, tmp_path, caplog) -> None:
+    class Boom:
+        def record_call(self, *args, **kwargs):
+            raise RuntimeError("disk full")
+
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Boom())
+    with caplog.at_level("ERROR"):
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    (record,) = [r for r in caplog.records if "store write failed" in r.getMessage()]
+    assert record.levelname == "ERROR" and runner.calls[-1]["id"] in record.getMessage()
 
 
 def test_without_runs_dir_or_run_id_nothing_is_written(fake_claude, tmp_path) -> None:
@@ -1445,43 +1486,45 @@ def test_alt_model_for_returns_the_next_binding_or_falls_back_to_the_same_model(
     assert _alt_model_for(tiers, "cheap", "haiku") == "haiku"
 
 
-def test_a_safeguard_refusal_retries_once_on_the_alternate_model(sequenced_claude, tmp_path) -> None:
+def test_a_safeguard_refusal_retries_once_on_the_alternate_model(sequenced_claude, tmp_path, conn) -> None:
     script, set_sequence, _ = sequenced_claude
     set_sequence(SAFEGUARD, OK)
     profile = {**PROFILE, "tiers": {**PROFILE["tiers"], "standard": ["sonnet", "opus"]}}
-    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
 
     assert dict(runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")) == {"ok": True}
-    rows = _ledger_lines(tmp_path, "r1")
+    rows = _ledger_lines(conn, "r1")
     assert len(rows) == 2
     assert rows[1]["retry_of"] == rows[0]["id"]
     assert rows[1]["reason"] == "safeguard_refusal"
     assert rows[1]["model"] == "opus"
 
 
-def test_a_structured_output_error_retries_once_on_the_alternate_model(sequenced_claude, tmp_path) -> None:
+def test_a_structured_output_error_retries_once_on_the_alternate_model(sequenced_claude, tmp_path, conn) -> None:
     script, set_sequence, _ = sequenced_claude
     set_sequence(STRUCTURED_OUTPUT_ERROR, OK)
     profile = {**PROFILE, "tiers": {**PROFILE["tiers"], "standard": ["sonnet", "opus"]}}
-    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
 
     assert dict(runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")) == {"ok": True}
-    rows = _ledger_lines(tmp_path, "r1")
+    rows = _ledger_lines(conn, "r1")
     assert len(rows) == 2
     assert rows[1]["retry_of"] == rows[0]["id"]
     assert rows[1]["reason"] == "structured_output"
     assert rows[1]["model"] == "opus"
 
 
-def test_a_safeguard_refusal_that_recurs_on_the_alternate_model_propagates_the_original_error(sequenced_claude, tmp_path) -> None:
+def test_a_safeguard_refusal_that_recurs_on_the_alternate_model_propagates_the_original_error(
+    sequenced_claude, tmp_path, conn
+) -> None:
     script, set_sequence, _ = sequenced_claude
     set_sequence(SAFEGUARD, SAFEGUARD)
     profile = {**PROFILE, "tiers": {**PROFILE["tiers"], "standard": ["sonnet", "opus"]}}
-    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
 
     with pytest.raises(RunnerError, match="safeguards flagged"):
         runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")
-    rows = _ledger_lines(tmp_path, "r1")
+    rows = _ledger_lines(conn, "r1")
     assert len(rows) == 2
     assert rows[1]["retry_of"] == rows[0]["id"]
     assert rows[1]["model"] == "opus"
@@ -1613,47 +1656,47 @@ def test_next_spent_on_a_stop_replaces_rather_than_adds() -> None:
 # ── the ledger sees every billed attempt, not just the one that returns ─────
 
 
-def test_a_transient_retry_ledgers_the_failed_attempt_before_the_success(sequenced_claude, tmp_path) -> None:
+def test_a_transient_retry_ledgers_the_failed_attempt_before_the_success(sequenced_claude, tmp_path, conn) -> None:
     script, set_sequence, _ = sequenced_claude
     set_sequence(SAFEGUARD, OK)
-    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
 
     assert dict(runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")) == {"ok": True}
-    rows = _ledger_lines(tmp_path, "r1")
+    rows = _ledger_lines(conn, "r1")
     assert len(rows) == 2, "the retried attempt was billed too and must not vanish from the ledger"
-    assert rows[0]["ok"] is False and "safeguards flagged" in rows[0]["error"]
-    assert rows[1]["ok"] is True and "error" not in rows[1]
+    assert [row["ok"] for row in rows] == [False, True]
 
 
-def test_a_transient_retry_with_tracing_ledgers_the_renamed_trace_not_the_reused_one(sequenced_claude, tmp_path) -> None:
+def test_a_transient_retry_with_tracing_ledgers_the_renamed_trace_not_the_reused_one(
+    sequenced_claude, tmp_path, conn
+) -> None:
     """The retry reuses the failed attempt's filename, so its ledger row must not still point there."""
     script, set_sequence, _ = sequenced_claude
     set_sequence(SAFEGUARD, OK)
     runner = ClaudeCodeRunner(
-        PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", trace_dir=tmp_path / "trace",
+        PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn),
+        trace_dir=tmp_path / "trace",
     )
 
     runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")
-    rows = _ledger_lines(tmp_path, "r1")
+    rows = _ledger_lines(conn, "r1")
     assert len(rows) == 2
     assert rows[0]["trace"] != rows[1]["trace"], "one path must not be claimed by two rows"
     assert rows[0]["trace"].endswith("arbitrate-1.error.jsonl")
     assert rows[1]["trace"].endswith("arbitrate-1.jsonl")
 
 
-def test_a_budget_stop_still_ledgers_the_attempt_it_spent(sequenced_claude, tmp_path) -> None:
+def test_a_budget_stop_still_ledgers_the_attempt_it_spent(sequenced_claude, tmp_path, conn) -> None:
     script, set_sequence, _ = sequenced_claude
     set_sequence(REFUSED)
-    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
 
     with pytest.raises(BudgetStop):
         runner.run(role="build", schema=SCHEMA, prompt="build it")
-    rows = _ledger_lines(tmp_path, "r1")
-    assert len(rows) == 1
-    assert rows[0]["ok"] is False and "error_max_budget_usd" in rows[0]["error"]
+    assert [row["ok"] for row in _ledger_lines(conn, "r1")] == [False]
 
 
-def test_a_patch_empty_refusal_is_not_ledgered_as_a_success(tmp_path, repo) -> None:
+def test_a_patch_empty_refusal_is_not_ledgered_as_a_success(tmp_path, repo, conn) -> None:
     output = tmp_path / "output.json"
     output.write_text(
         json.dumps({"is_error": False, "total_cost_usd": 0.01, "num_turns": 1, "structured_output": {"patch": ""}}),
@@ -1662,12 +1705,12 @@ def test_a_patch_empty_refusal_is_not_ledgered_as_a_success(tmp_path, repo) -> N
     script = tmp_path / "claude"
     script.write_text(f"#!/bin/sh\ncat {output}\n", encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
-    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo, runs_dir=tmp_path, run_id="r1")
+    runner = ClaudeCodeRunner(
+        PROFILE, claude_bin=str(script), cwd=tmp_path, repo_dir=repo, runs_dir=tmp_path, run_id="r1", store=Store(conn)
+    )
     with pytest.raises(RunnerError, match="patch_empty"):
         runner.run(role="build", schema=SCHEMA, prompt="go")
-    rows = _ledger_lines(tmp_path, "r1")
-    assert len(rows) == 1
-    assert rows[0]["ok"] is False and "patch_empty" in rows[0]["error"]
+    assert [row["ok"] for row in _ledger_lines(conn, "r1")] == [False]
 
 
 def test_a_patch_empty_retry_does_not_overwrite_the_failed_attempts_trace(tmp_path, repo) -> None:
@@ -1984,12 +2027,14 @@ def test_effort_without_a_class_key_reads_the_legacy_tier_name(fake_claude, tmp_
     assert effort == "xhigh"
 
 
-def test_a_safeguard_refusal_retries_on_the_next_classes_entry(sequenced_claude, tmp_path) -> None:
+def test_a_safeguard_refusal_retries_on_the_next_classes_entry(sequenced_claude, tmp_path, conn) -> None:
     script, set_sequence, _ = sequenced_claude
     set_sequence(SAFEGUARD, OK)
-    runner = ClaudeCodeRunner({**PROFILE, **CLASSES_PROFILE}, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner = ClaudeCodeRunner(
+        {**PROFILE, **CLASSES_PROFILE}, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn)
+    )
     runner.run(role="arbitrate", schema=SCHEMA, prompt="decide", tier="deep")
-    assert [row["model"] for row in _ledger_lines(tmp_path, "r1")] == ["opus", "opus-2"]
+    assert [row["model"] for row in _ledger_lines(conn, "r1")] == ["opus", "opus-2"]
 
 
 # ── a supplied shadow router decision is recorded, never obeyed ─────────────
