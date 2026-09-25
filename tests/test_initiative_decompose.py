@@ -12,6 +12,7 @@ import yaml
 from graphs._contract import ContractViolation
 from graphs.delivery import initiative_decompose
 from runner import ScriptedRunner
+from runner.decision_log import RouterDecision
 from runner.tier_resolution import Hints
 
 DECOMPOSITION = {
@@ -579,3 +580,68 @@ def test_every_adversary_call_keeps_the_deep_literal(cart) -> None:
         adversary = [c for c in runner.calls if c["role"] == "review_adversary"]
         assert len(adversary) == 2, name
         assert [c["tier"] for c in adversary] == ["deep", "deep"], name
+
+
+# ── router decisions: each call gets one from the DecisionSource ─────────────
+
+DECISION = RouterDecision(
+    chosen_class="deep", model="m", effort="high", budget_usd=1.0, reasons=("adversary",), clipped_by=()
+)
+
+
+class DecidedRunner(ScriptedRunner):
+    """A `ScriptedRunner` that accepts `router_decision` and records it, None when the caller passed none."""
+
+    def run(self, *, router_decision=None, **kwargs):
+        try:
+            return super().run(**kwargs)
+        finally:
+            self.calls[-1] = {**self.calls[-1], "router_decision": router_decision}
+
+
+def _adversary_runs(cart, **extra):
+    """Both adversary scenarios: edge challenge plus an unbuildable correction, and plus a lint correction."""
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    surface = {"task": "t1", "surface": "widget-thing", "replacement": "schema.py"}
+    reach = {"task": "t1", "surface": "~/scratch/notes.md", "replacement": "graphs/notes.py"}
+    scenarios = [
+        (["widget-thing"], [{"repo": "graphs", "path": "graphs/schema.py"}], surface),
+        (["~/scratch/notes.md"], [], reach),
+    ]
+    runners = []
+    for surfaces, tree, correction in scenarios:
+        tasks = [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": surfaces}]
+        answers = {
+            "decompose": {**DECOMPOSITION, "tasks": tasks},
+            "review_adversary": [ACCEPTED, {"corrections": [correction], "summary": "ok"}],
+        }
+        runner = DecidedRunner(answers)
+        initiative_decompose.run(
+            {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": tree, **extra}, runner
+        )
+        runners.append(runner)
+    return runners
+
+
+def test_every_call_receives_the_decision_and_the_adversary_keeps_tier_deep(cart) -> None:
+    for runner in _adversary_runs(cart, decision_source=lambda role, hints: DECISION):
+        assert [c["role"] for c in runner.calls] == ["decompose", "review_adversary", "review_adversary"]
+        assert all(c["router_decision"] is DECISION for c in runner.calls)
+        assert [c["tier"] for c in runner.calls] == [None, "deep", "deep"]
+
+
+def test_the_source_is_asked_with_the_decompose_hints_and_none_for_the_adversary(cart) -> None:
+    asked = []
+
+    def source(role, hints):
+        asked.append((role, hints))
+
+    _adversary_runs(cart, decision_source=source)
+    per_run = [("decompose", Hints(judgment="high")), ("review_adversary", None), ("review_adversary", None)]
+    assert asked == per_run * 2
+
+
+def test_the_default_source_passes_no_decision(cart) -> None:
+    for runner in _adversary_runs(cart):
+        assert len(runner.calls) == 3
+        assert all(c["router_decision"] is None for c in runner.calls)

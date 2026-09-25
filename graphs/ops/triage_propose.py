@@ -18,12 +18,21 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from graphs._contract import ContractViolation, proposal, require, require_cartridge
+from runner.decision_log import RouterDecision
+from runner.decision_source import DecisionSource, NoDecisionSource, ask
 from runner.protocol import NodeRunner
 from runner.tier_resolution import Hints
 
 __all__ = ["GRAPH_NAME", "run"]
 
 GRAPH_NAME = "triage-propose"
+
+
+def _decision(source: DecisionSource, role: str, hints: Hints | None) -> dict[str, RouterDecision]:
+    """`router_decision` kwarg for a runner call; empty when the source has no decision, so it defaults to None."""
+    decision = ask(source, role, hints)
+    return {} if decision is None else {"router_decision": decision}
+
 
 DEFAULT_MAX_ALERTS = 15
 DEFAULT_VERIFY_CAP = 5
@@ -137,6 +146,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "a node that fetches cannot be replayed."
         )
 
+    source = args.get("decision_source") or NoDecisionSource()
     max_alerts = int(args.get("max_alerts") or DEFAULT_MAX_ALERTS)
     verify_cap = int(args.get("verify_cap") or DEFAULT_VERIFY_CAP)
     if verify_cap > max_alerts:
@@ -159,9 +169,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     runbook_gaps = 0
 
     for index, alert in enumerate(fetched):
+        classify_hints = Hints(judgment="low")
         classification = runner.run(
             role="triage_classify",
-            hints=Hints(judgment="low"),
+            hints=classify_hints,
+            **_decision(source, "triage_classify", classify_hints),
             schema=CLASSIFY_SCHEMA,
             context=context,
             prompt=(
@@ -176,9 +188,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             triaged.append({"alert": dict(alert), "classification": dict(classification), "verified": False})
             continue
 
+        verify_hints = Hints(judgment="high")
         verification = runner.run(
             role="evidence_verify",
-            hints=Hints(judgment="high"),
+            hints=verify_hints,
+            **_decision(source, "evidence_verify", verify_hints),
             schema=VERIFY_SCHEMA,
             context=context,
             prompt=(

@@ -16,6 +16,7 @@ import pytest
 from graphs._contract import ContractViolation
 from graphs.delivery import phase_validate
 from runner import ScriptedRunner
+from runner.decision_log import RouterDecision
 from runner.tier_resolution import Hints
 
 _UNSET = object()
@@ -716,3 +717,64 @@ def test_two_malformed_refusals_abstain_rather_than_quarantine(cart) -> None:
     assert by_task["t1-probe"]["reasoning"] == "second attempt, still nothing", (
         "the record reflects the retry that was actually judged, not the first, discarded attempt"
     )
+
+
+# ── router decisions: each call gets one from the DecisionSource ─────────────
+
+DECISION = RouterDecision(
+    chosen_class="standard", model="m", effort="medium", budget_usd=1.0, reasons=("validator",), clipped_by=()
+)
+
+
+class DecidedRunner(HintedRunner):
+    """A `HintedRunner` that accepts `router_decision` and records it, None when the caller passed none."""
+
+    def run(self, *, router_decision=None, **kwargs):
+        try:
+            return super().run(**kwargs)
+        finally:
+            self.calls[-1] = {**self.calls[-1], "router_decision": router_decision}
+
+
+def _decided(cart, responses, **extra):
+    args = {"run_id": "r1", "date": "2026-09-01", "cartridge": cart, "phase_state": copy.deepcopy(PHASE_STATE), **extra}
+    runner = DecidedRunner(responses)
+    phase_validate.run(args, runner)
+    return runner
+
+
+def test_every_call_receives_the_decision_including_the_placeholder_retry(cart) -> None:
+    runner = _decided(
+        cart,
+        {"validate_chunk": [PLACEHOLDER, CHUNK_OK], "validate_phase": PHASE_MET},
+        decision_source=lambda role, hints: DECISION,
+    )
+    assert [c["role"] for c in runner.calls] == ["validate_chunk"] * 3 + ["validate_phase"]
+    assert all(c["router_decision"] is DECISION for c in runner.calls)
+
+
+def test_the_refusal_retry_receives_the_decision_too(cart) -> None:
+    malformed = {"satisfied": False, "gaps": ["no migration"], "reasoning": "half", "defects": []}
+    runner = _decided(
+        cart,
+        {"validate_chunk": [malformed, CHUNK_OK], "validate_phase": PHASE_MET},
+        decision_source=lambda role, hints: DECISION,
+    )
+    assert len(runner.calls) == 4
+    assert all(c["router_decision"] is DECISION for c in runner.calls)
+
+
+def test_the_source_is_asked_with_the_hints_the_call_declares(cart) -> None:
+    asked = []
+
+    def source(role, hints):
+        asked.append((role, hints))
+
+    runner = _decided(cart, {"validate_chunk": CHUNK_OK, "validate_phase": PHASE_MET}, decision_source=source)
+    assert asked == [(c["role"], c["hints"]) for c in runner.calls]
+
+
+def test_the_default_source_passes_no_decision(cart) -> None:
+    runner = _decided(cart, {"validate_chunk": CHUNK_OK, "validate_phase": PHASE_MET})
+    assert len(runner.calls) == 3
+    assert all(c["router_decision"] is None for c in runner.calls)
