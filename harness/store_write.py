@@ -140,7 +140,23 @@ def task_record_row(run_id: str, phase_id: str, task_id: str, record: Mapping[st
     }
 
 
-def attempt_row(run_id: str, task_id: str, seq: int, phase_id: str, kind: str, reason: str | None, ts: str) -> Row:
+def task_cause(record: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """The (cause, cause_why) a task record carries; None for each one it does not."""
+    return record.get("cause"), record.get("cause_why")
+
+
+def attempt_row(
+    run_id: str,
+    task_id: str,
+    seq: int,
+    phase_id: str,
+    kind: str,
+    reason: str | None,
+    ts: str,
+    *,
+    cause: str | None = None,
+    cause_why: str | None = None,
+) -> Row:
     return {
         "run_id": run_id,
         "task_id": task_id,
@@ -149,6 +165,8 @@ def attempt_row(run_id: str, task_id: str, seq: int, phase_id: str, kind: str, r
         "kind": kind,
         "reason": reason,
         "ts": ts,
+        "cause": cause,
+        "cause_why": cause_why,
     }
 
 
@@ -263,8 +281,18 @@ class Store:
         reason: str | None,
         ts: str,
         epoch: int | None = None,
+        *,
+        cause: str | None = None,
+        cause_why: str | None = None,
     ) -> int:
-        return self._insert("attempts", attempt_row(run_id, task_id, seq, phase_id, kind, reason, ts))
+        row = attempt_row(run_id, task_id, seq, phase_id, kind, reason, ts, cause=cause, cause_why=cause_why)
+        return self._insert("attempts", row)
+
+    def set_attempt_cause(self, run_id: str, task_id: str, seq: int, cause: str | None, cause_why: str | None) -> int:
+        """Set cause and cause_why on an existing attempt. Returns the rows changed, 0 when there is no such attempt."""
+        m = self.conn.dialect.placeholder
+        sql = f"UPDATE attempts SET cause = {m}, cause_why = {m} WHERE run_id = {m} AND task_id = {m} AND seq = {m}"
+        return self.conn.execute(sql, (cause, cause_why, run_id, task_id, seq))
 
     def record_call(
         self,
