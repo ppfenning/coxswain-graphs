@@ -43,6 +43,14 @@ def _tokens(text: str) -> list[str]:
     return re.findall(r"\S+", text)
 
 
+# Top-level directories a real absolute path starts with (Linux FHS, macOS, Nix). A rooted token whose first
+# segment is none of these (`/v1/chat/completions`, `/rest/api/2/search`) names a route, not a file.
+_FS_ROOTS = frozenset({
+    "bin", "boot", "etc", "home", "lib", "lib64", "media", "mnt", "nix", "opt", "private", "proc", "root", "run",
+    "sbin", "snap", "srv", "sys", "tmp", "Users", "usr", "var", "Volumes",
+})
+
+
 def _is_notation(candidate: str) -> bool:
     """A token that is not a path at all: a bare slash between words
     ("cartridges 1.0 / graphs 1.0"), or a shape with an angle-bracket
@@ -51,6 +59,8 @@ def _is_notation(candidate: str) -> bool:
     stripped = candidate.strip("`,.()")
     if stripped.startswith("/dev/"):
         return True  # a device (`/dev/null`) is where output goes, not an artifact anyone reads
+    if stripped.startswith("/") and stripped.split("/")[1] not in _FS_ROOTS:
+        return True  # a URL or API route (`/v1/chat/completions`), not a file: its first segment is no filesystem root
     return stripped in ("/", "~/") or "<" in stripped or ">" in stripped or not re.search(r"[\w.]", stripped)
 
 
