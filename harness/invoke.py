@@ -110,7 +110,10 @@ def invoke_graphs(
     results: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=max(1, max_parallel)) as pool:
+    # Not a `with` block: its exit is `shutdown(wait=True)`, which on a SIGTERM
+    # would start and finish every queued node before the run records its end.
+    pool = ThreadPoolExecutor(max_workers=max(1, max_parallel))
+    try:
         futures = {
             pool.submit(
                 specs[invocation.graph].run,
@@ -127,6 +130,15 @@ def invoke_graphs(
                 # continue-and-quarantine: this one is set aside with its
                 # diagnosis, the rest of the fan-out finishes.
                 failures.append(f"{invocation.id}: {exc}")
+    except SystemExit:
+        # A SIGTERM arrives here as SystemExit (harness/cli.py `_exit_on_sigterm`):
+        # drop the queue and leave; `main` stops the nodes already running.
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    except BaseException:
+        pool.shutdown(wait=True)
+        raise
+    pool.shutdown(wait=True)
 
     ordered = [results[key] for key in sorted(results)]
     proposals = [item for result in ordered for item in result.get("proposals", [])]
