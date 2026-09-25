@@ -48,7 +48,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
 
-from core import workstore
+from core import ledger, workstore
 from core.manifest import build_manifest, gate_diff, record_run
 from core.workstore import WorkStoreError, record_attempt
 
@@ -76,6 +76,8 @@ from harness.escalate import escalate_self_modification, touched_paths
 from harness.gate import apply_arm_for, auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
+from harness.store_lease import assert_epoch
+from harness.store_write import Store
 from harness.worktree import apply_patch, create_worktree, keep_worktree, prune_registrations, remove_worktree
 from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import LimitStop, RunnerError
@@ -198,6 +200,9 @@ class _Ctx:
     default_ref: str
     resume_from: str | None = None
     repo_checks: list = field(default_factory=list)
+    store: Store | None = None
+    epoch: int | None = None
+    lease_name: str | None = None
 
     # ── names, in one place, so the topology is readable ─────────────────────
     def phase_branch(self, phase: str) -> str:
@@ -753,6 +758,9 @@ def run_epic(
     fix_attempts: int | None = None,
     resume_from: str | None = None,
     keep_worktrees: bool = False,
+    store: Store | None = None,
+    epoch: int | None = None,
+    lease_name: str | None = None,
 ) -> dict[str, Any]:
     """Drive a whole initiative: every phase, in dependency order, landing nothing.
 
@@ -771,7 +779,13 @@ def run_epic(
     `finally`: removed by default, or moved under `_kept/<run_id>` when
     `keep_worktrees` is set. The primitives live in `harness.worktree`; this
     only decides which one to call.
+
+    With a `store`, the run is also recorded there: phases, tasks, attempts, gate
+    decisions and ledger rows. With an `epoch` as well, every leader-only write first
+    asserts that epoch against the lease `lease_name` and is refused when it is stale.
     """
+    if epoch is not None and store is None:
+        raise ValueError("epoch fences writes against the store's lease, so it needs a store")
     repo = Path(repo)
     ctx: _Ctx | None = None
     try:
@@ -800,6 +814,9 @@ def run_epic(
             fix_attempts=fix_attempts,
             resume_from=resume_from,
             repo_checks=repo_checks(agent_checks_text),
+            store=store,
+            epoch=epoch,
+            lease_name=lease_name,
             initiative_id=str(initiative.get("id")),
             # An unparented phase branches from the repository's current HEAD, read
             # once here so every phase in a run stacks on the same ground.
@@ -824,8 +841,12 @@ def run_epic(
         stacks_rebased = 0
         paused_until: str | None = None
 
+        def add_phase(record: dict[str, Any]) -> None:
+            phases.append(record)
+            _record_phase(ctx, record)
+
         for phase in cyclic:
-            phases.append(
+            add_phase(
                 {
                     "phase": phase,
                     "status": "blocked",
@@ -843,7 +864,7 @@ def run_epic(
                 # Two parents is a merge of two stacks, and a v1 stack has one base
                 # ref. Refusing beats picking one parent and silently building on
                 # half the ground.
-                phases.append(
+                add_phase(
                     {
                         "phase": phase,
                         "status": "blocked",
@@ -861,7 +882,7 @@ def run_epic(
                 # v1 is blanket no: a phase unblocks its dependents only when
                 # `validate_phase` says the goal is met. The validator reports
                 # `quarantine_blocks_dependents`; nothing acts on it yet.
-                phases.append(
+                add_phase(
                     {
                         "phase": phase,
                         "status": "blocked",
@@ -885,7 +906,7 @@ def run_epic(
             quarantined.extend(record.pop("quarantined"))
             proposals.extend(record.pop("batch"))
             stacks_rebased += 1 if record.get("rebased") else 0
-            phases.append(record)
+            add_phase(record)
             if record["status"] == "complete":
                 complete.add(phase)
 
@@ -985,10 +1006,15 @@ def _quarantine_task(
     the terse one on `entry` — the next build's carried-forward brief gets the
     fuller text, the printed quarantine line stays short.
     """
+    stale = _fenced(ctx)
+    if stale is not None:
+        # A stale leader records no attempt anywhere, so it is not an attempt either.
+        return {"id": task, "phase": phase, "grain": "task", "reason": f"{stale}; not recorded: {reason}", "kind": "no_work"}
     patch_kept = kind in ("unverified", "infra")
     entry: dict[str, Any] = {"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": kind}
     if patch_kept:
         entry["patch_kept"] = True
+    ts = _now()
     path = (by_id.get(task) or {}).get("path")
     if path:
         with contextlib.suppress(WorkStoreError, OSError):
@@ -998,10 +1024,73 @@ def _quarantine_task(
                 phase=phase,
                 reason=detail or reason,
                 kind=kind,
-                ts=datetime.now(UTC).isoformat(),
+                ts=ts,
                 **({"patch_kept": True} if patch_kept else {}),
             )
+    if ctx.store is not None:
+        # The store's attempt exists whether or not the item has a file behind it.
+        seq = _next_attempt_seq(ctx.store, ctx.run_id, task)
+        ctx.store.record_attempt(ctx.run_id, task, seq, phase, kind, detail or reason, ts, epoch=ctx.epoch)
     return entry
+
+
+def _next_attempt_seq(store: Store, run_id: str, task: str) -> int:
+    """The attempts already stored for (run, task), so a rerun of the same run id appends rather than collides."""
+    mark = store.conn.dialect.placeholder
+    row = store.conn.query_one(f"SELECT COUNT(*) FROM attempts WHERE run_id = {mark} AND task_id = {mark}", (run_id, task))
+    return 0 if row is None else int(row[0])
+
+
+LEASE_NAME = "chair"
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _fenced(ctx: _Ctx) -> str | None:
+    """None when a leader-only write may proceed, else the `stale epoch` reason. No epoch, no fence."""
+    if ctx.epoch is None or ctx.store is None:
+        return None
+    conn, name = ctx.store.conn, ctx.lease_name or LEASE_NAME
+    if assert_epoch(conn, name, ctx.epoch, _now()):
+        return None
+    row = conn.query_one(f"SELECT epoch FROM leases WHERE name = {conn.dialect.placeholder}", (name,))
+    held = "none" if row is None else row[0]
+    return f"stale epoch: this driver holds epoch {ctx.epoch}, lease '{name}' is at epoch {held} or has expired"
+
+
+def _record_phase(ctx: _Ctx, record: Mapping[str, Any]) -> None:
+    if ctx.store is not None and _fenced(ctx) is None:
+        row = {**record, "run_id": f"{ctx.run_id}:{record['phase']}", "ts": _now(), "principal": PRINCIPAL}
+        ctx.store.record_phase(row, epoch=ctx.epoch)
+
+
+def _record_tasks(
+    ctx: _Ctx, phase: str, task_records: Sequence[Mapping[str, Any]], quarantined: Sequence[Mapping[str, Any]]
+) -> None:
+    """One row per task at its final state: the store keeps the first row for a (run, task)."""
+    if ctx.store is None or _fenced(ctx) is not None:
+        return
+    states = {str(q["id"]): "quarantined" for q in quarantined if q.get("grain") == "task"}
+    states.update({str(t["id"]): str(t.get("state") or t["status"]) for t in task_records})
+    ts = _now()
+    for task, state in sorted(states.items()):
+        ctx.store.record_task(ctx.run_id, phase, task, state, ts, epoch=ctx.epoch)
+
+
+def _refuse_stale(state: _Execution, *, phase: str, subject: str, slot: str, reason: str) -> None:
+    """Quarantine what a stale leader tried to write. Not an attempt, so never through `_quarantine_task`."""
+    task_grain = bool(subject) and slot != "rebase"
+    entry = {
+        "id": subject if task_grain else phase,
+        "phase": phase,
+        "grain": "task" if task_grain else "phase",
+        "reason": reason,
+        "kind": "no_work",
+    }
+    if entry not in state.quarantined:
+        state.quarantined.append(entry)
 
 
 def _frontmatter_block(body: str) -> str | None:
@@ -1081,6 +1170,11 @@ def _run_phase(
         "batch": [],
     }
 
+    # A stale leader opens no branch and builds nothing.
+    stale_start = _fenced(ctx)
+    if stale_start:
+        return _stale_phase(record, stale_start)
+
     ok, detail, reused = _open_phase_worktree(ctx, phase, base_ref)
     if not ok:
         record["status"] = "blocked"
@@ -1126,6 +1220,9 @@ def _run_phase(
         return record
 
     if action == "recreate":
+        stale_recreate = _fenced(ctx)
+        if stale_recreate:
+            return _stale_phase(record, stale_recreate)
         _git("-C", str(ctx.phase_worktree(phase)), "checkout", "--detach", "-q")
         _git("-C", str(ctx.repo), "worktree", "remove", "--force", str(ctx.phase_worktree(phase)))
         _git("-C", str(ctx.repo), "branch", "-D", branch)
@@ -1672,6 +1769,8 @@ def _run_phase(
                 if task_record["id"] == task:
                     task_record["state"] = "approved"
 
+    _record_tasks(ctx, phase, record["task_records"], quarantined)
+
     record["status"], reason = _phase_status(
         verdict,
         validated=validated,
@@ -1690,7 +1789,8 @@ def _run_phase(
     # trim is not a second opinion on completeness, it runs after that
     # question is already settled.
     if record["status"] == "complete" and verdict is not None and verdict.get("goal_met") and "style_pass" in ctx.bound:
-        outcome = _trim_phase(ctx, phase)
+        stale_trim = _fenced(ctx)
+        outcome = f"refused: {stale_trim}" if stale_trim else _trim_phase(ctx, phase)
         if outcome is not None:
             record["trim"] = f"trim: {outcome}"
 
@@ -1719,9 +1819,28 @@ def _run_phase(
         human_minutes=human_minutes,
         totals=totals,
     )
-    record_run(manifest, runs_dir=ctx.runs_dir, ledger_path=ctx.ledger_path)
-    record["manifest"] = f"{ctx.run_id}:{phase}"
     record["totals"] = totals
+    stale = _fenced(ctx)
+    if stale is not None:
+        return _stale_phase(record, stale)
+    record_run(manifest, runs_dir=ctx.runs_dir, ledger_path=ctx.ledger_path)
+    if ctx.store is not None:
+        # Ledger rows are built in `core.manifest.record_run`; the store copies this phase's rows back by run id.
+        for row in ledger.read(ctx.ledger_path):
+            if row.get("run_id") == manifest["run_id"]:
+                ctx.store.record_ledger(row, epoch=ctx.epoch)
+        ctx.store.record_gate_decisions(ctx.run_id, phase, diffs, epoch=ctx.epoch)
+    record["manifest"] = f"{ctx.run_id}:{phase}"
+    return record
+
+
+def _stale_phase(record: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Block the phase on a stale epoch, so it neither reads complete nor unblocks its dependents."""
+    record["status"] = "blocked"
+    record["reason"] = reason
+    record["quarantined"].append(
+        {"id": record["phase"], "phase": record["phase"], "grain": "phase", "reason": reason, "kind": "no_work"}
+    )
     return record
 
 
@@ -2064,6 +2183,11 @@ def _execute(
     and reports honestly that nothing happened. That is what makes an escalated
     task's merge impossible to earn rather than merely discouraged.
     """
+    stale = _fenced(ctx)
+    if stale is not None:
+        _refuse_stale(state, phase=phase, subject=subject, slot=slot, reason=stale)
+        return False, stale
+
     kind = item.get("kind")
 
     if kind == "draft_pr_create" and slot == "draft":
