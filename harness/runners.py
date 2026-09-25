@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,10 @@ from runner.system_one import ConfigError, DecisionRunner, FastPathRunner, Syste
 from runner.system_one_specs import role_specs
 
 __all__ = ["build_runner"]
+
+
+class _Unavailable(Exception):
+    """The block is valid but its backend cannot be served now. The message is the one-line reason."""
 
 
 def _jev(model: str, api_key: str, block: Mapping[str, Any]) -> DecisionRunner:
@@ -26,7 +31,12 @@ def _knn_local(model: str, api_key: str, block: Mapping[str, Any]) -> DecisionRu
     from runner.system_one_knn import DEFAULT_EMBEDDING_MODEL, load_knn_decider
 
     if not block.get("examples"):
-        raise ValueError("system_one.examples must name the examples file for backend knn-local")
+        raise _Unavailable("system_one.examples names no examples file for backend knn-local")
+    examples = Path(block["examples"])
+    if not examples.is_file():
+        raise _Unavailable(f"examples file {examples} does not exist")
+    if not examples.read_text(encoding="utf-8").strip():
+        raise _Unavailable(f"examples file {examples} is empty")
     return load_knn_decider(
         block["examples"],
         block.get("k", 5),
@@ -60,8 +70,11 @@ def _decider(config: SystemOneConfig, profile: Mapping[str, Any]) -> DecisionRun
     env_var = profile.get("auth_env", "ANTHROPIC_API_KEY")
     api_key = os.environ.get(env_var, "")
     if config.backend in _NEEDS_KEY and not api_key:
-        raise ValueError(f"system_one needs ${env_var} (the profile's auth_env), and it is not set")
-    return constructor(config.model, api_key, profile["system_one"])
+        raise _Unavailable(f"${env_var} (the profile's auth_env) is not set")
+    try:
+        return constructor(config.model, api_key, profile["system_one"])
+    except ImportError as error:
+        raise _Unavailable(str(error)) from error
 
 
 class _DelegatingFastPath(FastPathRunner):
@@ -86,12 +99,25 @@ class _DelegatingFastPath(FastPathRunner):
             setattr(self._inner, name, value)
 
 
-def _with_fast_path(real: Any, profile: Mapping[str, Any]) -> Any:
-    """`real` itself unless the profile turns a role on, then `real` wrapped in the fast path."""
+def _to_stderr(line: str) -> None:
+    print(line, file=sys.stderr)
+
+
+def _with_fast_path(real: Any, profile: Mapping[str, Any], notes: Callable[[str], None] = _to_stderr) -> Any:
+    """`real` itself unless the profile turns a role on, then `real` wrapped in the fast path.
+
+    A malformed block raises. A valid block whose backend is unavailable leaves `real` unwrapped
+    and reports one `system-one: off (<reason>)` line to `notes`.
+    """
     config = _active_config(profile)
     if config is None:
         return real
-    return _DelegatingFastPath(real, _decider(config, profile), config.roles, role_specs(), backend=config.backend)
+    try:
+        decider = _decider(config, profile)
+    except _Unavailable as unavailable:
+        notes(f"system-one: off ({unavailable})")
+        return real
+    return _DelegatingFastPath(real, decider, config.roles, role_specs(), backend=config.backend)
 
 
 def build_runner(
@@ -101,6 +127,7 @@ def build_runner(
     role_skills: Mapping[str, str] | None = None,
     workdir: str | Path | None = None,
     repo: str | Path | None = None,
+    notes: Callable[[str], None] = _to_stderr,
 ) -> Any:
     """A ScriptedRunner from canned responses, or one of the live runners.
 
@@ -141,4 +168,4 @@ def build_runner(
         from runner.anthropic_runner import AnthropicRunner
 
         real = AnthropicRunner(profile, role_skills=role_skills or {})
-    return _with_fast_path(real, profile)
+    return _with_fast_path(real, profile, notes)
