@@ -104,6 +104,7 @@ def test_run_row_takes_the_launch_record_and_keeps_the_whole_record():
         "launched_by": "chair-2026-09-23",
         "launched_at": "2026-09-24T13:56:37.979501+00:00",
         "graph_id": None,
+        "host": None,
         "started_at": None,
         "ended_at": None,
         "status": None,
@@ -111,6 +112,15 @@ def test_run_row_takes_the_launch_record_and_keeps_the_whole_record():
     }
     assert run_row(RUN)["launched_by"] is None
     assert run_row(RUN, {**LAUNCH, "graph_id": "g1"})["graph_id"] == "g1"
+
+
+def test_run_row_with_a_host_carries_it():
+    assert run_row(RUN, LAUNCH, host="h1")["host"] == "h1"
+
+
+def test_run_row_without_a_host_has_none_and_ignores_the_launch_record():
+    assert run_row(RUN, LAUNCH)["host"] is None
+    assert run_row(RUN, {**LAUNCH, "host": "from-launch"})["host"] is None
 
 
 def test_a_phase_records_run_id_splits_into_run_and_phase():
@@ -222,7 +232,7 @@ def test_gate_rows_number_the_decisions_and_flatten_flags():
 
 def test_every_builder_emits_exactly_the_tables_columns(conn):
     migrated = {"graph_id", "node_id"}
-    assert set(run_row(RUN)) == cols(conn, "runs") - {"host"}  # host is written by a later ticket
+    assert set(run_row(RUN)) == cols(conn, "runs")
     assert set(phase_row(PHASE)) == cols(conn, "phases")
     assert set(task_row("r", "p", "t", "s", "u")) == cols(conn, "tasks")
     assert set(attempt_row("r", "t", 0, "p", "k", None, "ts")) == cols(conn, "attempts")
@@ -265,6 +275,16 @@ def test_run_task_and_attempt_inserts_are_idempotent(store):
     assert [store.record_attempt("r", "t", 0, "p", "first", None, "ts") for _ in range(2)] == [1, 0]
     assert store.record_attempt("r", "t", 1, "p", "retry", "again", "ts") == 1
     assert [store.total_rows(t) for t in ("runs", "tasks", "attempts")] == [1, 1, 2]
+
+
+def test_record_run_with_a_host_stores_it(store, conn):
+    assert store.record_run(RUN, LAUNCH, host="h1") == 1
+    assert conn.query_one("SELECT host FROM runs") == ("h1",)
+
+
+def test_record_run_without_a_host_stores_null(store, conn):
+    assert store.record_run(RUN, LAUNCH) == 1
+    assert conn.query_one("SELECT host FROM runs") == (None,)
 
 
 def test_finish_run_stamps_the_end_of_a_recorded_run_and_a_repeat_changes_nothing_new(store, conn):

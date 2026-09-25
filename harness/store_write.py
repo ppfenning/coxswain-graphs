@@ -92,7 +92,8 @@ def split_phase_id(run_id: str) -> tuple[str, str]:
     return run, phase
 
 
-def run_row(record: Mapping[str, Any], launch: Mapping[str, Any] | None = None) -> Row:
+def run_row(record: Mapping[str, Any], launch: Mapping[str, Any] | None = None, *, host: str | None = None) -> Row:
+    """`host` is passed in, never read from `launch` (written by tools) or from the machine: this stays pure."""
     launched = launch or {}
     return {
         "run_id": record["run_id"],
@@ -100,6 +101,7 @@ def run_row(record: Mapping[str, Any], launch: Mapping[str, Any] | None = None) 
         "launched_by": launched.get("launched_by"),
         "launched_at": launched.get("at"),
         "graph_id": launched.get("graph_id"),
+        "host": host,
         "started_at": None,
         "ended_at": None,
         "status": None,
@@ -206,9 +208,14 @@ class Store:
         return self.conn.execute(sql, params)
 
     def record_run(
-        self, record: Mapping[str, Any], launch: Mapping[str, Any] | None = None, epoch: int | None = None
+        self,
+        record: Mapping[str, Any],
+        launch: Mapping[str, Any] | None = None,
+        epoch: int | None = None,
+        *,
+        host: str | None = None,
     ) -> int:
-        return self._insert("runs", run_row(record, launch))
+        return self._insert("runs", run_row(record, launch, host=host))
 
     def finish_run(self, run_id: str, ended_at: str, status: str) -> int:
         """Stamp how a run ended. Returns the rows changed; the same values twice is harmless."""
