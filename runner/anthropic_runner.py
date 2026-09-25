@@ -17,19 +17,26 @@ and neither does any cartridge, graph, or test fixture.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
+import uuid
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from runner.decision_log import CallDecision, RouterDecision, joined_reasons
+from runner.decision_log import CallDecision, RouterDecision, joined_reasons, to_row
 from runner.protocol import NodeResult, RunnerError
 from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class
+
+if TYPE_CHECKING:
+    # Type only: importing harness at module load is circular, since harness imports the runners.
+    from harness.store_write import Store
 
 __all__ = ["AnthropicRunner", "load_provider_profile"]
 
@@ -153,7 +160,14 @@ class AnthropicRunner:
         max_tokens: int = 16000,
         extra_system: str = "",
         role_skills: Mapping[str, str] | None = None,
+        store: Store | None = None,
+        run_id: str | None = None,
     ) -> None:
+        # Also record every finished call in the run-record store. This runner receives no run id today,
+        # so a new optional `run_id` (`run:phase`) is the smallest way to give the store its context.
+        self.store = store
+        self.run_id = run_id
+        self._store_seq = itertools.count(1)
         # role -> path of the skill body the cartridge bound to it, resolved by
         # the harness. Prepended to the node's system below — the moment a
         # binding stops being a validated name and becomes what the node knows.
@@ -210,6 +224,33 @@ class AnthropicRunner:
             except OSError as exc:
                 raise RunnerError(f"cannot read context pack {path}: {exc}") from exc
         return "\n\n".join(chunks)
+
+    def _record_to_store(self, role: str, task: str | None, tier: str, model: str, decision: CallDecision | None) -> None:
+        """Write one finished call to the store; no decision means the call failed. A store error is warned about, never raised."""
+        if self.store is None or not self.run_id:
+            return
+        from harness.store_write import split_phase_id  # here, not at the top: harness imports this module
+
+        run_id, phase_id = split_phase_id(self.run_id)
+        call = {
+            "id": str(uuid.uuid4()),
+            "role": role,
+            "task_id": task,
+            "tier": tier,
+            "model": model,
+            "ts": datetime.now(UTC).isoformat(),
+            "ok": decision is not None,
+        }
+        try:
+            self.store.record_call(
+                call,
+                None if decision is None else to_row(decision),
+                run_id=run_id,
+                seq=next(self._store_seq),
+                phase_id=phase_id or None,
+            )
+        except Exception as exc:
+            warnings.warn(f"store write failed for call {call['id']}: {exc}", RuntimeWarning, stacklevel=2)
 
     def run(
         self,
@@ -281,19 +322,23 @@ class AnthropicRunner:
         # confusing one three frames further up.
         if getattr(response, "stop_reason", None) == "refusal":
             details = getattr(response, "stop_details", None)
+            self._record_to_store(role, task, recorded.tier, model_id, None)
             raise RunnerError(f"node '{role}' was refused by the model (category: {getattr(details, 'category', None)})")
 
         try:
             text = next(block.text for block in response.content if block.type == "text")
         except StopIteration as exc:
+            self._record_to_store(role, task, recorded.tier, model_id, None)
             raise RunnerError(f"node '{role}' returned no text block") from exc
 
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
+            self._record_to_store(role, task, recorded.tier, model_id, None)
             raise RunnerError(f"node '{role}' returned text that is not valid JSON: {exc}") from exc
 
         if not isinstance(data, dict):
+            self._record_to_store(role, task, recorded.tier, model_id, None)
             raise RunnerError(f"node '{role}' returned {type(data).__name__}, expected an object")
         result = NodeResult(data)
         result.decision = _decision(
@@ -306,4 +351,5 @@ class AnthropicRunner:
             task=task,
             router_decision=shadow,
         )
+        self._record_to_store(role, task, recorded.tier, result.decision.model_id, result.decision)
         return result
