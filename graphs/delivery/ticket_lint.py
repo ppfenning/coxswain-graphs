@@ -1,7 +1,7 @@
-"""lint_tickets — the four static checks from docs/design/work-shape.md §3.
+"""lint_tickets — the static checks from docs/design/work-shape.md §3, plus `cross_repo`.
 
 Pure: plain data in, plain data out, no file I/O, no network, no clock.
-`reach` and `coupling` are refusals; `grant` and `size` are advisory
+`reach` and `coupling` are refusals; `grant`, `size` and `cross_repo` are advisory
 (`Problem.severity`) — the caller in `initiative_decompose.py` routes on that.
 `tree` rows may carry an optional `"imports"` list (paths that file imports),
 computed once at the edge, so the coupling rule's import disjunct stays pure.
@@ -25,6 +25,17 @@ _RISKY_TWO_WORD = frozenset({"git push"})
 _CORPUS_DENYLIST = ("workspace/", "runs/", "*.usage.json", "ledger.jsonl", "~/.local/state")
 _CORPUS_CORRECTION = "route this to `cox stats` or the chair; the build seat sees one repository worktree"
 
+# Top-level directories only one Coxswain repository has. `docs/` and `tests/` exist everywhere and are absent on purpose.
+_OTHER_REPO_ROOTS: Mapping[str, tuple[str, ...]] = {
+    "tools": ("agent_tools/",),
+    "graphs": ("harness/", "runner/", "graphs/"),
+    "cartridges": ("core/", "providers/", "cartridges/", "skills-plugins/"),
+    "umbrella": ("devtools/",),
+    "plugins": ("coxswain_plugins/",),
+}
+_PATH_PUNCTUATION = "`,.()\"':;"
+_CROSS_REPO_CORRECTION = "paste the code the build needs into the ticket: a build reads only its own repository"
+
 
 @dataclass(frozen=True)
 class Problem:
@@ -35,7 +46,7 @@ class Problem:
 
     @property
     def severity(self) -> str:
-        """`"refusal"` for reach/coupling, `"advisory"` for grant/size."""
+        """`"refusal"` for reach/coupling, `"advisory"` for grant/size/cross_repo."""
         return "refusal" if self.rule in _REFUSAL_RULES else "advisory"
 
 
@@ -120,6 +131,41 @@ def _reach_problems(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[s
             for path in _reach_candidates(task)
             if path not in known_paths and path not in corpus_hits and not _inside_by_suffix(path, known_paths)
         )
+    return problems
+
+
+def _owner_of(path: str) -> str | None:
+    """The Coxswain repository whose top-level directory `path` starts with, else None."""
+    if _is_notation(path):
+        return None
+    return next((repo for repo, roots in _OTHER_REPO_ROOTS.items() if path.startswith(roots)), None)
+
+
+def _repo_key(repo: str) -> str | None:
+    """The `_OTHER_REPO_ROOTS` key a `--target-repo` value names: `graphs`, `coxswain-graphs`, `~/x/graphs-repo`."""
+    segment = repo.rstrip("/").rsplit("/", 1)[-1].lower()
+    return next((key for key in _OTHER_REPO_ROOTS if key in segment.replace("_", "-").split("-")), None)
+
+
+def _own_repos(repo: str, tree: Sequence[Mapping[str, Any]]) -> frozenset[str]:
+    """The target named by `repo`, plus every repository whose roots the tree's own paths sit under."""
+    from_tree = {_owner_of(str(row.get("path"))) for row in tree}
+    return frozenset(key for key in {_repo_key(repo), *from_tree} if key is not None)
+
+
+def _cross_repo_problems(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[str, Any]], repo: str) -> list[Problem]:
+    """Silent when the target is unknown: "lives in another repository" needs to know which one is this one."""
+    known_paths = {str(row.get("path")) for row in tree}
+    own = _own_repos(repo, tree)
+    if not own:
+        return []
+    problems: list[Problem] = []
+    for task in tasks:
+        named = [*_tokens(str(task.get("body") or "")), *(str(s) for s in task.get("surfaces") or [])]
+        for path in dict.fromkeys(n.strip(_PATH_PUNCTUATION) for n in named):
+            owner = _owner_of(path)
+            if owner and owner not in own and path not in known_paths:
+                problems.append(Problem(str(task["id"]), "cross_repo", f"names {path}, which lives in {owner}", _CROSS_REPO_CORRECTION))
     return problems
 
 
@@ -247,4 +293,5 @@ def lint_tickets(
         *_coupling_problems(fixed_tasks, tree),
         *_grant_problems(fixed_tasks, grants),
         *_size_problems(fixed_tasks),
+        *_cross_repo_problems(fixed_tasks, tree, repo),
     ]
