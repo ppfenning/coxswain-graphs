@@ -47,6 +47,8 @@ __all__ = [
     "run_graph",
     "run_summary",
     "summary_row",
+    "task_record",
+    "task_records",
 ]
 
 Row = dict[str, Any]
@@ -68,7 +70,8 @@ _GATE_COLS = ("run_id", "phase_id", "seq", "kind", "target", "decision", "risk",
 _LEASE_COLS = ("name", "holder", "epoch", "heartbeat_at", "expires_at")
 _GRAPH_COLS = ("graph_id", "name", "version", "content_hash", "registered_at", "definition_json")
 _NODE_COLS = ("graph_id", "node_id", "ord", "role", "default_tier", "default_class", "output_schema_hash")
-_JSON_COLS = frozenset({"decision_json", "detail_json", "row_json", "definition_json"})
+_TASK_RECORD_COLS = ("run_id", "phase_id", "task_id", "record_json", "updated_at")
+_JSON_COLS = frozenset({"decision_json", "detail_json", "row_json", "definition_json", "record_json"})
 
 
 class StoreVersionError(RuntimeError):
@@ -262,6 +265,22 @@ def run_graph(conn: Connection, run_id: str) -> Row | None:
         "nodes": [_dict(_NODE_COLS, n) for n in nodes],
         "edges": [_dict(("src", "dst"), e) for e in edges],
     }
+
+
+def task_record(conn: Connection, run_id: str, phase_id: str, task_id: str) -> Row | None:
+    """The decoded record_json of one task, or None when the store has no such row."""
+    p = conn.dialect.placeholder
+    sql = f"{_select(_TASK_RECORD_COLS, 'task_records')} WHERE run_id = {p} AND phase_id = {p} AND task_id = {p}"
+    row = conn.query_one(sql, (run_id, phase_id, task_id))
+    return None if row is None else _dict(_TASK_RECORD_COLS, row)["record_json"]
+
+
+def task_records(conn: Connection, run_id: str) -> dict[tuple[str, str], Row]:
+    """A run's task records keyed by (phase_id, task_id), in that key order."""
+    p = conn.dialect.placeholder
+    sql = f"{_select(_TASK_RECORD_COLS, 'task_records')} WHERE run_id = {p} ORDER BY phase_id, task_id"
+    rows = (_dict(_TASK_RECORD_COLS, r) for r in conn.query_all(sql, (run_id,)))
+    return {(r["phase_id"], r["task_id"]): r["record_json"] for r in rows}
 
 
 def read_trace(root: str | Path, run_id: str, call_id: str) -> list[Row]:
