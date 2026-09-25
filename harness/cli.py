@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from datetime import date as date_type
 from pathlib import Path
@@ -47,8 +47,8 @@ from harness.runners import build_runner
 from harness.store_dialect import default_url
 from harness.store_graphs import derive_definition, register
 from harness.store_migrate import open_store
+from harness.store_read import cost_by_model, run_summary
 from harness.store_write import Store
-from harness.usage import record_usage
 from harness.worktree import apply_patch, create_worktree, keep_worktree, remove_worktree
 from runner.protocol import RunnerError
 
@@ -374,6 +374,45 @@ def _finish_store_run(store: Store, run_id: str, ended_at: str, status: str) -> 
         print(f"store: could not record the end of {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
 
 
+def _usage_line(summary: Mapping[str, Any] | None, models: Sequence[Mapping[str, Any]]) -> str | None:
+    """The run's totals as one log line; None when the run recorded no calls.
+
+    `models` are cost_by_model rows, one per (alias, tier); the line has one entry per alias, as the file ledger had.
+    """
+    if summary is None or not summary["calls"]:
+        return None
+    aliases = list(dict.fromkeys(m["model_alias"] for m in models))
+    merged = [
+        (a, sum(m["calls"] for m in models if m["model_alias"] == a), sum(m["cost_usd"] for m in models if m["model_alias"] == a))
+        for a in aliases
+    ]
+    breakdown = ", ".join(f"{a}: {n} call(s) ${round(cost, 4)}" for a, n, cost in merged)
+    cached, total = summary["cache_read_tokens"], summary["input_total"]
+    share = f", {100 * cached // total}% of input was cache reads" if total else ""
+    return f"  usage   : {summary['calls']} node call(s), {summary['turns']} turns, ${round(summary['cost_usd'], 4)} — {breakdown}{share}"
+
+
+def _undercount_note(run_id: str, stored: int, seen: int) -> str | None:
+    """A warning when the runner made more calls than the store holds; a runner's failed store write only logs."""
+    return f"store: holds {stored} of the {seen} call(s) {run_id} made; the usage totals undercount" if seen > stored else None
+
+
+def _print_usage(store: Store, run_id: str, runner: Any) -> None:
+    """Print the run's totals from the store. A store that fails here warns; it never changes the run's exit."""
+    try:
+        summary = run_summary(store.conn, run_id)
+        models = cost_by_model(store.conn, run_id)
+    except Exception as exc:
+        print(f"store: could not read the usage of {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
+        return
+    line = _usage_line(summary, models)
+    if line is not None:
+        print(line)
+    note = _undercount_note(run_id, summary["calls"] if summary else 0, len(getattr(runner, "calls", None) or []))
+    if note is not None:
+        print(note, file=sys.stderr)
+
+
 def _materialise(spec: GraphSpec, args: argparse.Namespace, parser: argparse.ArgumentParser) -> dict[str, Any]:
     """Turn a spec's declared needs into graph args. All I/O happens HERE.
 
@@ -553,9 +592,8 @@ def _main(argv: list[str] | None) -> int:
         repo=args.repo,
     )
 
-    # A runner that keeps a per-call ledger needs to know where and under what
-    # name — without these two, its ledger has nothing to write to and
-    # `record_usage`'s read of it has nothing to read.
+    # A runner that still keeps a per-call ledger needs to know where and under
+    # what name. Nothing here reads that ledger any more; usage comes from the store.
     if hasattr(runner, "runs_dir"):
         runner.runs_dir = Path(args.runs_dir)
     if hasattr(runner, "run_id"):
@@ -592,11 +630,12 @@ def _main(argv: list[str] | None) -> int:
         # First, so the run's end is on record even if a later step here raises.
         _finish_store_run(store, run_id, datetime.now(UTC).isoformat(), status)
         # Every exit below — success, a caught exception's `return 1`, or
-        # anything left to raise past this point — leaves `usage.json` matching
-        # whatever the per-call ledger holds, not only the happy path. `close`
-        # runs AFTER, the order the single-graph path always had: a runner that
-        # frees what it was counting in `close` must still be readable here.
-        record_usage(runner, runs_dir=args.runs_dir, run_id=run_id)
+        # anything left to raise past this point — prints the run's totals from
+        # the store, which holds every call recorded so far. Guarded like
+        # `_finish_store_run`: a store fault warns and never skips what follows.
+        # `close` runs AFTER, the order the single-graph path always had: the
+        # runner's `calls` must still be readable for the undercount check.
+        _print_usage(store, run_id, runner)
         close = getattr(runner, "close", None)
         if callable(close):
             close()
