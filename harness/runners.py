@@ -14,7 +14,7 @@ from runner import ScriptedRunner
 from runner.system_one import ConfigError, DecisionRunner, FastPathRunner, SystemOneConfig, parse_system_one_block
 from runner.system_one_specs import role_specs
 
-__all__ = ["build_runner"]
+__all__ = ["RUNNER_ENTRY_POINT_GROUP", "build_runner"]
 
 
 class _Unavailable(Exception):
@@ -116,6 +116,59 @@ def _with_fast_path(real: Any, profile: Mapping[str, Any], notes: Callable[[str]
     return _DelegatingFastPath(real, decider, config.roles, role_specs(), backend=config.backend)
 
 
+RUNNER_ENTRY_POINT_GROUP = "coxswain.runners"
+
+# A runner factory: (profile, *, role_skills, workdir, repo) -> runner.
+_RunnerFactory = Callable[..., Any]
+
+
+def _claude_code(
+    profile: Mapping[str, Any],
+    *,
+    role_skills: Mapping[str, str] | None,
+    workdir: str | Path | None,
+    repo: str | Path | None,
+) -> Any:
+    from runner.claude_code_runner import ClaudeCodeRunner
+
+    return ClaudeCodeRunner(
+        profile,
+        role_skills=role_skills or {},
+        cwd=workdir,
+        repo_dir=repo,
+        trace_dir=os.environ.get("AGENT_GRAPHS_TRACE_DIR") or None,
+    )
+
+
+def _anthropic(
+    profile: Mapping[str, Any],
+    *,
+    role_skills: Mapping[str, str] | None,
+    workdir: str | Path | None,
+    repo: str | Path | None,
+) -> Any:
+    from runner.anthropic_runner import AnthropicRunner
+
+    return AnthropicRunner(profile, role_skills=role_skills or {})
+
+
+_RUNNERS: dict[str, _RunnerFactory] = {"claude-code": _claude_code, "anthropic": _anthropic}
+
+
+def _runner_factory(name: str) -> _RunnerFactory:
+    """The built-in factory for `name`, else the one a `coxswain.runners` entry point loads. Never a fallback."""
+    built_in = _RUNNERS.get(name)
+    if built_in is not None:
+        return built_in
+    for entry in importlib.metadata.entry_points(group=RUNNER_ENTRY_POINT_GROUP):
+        if entry.name == name:
+            return entry.load()
+    raise ValueError(
+        f"runner {name!r} is not registered: built in are claude-code and anthropic; "
+        f"others register by entry point under {RUNNER_ENTRY_POINT_GROUP} (ppfenning/coxswain-plugins)"
+    )
+
+
 def build_runner(
     *,
     scripted: str | Path | None,
@@ -136,8 +189,9 @@ def build_runner(
     is the moment a cartridge binding stops being a validated name and starts
     being what the node actually knows.
 
-    Which live runner is the PROFILE's call (`runner: claude-code` selects the
-    headless Claude Code runner; anything else is the Messages API), because the
+    Which live runner is the PROFILE's call (`runner:` names a built-in, claude-code
+    or anthropic, or a plugin registered under coxswain.runners; no key means
+    anthropic, and an unregistered name refuses), because the
     vendor axis is the profile's whole job and a CLI flag would be a second copy
     of it. `workdir` and `repo` matter only to a runner whose nodes can read
     the world: the work store root the arms write under, and the repository the
@@ -150,18 +204,6 @@ def build_runner(
     from runner.anthropic_runner import load_provider_profile
 
     profile = load_provider_profile(provider_profile)
-    if profile.get("runner") == "claude-code":
-        from runner.claude_code_runner import ClaudeCodeRunner
-
-        real: Any = ClaudeCodeRunner(
-            profile,
-            role_skills=role_skills or {},
-            cwd=workdir,
-            repo_dir=repo,
-            trace_dir=os.environ.get("AGENT_GRAPHS_TRACE_DIR") or None,
-        )
-    else:
-        from runner.anthropic_runner import AnthropicRunner
-
-        real = AnthropicRunner(profile, role_skills=role_skills or {})
+    factory = _runner_factory(profile.get("runner") or "anthropic")
+    real = factory(profile, role_skills=role_skills or {}, workdir=workdir, repo=repo)
     return _with_fast_path(real, profile, notes)
