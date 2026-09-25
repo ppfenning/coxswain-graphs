@@ -763,6 +763,106 @@ def test_a_failed_graph_writes_no_result_file(tmp_path) -> None:
     assert not out.exists()
 
 
+# --- a single-graph run records one phases row, its gate decisions and ledger rows, and no manifest file --------------------
+
+_GATED = {
+    "kind": "comment_add",
+    "risk": "low",
+    "target": "docs/x.md",
+    "evidence": [{"check": "c", "output": "ok"}],
+    "rationale": "r",
+    "suggested_action": "amend",
+}
+
+
+def _gated_run(tmp_path: Path, store) -> int:
+    profile = tmp_path / "profile.yaml"
+    profile.write_text("provider: test\n", encoding="utf-8")
+    spec = SimpleNamespace(
+        name="review-diff", graph_name="review-diff", needs=(), run=lambda graph_args, runner: {"proposals": [dict(_GATED)]}
+    )
+    args = SimpleNamespace(
+        graph="review-diff",
+        date="2026-09-25",
+        runs_dir=tmp_path / "runs",
+        ledger=tmp_path / "ledger.jsonl",
+        provider_profile=str(profile),
+        repo=None,
+        assume="r",
+        result_out=None,
+    )
+    return cli._run_graph(
+        specs={"review-diff": spec},
+        parser=_FakeParser(args),
+        args=args,
+        cartridge={**_CARTRIDGE, "write_kinds": {"comment_add": {"risk": "low", "ramp": "gated"}}},
+        runner=ScriptedRunner({}),
+        run_id="r1",
+        store=store,
+    )
+
+
+@pytest.fixture
+def run_store(tmp_path):
+    from harness.store_migrate import open_store
+    from harness.store_write import Store
+
+    conn = open_store(f"sqlite:///{tmp_path}/single.db", "2026-09-25T00:00:00+00:00")
+    yield Store(conn)
+    conn.close()
+
+
+def test_a_single_graph_run_writes_no_manifest_file(tmp_path, run_store) -> None:
+    assert _gated_run(tmp_path, run_store) == 0
+
+    assert not (tmp_path / "runs" / "r1.json").exists()
+    assert list((tmp_path / "runs").rglob("*.json")) == []
+
+
+def test_a_single_graph_run_leaves_one_phases_row_with_its_gate_decision_and_ledger_rows(tmp_path, run_store) -> None:
+    from core import ledger
+
+    assert _gated_run(tmp_path, run_store) == 0
+
+    phases = run_store.conn.query_all("SELECT run_id, phase_id, record_json FROM phases")
+    assert len(phases) == 1
+    run_id, phase_id, record_json = phases[0]
+    record = json.loads(record_json)
+    assert (run_id, phase_id) == ("r1", "review-diff")
+    assert record["manifest_record"]["run_id"] == "r1"
+    assert record["manifest"] == "r1:review-diff"
+    assert run_store.conn.query_one("SELECT COUNT(*) FROM gate_decisions WHERE run_id = 'r1'")[0] == 1
+    in_file = [row for row in ledger.read(tmp_path / "ledger.jsonl") if row.get("run_id") == "r1"]
+    assert len(in_file) > 0
+    assert run_store.conn.query_one("SELECT COUNT(*) FROM ledger WHERE run_id = 'r1'")[0] == len(in_file)
+
+
+def test_the_summary_names_the_run_store_not_a_manifest_file(tmp_path, run_store, capsys) -> None:
+    assert _gated_run(tmp_path, run_store) == 0
+
+    out = capsys.readouterr().out
+    assert "  manifest: recorded in the run store under r1" in out
+    assert "r1.json" not in out
+
+
+def test_a_store_failure_on_the_phase_record_warns_and_still_exits_zero(tmp_path, run_store, monkeypatch, capsys) -> None:
+    def boom(self, record, epoch=None):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(type(run_store), "record_phase", boom)
+
+    assert _gated_run(tmp_path, run_store) == 0
+
+    assert "store: could not record r1: database is locked" in capsys.readouterr().err
+
+
+def test_without_a_store_a_single_graph_run_still_appends_the_ledger_and_exits_zero(tmp_path) -> None:
+    assert _gated_run(tmp_path, None) == 0
+
+    assert (tmp_path / "ledger.jsonl").is_file()
+    assert not (tmp_path / "runs" / "r1.json").exists()
+
+
 def test_the_parser_takes_result_out_and_defaults_it_to_none() -> None:
     parser = cli._build_parser({})
     base = ["sweep", "--team", "acme"]
