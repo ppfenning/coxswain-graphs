@@ -65,6 +65,33 @@ jobs:
       - name: ruff (rules in pyproject.toml; pre-commit mirrors it)
         run: pip install ruff==0.16.6 && ruff check .
 
+  # The suite on Python 3.14, the version Pat wants as primary. Not in the branch
+  # ruleset, which requires `test` by name, so a red run here is a finding, not a
+  # merge block. Swapping which version `test` runs is a later step.
+  py314:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SUBSTRATE_TOKEN: ${{ secrets.SUBSTRATE_REPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Check out the substrate (optional)
+        if: env.SUBSTRATE_TOKEN != ''
+        uses: actions/checkout@v5
+        with:
+          repository: ppfenning/agent-cartridges
+          path: .agent-cartridges
+          token: ${{ env.SUBSTRATE_TOKEN }}
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+          if [ -d .agent-cartridges ]; then pip install ./.agent-cartridges; fi
+      - run: pytest -q
+
   # Runs the store tests against a real Postgres. Not in the branch ruleset, so a
   # red run here is a finding to read, not a merge block. Only the store files
   # run, to keep the extra runner minutes to the tests that have a Postgres param.
