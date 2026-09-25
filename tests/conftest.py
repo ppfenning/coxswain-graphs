@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
+import uuid
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pytest
 
@@ -68,3 +71,47 @@ def build_response() -> dict:
 @pytest.fixture
 def review_response() -> dict:
     return {"verdict": "approve", "findings": [], "rationale": "matches the charter"}
+
+
+T0 = "2026-09-24T00:00:00Z"
+
+
+def with_search_path(url: str, schema: str) -> str:
+    """`url` with libpq's `options=-csearch_path=<schema>` added to its query string."""
+    parts = urlsplit(url)
+    query = [*parse_qsl(parts.query), ("options", f"-csearch_path={schema}")]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def store_url(request):
+    """A store URL per backend. Postgres runs only when COXSWAIN_TEST_PG_URL is set, in a schema of its own."""
+    if request.param == "sqlite":
+        yield "sqlite:///:memory:"
+        return
+    base = os.environ.get("COXSWAIN_TEST_PG_URL")
+    if not base:
+        pytest.skip("COXSWAIN_TEST_PG_URL is not set")
+    import psycopg
+
+    schema = f"t_{uuid.uuid4().hex}"
+    admin = psycopg.connect(base, autocommit=True)
+    try:
+        admin.execute(f"CREATE SCHEMA {schema}")
+        yield with_search_path(base, schema)
+    finally:
+        try:
+            admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            admin.close()
+
+
+@pytest.fixture
+def store_conn(store_url):
+    from harness.store_migrate import open_store
+
+    c = open_store(store_url, T0)
+    try:
+        yield c
+    finally:
+        c.close()
