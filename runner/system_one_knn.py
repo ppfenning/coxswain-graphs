@@ -99,8 +99,7 @@ def _state_text(state: Mapping[str, str]) -> str:
     return "\n".join(f"{name}: {text}" for name, text in state.items())
 
 
-def _first_seen(labels: Iterable[str]) -> list[str]:
-    return list(dict.fromkeys(labels))
+_YES_NO = ("yes", "no")
 
 
 class KnnDecider:
@@ -118,12 +117,12 @@ class KnnDecider:
 
     def decide(self, question: Question, state: Mapping[str, str]) -> Answer:
         if isinstance(question, Noul):
-            kind, order, keep = "noul", _first_seen(self._labels), set(self._labels)
+            kind, order, keep = "noul", list(_YES_NO), set(_YES_NO)
         elif isinstance(question, Choice):
             kind, order, keep = "choice", list(question.options), set(question.options)
         else:
             raise UnsupportedQuestion(f"knn does not answer {type(question).__name__} questions")
-        # A Choice can only be answered from options it offers, so other labels are dropped before the k nearest.
+        # A question is answered only from labels it offers (Noul offers yes and no); others are dropped before the k nearest.
         rows = [(label, vector) for label, vector in zip(self._labels, self._vectors) if label in keep]
         if not rows:
             raise UnsupportedQuestion("no example carries a label this question offers")
