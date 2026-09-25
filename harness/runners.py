@@ -167,7 +167,23 @@ def _anthropic(
     return AnthropicRunner(profile, role_skills=role_skills or {})
 
 
-_RUNNERS: dict[str, _RunnerFactory] = {"claude-code": _claude_code, "anthropic": _anthropic}
+def _openai_compatible(
+    profile: Mapping[str, Any],
+    *,
+    role_skills: Mapping[str, str] | None,
+    workdir: str | Path | None,
+    repo: str | Path | None,
+) -> Any:
+    from runner.openai_compatible_runner import OpenAICompatibleRunner
+
+    return OpenAICompatibleRunner(profile, role_skills=role_skills or {})
+
+
+_RUNNERS: dict[str, _RunnerFactory] = {
+    "claude-code": _claude_code,
+    "anthropic": _anthropic,
+    "openai-compatible": _openai_compatible,
+}
 
 
 def _runner_factory(name: str) -> _RunnerFactory:
@@ -179,7 +195,7 @@ def _runner_factory(name: str) -> _RunnerFactory:
         if entry.name == name:
             return entry.load()
     raise ValueError(
-        f"runner {name!r} is not registered: built in are claude-code and anthropic; "
+        f"runner {name!r} is not registered: built in are {', '.join(_RUNNERS)}; "
         f"others register by entry point under {RUNNER_ENTRY_POINT_GROUP} (ppfenning/coxswain-plugins)"
     )
 
@@ -204,8 +220,8 @@ def build_runner(
     is the moment a cartridge binding stops being a validated name and starts
     being what the node actually knows.
 
-    Which live runner is the PROFILE's call (`runner:` names a built-in, claude-code
-    or anthropic, or a plugin registered under coxswain.runners; no key means
+    Which live runner is the PROFILE's call (`runner:` names a built-in, claude-code,
+    anthropic or openai-compatible, or a plugin registered under coxswain.runners; no key means
     anthropic, and an unregistered name refuses), because the
     vendor axis is the profile's whole job and a CLI flag would be a second copy
     of it. `workdir` and `repo` matter only to a runner whose nodes can read
