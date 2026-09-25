@@ -270,6 +270,7 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--date", default=date_type.today().isoformat())  # noqa: DTZ011 — the operator's local date is the intended default
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--result-out", default=None, help="write the graph's result as JSON to this path")
     return parser
 
 
@@ -636,6 +637,10 @@ def _run_graph(
         # outliving its own reason and blocking a working graph forever.
         parser.error("sweep is registered but has no SPEC yet (graphs/ops/sweep.py); not runnable standalone")
 
+    # Set only by the generic single-graph branch below; the phase and cos
+    # drivers build a synthetic result and do not honour --result-out.
+    result_out: str | None = None
+
     if args.graph == "phase":
         # Not one graph run but many, one per unblocked task. The work store is
         # read HERE and the tasks handed in as arguments, because a graph that
@@ -757,6 +762,7 @@ def _run_graph(
     else:
         spec = specs[args.graph]
         graph_name = spec.graph_name
+        result_out = getattr(args, "result_out", None)
         if args.graph == "retro" and getattr(args, "ledger_rows", None) is None:
             # The rows retro reasons over default to the ledger this harness
             # already keeps. Explicit --ledger-rows still points it anywhere —
@@ -890,6 +896,10 @@ def _run_graph(
     )
     record_run(manifest, runs_dir=args.runs_dir, ledger_path=args.ledger)
 
+    if result_out:
+        Path(result_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(result_out).write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+
     # And then what the run itself established, on the same clock as the
     # manifest. This lands AFTER record_run because it is a post-hoc verdict on
     # a run already recorded, not a second opinion on the gate.
@@ -904,5 +914,7 @@ def _run_graph(
 
     print(f"\nrecorded {run_id}: {len(auto_applied)} auto-applied, {len(diffs)} gated decision(s), {len(proposals)} proposal(s)")
     print(f"  manifest: {Path(args.runs_dir) / (run_id + '.json')}")
+    if result_out:
+        print(f"  result  : {result_out}")
     print(f"  ledger  : {args.ledger}")
     return 0

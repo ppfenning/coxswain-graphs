@@ -530,3 +530,77 @@ def test_a_profile_storage_url_sends_the_rows_there_and_not_to_the_default_file(
     assert _rows(elsewhere, "SELECT COUNT(*) FROM runs") == [(1,)]
     assert _rows(elsewhere, "SELECT COUNT(*) FROM node_calls") == [(3,)]
     assert not (tmp_path / "cox.db").exists()
+
+
+# --- --result-out: the generic path hands the graph's result to its caller ------------------------------------------------
+
+_REVIEW_RESULT = {
+    "verdict": "approve",
+    "findings": [{"file": "a.py", "line": 3, "detail": "d", "charter_principle": "A1"}],
+    "rationale": "r",
+    "checks": [],
+}
+
+
+def _review_diff_run(tmp_path: Path, *, result_out: Path | None, raises: Exception | None = None) -> int:
+    def _run(graph_args, runner):
+        if raises is not None:
+            raise raises
+        return dict(_REVIEW_RESULT)
+
+    profile = tmp_path / "profile.yaml"
+    profile.write_text("provider: test\n", encoding="utf-8")
+    spec = SimpleNamespace(name="review-diff", graph_name="review-diff", needs=(), run=_run)
+    args = SimpleNamespace(
+        graph="review-diff",
+        date="2026-09-24",
+        runs_dir=tmp_path / "runs",
+        ledger=tmp_path / "ledger.jsonl",
+        provider_profile=str(profile),
+        repo=None,
+        assume=None,
+        result_out=None if result_out is None else str(result_out),
+    )
+    return cli._run_graph(
+        specs={"review-diff": spec},
+        parser=_FakeParser(args),
+        args=args,
+        cartridge=_CARTRIDGE,
+        runner=ScriptedRunner({}),
+        run_id="r1",
+    )
+
+
+def test_result_out_writes_the_graphs_result_and_creates_the_parent(tmp_path, capsys) -> None:
+    out = tmp_path / "out" / "result.json"
+
+    assert _review_diff_run(tmp_path, result_out=out) == 0
+
+    written = json.loads(out.read_text(encoding="utf-8"))
+    assert written["verdict"] == _REVIEW_RESULT["verdict"]
+    assert written["findings"] == _REVIEW_RESULT["findings"]
+    assert f"  result  : {out}" in capsys.readouterr().out
+
+
+def test_without_result_out_no_result_file_is_written(tmp_path, capsys) -> None:
+    assert _review_diff_run(tmp_path, result_out=None) == 0
+
+    assert "result  :" not in capsys.readouterr().out
+    assert not list(tmp_path.rglob("result*.json"))
+
+
+def test_a_failed_graph_writes_no_result_file(tmp_path) -> None:
+    from graphs._contract import ContractViolation
+
+    out = tmp_path / "result.json"
+
+    assert _review_diff_run(tmp_path, result_out=out, raises=ContractViolation("bad")) == 1
+    assert not out.exists()
+
+
+def test_the_parser_takes_result_out_and_defaults_it_to_none() -> None:
+    parser = cli._build_parser({})
+    base = ["sweep", "--team", "acme"]
+
+    assert parser.parse_args(base).result_out is None
+    assert parser.parse_args([*base, "--result-out", "x.json"]).result_out == "x.json"
