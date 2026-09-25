@@ -842,6 +842,7 @@ def _plan_competition(
     date: Any,
     plan: Mapping[str, Any],
     first: _Author,
+    task_id: Any,
 ) -> tuple[dict[str, Any], dict[str, Any], _Author]:
     """A second, independent plan, and a decision between the two.
 
@@ -863,6 +864,7 @@ def _plan_competition(
             role=second.role,
             tier=second.tier,
             thread=second.thread,
+            task=str(task_id),
             schema=PLAN_SCHEMA,
             context=context,
             prompt=(
@@ -883,6 +885,7 @@ def _plan_competition(
             role=arbiter.role,
             tier=arbiter.tier,
             thread=arbiter.thread,
+            task=str(task_id),
             schema=PLAN_CHOICE_SCHEMA,
             context=context,
             prompt=(
@@ -972,6 +975,7 @@ def _plan_attack(
     ticket: Any,
     author: _Author,
     plan: Mapping[str, Any],
+    task_id: Any,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The adversary, moved to the front of the loop.
 
@@ -992,6 +996,7 @@ def _plan_attack(
     attack = dict(
         runner.run(
             role="plan_adversary",
+            task=str(task_id),
             hints=Hints(judgment="high"),
             schema=PLAN_ATTACK_SCHEMA,
             context=context,
@@ -1020,6 +1025,7 @@ def _plan_attack(
             role=author.role,
             tier=author.tier,
             thread=author.thread,
+            task=str(task_id),
             schema=PLAN_SCHEMA,
             context=context,
             prompt=(
@@ -1081,6 +1087,7 @@ def _handoff(
             runner.run(
                 role="handoff",
                 tier="standard",
+                task=None if ticket_id is None else str(ticket_id),
                 schema=HANDOFF_SCHEMA,
                 context=context,
                 prompt=(
@@ -1240,6 +1247,7 @@ def _reviewer_answer(
     schema: Mapping[str, Any],
     context: list[str],
     prompt: str,
+    task_id: Any = None,
 ) -> tuple[dict[str, Any], bool]:
     """One reviewer's answer, and one retry if it is a placeholder instead.
 
@@ -1248,13 +1256,19 @@ def _reviewer_answer(
     never more — a reviewer that will not answer twice abstains, and it is the
     caller's to decide what an abstention costs.
     """
+    task = None if task_id is None else str(task_id)
     try:
-        first = dict(runner.run(role=role, tier=model_tier, hints=hints, schema=schema, context=context, prompt=prompt))
+        first = dict(
+            runner.run(
+                role=role, tier=model_tier, hints=hints, schema=schema, context=context, prompt=prompt, task=task
+            )
+        )
         if not review_is_placeholder(first):
             return first, False
         second = dict(
             runner.run(
                 role=role,
+                task=task,
                 tier=model_tier,
                 hints=hints,
                 schema=schema,
@@ -1364,6 +1378,7 @@ def _review_round(
     handoff: Mapping[str, Any] | None,
     tier: int,
     attempt: int,
+    task_id: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | str | None, str, bool, bool]:
     """One full round of review, and the verdict it reaches.
 
@@ -1379,6 +1394,7 @@ def _review_round(
     """
     # The call declares its role and hints; the resolver picks the model tier.
     patch = str(build.get("patch") or "")
+    task = None if task_id is None else str(task_id)
     review_hints = _hints(patch, attempt=attempt)
     arbiter_hints = _hints(patch, attempt=attempt, judgment="high")
     charter_prompt = (
@@ -1400,6 +1416,7 @@ def _review_round(
         schema=REVIEW_SCHEMA,
         context=context,
         prompt=charter_prompt,
+        task_id=task_id,
     )
 
     # Tier 0 is the cheapest review, never the absence of one.
@@ -1422,6 +1439,7 @@ def _review_round(
                     f"Patch:\n{build.get('patch')}\n\n"
                     "State your strongest objection plainly, even if you end up approving."
                 ),
+                task_id=task_id,
             )
         except _NodeFailure as exc:
             # The charter reviewer already answered by the time the adversary
@@ -1446,6 +1464,7 @@ def _review_round(
                 sole_arbitration = dict(
                     runner.run(
                         role="arbitrate",
+                        task=task,
                         hints=arbiter_hints,
                         schema=ARBITRATE_SCHEMA,
                         context=context,
@@ -1468,6 +1487,7 @@ def _review_round(
                 sole_arbitration = dict(
                     runner.run(
                         role="arbitrate",
+                        task=task,
                         hints=arbiter_hints,
                         schema=ARBITRATE_SCHEMA,
                         context=context,
@@ -1497,6 +1517,7 @@ def _review_round(
             arbitration = dict(
                 runner.run(
                     role="arbitrate",
+                    task=task,
                     hints=arbiter_hints,
                     schema=ARBITRATE_SCHEMA,
                     context=context,
@@ -1658,6 +1679,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
         role=author.role,
         tier=author.tier,
         thread=author.thread,
+        task=str(ticket),
         schema=PLAN_SCHEMA,
         context=context,
         prompt=(
@@ -1672,7 +1694,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
     competition: dict[str, Any] | None = None
     if "plan_alternative" in bound and "plan_arbitrate" in bound and compete:
         chosen_plan, competition, author = _plan_competition(
-            runner, context=context, ticket=ticket_text, date=date, plan=first_plan, first=author
+            runner, context=context, ticket=ticket_text, date=date, plan=first_plan, first=author, task_id=ticket
         )
     else:
         chosen_plan = dict(first_plan)
@@ -1681,7 +1703,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
     plan_attack: dict[str, Any] | None = None
     if "plan_adversary" in bound and compete:
         plan, plan_attack = _plan_attack(
-            runner, context=context, ticket=ticket_text, author=author, plan=chosen_plan
+            runner, context=context, ticket=ticket_text, author=author, plan=chosen_plan, task_id=ticket
         )
     else:
         plan = chosen_plan
@@ -1834,6 +1856,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
                 handoff=handoff,
                 tier=tier,
                 attempt=1,
+                task_id=ticket,
             )
     except _NodeFailure as exc:
         return _infra_result(run_id=run_id, date=date, ticket=ticket, scope=scope, build=build, handoff=handoff, exc=exc)
@@ -1975,6 +1998,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
                 handoff=handoff,
                 tier=tier,
                 attempt=int(attempts),
+                task_id=ticket,
             )
         except _NodeFailure as exc:
             return _infra_result(run_id=run_id, date=date, ticket=ticket, scope=scope, build=build, handoff=handoff, exc=exc)
