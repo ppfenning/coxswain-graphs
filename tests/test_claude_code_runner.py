@@ -862,7 +862,7 @@ def test_the_decision_carries_version_and_model_from_the_init_event(fake_claude,
     out = runner.run(role="build", tier="standard", schema=SCHEMA, prompt="go", thread="T-1", task="t9")
     d = out.decision
     assert (d.claude_code_version, d.model_id) == ("2.0.31", "claude-haiku-4-5-20251001")
-    assert (d.role, d.requested_tier, d.chosen_tier, d.reason) == ("build", "standard", "standard", "caller")
+    assert (d.role, d.requested_tier, d.chosen_tier, d.reason) == ("build", "standard", "reason", "caller")
     assert (d.ticket_key, d.outcome_key) == ("t9", ""), "the ticket is `task`, as in the ledger's task_id; a thread is not a ticket"
     assert dict(out) == {"ok": True}, "the decision is an attribute, not a key"
 
@@ -870,13 +870,13 @@ def test_the_decision_carries_version_and_model_from_the_init_event(fake_claude,
 def test_a_tier_override_that_changes_the_tier_is_reason_override(fake_claude, tmp_path) -> None:
     runner = _streamed(tmp_path, fake_claude, [INIT, RESULT], tier_overrides={"build": "cheap"})
     d = runner.run(role="build", tier="standard", schema=SCHEMA, prompt="go").decision
-    assert (d.requested_tier, d.chosen_tier, d.reason) == ("standard", "cheap", "override")
+    assert (d.requested_tier, d.chosen_tier, d.reason) == ("standard", "extract", "override")
 
 
 def test_an_override_to_the_tier_already_asked_for_is_still_reason_override(fake_claude, tmp_path) -> None:
     runner = _streamed(tmp_path, fake_claude, [INIT, RESULT], tier_overrides={"build": "standard"})
     d = runner.run(role="build", tier="standard", schema=SCHEMA, prompt="go").decision
-    assert (d.chosen_tier, d.reason) == ("standard", "override")
+    assert (d.chosen_tier, d.reason) == ("reason", "override")
 
 
 def test_an_init_event_lacking_the_fields_gives_none_version_and_the_resolved_model(fake_claude, tmp_path) -> None:
@@ -1746,22 +1746,22 @@ def _tier_run(fake_claude, tmp_path, profile=None, **call):
 
 def test_a_profile_default_beats_default_tier(fake_claude, tmp_path) -> None:
     d, model, effort = _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "deep"}})
-    assert (d.chosen_tier, d.reason, model, effort) == ("deep", "profile_default", "opus", "xhigh")
+    assert (d.chosen_tier, d.reason, model, effort) == ("judge", "profile_default", "opus", "xhigh")
 
 
 def test_a_tier_override_beats_a_profile_default(fake_claude, tmp_path) -> None:
     d, model, _ = _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "deep"}, "tier_overrides": {"plan": "cheap"}})
-    assert (d.chosen_tier, d.reason, model) == ("cheap", "override", "haiku")
+    assert (d.chosen_tier, d.reason, model) == ("extract", "override", "haiku")
 
 
 def test_no_tier_and_no_default_lands_on_the_floor(fake_claude, tmp_path) -> None:
     d, model, _ = _tier_run(fake_claude, tmp_path)
-    assert (d.requested_tier, d.chosen_tier, d.reason, model) == ("standard", "standard", "floor", "sonnet")
+    assert (d.requested_tier, d.chosen_tier, d.reason, model) == ("standard", "reason", "floor", "sonnet")
 
 
 def test_a_tier_the_caller_named_beats_a_profile_default(fake_claude, tmp_path) -> None:
     d, model, _ = _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "cheap"}}, tier="deep")
-    assert (d.chosen_tier, d.reason, model) == ("deep", "caller", "opus")
+    assert (d.chosen_tier, d.reason, model) == ("judge", "caller", "opus")
 
 
 def test_an_explicit_budget_is_recorded_as_given_and_effort_comes_from_the_tier(fake_claude, tmp_path) -> None:
@@ -1772,3 +1772,41 @@ def test_an_explicit_budget_is_recorded_as_given_and_effort_comes_from_the_tier(
 def test_a_profile_default_naming_an_unbound_tier_is_named(fake_claude, tmp_path) -> None:
     with pytest.raises(RunnerError, match="no model for tier 'huge'"):
         _tier_run(fake_claude, tmp_path, {"defaults": {"plan": "huge"}})
+
+
+# ── the profile `classes` map ────────────────────────────────────────────────
+
+CLASSES_PROFILE = {"classes": {"extract": ["haiku", "haiku-2"], "reason": "sonnet", "judge": ["opus", "opus-2"]}}
+
+
+def test_a_class_resolves_to_the_first_classes_entry(fake_claude, tmp_path) -> None:
+    d, model, _ = _tier_run(fake_claude, tmp_path, CLASSES_PROFILE, tier="deep")
+    assert (d.chosen_tier, model) == ("judge", "opus")
+
+
+def test_a_profile_without_classes_still_uses_the_tiers_map(fake_claude, tmp_path) -> None:
+    d, model, _ = _tier_run(fake_claude, tmp_path, {"tiers": {"cheap": "h", "standard": "s", "deep": "d"}}, tier="deep")
+    assert (d.chosen_tier, model) == ("judge", "d")
+
+
+def test_a_class_the_profile_does_not_bind_falls_to_the_floor_model(fake_claude, tmp_path) -> None:
+    _, model, _ = _tier_run(fake_claude, tmp_path, {"classes": {"extract": "haiku", "reason": "sonnet"}}, tier="deep")
+    assert model == "haiku"
+
+
+def test_a_class_keyed_effort_beats_the_legacy_tier_name(fake_claude, tmp_path) -> None:
+    _, _, effort = _tier_run(fake_claude, tmp_path, {**CLASSES_PROFILE, "effort": {"judge": "max"}}, tier="deep")
+    assert effort == "max"
+
+
+def test_effort_without_a_class_key_reads_the_legacy_tier_name(fake_claude, tmp_path) -> None:
+    _, _, effort = _tier_run(fake_claude, tmp_path, CLASSES_PROFILE, tier="deep")
+    assert effort == "xhigh"
+
+
+def test_a_safeguard_refusal_retries_on_the_next_classes_entry(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(SAFEGUARD, OK)
+    runner = ClaudeCodeRunner({**PROFILE, **CLASSES_PROFILE}, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1")
+    runner.run(role="arbitrate", schema=SCHEMA, prompt="decide", tier="deep")
+    assert [row["model"] for row in _ledger_lines(tmp_path, "r1")] == ["opus", "opus-2"]
