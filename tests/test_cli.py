@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -12,6 +13,7 @@ from typing import ClassVar
 import pytest
 
 import harness.cli as cli
+from runner.scripted import ScriptedRunner
 
 
 class _Args:
@@ -401,3 +403,130 @@ def test_phase_launches_a_task_whose_foreign_need_is_done(monkeypatch, phase_nam
 def test_phase_leaves_a_task_unready_while_its_foreign_need_is_not_done(monkeypatch, capsys, phase_name) -> None:
     assert _run_phase_graph(monkeypatch, "ready", phase_name) == []
     assert "nothing ready in demo" in capsys.readouterr().out
+
+
+# --- the run-record store -------------------------------------------------------------------------------------------
+
+_LOADED_GRAPH = SimpleNamespace(
+    name="lifecycle-propose",
+    version="1",
+    nodes=[
+        SimpleNamespace(node_id=n, role=n, default_tier="standard", default_class="coding", output_schema=None)
+        for n in ("plan", "build", "review")
+    ],
+    edges=[("plan", "build"), ("build", "review")],
+)
+_CARTRIDGE = {"cartridge_sha": "sha-1", "team": "acme", "overlay_sha": None}
+
+
+class _StoreRunner(ScriptedRunner):
+    """A scripted runner that records each call to `.store` the way the live runners do."""
+
+    store = None
+    run_id = None
+
+    def run(self, **kwargs):
+        result = super().run(**kwargs)
+        call = {"id": f"call-{len(self.calls)}", "role": kwargs["role"], "ok": True}
+        self.store.record_call(call, run_id=self.run_id, seq=len(self.calls))
+        return result
+
+
+def _store_run(monkeypatch, tmp_path, *, profile_url=None, graph=lambda runner: 0):
+    """Stage `main` over a scripted runner; `graph(runner)` stands in for the dispatched graph."""
+    runner = _StoreRunner({"plan": {}, "build": {}, "review": {}})
+    args = _Args(tmp_path, "runS")
+    args.worktree_root = str(tmp_path)
+    if profile_url is not None:
+        profile = tmp_path / "profile.yaml"
+        profile.write_text(f"tiers: {{}}\nstorage_url: {profile_url}\n", encoding="utf-8")
+        args.provider_profile = str(profile)
+    _patch_common(monkeypatch, args, runner)
+    spec = SimpleNamespace(graph_name="lifecycle-propose", graph=_LOADED_GRAPH)
+    monkeypatch.setattr(cli, "discover", lambda: {"lifecycle": spec})
+    monkeypatch.setattr(cli, "resolve_cartridge", lambda *a, **k: (_CARTRIDGE, {}))
+    monkeypatch.setattr(cli, "_run_graph", lambda **k: graph(k["runner"]))
+    return runner
+
+
+def _rows(db: Path, sql: str) -> list[tuple]:
+    conn = sqlite3.connect(db)
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+def _three_calls(runner) -> int:
+    for role in ("plan", "build", "review"):
+        runner.run(role=role, schema={}, prompt="p")
+    return 0
+
+
+def test_storage_url_is_the_profile_key_else_the_sqlite_file_in_the_runs_dir() -> None:
+    assert cli._storage_url({"storage_url": "sqlite:///x.db"}, "runs") == "sqlite:///x.db"
+    assert cli._storage_url({}, "runs") == "sqlite:///runs/cox.db"
+    assert cli._storage_url({"storage_url": ""}, "runs") == "sqlite:///runs/cox.db"
+
+
+def test_a_run_leaves_a_runs_row_joined_to_its_graph_and_a_node_call_per_scripted_call(monkeypatch, tmp_path) -> None:
+    _store_run(monkeypatch, tmp_path, graph=_three_calls)
+
+    assert cli.main([]) == 0
+
+    db = tmp_path / "cox.db"
+    assert db.exists()
+    assert _rows(db, "SELECT principal, launched_by, cartridge_sha, cartridge_team, status FROM runs") == [
+        ("lifecycle-propose", "cli", "sha-1", "acme", "ok")
+    ]
+    assert _rows(db, "SELECT COUNT(*) FROM runs r JOIN graphs g ON g.graph_id = r.graph_id") == [(1,)]
+    assert _rows(db, "SELECT COUNT(*) FROM runs r JOIN graph_nodes n ON n.graph_id = r.graph_id") == [(3,)]
+    assert _rows(db, "SELECT run_id, role FROM node_calls ORDER BY seq") == [
+        ("runS", "plan"),
+        ("runS", "build"),
+        ("runS", "review"),
+    ]
+    assert _rows(db, "SELECT ended_at IS NOT NULL FROM runs") == [(1,)]
+
+
+def test_a_failed_return_and_a_raise_each_stamp_the_run_ended(monkeypatch, tmp_path) -> None:
+    _store_run(monkeypatch, tmp_path, graph=lambda runner: 1)
+    assert cli.main([]) == 1
+    assert _rows(tmp_path / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("failed", 1)]
+
+    def boom(runner):
+        raise RuntimeError("boom")
+
+    other = tmp_path / "raised"
+    other.mkdir()
+    _store_run(monkeypatch, other, graph=boom)
+    with pytest.raises(RuntimeError):
+        cli.main([])
+    assert _rows(other / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("error", 1)]
+
+
+@pytest.mark.parametrize("bad_url", ["sqlite:///{tmp}/no/such/dir/x.db", "mysql://user@host/db"])
+def test_an_unopenable_store_url_exits_nonzero_before_any_node_runs(monkeypatch, tmp_path, capsys, bad_url) -> None:
+    launched: list[int] = []
+    runner = _store_run(
+        monkeypatch, tmp_path, profile_url=bad_url.format(tmp=tmp_path), graph=lambda r: launched.append(1) or 0
+    )
+
+    assert cli.main([]) == 1
+
+    err = capsys.readouterr().err.strip().splitlines()
+    assert len(err) == 1
+    assert err[0].startswith(f"store: cannot use {bad_url.split(':', 1)[0]} store: ")
+    assert launched == []
+    assert runner.calls == []
+
+
+def test_a_profile_storage_url_sends_the_rows_there_and_not_to_the_default_file(monkeypatch, tmp_path) -> None:
+    elsewhere = tmp_path / "elsewhere.db"
+    _store_run(monkeypatch, tmp_path, profile_url=f"sqlite:///{elsewhere}", graph=_three_calls)
+
+    assert cli.main([]) == 0
+
+    assert _rows(elsewhere, "SELECT COUNT(*) FROM runs") == [(1,)]
+    assert _rows(elsewhere, "SELECT COUNT(*) FROM node_calls") == [(3,)]
+    assert not (tmp_path / "cox.db").exists()

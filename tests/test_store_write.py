@@ -105,12 +105,14 @@ def test_run_row_takes_the_launch_record_and_keeps_the_whole_record():
         "provider_profile": "claude-code@f9b9789c88cc",
         "launched_by": "chair-2026-09-23",
         "launched_at": "2026-09-24T13:56:37.979501+00:00",
+        "graph_id": None,
         "started_at": None,
         "ended_at": None,
         "status": None,
         "record_json": RUN,
     }
     assert run_row(RUN)["launched_by"] is None
+    assert run_row(RUN, {**LAUNCH, "graph_id": "g1"})["graph_id"] == "g1"
 
 
 def test_a_phase_records_run_id_splits_into_run_and_phase():
@@ -222,7 +224,7 @@ def test_gate_rows_number_the_decisions_and_flatten_flags():
 
 def test_every_builder_emits_exactly_the_tables_columns(conn):
     migrated = {"graph_id", "node_id"}
-    assert set(run_row(RUN)) == cols(conn, "runs") - migrated
+    assert set(run_row(RUN)) == cols(conn, "runs")
     assert set(phase_row(PHASE)) == cols(conn, "phases")
     assert set(task_row("r", "p", "t", "s", "u")) == cols(conn, "tasks")
     assert set(attempt_row("r", "t", 0, "p", "k", None, "ts")) == cols(conn, "attempts")
@@ -263,6 +265,13 @@ def test_run_task_and_attempt_inserts_are_idempotent(store):
     assert [store.record_attempt("r", "t", 0, "p", "first", None, "ts") for _ in range(2)] == [1, 0]
     assert store.record_attempt("r", "t", 1, "p", "retry", "again", "ts") == 1
     assert [store.total_rows(t) for t in ("runs", "tasks", "attempts")] == [1, 1, 2]
+
+
+def test_finish_run_stamps_the_end_of_a_recorded_run_and_a_repeat_changes_nothing_new(store, conn):
+    assert store.finish_run("graphs-model-router-2", "t0", "ok") == 0
+    store.record_run(RUN, {**LAUNCH, "graph_id": "g1"})
+    assert [store.finish_run("graphs-model-router-2", "t1", "failed") for _ in range(2)] == [1, 1]
+    assert conn.query_one("SELECT graph_id, ended_at, status FROM runs") == ("g1", "t1", "failed")
 
 
 def test_ledger_and_gate_rows_store_the_epoch_and_rerun_writes_nothing(store, conn):

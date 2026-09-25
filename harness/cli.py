@@ -40,6 +40,10 @@ from harness.phase import run_phase
 from harness.registry import GraphSpec, discover
 from harness.resolve import overlay_path, resolve_cartridge, role_skill_bodies
 from harness.runners import build_runner
+from harness.store_dialect import default_url
+from harness.store_graphs import derive_definition, register
+from harness.store_migrate import open_store
+from harness.store_write import Store
 from harness.usage import record_usage
 from harness.worktree import apply_patch, create_worktree, keep_worktree, remove_worktree
 from runner.protocol import RunnerError
@@ -276,6 +280,95 @@ def _provider_profile_scope(path: Path | str) -> str:
     return f"{resolved.stem}@{digest}"
 
 
+_PHASE_PRINCIPAL = "phase(lifecycle-propose)"
+_COS_PRINCIPAL = "coxswain(dispatch)"
+
+
+def _read_profile(path: Path | str) -> Mapping[str, Any]:
+    """The provider profile's mapping; empty when unreadable, since the scripted path may name no real file."""
+    try:
+        data = yaml.safe_load(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, Mapping) else {}
+
+
+def _storage_url(profile: Mapping[str, Any], runs_dir: Path | str) -> str:
+    """The profile's `storage_url`; without one, the sqlite file inside the runs directory."""
+    url = profile.get("storage_url")
+    return url if isinstance(url, str) and url else default_url(runs_dir)
+
+
+def _principal(graph: str, specs: Mapping[str, GraphSpec], *, docket: str | None) -> str:
+    """The run's principal, named as the manifest names it. `epic` is the driver's own constant."""
+    if graph == "epic":
+        from harness.epic import PRINCIPAL
+
+        return PRINCIPAL
+    if graph == "phase":
+        return _PHASE_PRINCIPAL
+    if graph == "cos" and not docket:
+        return _COS_PRINCIPAL
+    return specs[graph].graph_name if graph in specs else graph
+
+
+def _register_graph(conn: Any, specs: Mapping[str, GraphSpec], graph: str, now: str) -> str | None:
+    """Register the graph this run executes and return its id.
+
+    unknown: no graph in this repository declares a loaded graph object yet. A spec that
+    carries one on `.graph` is registered; one that does not leaves the run's graph_id empty.
+    """
+    spec = specs.get("lifecycle" if graph in ("phase", "epic") else graph)
+    loaded = getattr(spec, "graph", None)
+    return None if loaded is None else register(conn, derive_definition(loaded), now)
+
+
+def _begin_store_run(
+    args: argparse.Namespace, specs: Mapping[str, GraphSpec], cartridge: Mapping[str, Any], run_id: str, now: str
+) -> Store | None:
+    """Open the run-record store, register the graph and write the run row; None (after one line) if any of it fails."""
+    url = _storage_url(_read_profile(args.provider_profile), args.runs_dir)
+    conn = None
+    try:
+        if url == default_url(args.runs_dir):
+            Path(args.runs_dir).mkdir(parents=True, exist_ok=True)
+        conn = open_store(url, now)
+        graph_id = _register_graph(conn, specs, args.graph, now)
+        try:
+            provider_profile = _provider_profile_scope(args.provider_profile)
+        except OSError:
+            provider_profile = str(args.provider_profile)
+        record = {
+            "run_id": run_id,
+            "principal": _principal(args.graph, specs, docket=getattr(args, "docket", None)),
+            "cartridge_sha": cartridge.get("cartridge_sha"),
+            "cartridge_team": cartridge.get("team"),
+            "overlay_sha": cartridge.get("overlay_sha"),
+            "provider_profile": provider_profile,
+        }
+        launch = {
+            "launched_by": os.environ.get("AGENT_GRAPHS_LAUNCHED_BY") or "cli",
+            "at": now,
+            "graph_id": graph_id,
+        }
+        store = Store(conn)
+        store.record_run(record, launch)
+    except Exception as exc:
+        if conn is not None:
+            conn.close()
+        print(f"store: cannot use {url.split(':', 1)[0]} store: {' '.join(str(exc).split())}", file=sys.stderr)
+        return None
+    return store
+
+
+def _finish_store_run(store: Store, run_id: str, ended_at: str, status: str) -> None:
+    """Stamp the run's end. A store that fails here warns; it never changes the run's exit."""
+    try:
+        store.finish_run(run_id, ended_at, status)
+    except Exception as exc:
+        print(f"store: could not record the end of {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
+
+
 def _materialise(spec: GraphSpec, args: argparse.Namespace, parser: argparse.ArgumentParser) -> dict[str, Any]:
     """Turn a spec's declared needs into graph args. All I/O happens HERE.
 
@@ -381,6 +474,14 @@ def main(argv: list[str] | None = None) -> int:
         if level == "fatal":
             return 1
 
+    run_id = args.run_id or f"{args.graph}-{args.date}-{uuid.uuid4().hex[:8]}"
+
+    # The run's record is opened before any runner exists: a run whose record
+    # cannot be kept must not start. `now` is read here, at the edge, and handed down.
+    store = _begin_store_run(args, specs, cartridge, run_id, datetime.now(UTC).isoformat())
+    if store is None:
+        return 1
+
     runner = build_runner(
         scripted=args.scripted,
         provider_profile=args.provider_profile,
@@ -389,8 +490,6 @@ def main(argv: list[str] | None = None) -> int:
         repo=args.repo,
     )
 
-    run_id = args.run_id or f"{args.graph}-{args.date}-{uuid.uuid4().hex[:8]}"
-
     # A runner that keeps a per-call ledger needs to know where and under what
     # name — without these two, its ledger has nothing to write to and
     # `record_usage`'s read of it has nothing to read.
@@ -398,6 +497,8 @@ def main(argv: list[str] | None = None) -> int:
         runner.runs_dir = Path(args.runs_dir)
     if hasattr(runner, "run_id"):
         runner.run_id = run_id
+    if hasattr(runner, "store"):
+        runner.store = store
     if hasattr(runner, "node_cap_usd"):
         runner.node_cap_usd = args.node_cap_usd
 
@@ -416,9 +517,17 @@ def main(argv: list[str] | None = None) -> int:
     # so there is nothing here for them to clean up.
     worktree = _lifecycle_worktree(args, cartridge, run_id) if args.graph == "lifecycle" else None
 
+    # Anything that leaves `_run_graph` without returning (a parser error, a raise) is "error".
+    status = "error"
     try:
-        return _run_graph(specs=specs, parser=parser, args=args, cartridge=cartridge, runner=runner, run_id=run_id)
+        code = _run_graph(
+            specs=specs, parser=parser, args=args, cartridge=cartridge, runner=runner, run_id=run_id, store=store
+        )
+        status = "ok" if code == 0 else "failed"
+        return code
     finally:
+        # First, so the run's end is on record even if a later step here raises.
+        _finish_store_run(store, run_id, datetime.now(UTC).isoformat(), status)
         # Every exit below — success, a caught exception's `return 1`, or
         # anything left to raise past this point — leaves `usage.json` matching
         # whatever the per-call ledger holds, not only the happy path. `close`
@@ -428,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
         close = getattr(runner, "close", None)
         if callable(close):
             close()
+        store.conn.close()
         # Cleanup runs last — quarantine, a caught exception's `return 1`, or
         # anything still raising past this point — so a run never leaves its
         # worktree behind for a human to notice. Guarded on the directory
@@ -459,6 +569,7 @@ def _run_graph(
     cartridge: Mapping[str, Any],
     runner: Any,
     run_id: str,
+    store: Store | None = None,
 ) -> int:
     if args.graph == "epic":
         # The whole initiative. The driver gates and records PER PHASE — phase
@@ -496,6 +607,7 @@ def _run_graph(
             assume=args.assume,
             fix_attempts=args.fix_attempts,
             resume_from=args.resume_from,
+            store=store,
         )
         totals = result.get("totals") or {}
         print(
@@ -567,7 +679,7 @@ def _run_graph(
         )
         for failure in failures:
             print(f"task failed: {failure}", file=sys.stderr)
-        graph_name = "phase(lifecycle-propose)"
+        graph_name = _PHASE_PRINCIPAL
         result = {
             "run_id": run_id,
             "phase": phase_name,
@@ -625,7 +737,7 @@ def _run_graph(
             print(f"coxswain deferred: {reasons}")
         if cos_out["consumed"]:
             print(f"intake consumed: {', '.join(cos_out['consumed'])}")
-        graph_name = "coxswain(dispatch)"
+        graph_name = _COS_PRINCIPAL
         result = {
             "run_id": run_id,
             "date": args.date,
