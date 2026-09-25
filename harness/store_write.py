@@ -99,6 +99,7 @@ def run_row(record: Mapping[str, Any], launch: Mapping[str, Any] | None = None) 
         **_pick(record, _RUN_KEYS),
         "launched_by": launched.get("launched_by"),
         "launched_at": launched.get("at"),
+        "graph_id": launched.get("graph_id"),
         "started_at": None,
         "ended_at": None,
         "status": None,
@@ -208,6 +209,12 @@ class Store:
         self, record: Mapping[str, Any], launch: Mapping[str, Any] | None = None, epoch: int | None = None
     ) -> int:
         return self._insert("runs", run_row(record, launch))
+
+    def finish_run(self, run_id: str, ended_at: str, status: str) -> int:
+        """Stamp how a run ended. Returns the rows changed; the same values twice is harmless."""
+        mark = self.conn.dialect.placeholder
+        sql = f"UPDATE runs SET ended_at = {mark}, status = {mark} WHERE run_id = {mark}"
+        return self.conn.execute(sql, (ended_at, status, run_id))
 
     def record_phase(self, record: Mapping[str, Any], epoch: int | None = None) -> int:
         return self._insert("phases", phase_row(record))
