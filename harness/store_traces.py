@@ -174,7 +174,7 @@ def _put(root: TracesRoot, path: str, table: Any) -> None:
 
 
 def write_run(root: TracesRoot, day: str, run_id: str, calls: Mapping[str, list[dict[str, Any]]]) -> int:
-    """Write the run as one Parquet file and return its row count. A call already in the file is replaced."""
+    """Write the run as one Parquet file; return the rows read back for `calls`, not the file total. A call already in the file is replaced."""
     try:
         import pyarrow  # noqa: F401
     except ImportError as exc:
@@ -186,7 +186,7 @@ def write_run(root: TracesRoot, day: str, run_id: str, calls: Mapping[str, list[
     new = [row for call_id, events in calls.items() for row in to_rows(run_id, call_id, day, events)]
     table = _table([r for r in kept if r["call_id"] not in calls] + new)
     _put(root, path, table)
-    return table.num_rows
+    return sum(1 for r in _parquet_rows(root, path) if r["call_id"] in calls)
 
 
 def parse_argv(argv: Sequence[str]) -> tuple[str, str] | None:

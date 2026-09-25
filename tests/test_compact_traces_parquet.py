@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from harness import cli, store_traces
+from harness.traces_url import resolve_traces_root
 
 RUN = "runP"
 EVENTS = [{"type": "system"}, {"type": "assistant"}, {"type": "result"}]
@@ -62,6 +63,20 @@ def test_a_rerun_after_a_crash_rewrites_the_file_without_duplicates(monkeypatch,
 
     assert len(list(store_traces.iter_run(tmp_path / "traces", RUN))) == 2 * len(EVENTS)
     assert not (tmp_path / f"{RUN}-trace").exists()
+
+
+def test_a_run_whose_file_already_holds_another_calls_rows_compacts_and_keeps_them(monkeypatch, tmp_path, capsys) -> None:
+    pytest.importorskip("pyarrow")
+    root = resolve_traces_root(str(tmp_path / "traces"), tmp_path, {})
+    store_traces.write_run(root, "2026-09-25", RUN, {"other-call": EVENTS})
+    files = _stage(monkeypatch, tmp_path)
+
+    _compact(tmp_path)
+
+    assert not any(f.exists() for f in files)
+    assert store_traces.read_call(root, RUN, "other-call") == EVENTS
+    assert store_traces.read_call(root, RUN, "call-1") == EVENTS
+    assert "not compacted" not in capsys.readouterr().err
 
 
 def test_a_row_count_mismatch_keeps_every_loose_file(monkeypatch, tmp_path, capsys) -> None:
