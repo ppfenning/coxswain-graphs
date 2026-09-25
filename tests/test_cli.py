@@ -1176,7 +1176,7 @@ def test_trace_helpers_read_the_path_and_the_events_from_literals() -> None:
 
 
 def test_a_run_compacts_its_trace_files_into_the_trace_store_and_removes_the_trace_dir(monkeypatch, tmp_path) -> None:
-    pytest.importorskip("zstandard")
+    pytest.importorskip("pyarrow")
     from harness import store_traces
 
     seen = []
@@ -1194,31 +1194,34 @@ def test_a_run_compacts_its_trace_files_into_the_trace_store_and_removes_the_tra
     assert not (tmp_path / "runS-trace").exists()
     for call_id in ("call-1", "call-2", "call-3"):
         assert store_traces.read_call(tmp_path / "traces", "runS", call_id) == [{"type": "system"}, {"type": "result"}]
-    assert (tmp_path / "traces" / "2026" / "09" / "25" / "runS.jsonl.zst").is_file()
+    assert (tmp_path / "traces" / "2026" / "09" / "25" / "runS.parquet").is_file()
 
 
-def test_a_failing_append_leaves_the_files_and_the_exit_code_unchanged(monkeypatch, tmp_path, capsys) -> None:
+def test_a_failing_write_leaves_the_files_and_the_exit_code_unchanged(monkeypatch, tmp_path, capsys) -> None:
+    pytest.importorskip("pyarrow")
     from harness import store_traces
 
     def boom(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(store_traces, "append_call", boom)
+    monkeypatch.setattr(store_traces, "write_run", boom)
     _store_run(monkeypatch, tmp_path, graph=_three_calls, runner_cls=_TraceRunner)
 
     assert cli.main([]) == 0
 
     assert len(list((tmp_path / "runS-trace").iterdir())) == 3
-    assert capsys.readouterr().err.count("traces: could not compact") == 3
+    assert capsys.readouterr().err.count("traces: could not compact") == 1
 
 
-def test_without_zstandard_compaction_warns_once_and_leaves_the_files(monkeypatch, tmp_path, capsys) -> None:
+def test_without_pyarrow_compaction_warns_once_and_leaves_the_files(monkeypatch, tmp_path, capsys) -> None:
     from harness import store_traces
 
     def unavailable(*args, **kwargs):
-        raise store_traces.TracesUnavailable("reading or writing traces needs zstandard")
+        raise store_traces.ParquetUnavailable("writing traces as Parquet needs pyarrow")
 
-    monkeypatch.setattr(store_traces, "append_call", unavailable)
+    monkeypatch.setattr(cli, "have_pyarrow", lambda: True)
+    monkeypatch.setattr(cli, "resolve_traces_root", lambda *a, **k: None)
+    monkeypatch.setattr(store_traces, "write_run", unavailable)
     _store_run(monkeypatch, tmp_path, graph=_three_calls, runner_cls=_TraceRunner)
 
     assert cli.main([]) == 0
