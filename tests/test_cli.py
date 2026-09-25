@@ -880,6 +880,191 @@ def test_main_installs_the_handler_for_the_run_and_puts_the_previous_one_back(mo
     assert signal.getsignal(signal.SIGTERM) is before
 
 
+# ── the run lease ────────────────────────────────────────────────────────────
+
+
+def _lease_row(tmp_path: Path, name: str) -> tuple | None:
+    rows = _rows(
+        tmp_path / "cox.db", f"SELECT name, holder, epoch, heartbeat_at, expires_at FROM leases WHERE name = '{name}'"
+    )
+    return rows[0] if rows else None
+
+
+def _hold_lease(tmp_path: Path, name: str, holder: str) -> None:
+    from datetime import UTC, datetime
+
+    from harness.store_lease import acquire
+    from harness.store_migrate import open_store
+
+    now = datetime.now(UTC).isoformat()
+    conn = open_store(f"sqlite:///{tmp_path}/cox.db", now)
+    assert acquire(conn, name, holder, now, 120).ok
+    conn.close()
+
+
+def test_a_run_refuses_to_start_while_another_run_holds_the_prefix_lease(monkeypatch, tmp_path, capsys) -> None:
+    ran = []
+    _store_run(monkeypatch, tmp_path, graph=lambda runner: ran.append(1) or 0)
+    _hold_lease(tmp_path, "runs:runS", "runS-1")
+
+    assert cli.main([]) == 2
+
+    assert ran == []
+    assert "run: runS-1 holds runs:runS; refusing to start runS" in capsys.readouterr().err
+    assert _rows(tmp_path / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("refused", 1)]
+    assert _lease_row(tmp_path, "runs:runS")[1] == "runS-1"
+
+
+def test_a_finished_run_leaves_its_lease_released_and_its_row_ended(monkeypatch, tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from harness.store_lease import lease_state
+
+    _store_run(monkeypatch, tmp_path, graph=_three_calls)
+
+    assert cli.main([]) == 0
+
+    row = _lease_row(tmp_path, "runs:runS")
+    assert (row[1], row[2]) == ("runS", 1)
+    assert lease_state(row, datetime.now(UTC).isoformat()) == "expired"
+    assert _rows(tmp_path / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("ok", 1)]
+
+
+def test_a_raising_graph_still_releases_the_lease(monkeypatch, tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from harness.store_lease import lease_state
+
+    def boom(runner) -> int:
+        raise RuntimeError("boom")
+
+    _store_run(monkeypatch, tmp_path, graph=boom)
+
+    with pytest.raises(RuntimeError):
+        cli.main([])
+
+    assert lease_state(_lease_row(tmp_path, "runs:runS"), datetime.now(UTC).isoformat()) == "expired"
+
+
+def _expired(tmp_path: Path) -> bool:
+    from datetime import UTC, datetime
+
+    from harness.store_lease import lease_state
+
+    return lease_state(_lease_row(tmp_path, "runs:runS"), datetime.now(UTC).isoformat()) == "expired"
+
+
+@pytest.mark.parametrize("step", ["build_runner", "_lifecycle_worktree"])
+def test_a_setup_step_that_raises_after_the_lease_still_releases_it_and_ends_the_run(
+    monkeypatch, tmp_path, step
+) -> None:
+    def boom(*args, **kwargs):
+        raise RuntimeError(f"{step} failed")
+
+    working = cli._lifecycle_worktree
+    _store_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, step, boom)
+
+    with pytest.raises(RuntimeError):
+        cli.main([])
+
+    assert _expired(tmp_path)
+    assert _rows(tmp_path / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("error", 1)]
+
+    # The corrected relaunch of the same prefix starts; the dead run does not hold it.
+    relaunch = _Args(tmp_path, "runS-2")
+    relaunch.worktree_root = str(tmp_path)
+    _store_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_lifecycle_worktree", working)
+    monkeypatch.setattr(cli, "_build_parser", lambda specs: _FakeParser(relaunch))
+
+    assert cli.main([]) == 0
+
+
+def _record_quiet_then_release(monkeypatch) -> list[str]:
+    from harness import store_lease
+
+    order: list[str] = []
+    monkeypatch.setattr(cli, "_stop_children_until_quiet", lambda: order.append("quiet"))
+    monkeypatch.setattr(cli, "release", lambda *a: order.append("release") or store_lease.release(*a))
+    return order
+
+
+def test_sigterm_during_the_graph_frees_the_lease_only_after_the_workers_are_quiet(monkeypatch, tmp_path) -> None:
+    def terminated(runner):
+        raise SystemExit(143)
+
+    _store_run(monkeypatch, tmp_path, graph=terminated)
+    order = _record_quiet_then_release(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([])
+
+    assert excinfo.value.code == 143
+    assert order[:2] == ["quiet", "release"]
+    assert _expired(tmp_path)
+
+
+def test_sigterm_during_setup_frees_the_lease_after_the_workers_are_quiet_and_ends_the_run(
+    monkeypatch, tmp_path
+) -> None:
+    def terminated(**kwargs):
+        raise SystemExit(143)
+
+    _store_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "build_runner", terminated)
+    order = _record_quiet_then_release(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        cli.main([])
+
+    assert order[:2] == ["quiet", "release"]
+    assert _expired(tmp_path)
+    assert _rows(tmp_path / "cox.db", "SELECT status, ended_at IS NOT NULL FROM runs") == [("error", 1)]
+
+
+def test_a_release_error_warns_and_leaves_the_exit_code(monkeypatch, tmp_path, capsys) -> None:
+    def boom(*args, **kwargs):
+        raise RuntimeError("store gone")
+
+    _store_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "release", boom)
+
+    assert cli.main([]) == 0
+    assert "lease: could not release runs:runS: store gone" in capsys.readouterr().err
+
+
+def test_the_epic_path_hands_run_epic_the_epoch_and_the_lease_name(monkeypatch, tmp_path) -> None:
+    import harness.epic
+
+    seen = {}
+
+    def fake_run_epic(**kwargs):
+        seen.update(epoch=kwargs["epoch"], lease_name=kwargs["lease_name"])
+        return {}
+
+    runner = ScriptedRunner({"plan": {}, "build": {}, "review": {}})
+    args = _Args(tmp_path, "runS-2")
+    args.worktree_root = str(tmp_path)
+    args.graph = "epic"
+    args.initiative = "demo"
+    args.repo = str(tmp_path)
+    args.max_parallel = 1
+    args.ledger = tmp_path / "ledger.jsonl"
+    args.assume = False
+    args.fix_attempts = 0
+    args.resume_from = None
+    _patch_common(monkeypatch, args, runner)
+    monkeypatch.setattr(cli, "resolve_cartridge", lambda *a, **k: (_CARTRIDGE, {}))
+    monkeypatch.setattr(cli.workstore, "read_initiative", lambda name: {})
+    monkeypatch.setattr(cli, "_provider_profile_scope", lambda profile: "acme")
+    monkeypatch.setattr(harness.epic, "run_epic", fake_run_epic)
+
+    assert cli.main([]) == 0
+
+    assert seen == {"epoch": 1, "lease_name": "runs:runS"}
+
+
 # ── trace compaction at run end ──────────────────────────────────────────────
 
 
