@@ -34,6 +34,7 @@ from harness.epic import (
     _trace_evidence,
     _unapproved,
     branch_action,
+    default_branch,
     phase_order,
     phase_parents,
     run_epic,
@@ -505,6 +506,43 @@ def test_every_phase_records_its_own_manifest_and_ledger_rows(repo, cart, tmp_pa
     assert len(merges) == 3 and {row["outcome"] for row in merges} == {"clean"}
     drafts = [row for row in rows if row["kind"] == "draft_pr_create"]
     assert len(drafts) == 3 and {row["outcome"] for row in drafts} == {"clean"}
+
+
+# ── the base of an unparented phase ─────────────────────────────────────────
+
+
+def test_default_branch_prefers_a_local_origin_head() -> None:
+    assert default_branch("origin/develop", {"develop", "main"}, "topic") == "develop"
+
+
+def test_default_branch_skips_an_origin_head_that_is_not_local() -> None:
+    assert default_branch("origin/develop", {"main"}, "topic") == "main"
+
+
+def test_default_branch_prefers_main_over_master() -> None:
+    assert default_branch(None, {"main", "master"}, "topic") == "main"
+
+
+def test_default_branch_falls_back_to_master() -> None:
+    assert default_branch(None, {"master", "topic"}, "topic") == "master"
+
+
+def test_default_branch_falls_back_to_the_checkout_when_no_default_exists() -> None:
+    assert default_branch(None, {"topic"}, "topic") == "topic"
+
+
+def test_an_unparented_phase_branches_from_main_not_from_the_checked_out_branch(repo, cart, tmp_path) -> None:
+    git("checkout", "-q", "-b", "side", cwd=repo)
+    (repo / "side.txt").write_text("ok\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "side", cwd=repo)
+    side_tip = git("rev-parse", "side", cwd=repo)
+
+    drive(repo, cart, tmp_path)
+
+    phase = "epic/demo-initiative/p1-foundations"
+    assert git("merge-base", phase, "main", cwd=repo) == git("rev-parse", "main", cwd=repo)
+    assert not is_ancestor(repo, side_tip, phase)
 
 
 # ── day one: the terminal state is branches and proposals ───────────────────
