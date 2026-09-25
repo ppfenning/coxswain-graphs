@@ -2130,7 +2130,9 @@ def _build_batch(
                 *built[task]["evidence"],
             ],
             rationale=f"{task} was built, checked and reviewed in this run",
-            suggested_action=f"mark {task} done",
+            # `approved`, never `done`: the apply arm writes the state this names, and only
+            # `cox runs land` writes `done`, after the merge (tools #153).
+            suggested_action=f"mark {task} approved",
         )
         batch.append(move)
         slots[id(move)] = ("state_move", task)
