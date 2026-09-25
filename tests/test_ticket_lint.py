@@ -35,6 +35,17 @@ def test_a_device_path_is_notation_not_a_reach_problem():
     assert lint_tickets(tasks, [], [], "graphs") == []
 
 
+def test_a_url_route_is_notation_not_a_reach_problem():
+    """graphs-openai-compatible-runner-1: `/v1/chat/completions` was refused as `names /v1/chat/completions, not inside`."""
+    tasks = [_task(body="POST to `{base}` + `/v1/chat/completions`; Jira lists at /rest/api/2/search")]
+    assert lint_tickets(tasks, [], [], "graphs") == []
+
+
+def test_a_rooted_path_under_a_real_filesystem_root_is_still_a_reach_refusal():
+    tasks = [_task(body="read /etc/coxswain/settings.yaml and /tmp/notes.md")]
+    assert [p.rule for p in lint_tickets(tasks, [], [], "graphs")] == ["reach", "reach"]
+
+
 def test_an_absolute_spelling_of_a_repository_file_is_not_a_reach_problem():
     """graphs-advisory-not-surface-1: the seat wrote the repo file's absolute path and was refused."""
     tasks = [_task(body="the emit step in /home/x/repos/coxswain-graphs/graphs/delivery/ticket_lint.py merges advisories")]
