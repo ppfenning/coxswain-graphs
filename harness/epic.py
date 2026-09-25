@@ -174,6 +174,18 @@ def _git(*args: str, cwd: Path | None = None) -> tuple[bool, str]:
     return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
 
 
+def default_branch(origin_head: str | None, local: set[str], head: str) -> str:
+    """Origin's default if it is local, else main, else master, else `head`."""
+    origin_name = (origin_head or "").removeprefix("origin/")
+    if origin_name and origin_name in local:
+        return origin_name
+    if "main" in local:
+        return "main"
+    if "master" in local:
+        return "master"
+    return head
+
+
 @dataclass(frozen=True)
 class _Ctx:
     """Everything the per-phase work needs, fixed for the whole run.
@@ -789,7 +801,9 @@ def run_epic(
     repo = Path(repo)
     ctx: _Ctx | None = None
     try:
-        ok, head = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
+        head_ok, head_out = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
+        origin_ok, origin_out = _git("-C", str(repo), "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+        local_ok, local_out = _git("-C", str(repo), "for-each-ref", "--format=%(refname:short)", "refs/heads")
         try:
             # `utf-8-sig` also strips a leading BOM, which would otherwise survive
             # into the first command's name and cmd and never resolve as a shell
@@ -818,9 +832,14 @@ def run_epic(
             epoch=epoch,
             lease_name=lease_name,
             initiative_id=str(initiative.get("id")),
-            # An unparented phase branches from the repository's current HEAD, read
-            # once here so every phase in a run stacks on the same ground.
-            default_ref=head.strip() if ok else "HEAD",
+            # An unparented phase branches from the repository's default branch, read
+            # once here so every phase in a run stacks on the same ground, whatever
+            # branch the checkout has out.
+            default_ref=default_branch(
+                origin_out.strip() if origin_ok else None,
+                set(local_out.split()) if local_ok else set(),
+                head_out.strip() if head_ok else "HEAD",
+            ),
         )
 
         # The driver's own view of the work. `ready_tasks` answers from item state,
