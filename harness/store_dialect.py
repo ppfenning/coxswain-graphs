@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -108,6 +109,8 @@ class Connection:
 
     Outside `transaction` each statement stands alone, and a failed one leaves no
     transaction open. `transaction` owns BEGIN, COMMIT and ROLLBACK as plain SQL.
+    One lock serialises the threads sharing it (a runner's calls run on a thread pool):
+    a statement waits while another thread's transaction is open, and never joins it.
     """
 
     def __init__(self, raw: Any, dialect: Dialect, begin: str = "BEGIN") -> None:
@@ -115,14 +118,16 @@ class Connection:
         self.dialect = dialect
         self._begin = begin
         self._in_tx = False
+        self._lock = threading.RLock()
 
     def _run(self, action: Callable[[Any], _T]) -> _T:
-        try:
-            return action(self.raw.cursor())
-        except BaseException:
-            if not self._in_tx:
-                self.raw.rollback()
-            raise
+        with self._lock:
+            try:
+                return action(self.raw.cursor())
+            except BaseException:
+                if not self._in_tx:
+                    self.raw.rollback()
+                raise
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         """Rows the statement changed; 0 when ON CONFLICT DO NOTHING skipped the row."""
@@ -155,20 +160,21 @@ class Connection:
 
     @contextmanager
     def transaction(self) -> Iterator[Connection]:
-        """Commit on clean exit, roll back and re-raise on error. A nested use joins the outer one."""
-        if self._in_tx:
-            yield self
-            return
-        self.raw.cursor().execute(self._begin)
-        self._in_tx = True
-        try:
-            yield self
-            self.raw.cursor().execute("COMMIT")
-        except BaseException:
-            self.raw.cursor().execute("ROLLBACK")
-            raise
-        finally:
-            self._in_tx = False
+        """Commit on clean exit, roll back and re-raise on error. A nested use in the same thread joins the outer one."""
+        with self._lock:
+            if self._in_tx:
+                yield self
+                return
+            self.raw.cursor().execute(self._begin)
+            self._in_tx = True
+            try:
+                yield self
+                self.raw.cursor().execute("COMMIT")
+            except BaseException:
+                self.raw.cursor().execute("ROLLBACK")
+                raise
+            finally:
+                self._in_tx = False
 
     def close(self) -> None:
         self.raw.close()
@@ -187,7 +193,8 @@ def connect(url: str) -> Connection:
     """Open a connection for a sqlite: or postgresql: URL."""
     if url.startswith("sqlite://"):
         # isolation_level=None: no implicit BEGIN, so a failed statement holds no lock.
-        raw = sqlite3.connect(_sqlite_target(url), timeout=30.0, isolation_level=None)
+        # check_same_thread=False: the Connection's own lock serialises the threads that share it.
+        raw = sqlite3.connect(_sqlite_target(url), timeout=30.0, isolation_level=None, check_same_thread=False)
         raw.execute("PRAGMA journal_mode=WAL")
         raw.execute("PRAGMA foreign_keys=ON")
         raw.execute("PRAGMA busy_timeout=30000")

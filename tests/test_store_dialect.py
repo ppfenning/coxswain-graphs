@@ -241,3 +241,34 @@ def test_postgres_url_with_a_driver_opens_autocommit_with_json_as_text(monkeypat
 def test_an_unknown_scheme_is_refused():
     with pytest.raises(ValueError, match="sqlite://"):
         connect("mysql://h/db")
+
+
+def test_a_connection_opened_in_one_thread_writes_from_another(tmp_path):
+    conn = connect(default_url(tmp_path))
+    conn.execute("CREATE TABLE r (id INTEGER PRIMARY KEY)")
+    errors = []
+
+    def write():
+        try:
+            conn.execute("INSERT INTO r (id) VALUES (?)", (1,))
+        except Exception as exc:  # reported to the main thread below
+            errors.append(exc)
+
+    thread = threading.Thread(target=write)
+    thread.start()
+    thread.join(timeout=10)
+    assert errors == []
+    assert conn.query_all("SELECT id FROM r") == [(1,)]
+
+
+def test_another_threads_statement_waits_for_an_open_transaction_and_does_not_join_it(tmp_path):
+    conn = connect(default_url(tmp_path))
+    conn.execute("CREATE TABLE r (id INTEGER PRIMARY KEY)")
+    thread = threading.Thread(target=lambda: conn.execute("INSERT INTO r (id) VALUES (?)", (2,)))
+    with pytest.raises(RuntimeError), conn.transaction():
+        conn.execute("INSERT INTO r (id) VALUES (?)", (1,))
+        thread.start()
+        time.sleep(0.2)
+        raise RuntimeError("roll back")
+    thread.join(timeout=10)
+    assert conn.query_all("SELECT id FROM r") == [(2,)]
