@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from runner.system_one import Answer, Choice, Noul, RoleSpec
+from runner.system_one import Answer, Choice, Noul, Question, RoleSpec
 
-__all__ = ["role_specs"]
+__all__ = ["question_for", "role_specs"]
 
 _HANDOFF_CRITERIA = (
     "Do the change facts satisfy the plan? Answer yes when the facts show the work the plan "
@@ -20,6 +20,18 @@ _REVIEW_PRESCREEN_CRITERIA = (
     "the approach is wrong."
 )
 
+_QUESTIONS: Mapping[str, Question] = {
+    "handoff": Noul(_HANDOFF_CRITERIA),
+    "review_charter": Choice(_REVIEW_PRESCREEN_CRITERIA, ("approve", "revise", "reject")),
+}
+
+
+def question_for(role: str) -> Question:
+    """The question the role's spec asks. Only the state varies by request, never the question."""
+    if role not in _QUESTIONS:
+        raise ValueError(f"no system-one question for role {role!r}; known: {', '.join(sorted(_QUESTIONS))}")
+    return _QUESTIONS[role]
+
 
 def _between(text: str, start: str, end: str) -> str:
     _, found, rest = text.partition(start)
@@ -29,13 +41,13 @@ def _between(text: str, start: str, end: str) -> str:
     return body
 
 
-def _handoff_build(request: Mapping[str, Any]) -> tuple[Noul, Mapping[str, str]]:
+def _handoff_build(request: Mapping[str, Any]) -> tuple[Question, Mapping[str, str]]:
     """The handoff request carries plan, summary and facts only inside `prompt`; slice them out unchanged."""
     prompt = str(request["prompt"])
     plan = _between(prompt, "\nPlan: ", "\nSummary: ")
     summary = _between(prompt, "\nSummary: ", "\nChange facts: ")
     facts = _between(prompt, "\nChange facts: ", "\nThe facts listed under Change facts")
-    return Noul(_HANDOFF_CRITERIA), {"plan": plan, "summary": summary, "change_facts": facts}
+    return question_for("handoff"), {"plan": plan, "summary": summary, "change_facts": facts}
 
 
 def _handoff_render(answer: Answer) -> Mapping[str, Any]:
@@ -46,12 +58,12 @@ def _handoff_agrees(answer: Answer, result: Mapping[str, Any]) -> bool:
     return _handoff_render(answer)["complete"] == bool(result.get("complete"))
 
 
-def _review_prescreen_build(request: Mapping[str, Any]) -> tuple[Choice, Mapping[str, str]]:
+def _review_prescreen_build(request: Mapping[str, Any]) -> tuple[Question, Mapping[str, str]]:
     """The charter review request carries plan and patch only inside `prompt`; slice them out unchanged."""
     prompt = str(request["prompt"])
     plan = _between(prompt, "\nTask: ", "\nSummary: ")
     patch = _between(prompt, "\nPatch:\n", "\n\nCite the charter")
-    return Choice(_REVIEW_PRESCREEN_CRITERIA, ("approve", "revise", "reject")), {"patch": patch, "plan": plan}
+    return question_for("review_charter"), {"patch": patch, "plan": plan}
 
 
 def _review_prescreen_render(answer: Answer) -> Mapping[str, Any]:
