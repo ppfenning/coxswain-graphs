@@ -6,6 +6,7 @@ import pytest
 from conftest import T0, with_search_path
 
 import harness.store_cli as store_cli
+from harness.cli import REPO_ROOT
 from harness.store_cli import main, resolve_store_url
 from harness.store_migrate import open_store
 from harness.store_read import task_record
@@ -195,6 +196,28 @@ def test_the_store_flag_is_accepted_after_the_subcommand(tmp_path, capsys):
     url = f"sqlite:///{tmp_path / 'cox.db'}"
     code = main(["lease", "acquire", "chair", "a", "--ttl", LONG, "--store-url", url, "--provider-profile", str(tmp_path / "none.yaml")])
     assert (code, one_object(capsys.readouterr().out)["ok"]) == (0, True)
+
+
+def test_neither_store_url_nor_runs_dir_exits_2_and_creates_no_file(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    before = sorted(REPO_ROOT.rglob("cox.db"))
+    code = main(["lease", "acquire", "chair", "a", "--ttl", LONG])
+    out, err = capsys.readouterr()
+    assert (code, out, err) == (2, "", "error: --store-url or --runs-dir is required\n")
+    assert list(tmp_path.rglob("cox.db")) == []
+    assert sorted(REPO_ROOT.rglob("cox.db")) == before
+
+
+def test_runs_dir_alone_opens_cox_db_in_it(tmp_path, capsys):
+    code = main(["--runs-dir", str(tmp_path), "lease", "acquire", "chair", "a", "--ttl", LONG])
+    assert (code, one_object(capsys.readouterr().out)["ok"]) == (0, True)
+    assert (tmp_path / "cox.db").is_file()
+
+
+def test_runs_dir_is_accepted_after_the_subcommand(tmp_path, capsys):
+    code = main(["lease", "acquire", "chair", "a", "--ttl", LONG, "--runs-dir", str(tmp_path)])
+    assert (code, one_object(capsys.readouterr().out)["ok"]) == (0, True)
+    assert (tmp_path / "cox.db").is_file()
 
 
 def test_the_flag_wins_over_the_profile_and_the_runs_dir():
