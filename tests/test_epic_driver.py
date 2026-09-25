@@ -16,6 +16,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from core import ledger, workstore
 from graphs._spec import GraphSpec
 from graphs.delivery import lifecycle_propose, phase_validate
 from graphs.ops import triage_quarantine
+from harness import epic as epic_module
 from harness.epic import (
     EXIT_PAUSED,
     _lifecycle_invocation,
@@ -37,6 +39,9 @@ from harness.epic import (
     task_outcome,
 )
 from harness.resume import load_result, save_result
+from harness.store_lease import acquire, release
+from harness.store_migrate import open_store
+from harness.store_write import Store, ledger_row
 from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import BudgetStop, LimitStop, RunnerError
 
@@ -303,7 +308,7 @@ SPECS = {
 
 def drive(
     repo, cart, tmp_path, *, runner=None, work=None, assume="a", run_id="epic-1", patches=None, fix_attempts=None,
-    keep_worktrees=False, specs=None,
+    keep_worktrees=False, specs=None, **extra,
 ):
     runner = runner or Runner(patches if patches is not None else {t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
     result = run_epic(
@@ -322,6 +327,7 @@ def drive(
         assume=assume,
         fix_attempts=fix_attempts,
         keep_worktrees=keep_worktrees,
+        **extra,
     )
     return result, runner
 
@@ -2393,3 +2399,159 @@ def test_a_tasks_tier_map_rides_the_lifecycle_invocation_and_no_map_is_empty() -
     plain = _lifecycle_invocation(ctx, {"id": "t2"}, body="", fix_attempts=None)
     assert tiered.args["tier"] == {"build": "deep"}
     assert plain.args["tier"] == {}
+
+
+# ── the run store, and the lease fence ──────────────────────────────────────
+
+LEASE = "chair"
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+@pytest.fixture
+def store():
+    conn = open_store("sqlite:///:memory:", _now())
+    yield Store(conn)
+    conn.close()
+
+
+def _hand_to_b(store: Store, epoch: int) -> int:
+    """Holder `a` releases the lease at `epoch` and holder `b` takes it over. Returns b's epoch."""
+    assert release(store.conn, LEASE, "a", epoch)
+    return acquire(store.conn, LEASE, "b", _now(), 3600).epoch
+
+
+def _taken_over_during(monkeypatch, store: Store, name: str, epoch: int) -> None:
+    """Hand the lease to `b` the first time the driver calls `harness.epic.<name>`, then let the call run."""
+    original = getattr(epic_module, name)
+    done: list[bool] = []
+
+    def wrapper(*args, **kwargs):
+        if not done:
+            done.append(_hand_to_b(store, epoch) > epoch)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(epic_module, name, wrapper)
+
+
+def _store_rows(store: Store) -> list[int]:
+    return [store.total_rows(t) for t in ("phases", "tasks", "attempts", "ledger", "gate_decisions")]
+
+
+def _assert_stale(entry: dict) -> None:
+    assert entry["reason"].startswith("stale epoch")
+    assert "epoch 1" in entry["reason"] and "epoch 2" in entry["reason"]
+
+
+def test_a_two_task_phase_leaves_one_phase_row_two_task_rows_and_its_attempt(repo, cart, tmp_path, store) -> None:
+    patches = {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")}
+    drive(repo, cart, tmp_path, work=initiative(two_phases=False), patches=patches, store=store)
+
+    assert [store.total_rows(t) for t in ("phases", "tasks", "attempts")] == [1, 2, 1]
+    quarantined = store.conn.query_one("SELECT state FROM tasks WHERE task_id = 't1-probe'")
+    assert tuple(quarantined) == ("quarantined",)
+    attempt = store.conn.query_one("SELECT run_id, phase_id, seq, kind FROM attempts WHERE task_id = 't1-probe'")
+    assert tuple(attempt) == ("epic-1", "p1-foundations", 0, "unverified")
+
+
+def test_a_landing_under_the_held_epoch_proceeds_and_its_ledger_rows_carry_it(repo, cart, tmp_path, store) -> None:
+    lease = acquire(store.conn, LEASE, "a", _now(), 3600)
+    result, _ = drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), store=store, epoch=lease.epoch, lease_name=LEASE
+    )
+
+    assert result["phases"][0]["status"] == "complete"
+    assert result["quarantined"] == []
+    rows = store.conn.query_one("SELECT COUNT(*), MIN(epoch), MAX(epoch) FROM ledger")
+    # Every distinct row the file got is in the store. The store's row_hash leaves out
+    # `target` and `subject` (harness/store_write.py), so rows differing only there are one row.
+    distinct = {ledger_row(row)["row_hash"] for row in ledger.read(tmp_path / "ledger.jsonl")}
+    assert rows[0] == len(distinct) > 0
+    assert tuple(rows)[1:] == (lease.epoch, lease.epoch)
+    gates = store.conn.query_one("SELECT COUNT(*), MIN(epoch), MAX(epoch) FROM gate_decisions")
+    assert gates[0] > 0 and tuple(gates)[1:] == (lease.epoch, lease.epoch)
+
+
+def test_a_driver_whose_lease_was_taken_before_the_phase_builds_nothing_and_records_nothing(
+    repo, cart, tmp_path, store
+) -> None:
+    held = acquire(store.conn, LEASE, "a", _now(), 3600).epoch
+    assert _hand_to_b(store, held) == 2
+    result, runner = drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), store=store, epoch=held, lease_name=LEASE
+    )
+
+    assert runner.calls == []
+    assert result["phases"][0]["status"] == "blocked"
+    assert [q["grain"] for q in result["quarantined"]] == ["phase"]
+    _assert_stale(result["quarantined"][0])
+    assert _store_rows(store) == [0, 0, 0, 0, 0]
+
+
+def test_a_landing_after_the_lease_is_taken_over_is_refused_and_records_no_ledger_row(
+    repo, cart, tmp_path, store, monkeypatch
+) -> None:
+    held = acquire(store.conn, LEASE, "a", _now(), 3600).epoch
+    _taken_over_during(monkeypatch, store, "gate", held)
+    result, _ = drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), store=store, epoch=held, lease_name=LEASE
+    )
+
+    assert {q["grain"] for q in result["quarantined"]} == {"task", "phase"}
+    for entry in result["quarantined"]:
+        _assert_stale(entry)
+    assert result["phases"][0]["status"] == "blocked"
+    assert _store_rows(store) == [0, 0, 0, 0, 0]
+    assert not (tmp_path / "ledger.jsonl").exists()
+    assert [b for b in branches(repo) if "--" in b] == [], "no draft branch was created"
+    assert all(not task["merged"] for task in result["tasks"])
+
+
+def test_a_quarantine_after_the_lease_is_taken_over_records_no_attempt(repo, cart, tmp_path, store, monkeypatch) -> None:
+    held = acquire(store.conn, LEASE, "a", _now(), 3600).epoch
+    _taken_over_during(monkeypatch, store, "_build_task", held)
+    patches = {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")}
+    result, _ = drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), patches=patches, store=store, epoch=held,
+        lease_name=LEASE,
+    )
+
+    probe = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    _assert_stale(probe)
+    assert "not recorded: " in probe["reason"] and probe["kind"] == "no_work"
+    assert _store_rows(store) == [0, 0, 0, 0, 0]
+
+
+def test_a_lease_lost_at_the_ledger_tail_blocks_the_phase_and_its_dependents(
+    repo, cart, tmp_path, store, monkeypatch
+) -> None:
+    held = acquire(store.conn, LEASE, "a", _now(), 3600).epoch
+    _taken_over_during(monkeypatch, store, "_phase_status", held)
+    result, _ = drive(repo, cart, tmp_path, store=store, epoch=held, lease_name=LEASE)
+
+    p1, p2 = result["phases"]
+    assert p1["status"] == "blocked"
+    _assert_stale(p1)
+    assert [q for q in result["quarantined"] if q["grain"] == "phase"] == [
+        {"id": "p1-foundations", "phase": "p1-foundations", "grain": "phase", "reason": p1["reason"], "kind": "no_work"}
+    ]
+    assert p2["status"] == "blocked" and "did not meet its goal" in p2["reason"]
+    # The landing ran under the live lease; only what came after the takeover is refused.
+    assert all(task["merged"] for task in result["tasks"])
+    assert [store.total_rows(t) for t in ("phases", "ledger", "gate_decisions")] == [0, 0, 0]
+    assert not (tmp_path / "ledger.jsonl").exists()
+
+
+def test_with_no_epoch_no_fence_is_checked_even_when_a_store_is_given(repo, cart, tmp_path, store) -> None:
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False), store=store)
+
+    assert result["phases"][0]["status"] == "complete"
+    unfenced = store.conn.query_one("SELECT COUNT(*) FROM ledger WHERE epoch IS NULL")
+    assert unfenced[0] == store.total_rows("ledger") > 0
+
+
+def test_an_epoch_without_a_store_is_refused_up_front(repo, cart, tmp_path) -> None:
+    with pytest.raises(ValueError, match="needs a store"):
+        drive(repo, cart, tmp_path, epoch=1)
