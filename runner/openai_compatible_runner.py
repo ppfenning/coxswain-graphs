@@ -1,8 +1,9 @@
 """A runner for models served by an OpenAI-compatible endpoint, such as a local server.
 
 The profile names the env var holding the endpoint's base URL. It never carries the URL.
-This task serves `local/` models only. A local call is free: it records a cost of 0.0, never
-draws on `budget_usd`, and cannot stop a budget.
+A `local/` model is served here. A local call is free: it records a cost of 0.0, never
+draws on `budget_usd`, and cannot stop a budget. An `anthropic/` model is handed to an
+AnthropicRunner built on first use, which owns that call's records and store writes.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import itertools
 import os
 import uuid
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -47,8 +48,26 @@ if TYPE_CHECKING:
 __all__ = ["OpenAICompatibleRunner"]
 
 LOCAL_PREFIX = "local/"
+ANTHROPIC_PREFIX = "anthropic/"
 MAX_TOKENS = 4096
 TEMPERATURE = 0.0
+TEXT_SCHEMA = {
+    "type": "object",
+    "properties": {"text": {"type": "string"}},
+    "required": ["text"],
+    "additionalProperties": False,
+}
+
+
+@dataclass(frozen=True)
+class _SharedSeqStore:
+    """The delegate's store, drawing `seq` from this runner's counter so a hybrid run keeps one sequence."""
+
+    store: Store
+    seq: Iterator[int]
+
+    def record_call(self, call: Mapping[str, Any], decision: Mapping[str, Any] | None = None, **kwargs: Any) -> int:
+        return self.store.record_call(call, decision, **{**kwargs, "seq": next(self.seq)})
 
 
 @dataclass(frozen=True)
@@ -75,6 +94,7 @@ class OpenAICompatibleRunner:
         max_tokens: int = MAX_TOKENS,
         store: Store | None = None,
         run_id: str | None = None,
+        delegate_factory: Callable[..., Any] = AnthropicRunner,
     ) -> None:
         self.profile = dict(profile)
         self.role_skills = dict(role_skills)
@@ -106,9 +126,30 @@ class OpenAICompatibleRunner:
         self.router_mode = _router_mode(self.profile)
         self.calls: list[dict[str, Any]] = []
         self._store_seq = itertools.count(1)
+        self._delegate_factory = delegate_factory
+        self._delegate: Any = None
 
     def close(self) -> None:
-        """No connection is held, so there is nothing to release."""
+        """Close the delegate if one was built and has a `close`; AnthropicRunner has none. A second call does nothing."""
+        delegate, self._delegate = self._delegate, None
+        closer = getattr(delegate, "close", None)
+        if closer is not None:
+            closer()
+
+    def _delegate_run(self, record: Mapping[str, Any], **kwargs: Any) -> NodeResult:
+        """One call on the delegate, built on first use. The delegate writes the store row; `record` joins `calls`."""
+        if self._delegate is None:
+            store = None if self.store is None else _SharedSeqStore(self.store, self._store_seq)
+            self._delegate = self._delegate_factory(
+                self.profile, role_skills=self.role_skills, store=store, run_id=self.run_id
+            )
+        try:
+            result = self._delegate.run(**kwargs)
+        except Exception:
+            self.calls.append(dict(record))
+            raise
+        self.calls.append({**record, "ok": True})
+        return result
 
     def _model_for(self, tier: str) -> str:
         model = self.tiers.get(tier)
@@ -200,10 +241,37 @@ class OpenAICompatibleRunner:
         class_model = _class_model(self.classes, resolution.chosen_class)
         model_id = class_model or self._model_for(resolution.tier)
         recorded = replace(resolution, tier=resolution.chosen_class) if class_model else resolution
-        # The hybrid task replaces this branch.
+        if model_id.startswith(ANTHROPIC_PREFIX):
+            # AnthropicRunner keeps no `calls` list and exposes no usage, so its record here carries no cost or tokens.
+            record = {
+                "id": str(uuid.uuid4()),
+                "role": role,
+                "task_id": task,
+                "tier": recorded.tier,
+                "model": model_id,
+                "ts": datetime.now(UTC).isoformat(),
+                "ok": False,
+            }
+            # The delegate resolves the tier itself and sends `model` to the API as given, so the prefix is stripped here.
+            # It requires a schema; a schemaless call gets the local path's `{"text": ...}` shape.
+            return self._delegate_run(
+                record,
+                role=role,
+                tier=tier,
+                hints=hints,
+                schema=schema or TEXT_SCHEMA,
+                prompt=prompt,
+                context=context,
+                thread=thread,
+                budget_usd=budget_usd,
+                task=task,
+                router_decision=router_decision,
+                model=model_id.removeprefix(ANTHROPIC_PREFIX),
+            )
         if not model_id.startswith(LOCAL_PREFIX):
             raise RunnerError(
-                f"node '{role}' resolved tier '{recorded.tier}' to model '{model_id}'; this runner serves only '{LOCAL_PREFIX}' models"
+                f"node '{role}' resolved tier '{recorded.tier}' to model '{model_id}'; "
+                f"this runner serves only '{LOCAL_PREFIX}' and '{ANTHROPIC_PREFIX}' models"
             )
         if self.router_mode == "on" and router_decision is not None:
             warnings.warn(ROUTER_ON_WARNING, RuntimeWarning, stacklevel=1)

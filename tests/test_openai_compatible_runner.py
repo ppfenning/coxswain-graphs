@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
 
 from harness.store_migrate import open_store
 from harness.store_write import Store
-from runner.openai_compatible_runner import OpenAICompatibleRunner
-from runner.protocol import RunnerError
+from runner.anthropic_runner import AnthropicRunner
+from runner.openai_compatible_runner import TEXT_SCHEMA, OpenAICompatibleRunner
+from runner.protocol import NodeResult, RunnerError
 from tests.fake_openai_server import FakeOpenAIServer
 
 ENV_VAR = "LOCAL_LLM_URL"
@@ -18,6 +22,59 @@ PROFILE = {
 }
 SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
 RUN = "run-1:p3-write"
+HYBRID = {
+    **PROFILE,
+    "tiers": {"cheap": "local/qwen-small", "standard": "anthropic/claude-sonnet-x", "deep": "remote/opus"},
+}
+
+
+class _FakeDelegate:
+    def __init__(self, fail: bool = False) -> None:
+        self.runs: list[dict[str, Any]] = []
+        self.closed = 0
+        self.fail = fail
+
+    def run(self, **kwargs: Any) -> NodeResult:
+        self.runs.append(kwargs)
+        if self.fail:
+            raise RunnerError("refused")
+        return NodeResult({"ok": True})
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class _Factory:
+    def __init__(self, fail: bool = False) -> None:
+        self.built: list[tuple[Any, dict[str, Any]]] = []
+        self.delegate = _FakeDelegate(fail)
+
+    def __call__(self, profile: Any, **kwargs: Any) -> _FakeDelegate:
+        self.built.append((profile, kwargs))
+        return self.delegate
+
+
+class _Client:
+    """Stands in for the anthropic SDK client that the real AnthropicRunner calls."""
+
+    def __init__(self, text: str = '{"ok": true}') -> None:
+        self.sent: list[dict[str, Any]] = []
+        self._response = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=text)])
+        self.messages = SimpleNamespace(create=self._create)
+
+    def _create(self, **kwargs: Any) -> Any:
+        self.sent.append(kwargs)
+        return self._response
+
+
+def _hybrid(server: FakeOpenAIServer, factory: Any, **kwargs: Any) -> OpenAICompatibleRunner:
+    return OpenAICompatibleRunner(
+        HYBRID, role_skills={"other": "skill.md"}, env={ENV_VAR: server.base_url}, delegate_factory=factory, **kwargs
+    )
+
+
+def _real(client: _Client) -> Any:
+    return lambda profile, **kwargs: AnthropicRunner(profile, client=client, **kwargs)
 
 
 def _runner(server: FakeOpenAIServer, **kwargs) -> OpenAICompatibleRunner:
@@ -93,3 +150,95 @@ def test_the_store_write_for_a_local_call_has_the_shape_the_anthropic_runner_wri
     assert rows[1][:4] == ("run-1", "p3-write", "r", 1)
     assert (rows[1][4], rows[1][5]) == (out.decision.model_id, out.decision.chosen_tier)
     assert rows[1][6:] == (0.0, 3, 2)
+
+
+def test_a_standard_tier_goes_to_the_delegate_and_never_touches_the_server() -> None:
+    factory = _Factory()
+    with FakeOpenAIServer([]) as server:
+        out = _hybrid(server, factory).run(role="r", tier="standard", schema=SCHEMA, prompt="go")
+    assert dict(out) == {"ok": True}
+    (sent,) = factory.delegate.runs
+    assert (sent["role"], sent["schema"], sent["prompt"]) == ("r", SCHEMA, "go")
+    assert (sent["tier"], sent["model"]) == ("standard", "claude-sonnet-x")
+    assert factory.built[0][1]["role_skills"] == {"other": "skill.md"}
+    assert server.requests == []
+
+
+def test_a_cheap_tier_never_builds_the_delegate() -> None:
+    factory = _Factory()
+    with FakeOpenAIServer(["hello"]) as server:
+        _hybrid(server, factory).run(role="r", tier="cheap", schema=None, prompt="hi")
+    assert factory.built == []
+
+
+def test_the_delegates_record_follows_a_local_record_in_calls() -> None:
+    factory = _Factory()
+    with FakeOpenAIServer(["hello"]) as server:
+        runner = _hybrid(server, factory)
+        runner.run(role="r", tier="cheap", schema=None, prompt="hi")
+        runner.run(role="r", tier="standard", schema=SCHEMA, prompt="go")
+        runner.run(role="r", tier="standard", schema=SCHEMA, prompt="again")
+    assert [(c["model"], c["ok"]) for c in runner.calls] == [
+        ("local/qwen-small", True),
+        ("anthropic/claude-sonnet-x", True),
+        ("anthropic/claude-sonnet-x", True),
+    ]
+    assert len(factory.built) == 1
+
+
+def test_a_failed_delegate_call_is_recorded_as_not_ok_and_reraised() -> None:
+    with FakeOpenAIServer([]) as server, pytest.raises(RunnerError, match="refused"):
+        runner = _hybrid(server, _Factory(fail=True))
+        runner.run(role="r", tier="standard", schema=SCHEMA, prompt="go")
+    assert [c["ok"] for c in runner.calls] == [False]
+
+
+def test_the_real_delegate_joins_calls_shares_one_store_sequence_and_closes_twice() -> None:
+    conn = open_store("sqlite:///:memory:", "2026-09-25T00:00:00Z")
+    client = _Client()
+    with FakeOpenAIServer(["hello"]) as server:
+        runner = _hybrid(server, _real(client), store=Store(conn), run_id=RUN)
+        runner.run(role="r", tier="cheap", schema=None, prompt="hi")
+        runner.run(role="r", tier="standard", schema=SCHEMA, prompt="go")
+    runner.close()
+    runner.close()
+    rows = conn.query_all("SELECT seq, model_id FROM node_calls ORDER BY seq")
+    conn.close()
+    assert rows == [(1, "local/qwen-small"), (2, "claude-sonnet-x")]
+    assert [c["model"] for c in runner.calls] == ["local/qwen-small", "anthropic/claude-sonnet-x"]
+    assert client.sent[0]["model"] == "claude-sonnet-x"
+
+
+def test_a_schemaless_anthropic_call_returns_text_like_the_local_path() -> None:
+    client = _Client('{"text": "hello"}')
+    with FakeOpenAIServer([]) as server:
+        out = _hybrid(server, _real(client)).run(role="r", tier="standard", schema=None, prompt="hi")
+    assert out["text"] == "hello"
+    assert client.sent[0]["output_config"]["format"]["schema"] == TEXT_SCHEMA
+
+
+def test_the_default_factory_builds_the_real_anthropic_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _Client()
+    monkeypatch.setattr(AnthropicRunner, "_build_client", lambda self: client)
+    with FakeOpenAIServer([]) as server:
+        runner = OpenAICompatibleRunner(HYBRID, role_skills={}, env={ENV_VAR: server.base_url})
+        runner.run(role="r", tier="standard", schema=SCHEMA, prompt="go")
+    assert client.sent[0]["model"] == "claude-sonnet-x"
+    runner.close()
+
+
+def test_close_closes_the_delegate_once() -> None:
+    factory = _Factory()
+    with FakeOpenAIServer([]) as server:
+        runner = _hybrid(server, factory)
+        runner.run(role="r", tier="standard", schema=SCHEMA, prompt="go")
+        runner.close()
+        runner.close()
+    assert factory.delegate.closed == 1
+
+
+def test_an_unknown_prefix_raises_without_building_the_delegate() -> None:
+    factory = _Factory()
+    with FakeOpenAIServer([]) as server, pytest.raises(RunnerError, match="deep"):
+        _hybrid(server, factory).run(role="r", tier="deep", schema=SCHEMA, prompt="go")
+    assert factory.built == []
