@@ -82,7 +82,9 @@ def test_a_stale_epoch_warns_once_and_ends_the_thread_without_raising(tmp_path, 
 
 
 def test_a_store_that_cannot_open_warns_once_and_ends_the_thread(tmp_path, capsys) -> None:
-    beat = Heartbeat(f"sqlite:///{tmp_path}/missing/dir/cox.db", "runs:x", "x-1", 1, clock=_now, interval=0.05)
+    beat = Heartbeat(
+        f"sqlite:///{tmp_path}/missing/dir/cox.db", "runs:x", "x-1", 1, clock=_now, interval=0.05, retry_wait=0.01
+    )
 
     beat.start()
     ended = _wait_until(lambda: not beat.alive)
@@ -90,6 +92,7 @@ def test_a_store_that_cannot_open_warns_once_and_ends_the_thread(tmp_path, capsy
     assert ended
     [line] = capsys.readouterr().err.splitlines()
     assert line.startswith("lease: heartbeat for runs:x stopped: cannot open the store:")
+    assert line.endswith("after 3 attempts")
 
 
 def test_a_renew_that_raises_warns_once_and_ends_the_thread(monkeypatch, tmp_path, capsys) -> None:
@@ -99,13 +102,110 @@ def test_a_renew_that_raises_warns_once_and_ends_the_thread(monkeypatch, tmp_pat
     url = default_url(tmp_path)
     open_store(url, _now()).close()
     monkeypatch.setattr(run_lease, "renew", broken)
-    beat = Heartbeat(url, "runs:x", "x-1", 1, clock=_now, interval=0.05)
+    beat = Heartbeat(url, "runs:x", "x-1", 1, clock=_now, interval=0.05, retry_wait=0.01)
 
     beat.start()
     ended = _wait_until(lambda: not beat.alive)
 
     assert ended
-    assert capsys.readouterr().err.splitlines() == ["lease: heartbeat for runs:x stopped: disk I/O error"]
+    assert capsys.readouterr().err.splitlines() == [
+        "lease: heartbeat for runs:x stopped: disk I/O error after 3 attempts"
+    ]
+
+
+def _flaky(failures: int, calls: list, result: bool = True):
+    def renew(*args, **kwargs):
+        calls.append(1)
+        if len(calls) <= failures:
+            raise sqlite3.OperationalError("disk I/O error")
+        return result
+
+    return renew
+
+
+def test_a_renew_that_raises_twice_is_retried_and_the_thread_keeps_going(monkeypatch, tmp_path, capsys) -> None:
+    url, calls = default_url(tmp_path), []
+    open_store(url, _now()).close()
+    monkeypatch.setattr(run_lease, "renew", _flaky(2, calls))
+    beat = Heartbeat(url, "runs:x", "x-1", 1, clock=_now, interval=0.01, retry_wait=0.01)
+
+    beat.start()
+    renewed_again = _wait_until(lambda: len(calls) >= 5)
+    alive = beat.alive
+    beat.stop()
+
+    assert renewed_again
+    assert alive
+    assert capsys.readouterr().err == ""
+
+
+def test_a_renew_that_raises_three_times_ends_the_thread_after_three_calls(monkeypatch, tmp_path, capsys) -> None:
+    url, calls = default_url(tmp_path), []
+    open_store(url, _now()).close()
+    monkeypatch.setattr(run_lease, "renew", _flaky(99, calls))
+    beat = Heartbeat(url, "runs:x", "x-1", 1, clock=_now, interval=0.01, retry_wait=0.01)
+
+    beat.start()
+    ended = _wait_until(lambda: not beat.alive)
+
+    assert ended
+    assert len(calls) == 3
+    assert capsys.readouterr().err.splitlines() == [
+        "lease: heartbeat for runs:x stopped: disk I/O error after 3 attempts"
+    ]
+
+
+def test_a_stale_epoch_is_not_retried(monkeypatch, tmp_path, capsys) -> None:
+    url, calls = default_url(tmp_path), []
+    open_store(url, _now()).close()
+    monkeypatch.setattr(run_lease, "renew", _flaky(0, calls, result=False))
+    beat = Heartbeat(url, "runs:x", "x-1", 1, clock=_now, interval=0.01, retry_wait=0.01)
+
+    beat.start()
+    ended = _wait_until(lambda: not beat.alive)
+
+    assert ended
+    assert len(calls) == 1
+    assert capsys.readouterr().err.splitlines() == ["lease: heartbeat for runs:x stopped: stale epoch 1"]
+
+
+def test_stop_during_a_retry_wait_returns_promptly(monkeypatch, tmp_path) -> None:
+    url, calls = default_url(tmp_path), []
+    open_store(url, _now()).close()
+    monkeypatch.setattr(run_lease, "renew", _flaky(99, calls))
+    beat = Heartbeat(url, "runs:x", "x-1", 1, clock=_now, interval=0.01, retry_wait=30)
+    beat.start()
+    assert _wait_until(lambda: len(calls) >= 1)
+
+    began = time.monotonic()
+    beat.stop()
+
+    assert time.monotonic() - began < 1.0
+    assert not beat.alive
+
+
+def test_an_open_that_fails_twice_is_retried_and_the_thread_reaches_renew(monkeypatch, tmp_path, capsys) -> None:
+    url, opens, calls = default_url(tmp_path), [], []
+    real_open = open_store
+    open_store(url, _now()).close()
+
+    def flaky_open(*args, **kwargs):
+        opens.append(1)
+        if len(opens) <= 2:
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(run_lease, "open_store", flaky_open)
+    monkeypatch.setattr(run_lease, "renew", _flaky(0, calls))
+    beat = Heartbeat(url, "runs:x", "x-1", 1, clock=_now, interval=0.01, retry_wait=0.01)
+
+    beat.start()
+    reached = _wait_until(lambda: len(calls) >= 1)
+    beat.stop()
+
+    assert reached
+    assert len(opens) == 3
+    assert capsys.readouterr().err == ""
 
 
 def test_stop_returns_within_its_timeout_when_a_renew_is_stuck(monkeypatch, tmp_path, capsys) -> None:
