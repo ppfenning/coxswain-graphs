@@ -284,13 +284,15 @@ def _import_records(store: Store, report: Report, files: Sequence[Path]) -> list
     # A run that left call lines or a usage file recorded something, so it is not never_recorded.
     recorded = {_cut(p.name, s) for p in files for s in (".calls.jsonl", _USAGE_SUFFIX) if p.name.endswith(s)}
     malformed: list[str] = []
-    launches = {_launch_key(p.name): d for p, d in docs.items() if is_launch(d)}
+    # A launch file is a launch by its name: the oldest ones hold only {"at": ...}, with no launched_by.
+    launch_paths = {p for p, d in docs.items() if p.name.endswith((".launched.json", ".launch.json")) or is_launch(d)}
+    launches = {_launch_key(p.name): d for p, d in docs.items() if p in launch_paths}
     phases: dict[str, list[Any]] = {}
     for doc in docs.values():
         if parse_phase(doc) is not None:
             phases.setdefault(split_phase_id(doc["run_id"])[0], []).append(doc)
     used: set[str] = set()
-    for path, doc in ((p, d) for p, d in docs.items() if not is_launch(d)):
+    for path, doc in ((p, d) for p, d in docs.items() if p not in launch_paths):
         run = parse_run(doc, launches.get(doc.get("run_id") if isinstance(doc, dict) else None))
         phase = None if run is not None else parse_phase(doc)
         if run is not None:
