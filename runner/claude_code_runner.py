@@ -41,11 +41,15 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from runner.decision_log import REASON_SEPARATOR, CallDecision, RouterDecision, joined_reasons, to_row
 from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
 from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class, to_tier
+
+if TYPE_CHECKING:
+    # Type only: importing harness at module load is circular, since harness imports this runner.
+    from harness.store_write import Store
 
 # Per docs/design/vendor-axis.md §2: session resume on a budget stop, structured
 # output, and Bash/Read/Edit tool grants are real; 200_000 is Claude's published
@@ -521,6 +525,7 @@ class ClaudeCodeRunner:
         trace_dir: Path | str | None = None,
         runs_dir: Path | str | None = None,
         run_id: str | None = None,
+        store: Store | None = None,
     ) -> None:
         self.profile = dict(profile)
         self.capabilities = dict(CAPABILITIES)
@@ -581,6 +586,10 @@ class ClaudeCodeRunner:
         # a record of what it spent instead of only what a survivor remembers.
         self.runs_dir: Path | None = Path(runs_dir).expanduser() if runs_dir else None
         self.run_id: str | None = run_id
+        # Also record every finished call in the run-record store. None leaves the file ledger as the only record.
+        self.store = store
+        self._store_seq = 0
+        self._store_lock = threading.Lock()
         # The project's own check commands, verbatim from the cartridge, set by
         # the harness. Traced builds spent a third of their turns discovering
         # how to run the tests — the wrong interpreter, `which pytest`,
@@ -634,8 +643,32 @@ class ClaudeCodeRunner:
             return decision
         return decision if tagged is None else tagged
 
+    def _record_to_store(self, call: Mapping[str, Any], *, ok: bool) -> None:
+        """Write one finished call to the store. A store error is warned about and never fails the call."""
+        if self.store is None or not self.run_id:
+            return
+        from harness.store_write import split_phase_id  # here, not at the top: harness imports this module
+
+        # Run and phase ids come from the runner's existing `run_id` (`run:phase`), split at the colon; a new argument was the larger change.
+        run_id, phase_id = split_phase_id(self.run_id)
+        with self._store_lock:
+            self._store_seq += 1
+            seq = self._store_seq
+        row = {k: v for k, v in call.items() if k != "decision"}
+        try:
+            self.store.record_call(
+                {**row, "ts": datetime.now(UTC).isoformat(), "ok": ok},
+                call.get("decision"),
+                run_id=run_id,
+                seq=seq,
+                phase_id=phase_id or None,
+            )
+        except Exception as exc:
+            _log.warning("store write failed for call %s: %s", call.get("id"), exc)
+
     def _append_call_ledger(self, call: Mapping[str, Any], *, ok: bool, error: str | None = None) -> None:
         """One JSON line per call, written as it returns — never a rewrite, never buffered."""
+        self._record_to_store(call, ok=ok)
         if not self.runs_dir or not self.run_id:
             return
         self.runs_dir.mkdir(parents=True, exist_ok=True)
