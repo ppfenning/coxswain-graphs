@@ -5,6 +5,7 @@ Time is an argument here too: the heartbeat is handed a clock and never reads on
 
 from __future__ import annotations
 
+import contextlib
 import re
 import sys
 import threading
@@ -23,13 +24,18 @@ def lease_name(run_id: str) -> str:
     return f"runs:{_NUMERIC_SUFFIX.sub('', run_id)}"
 
 
+def _close(conn) -> None:
+    with contextlib.suppress(Exception):
+        conn.close()
+
+
 class Heartbeat:
     """Renews a lease every `interval` seconds on its own connection until stopped or the renew fails.
 
-    A failed renew warns once on stderr and ends the thread. It never touches the run:
-    the epoch fence is what stops a stale writer. A store error is not retried here: a
-    SQLite connection already waits 30 s on a busy lock (`store_dialect.connect`), so an
-    error that reaches this loop is not the transient contention a retry would cure.
+    A stale epoch warns once on stderr and ends the thread at once. It never touches the run:
+    the epoch fence is what stops a stale writer. A renew or open that raises is retried on a
+    fresh connection, `attempts` tries in all with `retry_wait` seconds between them, and
+    only the last failure warns and ends the thread.
     """
 
     def __init__(
@@ -42,9 +48,12 @@ class Heartbeat:
         clock: Callable[[], str],
         interval: float = 30.0,
         ttl: int = 120,
+        attempts: int = 3,
+        retry_wait: float = 2.0,
     ) -> None:
         self._url, self._name, self._holder, self._epoch = url, name, holder, epoch
         self._clock, self._interval, self._ttl = clock, interval, ttl
+        self._attempts, self._retry_wait = max(1, attempts), retry_wait
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name=f"heartbeat-{name}", daemon=True)
 
@@ -65,20 +74,48 @@ class Heartbeat:
 
     def _loop(self) -> None:
         # SQLite connections are not shared across threads, so this thread opens its own.
-        try:
-            conn = open_store(self._url, self._clock())
-        except Exception as exc:
-            self._warn(f"cannot open the store: {' '.join(str(exc).split())}")
-            return
-        try:
-            while not self._stop.wait(self._interval):
-                if not renew(conn, self._name, self._holder, self._epoch, self._clock(), self._ttl):
-                    self._warn(f"stale epoch {self._epoch}")
-                    return
-        except Exception as exc:
-            self._warn(" ".join(str(exc).split()))
-        finally:
-            conn.close()
+        conn = self._open()
+        while conn is not None and not self._stop.wait(self._interval):
+            conn = self._tick(conn)
+        if conn is not None:
+            _close(conn)
+
+    def _open(self):
+        """A connection, or None after `attempts` failed opens or a stop during a retry wait."""
+        error = ""
+        for attempt in range(self._attempts):
+            if attempt and self._stop.wait(self._retry_wait):
+                return None
+            try:
+                return open_store(self._url, self._clock())
+            except Exception as exc:
+                error = " ".join(str(exc).split())
+        self._warn(f"cannot open the store: {error} after {self._attempts} attempts")
+        return None
+
+    def _tick(self, conn):
+        """Renew once, retrying an error on a fresh connection. Returns the live connection, or None when the thread ends."""
+        error = ""
+        for attempt in range(self._attempts):
+            if attempt:
+                if self._stop.wait(self._retry_wait):
+                    return None
+                try:
+                    conn = open_store(self._url, self._clock())
+                except Exception as exc:
+                    error = " ".join(str(exc).split())
+                    continue
+            try:
+                if renew(conn, self._name, self._holder, self._epoch, self._clock(), self._ttl):
+                    return conn
+                self._warn(f"stale epoch {self._epoch}")
+                _close(conn)
+                return None
+            except Exception as exc:
+                error = " ".join(str(exc).split())
+                _close(conn)
+        self._warn(f"{error} after {self._attempts} attempts")
+        return None
 
     def _warn(self, reason: str) -> None:
         print(f"lease: heartbeat for {self._name} stopped: {reason}", file=sys.stderr)
