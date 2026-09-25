@@ -42,7 +42,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from runner.decision_log import CallDecision, RouterDecision, joined_reasons
+from runner.decision_log import REASON_SEPARATOR, CallDecision, RouterDecision, joined_reasons
 from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
 from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class, to_tier
 
@@ -432,6 +432,44 @@ def _init_facts(init: object) -> tuple[str | None, str | None]:
     return (version if isinstance(version, str) else None, model if isinstance(model, str) else None)
 
 
+def _text_or_none(value: object) -> str | None:
+    """A non-empty string as itself; anything else as None."""
+    return value if isinstance(value, str) and value.strip() else None
+
+
+_VERSION = re.compile(r"\s*(\d+(?:\.\d+)*)(?:-([0-9A-Za-z.]+))?(?:\s|$)")
+
+Version = tuple[tuple[int, ...], str]
+
+
+def _parse_version(text: str | None) -> Version | None:
+    """(numbers, pre-release) of '2.1.3', '2.1.0-beta' or '2.1.3 (Claude Code)'; None for anything else, such as 'v2.1.3'."""
+    match = _VERSION.match(text or "")
+    return (tuple(int(part) for part in match.group(1).split(".")), match.group(2) or "") if match else None
+
+
+def _compare_versions(a: Version, b: Version) -> int:
+    """-1, 0 or 1. Numbers are zero-padded so 2.1 equals 2.1.0; a pre-release sorts below its release."""
+    width = max(len(a[0]), len(b[0]))
+    ka, kb = (((*n, *(0,) * (width - len(n))), pre == "", pre) for n, pre in (a, b))
+    return (ka > kb) - (ka < kb)
+
+
+def _version_violations(version: str | None, pin: str | None, floor: str | None) -> tuple[str, ...]:
+    """Reasons the CLI version breaks the profile's pin or floor; a set bound that will not parse is itself a reason."""
+    if not pin and not floor:
+        return ()
+    have, want_pin, want_floor = _parse_version(version), _parse_version(pin), _parse_version(floor)
+    unreadable = ("version_bound_unparseable",) if (pin and want_pin is None) or (floor and want_floor is None) else ()
+    if have is None:
+        return (*unreadable, "version_unknown")
+    return (
+        *unreadable,
+        *(("version_below_floor",) if want_floor is not None and _compare_versions(have, want_floor) < 0 else ()),
+        *(("version_pin_mismatch",) if want_pin is not None and _compare_versions(have, want_pin) != 0 else ()),
+    )
+
+
 _ROUTER_MODES = {"off": "off", "shadow": "shadow", "on": "on", True: "on", False: "off", None: "off"}
 
 
@@ -521,6 +559,9 @@ class ClaudeCodeRunner:
         self.tier_overrides = {str(k): str(v) for k, v in (self.profile.get("tier_overrides") or {}).items()}
         # role -> tier applied when the caller names no tier; an override still beats it.
         self.profile_defaults = {str(k): str(v) for k, v in (self.profile.get("defaults") or {}).items()}
+        # Recorded on the CallDecision reason, never enforced: the version is known only after start.
+        self.cli_version_pin = _text_or_none(self.profile.get("cli_version_pin"))
+        self.cli_version_floor = _text_or_none(self.profile.get("cli_version_floor"))
         # off, shadow or on. Only records a supplied decision; it never changes what runs.
         # Warned once per runner, not once per node.
         self.router_mode, router_warning = _router_mode(self.profile.get("router"))
@@ -1205,7 +1246,9 @@ class ClaudeCodeRunner:
             requested_tier=requested_tier,
             chosen_tier=cls,
             model_id=init_model or used_model,
-            reason=resolution.reason,
+            reason=REASON_SEPARATOR.join(
+                (resolution.reason, *_version_violations(version, self.cli_version_pin, self.cli_version_floor))
+            ),
             ticket_key=task or "",
             outcome_key="",
             claude_code_version=version,

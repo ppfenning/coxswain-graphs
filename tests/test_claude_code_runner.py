@@ -21,7 +21,9 @@ from runner.claude_code_runner import (
     ClaudeCodeRunner,
     _alt_model_for,
     _init_facts,
+    _parse_version,
     _run_verify,
+    _version_violations,
     apply_reported_patch,
     files_touched_from_patch,
     is_safeguard_refusal,
@@ -867,6 +869,50 @@ def test_the_decision_carries_version_and_model_from_the_init_event(fake_claude,
     assert (d.role, d.requested_tier, d.chosen_tier, d.reason) == ("build", "standard", "reason", "caller")
     assert (d.ticket_key, d.outcome_key) == ("t9", ""), "the ticket is `task`, as in the ledger's task_id; a thread is not a ticket"
     assert dict(out) == {"ok": True}, "the decision is an attribute, not a key"
+
+
+def test_parse_version_reads_numbers_and_pre_release_and_refuses_anything_else() -> None:
+    assert [_parse_version(t) for t in ("2.1.3", "2.1.3 (Claude Code)", "2.1.0-beta.1")] == [((2, 1, 3), ""), ((2, 1, 3), ""), ((2, 1, 0), "beta.1")]
+    assert [_parse_version(t) for t in (None, "", "v2.0.31", "latest", "2.1.3abc")] == [None] * 5
+
+
+def test_floor_equal_below_above_and_numeric() -> None:
+    assert [_version_violations(v, None, "2.9.0") for v in ("2.9.0", "2.8.9", "2.10.0", "2.9.0-rc.1")] == [
+        (), ("version_below_floor",), (), ("version_below_floor",)
+    ]
+
+
+def test_pin_mismatch_pads_short_versions_and_counts_a_pre_release() -> None:
+    assert [_version_violations(v, "2.1.0", None) for v in ("2.1.0", "2.1", "2.1.1", "2.1.0-beta")] == [
+        (), (), ("version_pin_mismatch",), ("version_pin_mismatch",)
+    ]
+
+
+def test_a_missing_version_is_unknown_only_when_a_bound_is_set() -> None:
+    assert [_version_violations(None, p, f) for p, f in (("2.0.31", None), (None, "2.0.31"), (None, None))] == [
+        ("version_unknown",), ("version_unknown",), ()
+    ]
+
+
+def test_an_unparseable_bound_is_recorded_not_skipped() -> None:
+    assert _version_violations("2.0.31", "v2.0.31", None) == ("version_bound_unparseable",)
+    assert _version_violations("2.0.31", "2.0.30", "latest") == ("version_bound_unparseable", "version_pin_mismatch")
+    assert _version_violations(None, None, "latest") == ("version_bound_unparseable", "version_unknown")
+
+
+@pytest.mark.parametrize(
+    ("bounds", "init", "reason"),
+    [
+        ({}, INIT, "caller"),
+        ({"cli_version_floor": "2.1.0"}, INIT, "caller; version_below_floor"),
+        ({"cli_version_pin": "2.0.30"}, INIT, "caller; version_pin_mismatch"),
+        ({"cli_version_pin": "v2.0.31"}, INIT, "caller; version_bound_unparseable"),
+        ({"cli_version_floor": "2.0.0"}, {"type": "system", "subtype": "init"}, "caller; version_unknown"),
+    ],
+)
+def test_a_version_violation_rides_on_the_reason_and_the_call_still_finishes(fake_claude, tmp_path, bounds, init, reason) -> None:
+    out = _streamed(tmp_path, fake_claude, [init, RESULT], **bounds).run(role="build", tier="standard", schema=SCHEMA, prompt="go")
+    assert (dict(out), out.decision.reason) == ({"ok": True}, reason)
 
 
 def test_a_tier_override_that_changes_the_tier_is_reason_override(fake_claude, tmp_path) -> None:
