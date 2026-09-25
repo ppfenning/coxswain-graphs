@@ -31,7 +31,7 @@ import core
 import yaml
 from core import ledger, workstore
 from core.cartridge import CartridgeError
-from core.manifest import build_manifest, record_run
+from core.manifest import append_ledger, build_manifest
 
 from graphs._contract import ContractViolation
 from harness import CORE_SCHEMA, run_lease, store_traces
@@ -796,6 +796,40 @@ def _main(argv: list[str] | None) -> int:
                 print(f"worktree {'removed' if ok else 'FAILED to remove'}: {detail}", file=sys.stderr if not ok else sys.stdout)
 
 
+def _record_run_to_store(
+    store: Store,
+    manifest: Mapping[str, Any],
+    diffs: Sequence[Mapping[str, Any]],
+    *,
+    graph_name: str,
+    ledger_path: Path | str,
+) -> None:
+    """Record a run as the epic driver records a phase: one phases row, its gate decisions, its ledger rows.
+
+    A store error warns and never changes the exit code.
+    """
+    run_id = str(manifest["run_id"])
+    phase_run_id = f"{run_id}:{graph_name}"
+    row = {
+        "run_id": phase_run_id,
+        "phase": graph_name,
+        "ts": manifest["ts"],
+        "principal": manifest["principal"],
+        "human_minutes": manifest["human_minutes"],
+        "totals": manifest["totals"],
+        "manifest": phase_run_id,
+        "manifest_record": dict(manifest),
+    }
+    try:
+        for entry in ledger.read(ledger_path):
+            if entry.get("run_id") == run_id:
+                store.record_ledger(entry)
+        store.record_gate_decisions(run_id, graph_name, diffs)
+        store.record_phase(row)
+    except Exception as exc:
+        print(f"store: could not record {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
+
+
 def _run_graph(
     *,
     specs: dict[str, GraphSpec],
@@ -1132,14 +1166,16 @@ def _run_graph(
         human_minutes=human_minutes,
         totals={**result.get("totals", {}), "auto_applied": len(auto_applied), "gated": len(gated)},
     )
-    record_run(manifest, runs_dir=args.runs_dir, ledger_path=args.ledger)
+    append_ledger(manifest, ledger_path=args.ledger)
+    if store is not None:
+        _record_run_to_store(store, manifest, diffs, graph_name=graph_name, ledger_path=args.ledger)
 
     if result_out:
         Path(result_out).parent.mkdir(parents=True, exist_ok=True)
         Path(result_out).write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
 
     # And then what the run itself established, on the same clock as the
-    # manifest. This lands AFTER record_run because it is a post-hoc verdict on
+    # manifest. This lands AFTER the manifest is recorded because it is a post-hoc verdict on
     # a run already recorded, not a second opinion on the gate.
     _observe_trap_failures(
         result,
@@ -1151,7 +1187,7 @@ def _run_graph(
     )
 
     print(f"\nrecorded {run_id}: {len(auto_applied)} auto-applied, {len(diffs)} gated decision(s), {len(proposals)} proposal(s)")
-    print(f"  manifest: {Path(args.runs_dir) / (run_id + '.json')}")
+    print(f"  manifest: recorded in the run store under {run_id}")
     if result_out:
         print(f"  result  : {result_out}")
     print(f"  ledger  : {args.ledger}")
