@@ -1536,6 +1536,15 @@ def test_an_escalated_tasks_state_move_lands_on_approved_not_done(repo, cart, tm
     )
 
 
+def test_the_state_move_proposal_names_approved_never_done(repo, cart, tmp_path) -> None:
+    """The apply arm writes the state the proposal names; `done` belongs to `cox runs land` alone."""
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
+
+    moves = [p for p in result["proposals"] if p["kind"] == "state_move"]
+    assert moves
+    assert all(p["suggested_action"] == f"mark {p['target']} approved" for p in moves)
+
+
 def test_a_normally_merged_task_reads_approved_never_done_until_cox_lands_it(repo, cart, tmp_path) -> None:
     """Merging into the phase stack is not landing — only `cox runs land` writes `done`."""
     result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
