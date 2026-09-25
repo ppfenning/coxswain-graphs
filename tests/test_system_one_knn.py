@@ -66,11 +66,11 @@ def test_a_three_to_one_vote_has_confidence_of_the_winning_share() -> None:
     assert answer.confidence == pytest.approx(0.75)
 
 
-def test_a_tie_goes_to_the_label_first_in_order() -> None:
+def test_a_noul_tie_goes_to_yes_whatever_the_file_order() -> None:
     yes_first = [("a", "yes", [1.0, 0.0]), ("b", "no", [1.0, 0.0])]
     no_first = list(reversed(yes_first))
     assert [_decider(yes_first, k=2).decide(Noul("q"), _state("query")).value for _ in range(2)] == ["yes", "yes"]
-    assert _decider(no_first, k=2).decide(Noul("q"), _state("query")).value == "no"
+    assert _decider(no_first, k=2).decide(Noul("q"), _state("query")).value == "yes"
     assert pick({"x": 0.5, "y": 0.5}, ["y", "x"]) == "y"
 
 
@@ -80,6 +80,38 @@ def test_a_choice_ties_by_option_order_and_drops_labels_it_does_not_offer() -> N
     assert answer.kind == "choice"
     assert answer.value == "y"
     assert answer.probabilities == pytest.approx({"y": 0.5, "x": 0.5})
+
+
+MIXED = [
+    ("a", "approve", [1.0, 0.0]),
+    ("b", "yes", [0.6, 0.8]),
+    ("c", "no", [0.0, 1.0]),
+    ("d", "revise", [0.8, 0.6]),
+]
+
+
+def test_a_noul_answers_only_yes_or_no_even_when_an_approve_example_is_nearest() -> None:
+    assert _decider(MIXED, k=1).decide(Noul("q"), _state("query")).value == "yes"
+    for k in (1, 3):
+        answer = _decider(MIXED, k=k).decide(Noul("q"), _state("query"))
+        assert answer.value in ("yes", "no")
+        assert set(answer.probabilities) == {"yes", "no"}
+
+
+def test_a_noul_with_no_yes_or_no_example_is_unsupported() -> None:
+    rows = [("a", "approve", [1.0, 0.0]), ("b", "revise", [0.0, 1.0])]
+    with pytest.raises(UnsupportedQuestion):
+        _decider(rows, k=1).decide(Noul("q"), _state("query"))
+
+
+def test_a_choice_still_answers_only_from_its_options_in_a_mixed_file() -> None:
+    options = ("approve", "revise", "reject")
+    nearest = _decider(MIXED, k=1).decide(Choice("q", options), _state("query"))
+    assert nearest.value == "approve"
+    wide = _decider(MIXED, k=4).decide(Choice("q", options), _state("query"))
+    assert list(wide.probabilities) == list(options)
+    assert wide.probabilities["reject"] == 0.0
+    assert wide.value in ("approve", "revise")
 
 
 def test_a_choice_probability_is_zero_for_an_option_no_neighbour_carries() -> None:
