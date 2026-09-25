@@ -64,3 +64,61 @@ jobs:
 
       - name: ruff (rules in pyproject.toml; pre-commit mirrors it)
         run: pip install ruff==0.16.6 && ruff check .
+
+  # Runs the store tests against a real Postgres. Not in the branch ruleset, so a
+  # red run here is a finding to read, not a merge block. Only the store files
+  # run, to keep the extra runner minutes to the tests that have a Postgres param.
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # `import harness` runs harness/__init__.py, which reaches `from core import
+    # ledger` in harness/autonomy.py. Without the substrate, tests/conftest.py
+    # drops every file that imports harness, which is all four store files. So
+    # unlike `test`, this job cannot degrade: no token means a red run.
+    env:
+      SUBSTRATE_TOKEN: ${{ secrets.SUBSTRATE_REPO_TOKEN }}
+      COXSWAIN_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Require the substrate token
+        if: env.SUBSTRATE_TOKEN == ''
+        run: |
+          echo "::error::SUBSTRATE_REPO_TOKEN is not set. The store tests import harness, which needs agent-cartridges, so without it this job would collect nothing."
+          exit 1
+
+      - name: Check out the substrate
+        uses: actions/checkout@v5
+        with:
+          repository: ppfenning/agent-cartridges
+          path: .agent-cartridges
+          token: ${{ env.SUBSTRATE_TOKEN }}
+
+      - name: Install
+        run: |
+          pip install -e ".[postgres,dev]"
+          pip install ./.agent-cartridges
+
+      # Fails here, with the import error, rather than as a pytest run that
+      # silently collected none of the store files.
+      - name: The store tests' imports resolve
+        run: python -c "import core, psycopg, harness.store_migrate"
+
+      - run: pytest -rs -q tests/test_store_lease.py tests/test_store_write.py tests/test_store_read.py tests/test_store_migrate.py

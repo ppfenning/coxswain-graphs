@@ -5,7 +5,7 @@ from types import ModuleType
 
 import pytest
 
-from harness.store_dialect import SQLITE, Connection, connect
+from harness.store_dialect import POSTGRES, SQLITE, Connection, connect
 from harness.store_migrate import (
     MigrationError,
     check_version,
@@ -31,14 +31,28 @@ TWO = ("CREATE TABLE t2 (id INTEGER PRIMARY KEY)", "INSERT INTO t2 (id) VALUES (
 
 
 @pytest.fixture
-def conn():
-    c = connect("sqlite:///:memory:")
+def conn(store_url):
+    """An unmigrated store on either backend; open_store would migrate it first."""
+    c = connect(store_url)
     yield c
     c.close()
 
 
 def tables(c):
-    return {r[0] for r in c.query_all("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if c.dialect is POSTGRES:
+        sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema()"
+    else:
+        sql = "SELECT name FROM sqlite_master WHERE type = 'table'"
+    return {r[0] for r in c.query_all(sql)}
+
+
+def missing_table_error(c):
+    """The exception each driver raises for a statement naming a table that does not exist."""
+    if c.dialect is POSTGRES:
+        from psycopg.errors import UndefinedTable
+
+        return UndefinedTable
+    return sqlite3.OperationalError
 
 
 def test_empty_database_applies_both_in_order_and_lands_at_two(conn):
@@ -71,7 +85,7 @@ def test_a_second_migrate_changes_nothing(conn):
 
 def test_a_failing_statement_rolls_back_that_migration_and_keeps_version_one(conn):
     bad = fake(2, ("CREATE TABLE t2 (id INTEGER PRIMARY KEY)", "INSERT INTO missing_table VALUES (1)"))
-    with pytest.raises(sqlite3.OperationalError, match="no such table: missing_table"):
+    with pytest.raises(missing_table_error(conn), match="missing_table"):
         migrate(conn, NOW, [fake(1, ONE), bad])
     assert conn.query_all("SELECT version FROM schema_version") == [(1,)]
     assert "t2" not in tables(conn)
@@ -93,6 +107,7 @@ class Interleaved(Connection):
             yield c
 
 
+# SQLite only: two file connections and BEGIN IMMEDIATE, which Postgres does not have.
 def test_a_concurrent_opener_that_migrates_first_is_not_migrated_over(tmp_path):
     url = f"sqlite:///{tmp_path / 'race.db'}"
     mods = [fake(1, ONE), fake(2, TWO)]
@@ -136,23 +151,25 @@ def test_discover_accepts_dotted_names(monkeypatch):
     assert [v for v, _ in discover_migrations(["fakepkg.store_ddl_0001"])] == [1]
 
 
-class Recording(Connection):
-    def __init__(self, raw):
-        super().__init__(raw, SQLITE, begin="BEGIN IMMEDIATE")
-        self.executed = []
-
-    def execute(self, sql, params=()):
-        self.executed.append(sql)
-        return super().execute(sql, params)
-
-
-def test_a_database_newer_than_the_code_is_refused_before_any_write(conn):
+def test_a_database_newer_than_the_code_is_refused_before_any_write(conn, monkeypatch):
     migrate(conn, NOW, [fake(1, ONE), fake(2, TWO), fake(3, ("SELECT 1",))])
-    watched = Recording(conn.raw)
+    executed = []
+
+    def watch(name):
+        real = getattr(conn, name)
+
+        def spy(*args, **kwargs):
+            executed.append(name)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(conn, name, spy)
+
+    for name in ("execute", "executemany", "transaction"):  # every way this connection writes
+        watch(name)
     with pytest.raises(MigrationError) as err:
-        migrate(watched, NOW, [fake(1, ONE), fake(2, TWO)])
+        migrate(conn, NOW, [fake(1, ONE), fake(2, TWO)])
     assert str(err.value) == "database is at schema version 3, newest known migration is 2"
-    assert watched.executed == []
+    assert executed == []
 
 
 def test_check_version_applies_nothing(conn):
@@ -165,7 +182,13 @@ def test_check_version_applies_nothing(conn):
     assert "t2" not in tables(conn)
 
 
-def test_open_store_leaves_the_store_at_the_newest_real_migration(tmp_path):
+def test_open_store_leaves_the_store_at_the_newest_real_migration(store_conn):
+    newest = len(default_modules())
+    assert check_version(store_conn) == (newest, newest)
+
+
+# SQLite only: the same check through a file path, which is how production opens its store.
+def test_open_store_on_a_file_leaves_the_store_at_the_newest_real_migration(tmp_path):
     c = open_store(f"sqlite:///{tmp_path / 'x.db'}", NOW)
     try:
         newest = len(default_modules())

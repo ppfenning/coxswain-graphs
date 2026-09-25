@@ -2,8 +2,7 @@ import hashlib
 
 import pytest
 
-from harness.store_dialect import json_load, json_text
-from harness.store_migrate import open_store
+from harness.store_dialect import POSTGRES, json_load, json_text
 from harness.store_write import (
     Store,
     attempt_row,
@@ -15,8 +14,6 @@ from harness.store_write import (
     split_phase_id,
     task_row,
 )
-
-NOW = "2026-09-24T00:00:00Z"
 
 PHASE = {
     "cartridge_sha": "bd20",
@@ -80,10 +77,8 @@ GATE = {
 
 
 @pytest.fixture
-def conn():
-    c = open_store("sqlite:///:memory:", NOW)
-    yield c
-    c.close()
+def conn(store_conn):
+    return store_conn
 
 
 @pytest.fixture
@@ -92,6 +87,9 @@ def store(conn):
 
 
 def cols(conn, table):
+    if conn.dialect is POSTGRES:
+        sql = "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = %s"
+        return {r[0] for r in conn.query_all(sql, (table,))}
     return {r[1] for r in conn.query_all(f"PRAGMA table_info({table})")}
 
 
@@ -242,7 +240,10 @@ def test_inserting_the_same_call_twice_gives_one_then_zero(store):
 def test_a_stored_call_fills_decision_columns_only_when_it_has_a_decision(store, conn):
     store.record_call(CALL, DECISION, run_id="r", seq=0)
     store.record_call({**CALL, "id": "call-2"}, run_id="r", seq=1)
-    sql = "SELECT router_tier, router_reason, claude_code_version, ok, decision_json FROM node_calls WHERE call_id = ?"
+    sql = (
+        "SELECT router_tier, router_reason, claude_code_version, ok, decision_json "
+        f"FROM node_calls WHERE call_id = {conn.dialect.placeholder}"
+    )
     with_decision = conn.query_one(sql, ("call-1",))
     assert with_decision[:4] == ("cheap", "small change", "2.1.0", 1)
     assert json_load(with_decision[4]) == DECISION
@@ -252,11 +253,10 @@ def test_a_stored_call_fills_decision_columns_only_when_it_has_a_decision(store,
 def test_a_phase_record_lands_split_and_a_rerun_writes_nothing(store, conn):
     assert store.record_phase(PHASE) == 1
     assert store.record_phase(PHASE) == 0
-    assert conn.query_one("SELECT run_id, phase_id, totals_json FROM phases") == (
-        "graphs-model-router-2",
-        "p1-record",
-        json_text(PHASE["totals"]),
-    )
+    run_id, phase_id, totals = conn.query_one("SELECT run_id, phase_id, totals_json FROM phases")
+    assert (run_id, phase_id) == ("graphs-model-router-2", "p1-record")
+    # Postgres hands JSONB back in its own spacing and key order, so compare decoded values, not text.
+    assert json_load(totals) == PHASE["totals"]
 
 
 def test_run_task_and_attempt_inserts_are_idempotent(store):
