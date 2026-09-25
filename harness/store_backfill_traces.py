@@ -1,6 +1,7 @@
 """Repack traces into one Parquet file per run under a trace store root.
 
 Usage: python -m harness.store_backfill_traces TRACES_ROOT [--loose-root DIR] [--calls-dir DIR]
+       python -m harness.store_backfill_traces relink TRACES_ROOT [--store-url URL] [--dry-run]
 
 Two sources feed a run. LOOSE_ROOT holds <run_id>-trace/<role>-<n>.jsonl, one stream event per
 line and no timestamps. Day and call id come from CALLS_DIR/<run_id>.calls.jsonl, matched on the
@@ -21,6 +22,11 @@ existing Parquet file pins the day.
 
 An empty trace file writes no rows. It verifies at zero events and is archived with its run, so a
 rerun finds nothing left to do.
+
+`relink` rewrites call ids in Parquet files that carry the synthetic id <run_id>-<role>-<n> to the
+`legacy:` id the store holds for the same call, matched on the call's "trace" file name. Wrong belief
+to avoid: "the synthetic id is the id the store knows". Only a call imported without an id has a
+`legacy:` id, and the backfill above cannot know it, so the two never join until relink runs.
 """
 
 from __future__ import annotations
@@ -38,12 +44,14 @@ from functools import reduce
 from pathlib import Path
 from typing import Any
 
-from harness import store_traces
+from harness import store_read, store_traces
+from harness.store_dialect import default_url, json_load
 from harness.traces_url import TracesRoot, have_pyarrow, redact_url, resolve_traces_root
 
 TRACE_DIR_SUFFIX = "-trace"
 CALLS_SUFFIX = ".calls.jsonl"
 ARCHIVE_DIR = "archive"
+LEGACY_PREFIX = "legacy:"
 _NAME = re.compile(r"^(?P<role>.+)-(?P<index>\d+)\.jsonl$")
 
 
@@ -116,6 +124,14 @@ class Report:
     mismatches: tuple[Mismatch, ...] = ()
     conflicts: tuple[Conflict, ...] = ()
     unavailable: bool = False
+
+
+@dataclass(frozen=True)
+class RelinkReport:
+    """`changed` is (run_id, rows) per run with rows to relink; rows are counted even when dry."""
+
+    changed: tuple[tuple[str, int], ...] = ()
+    mismatches: tuple[Mismatch, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -338,12 +354,103 @@ def file_mtime_day(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, UTC).date().isoformat()
 
 
+def relink_map(calls: Sequence[Call]) -> dict[str, str]:
+    """Synthetic call id to store id, for calls the store imported without an id and that name a trace."""
+    return {f"{c.run_id}-{Path(c.trace).stem}": c.id for c in calls if c.id.startswith(LEGACY_PREFIX) and c.trace}
+
+
+def relink_rows(rows: Sequence[dict[str, Any]], mapping: dict[str, str]) -> tuple[list[dict[str, Any]], int]:
+    """Copies of `rows` with call_id mapped, and how many changed."""
+    return (
+        [{**r, "call_id": mapping.get(r["call_id"], r["call_id"])} for r in rows],
+        sum(1 for r in rows if r["call_id"] in mapping),
+    )
+
+
+def load_legacy_calls(store_url: str) -> list[Call]:
+    """Store calls with a `legacy:` id whose detail_json names a trace. Reads only; the store is never written."""
+    conn = store_read.connect_readonly(store_url)
+    try:
+        rows = conn.query_all(
+            "SELECT run_id, call_id, detail_json FROM node_calls"
+            f" WHERE substr(call_id, 1, {len(LEGACY_PREFIX)}) = '{LEGACY_PREFIX}' ORDER BY run_id, seq"
+        )
+    finally:
+        conn.close()
+    return [
+        Call(run_id, call_id, "", "", str(detail["trace"]))
+        for run_id, call_id, raw in rows
+        if isinstance(detail := json_load(raw), dict) and detail.get("trace")
+    ]
+
+
+def _relink_run(traces: TracesRoot, run_id: str, mapping: dict[str, str], dry_run: bool) -> tuple[int, list[Mismatch]]:
+    """Rows changed across the run's Parquet files. A file is rewritten only when its row count holds."""
+    rows_changed, bad = 0, []
+    for path in store_traces._find_parquet(traces, run_id):
+        rows = store_traces._parquet_rows(traces, path)
+        new, n = relink_rows(rows, mapping)
+        if n and len(new) != len(rows):
+            bad.append(Mismatch(run_id, len(rows), len(new)))
+        elif n:
+            rows_changed += n
+            if not dry_run:
+                store_traces._put(traces, path, store_traces._table(new))
+    return rows_changed, bad
+
+
+def relink(traces: TracesRoot, calls: Sequence[Call], dry_run: bool) -> RelinkReport:
+    """Rewrite synthetic call ids in each run's Parquet files to the store's `legacy:` ids."""
+    runs = sorted({c.run_id for c in calls if c.id.startswith(LEGACY_PREFIX) and c.trace})
+    results = [
+        (run_id, *_relink_run(traces, run_id, relink_map([c for c in calls if c.run_id == run_id]), dry_run))
+        for run_id in runs
+    ]
+    return RelinkReport(
+        changed=tuple((run_id, n) for run_id, n, _ in results if n),
+        mismatches=tuple(m for _, _, bad in results for m in bad),
+    )
+
+
+def relink_main(argv: Sequence[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="python -m harness.store_backfill_traces relink",
+        description="Rewrite synthetic trace call ids to the store's legacy call ids",
+    )
+    ap.add_argument("traces_root", help="local trace store root holding the Parquet files")
+    ap.add_argument("--store-url", default=None, help="store URL; default cox.db in the parent of traces_root")
+    ap.add_argument("--dry-run", action="store_true", help="report what would change and write nothing")
+    args = ap.parse_args(argv)
+    if not have_pyarrow():
+        print("error: pyarrow is not installed", file=sys.stderr)
+        return 2
+    try:
+        traces = resolve_traces_root(args.traces_root, Path("."), {})
+        _local_dir(traces)
+        calls = load_legacy_calls(args.store_url or default_url(Path(args.traces_root).resolve().parent))
+        report = relink(traces, calls, args.dry_run)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    verb = "would relink" if args.dry_run else "relinked"
+    for run_id, n in report.changed:
+        print(f"{verb} run {run_id}: {n} rows")
+    for m in report.mismatches:
+        print(f"mismatch: run {m.run_id} had {m.expected} rows, relink produced {m.got}; nothing written")
+    rows = sum(n for _, n in report.changed)
+    print(f"{verb}: {len(report.changed)} runs, {rows} rows" if report.changed else "nothing to change")
+    return 1 if report.mismatches else 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    given = sys.argv[1:] if argv is None else list(argv)
+    if given[:1] == ["relink"]:
+        return relink_main(given[1:])
     ap = argparse.ArgumentParser(prog="python -m harness.store_backfill_traces", description=__doc__.splitlines()[0])
     ap.add_argument("traces_root", help="local trace store root; Parquet is written here and sources archived under it")
     ap.add_argument("--loose-root", type=Path, default=None, help="directory of <run_id>-trace directories")
     ap.add_argument("--calls-dir", type=Path, default=None, help="directory of <run_id>.calls.jsonl files")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(given)
     try:
         report = backfill(args.traces_root, args.loose_root, args.calls_dir, file_mtime_day)
     except ValueError as exc:
