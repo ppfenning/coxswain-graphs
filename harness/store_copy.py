@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 import harness.store_ddl_0001 as ddl1
 import harness.store_ddl_0002 as ddl2
+import harness.store_ddl_0003 as ddl3
 from harness.store_dialect import Connection, insert_ignore
 from harness.store_migrate import open_store
 
@@ -51,7 +52,9 @@ class CopyCheckFailed(Exception):
 
 def tables() -> tuple[Table, ...]:
     """(name, column names, key) for every table the DDL modules create, migration ALTER columns included."""
-    added = {t: tuple(c for u, c in ddl2._ADDED if u == t) for t, _ in ddl2._ADDED}
+    # The list must follow every migration's ALTERs: a column left out is dropped silently and the copy holds NULL.
+    alters = (*ddl2._ADDED, *ddl3._ADDED)
+    added = {t: tuple(c for u, c in alters if u == t) for t, _ in alters}
     return tuple(
         (name, (*(c for c, _ in columns), *added.get(name, ())), key)
         for name, columns, key in (*ddl1._TABLES, *ddl2._TABLES)
