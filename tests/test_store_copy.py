@@ -14,6 +14,7 @@ EXPECTED_ORDER = (
     "runs",
     "phases",
     "tasks",
+    "task_records",
     "attempts",
     "node_calls",
     "gate_decisions",
@@ -28,6 +29,9 @@ SEED = {
     "runs": [{"run_id": "r1", "principal": "pat", "status": "done", "graph_id": "g1", "record_json": '{"a": 1}'}],
     "phases": [{"run_id": "r1", "phase_id": "p1", "human_minutes": 1.5, "totals_json": "{}"}],
     "tasks": [{"run_id": "r1", "task_id": "t1", "phase_id": "p1", "state": "done"}],
+    "task_records": [
+        {"run_id": "r1", "phase_id": "p1", "task_id": "t1", "record_json": '{"s": "done"}', "updated_at": T0}
+    ],
     "attempts": [{"run_id": "r1", "task_id": "t1", "seq": 1, "kind": "build"}],
     "node_calls": [
         {"call_id": "c1", "run_id": "r1", "seq": 1, "cost_usd": 0.25, "ok": 1, "node_id": "n1"},
