@@ -21,6 +21,8 @@ shell = ["agent-cartridges"]
 live = ["anthropic>=0.40"]
 # The Jev decider for the system-one fast path. Optional: nothing imports it unless configured.
 system-one-jev = ["typesafe-sdk>=0.7.1"]
+# The local knn decider. Optional: nothing imports sentence-transformers unless the backend is configured.
+system-one-local = ["sentence-transformers>=3"]
 dev = ["pytest>=8", "ruff"]
 
 [tool.setuptools.packages.find]

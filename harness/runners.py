@@ -15,14 +15,31 @@ from runner.system_one_specs import role_specs
 __all__ = ["build_runner"]
 
 
-def _jev(model: str, api_key: str) -> DecisionRunner:
+def _jev(model: str, api_key: str, block: Mapping[str, Any]) -> DecisionRunner:
     from runner.system_one_jev import JevDecider
 
     return JevDecider(model, api_key)
 
 
-# Backend name to decider constructor. A new backend is one entry here.
-_BACKENDS: dict[str, Callable[[str, str], DecisionRunner]] = {"jev": _jev}
+def _knn_local(model: str, api_key: str, block: Mapping[str, Any]) -> DecisionRunner:
+    """Reads `examples` (a path), `k` (default 5), `device` (cpu or cuda) and `embedding_model` from the block."""
+    from runner.system_one_knn import DEFAULT_EMBEDDING_MODEL, load_knn_decider
+
+    if not block.get("examples"):
+        raise ValueError("system_one.examples must name the examples file for backend knn-local")
+    return load_knn_decider(
+        block["examples"],
+        block.get("k", 5),
+        device=block.get("device", "cpu"),
+        model_name=block.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+    )
+
+
+# Backend name to decider constructor, given the model, the api key and the whole `system_one` block.
+# A new backend is one entry here.
+_BACKENDS: dict[str, Callable[[str, str, Mapping[str, Any]], DecisionRunner]] = {"jev": _jev, "knn-local": _knn_local}
+# Backends that call a hosted API. The others run locally and need no key.
+_NEEDS_KEY = frozenset({"jev"})
 
 
 def _active_config(profile: Mapping[str, Any]) -> SystemOneConfig | None:
@@ -41,10 +58,10 @@ def _decider(config: SystemOneConfig, profile: Mapping[str, Any]) -> DecisionRun
     if constructor is None:
         raise ValueError(f"system_one.backend {config.backend!r} is unknown; known: {', '.join(sorted(_BACKENDS))}")
     env_var = profile.get("auth_env", "ANTHROPIC_API_KEY")
-    api_key = os.environ.get(env_var)
-    if not api_key:
+    api_key = os.environ.get(env_var, "")
+    if config.backend in _NEEDS_KEY and not api_key:
         raise ValueError(f"system_one needs ${env_var} (the profile's auth_env), and it is not set")
-    return constructor(config.model, api_key)
+    return constructor(config.model, api_key, profile["system_one"])
 
 
 class _DelegatingFastPath(FastPathRunner):
