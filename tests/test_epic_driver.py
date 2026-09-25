@@ -13,6 +13,7 @@ carry the work onto the phase branch actually happened.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
@@ -2465,6 +2466,24 @@ def test_a_two_task_phase_leaves_one_phase_row_two_task_rows_and_its_attempt(rep
     assert tuple(attempt) == ("epic-1", "p1-foundations", 0, "unverified")
 
 
+def test_each_phase_row_carries_the_content_of_its_manifest_file(repo, cart, tmp_path, store) -> None:
+    drive(repo, cart, tmp_path, work=initiative(), store=store)
+
+    rows = store.conn.query_all("SELECT phase_id, record_json FROM phases")
+    assert len(rows) == 2
+    for phase_id, record_json in rows:
+        record = json.loads(record_json)
+        assert record["manifest"] == f"epic-1:{phase_id}"
+        files = list((tmp_path / "runs").glob(f"*{phase_id}*"))
+        assert len(files) == 1, files
+        on_disk = json.loads(files[0].read_text())
+        assert record["manifest_record"] == on_disk
+        assert set(on_disk) == {
+            "cartridge_sha", "cartridge_team", "gate_diffs", "human_minutes", "overlay_sha", "principal",
+            "proposals", "provider_profile", "run_id", "totals", "ts",
+        }
+
+
 def test_a_landing_under_the_held_epoch_proceeds_and_its_ledger_rows_carry_it(repo, cart, tmp_path, store) -> None:
     lease = acquire(store.conn, LEASE, "a", _now(), 3600)
     result, _ = drive(
@@ -2516,6 +2535,17 @@ def test_a_landing_after_the_lease_is_taken_over_is_refused_and_records_no_ledge
     assert not (tmp_path / "ledger.jsonl").exists()
     assert [b for b in branches(repo) if "--" in b] == [], "no draft branch was created"
     assert all(not task["merged"] for task in result["tasks"])
+
+
+def test_a_stale_epoch_phase_records_no_manifest_record(repo, cart, tmp_path, store, monkeypatch) -> None:
+    held = acquire(store.conn, LEASE, "a", _now(), 3600).epoch
+    _taken_over_during(monkeypatch, store, "gate", held)
+    result, _ = drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), store=store, epoch=held, lease_name=LEASE
+    )
+
+    assert "manifest_record" not in result["phases"][0]
+    assert _store_rows(store) == [0, 0, 0, 0, 0]
 
 
 def test_a_quarantine_after_the_lease_is_taken_over_records_no_attempt(repo, cart, tmp_path, store, monkeypatch) -> None:

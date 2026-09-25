@@ -1831,6 +1831,7 @@ def _run_phase(
                 ctx.store.record_ledger(row, epoch=ctx.epoch)
         ctx.store.record_gate_decisions(ctx.run_id, phase, diffs, epoch=ctx.epoch)
     record["manifest"] = f"{ctx.run_id}:{phase}"
+    record["manifest_record"] = manifest
     return record
 
 
