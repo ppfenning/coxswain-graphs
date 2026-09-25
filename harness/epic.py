@@ -491,10 +491,11 @@ def _build_task(
         return record
 
     # Mechanical, model-free: a lint fix is not a build attempt, so it runs
-    # here rather than looping the fix back through review. Its changes land
-    # on the same commit the checks below see, and get folded into `result`'s
-    # own patch so every later reader — validation, escalation, merge — sees
-    # the fixed file, not the one the build actually produced.
+    # here rather than looping the fix back through review. Its changes are
+    # amended into the task's own commit, so the branch stays one commit (the
+    # land takes exactly one), and get folded into `result`'s own patch so
+    # every later reader — validation, escalation, merge — sees the fixed
+    # file, not the one the build actually produced.
     fixable = fixable_checks(ctx.checks)
     record["lint_fix_checks"] = [c["name"] for c in fixable]
     record["lint_fixed"] = False
@@ -503,7 +504,7 @@ def _build_task(
         _, dirty = _git("-C", str(worktree), "status", "--porcelain")
         if dirty:
             _git(*_IDENTITY, "-C", str(worktree), "add", "-A")
-            ok, detail = _git(*_IDENTITY, "-C", str(worktree), "commit", "-q", "-m", "lint fix")
+            ok, detail = _git(*_IDENTITY, "-C", str(worktree), "commit", "-q", "--amend", "--no-edit")
             if ok:
                 record["lint_fixed"] = True
                 build_field = result.get("build")

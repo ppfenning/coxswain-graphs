@@ -638,6 +638,7 @@ def test_a_checks_fix_command_lands_the_folded_patch(repo, cart, tmp_path) -> No
     assert task["lint_fix_checks"] == ["state"]
     landed = git("show", "epic/demo-initiative/p1-foundations:t1-probe.txt", cwd=repo)
     assert landed.strip() == "ok"
+    assert "lint fix" not in git("log", "--format=%s", "epic/demo-initiative/p1-foundations", cwd=repo)
 
 
 def test_a_fix_command_runs_once_and_never_for_a_check_with_none_configured(repo, cart, tmp_path) -> None:
