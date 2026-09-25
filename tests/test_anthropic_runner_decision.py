@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import warnings
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from runner.anthropic_runner import AnthropicRunner
+from runner.anthropic_runner import ROUTER_ON_WARNING, AnthropicRunner, load_provider_profile
+from runner.decision_log import RouterDecision
 from runner.protocol import RunnerError
 
 PROFILE = {"tiers": {"cheap": "m-cheap", "standard": "m-std", "deep": "m-deep"}}
@@ -207,3 +209,73 @@ def test_the_runner_imports_neither_cartridges_nor_the_core_router():
     names = [alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names]
     names += [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
     assert not [name for name in names if name.split(".")[0] == "cartridges" or name.startswith("core.router")]
+
+
+ROUTED = RouterDecision(
+    chosen_class="judge", model="m-routed", effort="max", budget_usd=2.5, reasons=("a", "b"), clipped_by=("chair",)
+)
+ROUTER_FIELDS = ("router_tier", "router_reason", "router_model", "router_effort", "router_budget_usd", "router_clipped_by")
+RECORDED = ("judge", "a; b", "m-routed", "max", 2.5, ("chair",))
+
+
+def _router_fields(decision: Any) -> tuple[Any, ...]:
+    return tuple(getattr(decision, name) for name in ROUTER_FIELDS)
+
+
+def test_shadow_copies_the_supplied_decision_and_still_runs_the_resolvers_model():
+    stub = _Stub()
+    decision = _run(stub, {"router": "shadow"}, tier="cheap", router_decision=ROUTED).decision
+    assert _router_fields(decision) == RECORDED
+    assert (stub.calls[0]["model"], decision.chosen_tier, decision.clipped_by) == ("m-cheap", "cheap", None)
+
+
+@pytest.mark.parametrize("profile", [{}, {"router": "off"}])
+def test_off_ignores_a_supplied_decision(profile):
+    assert _router_fields(_run(_Stub(), profile, router_decision=ROUTED).decision) == (None,) * 6
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "on"])
+def test_no_decision_leaves_the_router_fields_none(mode):
+    assert _router_fields(_run(_Stub(), {"router": mode}).decision) == (None,) * 6
+
+
+def test_on_acts_as_shadow_and_warns_once_per_process_across_runners():
+    stub = _Stub()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        runners = [AnthropicRunner({**PROFILE, "router": "on"}, client=stub) for _ in range(2)]
+        decisions = [r.run(role="r", schema={}, prompt="p", tier="cheap", router_decision=ROUTED).decision for r in runners * 2]
+    assert [_router_fields(d) for d in decisions] == [RECORDED] * 4
+    assert {(d.chosen_tier, d.reason) for d in decisions} == {("cheap", "caller")}
+    assert {call["model"] for call in stub.calls} == {"m-cheap"}
+    assert [str(w.message) for w in caught] == [ROUTER_ON_WARNING]
+
+
+def test_on_without_a_decision_does_not_warn():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _run(_Stub(), {"router": "on"})
+    assert caught == []
+
+
+def test_a_supplied_decision_never_changes_the_class_model_the_runner_calls():
+    stub = _Stub()
+    decision = _run(stub, {**CLASSES_PROFILE, "router": "shadow"}, tier="reason", router_decision=ROUTED).decision
+    assert (stub.calls[0]["model"], decision.chosen_tier, decision.reason, decision.router_model) == (
+        "c-first",
+        "reason",
+        "caller",
+        "m-routed",
+    )
+
+
+@pytest.mark.parametrize(("line", "mode"), [("router: off", "off"), ("router: on", "on"), ("router: shadow", "shadow"), ("", "off")])
+def test_a_yaml_profile_with_an_unquoted_mode_loads(tmp_path, line, mode):
+    path = tmp_path / "profile.yaml"
+    path.write_text(f"tiers:\n  standard: m-std\n{line}\n", encoding="utf-8")
+    assert AnthropicRunner(load_provider_profile(path), client=_Stub()).router_mode == mode
+
+
+def test_an_unknown_router_mode_is_refused_at_construction():
+    with pytest.raises(RunnerError, match="router"):
+        AnthropicRunner({**PROFILE, "router": "bogus"}, client=_Stub())
