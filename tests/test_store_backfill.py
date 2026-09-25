@@ -15,7 +15,9 @@ from harness.store_backfill import (
     archive_imported,
     backfill,
     balanced,
+    is_non_record,
     main,
+    malformed_reason,
     parse_attempts,
     parse_call_lines,
     parse_ledger_line,
@@ -24,7 +26,7 @@ from harness.store_backfill import (
 )
 from harness.store_dialect import default_url, json_load
 from harness.store_migrate import open_store
-from harness.store_write import Store
+from harness.store_write import Store, run_row
 
 NOW = "2026-09-24T00:00:00Z"
 TS = "2026-09-24T13:58:06.378339+00:00"
@@ -244,9 +246,25 @@ def test_malformed_lines_are_counted_and_skipped_not_fatal(store, tree):
     assert counts(report, "node_calls") == (6, 5, 0, 1)
     assert counts(report, "ledger") == (4, 3, 0, 1)
     assert counts(report, "runs") == (3, 2, 0, 1)
+    assert report["malformed_run_files"] == ["broken.json: not readable JSON"]
     assert balanced(report)
 
 
+def test_each_malformed_runs_file_is_named_with_its_reason(store, tree):
+    runs = tree / "runs"
+    (runs / "list.json").write_text("[1]")
+    (runs / "no-id.json").write_text(json.dumps({"principal": "x"}))
+    (runs / "bad-diffs.json").write_text(json.dumps({**RECORD, "run_id": "run-d", "gate_diffs": ["x"]}))
+    report = run(store, tree)
+    assert report["malformed_run_files"] == [
+        "bad-diffs.json: gate_diffs is not a list of objects",
+        "list.json: not a JSON object",
+        "no-id.json: no run_id",
+    ]
+    assert counts(report, "runs") == (5, 2, 0, 3)
+
+
+# Launch-only runs already imported before this status existed. never_recorded is a label, not a new import.
 def test_a_launch_with_no_run_record_and_no_phase_builds_a_run_from_the_launch_alone(store, tree):
     (tree / "runs" / "run-z.launch.json").write_text(json.dumps({"launched_by": "chair", "at": TS}))
     assert counts(run(store, tree), "runs") == (3, 3, 0, 0)
@@ -279,6 +297,87 @@ def test_an_epic_run_with_only_phase_manifests_gets_a_run_row_from_its_earliest_
     assert store.conn.query_one("SELECT COUNT(*) FROM phases WHERE run_id = 'run-e'")[0] == 2
     assert counts(report, "runs") == (3, 3, 0, 0)
     assert balanced(report)
+
+
+def test_malformed_reason_names_the_first_rule_a_document_breaks():
+    assert malformed_reason(None) == "not readable JSON"
+    assert malformed_reason([1]) == "not a JSON object"
+    assert malformed_reason({"run_id": ""}) == "no run_id"
+    assert malformed_reason({"run_id": "r", "gate_diffs": [1]}) == "gate_diffs is not a list of objects"
+
+
+def test_non_record_names_are_the_ceiling_policy_chair_leader_and_dot_files():
+    skipped = ("policy.gate.json", "policy.x.json", "chair.json", "leader.json", "x.ceiling.json", ".notify-state.json")
+    assert all(is_non_record(n) for n in skipped)
+    assert not any(is_non_record(n) for n in ("run-a.json", "run-a.launched.json", "run-a.usage.json", "policy.md"))
+
+
+def test_non_record_files_are_skipped_and_counted_not_malformed(store, tree):
+    runs = tree / "runs"
+    for name in ("policy.gate.json", "chair.json", "run-z.ceiling.json"):
+        (runs / name).write_text(json.dumps({"ceiling_usd": 1.0}))
+    (runs / ".hidden.calls.jsonl").write_text(json.dumps(call("h1")) + "\n")
+    report = run(store, tree)
+    assert report["skipped_files"] == 4
+    assert counts(report, "runs") == (2, 2, 0, 0)
+    assert counts(report, "node_calls") == (5, 5, 0, 0)
+    assert report["malformed_run_files"] == []
+    assert balanced(report)
+
+
+def test_a_launch_with_no_record_and_no_phase_imports_as_never_recorded(store, tree):
+    runs = tree / "runs"
+    (runs / "run-z.launched.json").write_text(json.dumps({"launched_by": "chair", "at": TS}))
+    report = run(store, tree)
+    row = store.conn.query_one("SELECT status, launched_by, launched_at, graph_id FROM runs WHERE run_id = 'run-z'")
+    assert tuple(row) == ("never_recorded", "chair", TS, None)
+    assert counts(report, "runs") == (3, 3, 0, 0)
+    assert balanced(report)
+
+
+def test_a_launch_only_run_imported_before_the_label_existed_is_labelled_never_recorded(store, tree):
+    (tree / "runs" / "run-z.launched.json").write_text(json.dumps({"launched_by": "chair", "at": TS}))
+    store._insert("runs", run_row({"run_id": "run-z"}, {"launched_by": "chair", "at": TS}))
+    report = run(store, tree)
+    assert store.conn.query_one("SELECT status FROM runs WHERE run_id = 'run-z'")[0] == "never_recorded"
+    assert counts(report, "runs") == (3, 2, 1, 0)
+
+
+def test_a_launch_whose_run_wrote_phases_calls_or_usage_is_not_marked_never_recorded(store, tree):
+    runs = tree / "runs"
+    for run_id in ("run-e", "run-c", "run-u"):
+        (runs / f"{run_id}.launched.json").write_text(json.dumps({"launched_by": "chair", "at": TS}))
+    (runs / "run-e:p1.json").write_text(json.dumps({**RECORD, "run_id": "run-e:p1"}))
+    (runs / "run-c.calls.jsonl").write_text(json.dumps(call("c1")) + "\n")
+    (runs / "run-u.usage.json").write_text(json.dumps({"calls": [call("u1")]}))
+    run(store, tree)
+    statuses = store.conn.query_all("SELECT run_id, status FROM runs WHERE run_id IN ('run-c', 'run-e', 'run-u')")
+    assert sorted(tuple(r) for r in statuses) == [("run-c", None), ("run-e", None), ("run-u", "backfilled")]
+
+
+def test_a_kind_less_attempt_imports_as_kind_unknown_and_one_without_ts_stays_malformed(store, tree):
+    old = "{run: r-old, phase: 2-cap, reason: 'quarantine-attempt-cap: x', ts: '" + TS + "'}"
+    no_ts = "{run: r-old, phase: 2-cap, reason: 'no ts', kind: refused}"
+    (tree / "work" / "p1" / "t3.md").write_text(
+        f"---\nid: t3\nphase: p1\nstate: ready\nneeds: []\nsurfaces: []\ntitle: t3\nattempts:\n  - {old}\n  - {no_ts}\n---\n\nbody\n"
+    )
+    report = run(store, tree)
+    assert counts(report, "attempts") == (5, 4, 0, 1)
+    assert store.conn.query_one("SELECT kind FROM attempts WHERE task_id = 't3'")[0] == "unknown"
+    assert parse_attempts("t", [{"run": "r", "phase": "p", "ts": TS}])[1] == 0
+    assert parse_attempts("t", [{"run": "r", "phase": "p", "kind": "k"}])[1] == 1
+
+
+def test_a_second_backfill_with_skipped_and_launch_only_files_inserts_nothing(store, tree):
+    runs = tree / "runs"
+    (runs / "chair.json").write_text("{}")
+    (runs / "run-z.launched.json").write_text(json.dumps({"launched_by": "chair", "at": TS}))
+    run(store, tree)
+    again = run(store, tree)
+    assert [again[t]["inserted"] for t in TABLES] == [0] * 6
+    assert counts(again, "runs") == (3, 0, 3, 0)
+    assert again["skipped_files"] == 1
+    assert balanced(again)
 
 
 def test_usage_calls_without_ids_import_as_legacy_ids_and_a_rerun_inserts_none(store, tree):
