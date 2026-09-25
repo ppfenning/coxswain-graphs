@@ -147,9 +147,9 @@ def counts(report, table):
 def test_a_call_line_that_is_not_json_is_counted_and_extra_keys_go_to_detail():
     lines = [json.dumps(call("c1", tools=["Read"])), "not json", "", "[1]", json.dumps({"role": "plan"})]
     rows, bad = parse_call_lines("r", lines)
-    assert [(r["call_id"], r["seq"], r["run_id"]) for r in rows] == [("c1", 0, "r")]
+    assert [(r["call_id"], r["seq"], r["run_id"]) for r in rows] == [("c1", 0, "r"), ("legacy:r:3", 3, "r")]
     assert rows[0]["detail_json"] == {"tools": ["Read"]}
-    assert bad == 3
+    assert bad == 2
 
 
 def test_usage_calls_take_the_shape_of_call_lines_and_a_usage_without_a_list_is_one_malformed_record():
@@ -247,9 +247,61 @@ def test_malformed_lines_are_counted_and_skipped_not_fatal(store, tree):
     assert balanced(report)
 
 
-def test_a_launch_with_no_run_record_is_counted_as_a_malformed_run(store, tree):
+def test_a_launch_with_no_run_record_and_no_phase_builds_a_run_from_the_launch_alone(store, tree):
     (tree / "runs" / "run-z.launch.json").write_text(json.dumps({"launched_by": "chair", "at": TS}))
-    assert counts(run(store, tree), "runs") == (3, 2, 0, 1)
+    assert counts(run(store, tree), "runs") == (3, 3, 0, 0)
+    row = store.conn.query_one("SELECT launched_by, principal FROM runs WHERE run_id = 'run-z'")
+    assert tuple(row) == ("chair", None)
+
+
+def test_a_launched_json_launch_pairs_with_its_run(store, tree):
+    (tree / "runs" / "run-a.launch.json").unlink()
+    (tree / "runs" / "run-a.launched.json").write_text(json.dumps({"launched_by": "chair-x", "at": TS}))
+    report = run(store, tree)
+    row = store.conn.query_one("SELECT launched_by, launched_at FROM runs WHERE run_id = 'run-a'")
+    assert tuple(row) == ("chair-x", TS)
+    assert counts(report, "runs") == (2, 2, 0, 0)
+
+
+def test_an_epic_run_with_only_phase_manifests_gets_a_run_row_from_its_earliest_phase(store, tree):
+    runs = tree / "runs"
+    (runs / "run-e.launched.json").write_text(json.dumps({"launched_by": "chair-e", "at": TS}))
+    later = {**RECORD, "run_id": "run-e:p2", "ts": "2026-09-24T15:00:00+00:00", "cartridge_sha": "late"}
+    earlier = {**RECORD, "run_id": "run-e:p1", "ts": "2026-09-24T14:00:00+00:00", "cartridge_sha": "early"}
+    (runs / "run-e:p2.json").write_text(json.dumps(later))
+    (runs / "run-e:p1.json").write_text(json.dumps(earlier))
+    report = run(store, tree)
+    row = store.conn.query_one(
+        "SELECT launched_by, launched_at, cartridge_sha, cartridge_team, provider_profile, principal"
+        " FROM runs WHERE run_id = 'run-e'"
+    )
+    assert tuple(row) == ("chair-e", TS, "early", "pat", "claude-code@f9", "epic-swarm")
+    assert store.conn.query_one("SELECT COUNT(*) FROM phases WHERE run_id = 'run-e'")[0] == 2
+    assert counts(report, "runs") == (3, 3, 0, 0)
+    assert balanced(report)
+
+
+def test_usage_calls_without_ids_import_as_legacy_ids_and_a_rerun_inserts_none(store, tree):
+    legacy = {"role": "scope_epic", "tier": "cheap", "model": "haiku", "cost_usd": 0.052752, "turns": 2}
+    (tree / "runs" / "run-u.usage.json").write_text(json.dumps({"calls": [legacy] * 3}))
+    first = run(store, tree)
+    ids = store.conn.query_all("SELECT call_id, seq FROM node_calls WHERE run_id = 'run-u' ORDER BY seq")
+    assert [tuple(r) for r in ids] == [("legacy:run-u:0", 0), ("legacy:run-u:1", 1), ("legacy:run-u:2", 2)]
+    assert counts(first, "node_calls")[3] == 0
+    second = run(store, tree)
+    assert counts(second, "node_calls")[1] == 0
+    assert balanced(second)
+
+
+def test_archive_refuses_a_balanced_report_that_counts_malformed_records(tree):
+    files = run_files(tree / "runs")
+    empty = {"seen": 0, "inserted": 0, "already_present": 0, "malformed": 0}
+    report = {"runs": dict(empty), "attempts": {**empty, "seen": 2, "inserted": 1, "malformed": 1}}
+    assert balanced(report)
+    with pytest.raises(ArchiveRefused, match="attempts=1"):
+        archive_imported(files, tree / "archive", report)
+    assert all(f.exists() for f in files)
+    assert not (tree / "archive").exists()
 
 
 def test_main_prints_the_report_and_exits_zero_when_it_balances(tree, capsys):
