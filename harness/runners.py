@@ -32,13 +32,13 @@ def _knn_local(model: str, api_key: str, block: Mapping[str, Any]) -> DecisionRu
 
     if not block.get("examples"):
         raise _Unavailable("system_one.examples names no examples file for backend knn-local")
-    examples = Path(block["examples"])
+    examples = Path(block["examples"]).expanduser()
     if not examples.is_file():
         raise _Unavailable(f"examples file {examples} does not exist")
     if not examples.read_text(encoding="utf-8").strip():
         raise _Unavailable(f"examples file {examples} is empty")
     return load_knn_decider(
-        block["examples"],
+        examples,
         block.get("k", 5),
         device=block.get("device", "cpu"),
         model_name=block.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
