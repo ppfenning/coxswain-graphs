@@ -17,7 +17,7 @@ from harness.store_cli_lease import lease_acquire, lease_release, lease_renew
 from harness.store_dialect import Connection, StoreDriverMissing
 from harness.store_landed import mark_landed
 from harness.store_migrate import MigrationError, open_store
-from harness.store_work_state import set_state
+from harness.store_work_state import Mismatch, set_state
 
 # Contract read by coxswain-tools. Exit 0 and exit 3 print exactly one JSON object on stdout.
 # Exit 2 prints nothing on stdout. Help and every error go to stderr.
@@ -102,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     state.add_argument("state", choices=WORK_STATES)
     state.add_argument("--by", required=True, type=_non_empty, help="who made the change")
     state.add_argument("--phase", help="phase for a new row; ignored when the row exists")
+    state.add_argument("--expect", choices=WORK_STATES, help="apply only if the row's current state equals this; exit 3 otherwise")
 
     lease = commands.add_parser("lease", help="acquire, renew or release a named lease")
     actions = lease.add_subparsers(dest="action", required=True)
@@ -133,7 +134,9 @@ def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[dict
         record = mark_landed(conn, args.run_id, args.phase, args.task, args.pr, args.at)
         return ({}, EXIT_PRECONDITION) if record is None else (record, EXIT_OK)
     if args.command == "set-state":
-        row = set_state(conn, args.initiative, args.task, args.state, args.by, args.phase, now)
+        row = set_state(conn, args.initiative, args.task, args.state, args.by, args.phase, now, expected=args.expect)
+        if isinstance(row, Mismatch):
+            return {"actual": row.current, "expected": args.expect}, EXIT_PRECONDITION
         return ({}, EXIT_PRECONDITION) if row is None else (row, EXIT_OK)
     if args.action == "acquire":
         result = lease_acquire(conn, args.name, args.holder, now, args.ttl)
@@ -148,9 +151,11 @@ def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _refusal(args: argparse.Namespace) -> str:
+def _refusal(args: argparse.Namespace, payload: Mapping[str, Any]) -> str:
     if args.command == "mark-landed":
         return f"no task record for run {args.run_id} phase {args.phase} task {args.task}"
+    if args.command == "set-state" and "actual" in payload:
+        return f"work item {args.task} is in state {payload['actual'] or 'no row'}, expected {payload['expected']}"
     if args.command == "set-state":
         return f"no work item {args.task} in initiative {args.initiative} and --phase was not given"
     return f"lease {args.name} refused for holder {args.holder}"
@@ -183,7 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         conn.close()
     if code == EXIT_PRECONDITION:
-        print(f"error: {_refusal(args)}", file=sys.stderr)
+        print(f"error: {_refusal(args, payload)}", file=sys.stderr)
     print(json.dumps(payload, sort_keys=True))
     return code
 
