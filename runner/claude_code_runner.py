@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -110,6 +111,11 @@ _DIFF_CMD = "git add -A && git diff --cached"
 # Checks led by one of these also run as `python -m <tool>`; builders reach for that form.
 _PY_TOOLS = frozenset({"pytest", "ruff"})
 _PLAIN_PATH = re.compile(r"[\w./-]+")  # no space, quote or glob: the only paths a `git -C` prefix rule may name
+
+
+def child_env(environ: Mapping[str, str], bash: str | None) -> dict[str, str]:
+    """Claude Code's Bash tool runs in $SHELL, and zsh fails an unquoted glob such as `--include=*.py`."""
+    return {**environ, "SHELL": bash} if bash is not None else dict(environ)
 
 
 def _capture_diff(scratch: Path) -> str:
@@ -1123,6 +1129,7 @@ class ClaudeCodeRunner:
                 # CLI files sessions by directory, and a resume looks there.
                 cwd=scratch or self.cwd,
                 timeout=self.timeout,
+                env=child_env(os.environ, shutil.which("bash")),
             )
         except FileNotFoundError as exc:
             raise RunnerError(f"'{self.claude_bin}' not found; is Claude Code installed and on PATH?") from exc
