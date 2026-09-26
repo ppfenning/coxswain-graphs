@@ -153,7 +153,7 @@ def test_the_runs_host_column_is_copied_including_null(src_url, dst_url):
 
 def test_every_source_row_lands_in_the_destination(src_url, dst_url):
     report = sc.copy(src_url, dst_url, T0)
-    assert report["node_calls"] == {"source": 2, "copied": 2, "present": 0}
+    assert report["node_calls"] == {"source": 2, "copied": 2, "refreshed": 0, "present": 0}
     assert {n: r["copied"] for n, r in report.items()} == {n: len(SEED[n]) for n in EXPECTED_ORDER}
     assert counts(dst_url) == {n: len(SEED[n]) for n in EXPECTED_ORDER}
     dst = open_store(dst_url, T0)
@@ -186,6 +186,38 @@ def test_a_second_copy_inserts_nothing_and_reports_every_row_present(src_url, ds
     assert counts(dst_url) == {n: len(SEED[n]) for n in EXPECTED_ORDER}
 
 
+def _update_source(src_url, sql):
+    src = open_store(src_url, T0)
+    try:
+        src.execute(sql)
+    finally:
+        src.close()
+
+
+def test_a_changed_lease_is_refreshed_in_the_destination(src_url, dst_url):
+    sc.copy(src_url, dst_url, T0)
+    _update_source(src_url, "UPDATE leases SET epoch = 5, expires_at = '2026-09-26T00:00:00Z' WHERE name = 'epic'")
+    again = sc.copy(src_url, dst_url, T0)
+    assert (again["leases"]["copied"], again["leases"]["refreshed"]) == (0, 1)
+    dst = open_store(dst_url, T0)
+    try:
+        assert dst.query_one("SELECT epoch, expires_at FROM leases WHERE name = 'epic'") == (5, "2026-09-26T00:00:00Z")
+    finally:
+        dst.close()
+
+
+def test_a_changed_node_call_is_left_as_it_was_in_the_destination(src_url, dst_url):
+    sc.copy(src_url, dst_url, T0)
+    _update_source(src_url, "UPDATE node_calls SET cost_usd = 9.0 WHERE call_id = 'c1'")
+    again = sc.copy(src_url, dst_url, T0)
+    assert (again["node_calls"]["copied"], again["node_calls"]["refreshed"]) == (0, 0)
+    dst = open_store(dst_url, T0)
+    try:
+        assert dst.query_one("SELECT cost_usd FROM node_calls WHERE call_id = 'c1'") == (0.25,)
+    finally:
+        dst.close()
+
+
 def test_a_batch_smaller_than_the_table_still_copies_every_row(src_url, dst_url):
     assert sc.copy(src_url, dst_url, T0, batch=1)["node_calls"]["copied"] == 2
 
@@ -198,7 +230,7 @@ def test_a_destination_with_extra_rows_still_passes_the_check(src_url, dst_url):
     finally:
         dst.close()
     report = sc.copy(src_url, dst_url, T0)
-    assert report["runs"] == {"source": 1, "copied": 1, "present": 0}
+    assert report["runs"] == {"source": 1, "copied": 1, "refreshed": 0, "present": 0}
     assert (counts(dst_url)["runs"], counts(dst_url)["leases"]) == (2, 2)
 
 
@@ -214,14 +246,14 @@ def test_a_shortfall_raises_with_the_report_and_main_exits_one(src_url, dst_url,
 def test_main_prints_a_line_per_table_and_exits_zero(src_url, dst_url, capsys):
     assert sc.main([src_url, dst_url]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert "node_calls source=2 copied=2 present=0" in lines
+    assert "node_calls source=2 copied=2 refreshed=0 present=0" in lines
     assert len(lines) == 1 + len(EXPECTED_ORDER)
 
 
 def test_main_json_is_one_object(src_url, dst_url, capsys):
     assert sc.main([src_url, dst_url, "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert (out["ok"], out["tables"]["leases"]) == (True, {"source": 1, "copied": 1, "present": 0})
+    assert (out["ok"], out["tables"]["leases"]) == (True, {"source": 1, "copied": 1, "refreshed": 0, "present": 0})
 
 
 def test_safe_url_keeps_only_scheme_and_path():

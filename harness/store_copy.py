@@ -3,8 +3,9 @@
     python -m harness.store_copy SRC_URL DST_URL [--json]
 
 Both sides are opened with `open_store`, so the destination is migrated first. Rows
-go in with insert-ignore, so a second run inserts nothing and reports every row
-present. A destination row with the same key but different content is left alone.
+of an append-only table go in with insert-ignore: a destination row with the same key
+but different content is left alone. Rows of a table in `_REFRESH` go in with upsert,
+so a second run overwrites them and reports them as refreshed. No run inserts a row twice.
 `schema_version` is not copied: each side migrates itself. The source is only read.
 """
 
@@ -24,7 +25,7 @@ import harness.store_ddl_0004 as ddl4
 import harness.store_ddl_0005 as ddl5
 import harness.store_ddl_0006 as ddl6
 import harness.store_ddl_0007 as ddl7
-from harness.store_dialect import Connection, insert_ignore
+from harness.store_dialect import Connection, insert_ignore, upsert
 from harness.store_migrate import open_store
 
 Table = tuple[str, tuple[str, ...], tuple[str, ...]]
@@ -46,6 +47,9 @@ _ORDER = (
     "leases",
     "chair_actions",
 )
+
+# Tables whose rows change after they are first written. Every other table in _ORDER is append-only.
+_REFRESH = frozenset({"runs", "phases", "tasks", "task_records", "work_items", "leases"})
 
 
 class CopyCheckFailed(Exception):
@@ -93,19 +97,24 @@ def _count(conn: Connection, table: str) -> int:
 
 def _copy_table(
     src: Connection, dst: Connection, table: str, columns: tuple[str, ...], key: tuple[str, ...], batch: int
-) -> tuple[int, int]:
-    """(rows read from src, rows inserted into dst). Reads in key order, one destination transaction per batch."""
+) -> tuple[int, int, int]:
+    """(rows read from src, rows inserted into dst, rows refreshed). One destination transaction per batch.
+
+    Refreshed counts the rows written over an existing key, changed or not.
+    """
     p = src.dialect.placeholder
     select = f"SELECT {', '.join(columns)} FROM {table} ORDER BY {', '.join(key)} LIMIT {p} OFFSET {p}"
-    insert = insert_ignore(dst.dialect, table, columns, key)
-    read = inserted = 0
+    statement = (upsert if table in _REFRESH else insert_ignore)(dst.dialect, table, columns, key)
+    before = _count(dst, table)
+    read = written = 0
     while True:
         rows = src.query_all(select, (batch, read))
         with dst.transaction():
-            inserted += sum(dst.execute(insert, row) for row in rows)
+            written += sum(dst.execute(statement, row) for row in rows)
         read += len(rows)
         if len(rows) < batch:
-            return read, inserted
+            inserted = _count(dst, table) - before
+            return read, inserted, written - inserted
 
 
 def copy(src_url: str, dst_url: str, now: str, batch: int = 500) -> dict[str, dict[str, int]]:
@@ -121,8 +130,8 @@ def copy(src_url: str, dst_url: str, now: str, batch: int = 500) -> dict[str, di
         try:
             report: dict[str, dict[str, int]] = {}
             for name, columns, key in plan(tables()):
-                read, inserted = _copy_table(src, dst, name, columns, key, batch)
-                report[name] = {"source": read, "copied": inserted, "present": read - inserted}
+                read, inserted, refreshed = _copy_table(src, dst, name, columns, key, batch)
+                report[name] = {"source": read, "copied": inserted, "refreshed": refreshed, "present": read - inserted}
             held = {n: _count(dst, n) for n in report}
             short = {n: c for n, c in held.items() if c < report[n]["source"]}
         finally:
@@ -135,7 +144,10 @@ def copy(src_url: str, dst_url: str, now: str, batch: int = 500) -> dict[str, di
 
 
 def _lines(report: dict[str, dict[str, int]]) -> list[str]:
-    return [f"{n} source={r['source']} copied={r['copied']} present={r['present']}" for n, r in report.items()]
+    return [
+        f"{n} source={r['source']} copied={r['copied']} refreshed={r['refreshed']} present={r['present']}"
+        for n, r in report.items()
+    ]
 
 
 def main(argv: Sequence[str]) -> int:
