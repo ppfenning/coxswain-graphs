@@ -56,6 +56,7 @@ from core.workstore import WorkStoreError, record_attempt
 
 from graphs._contract import proposal
 from graphs.delivery.lifecycle_propose import DEFAULT_FIX_ATTEMPTS
+from harness import work_mirror
 from harness.autonomy import split_by_policy
 from harness.cause_model import cause_evidence, classify_with_model, one_line
 from harness.cause_rule import classify_cause
@@ -81,7 +82,7 @@ from harness.gate import apply_arm_for, auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
 from harness.store_lease import assert_epoch
-from harness.store_write import Store
+from harness.store_write import Store, upsert_work_item
 from harness.worktree import apply_patch, create_worktree, keep_worktree, prune_registrations, remove_worktree
 from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import LimitStop, RunnerError
@@ -873,6 +874,7 @@ def run_epic(
         # writer of the store on disk; this is the driver keeping its own copy
         # honest about what the arm just did.
         items = [dict(item) for item in initiative.get("items") or []]
+        _mirror_read(ctx, items)
 
         parents = phase_parents(items)
         ordered, cyclic = phase_order(parents)
@@ -1142,6 +1144,64 @@ LEASE_NAME = "chair"
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _mirror_by(ctx: _Ctx) -> str:
+    return f"epic-driver:{ctx.run_id}"
+
+
+def _file_times(items: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """Task id to the ISO mtime of its work file; an item with no readable file has no entry."""
+    times: dict[str, str] = {}
+    for item in items:
+        with contextlib.suppress(OSError):
+            if item.get("path"):
+                times[str(item["id"])] = datetime.fromtimestamp(Path(str(item["path"])).stat().st_mtime, UTC).isoformat()
+    return times
+
+
+def _upsert_row(store: Store, row: Mapping[str, Any]) -> None:
+    upsert_work_item(
+        store.conn, row["initiative"], row["task_id"], row["phase"], row["state"], row["needs"],
+        row["updated_at"], row["updated_by"],
+    )  # fmt: skip
+
+
+def _mirror_read(ctx: _Ctx, items: Sequence[Mapping[str, Any]]) -> None:
+    """Mirror the files' state into work_items. The files stay authoritative: `items` is never touched.
+
+    A store error is logged and swallowed here, at the edge, so it can never fail the run.
+    """
+    if ctx.store is None:
+        return
+    try:
+        # Not a module-level import: harness/__init__ imports this module, so a top-level store_read import
+        # loads store_traces early and `python -m harness.store_traces` then warns a second line on stderr.
+        from harness import store_read
+
+        rows = store_read.work_items(ctx.store.conn, ctx.initiative_id)
+        upserts, disagreements = work_mirror.plan_mirror(
+            ctx.initiative_id, items, rows, _file_times(items), _mirror_by(ctx), fallback_time=_now()
+        )
+        for row in upserts:
+            _upsert_row(ctx.store, row)
+        for d in disagreements:
+            _log.warning(
+                "work_items disagrees with the file: initiative=%s task=%s file_state=%s store_state=%s updated_by=%s",
+                d["initiative"], d["task_id"], d["file_state"], d["store_state"], d["store_updated_by"],
+            )  # fmt: skip
+    except Exception as exc:
+        _log.warning("work_items mirror (read) failed for %s: %s: %s", ctx.initiative_id, type(exc).__name__, exc)
+
+
+def _mirror_write(ctx: _Ctx, item: Mapping[str, Any] | None, state: str) -> None:
+    """Upsert one task's work_items row after an arm wrote `state` to its file. Errors are logged, never raised."""
+    if ctx.store is None or item is None:
+        return
+    try:
+        _upsert_row(ctx.store, work_mirror.item_row(ctx.initiative_id, {**item, "state": state}, _now(), _mirror_by(ctx)))
+    except Exception as exc:
+        _log.warning("work_items mirror (write) failed for %s: %s: %s", item.get("id"), type(exc).__name__, exc)
 
 
 def _fenced(ctx: _Ctx) -> str | None:
@@ -2384,6 +2444,8 @@ def _execute(
         return False, reason
     if slot == "state_move":
         state.moved[subject] = applied
+        if applied:
+            _mirror_write(ctx, by_id.get(subject), "approved")
     return applied, detail
 
 
