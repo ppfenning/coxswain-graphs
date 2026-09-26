@@ -43,7 +43,7 @@ import json
 import logging
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -410,6 +410,17 @@ def unlanded(cherry_lines: Sequence[str], done_tasks: set[str]) -> list[str]:
     """
     subjects = [line.split(" ", 2)[2] if line.count(" ") >= 2 else "" for line in cherry_lines if line.startswith("+ ")]
     return [s for s in subjects if (t := _task_of(s)) is None or not (t in done_tasks or t.startswith("merge "))]
+
+
+def open_in_phase(items: Sequence[Mapping[str, Any]], phase: str, in_run: Collection[str]) -> list[str]:
+    """Ids of `phase` items neither `done` nor `dropped` and outside this run, in item order."""
+    return [
+        str(item["id"])
+        for item in items
+        if item.get("phase") == phase
+        and item.get("state") not in ("done", "dropped")
+        and str(item["id"]) not in in_run
+    ]
 
 
 def _phase_branch_has_unlanded_commits(ctx: _Ctx, phase: str, done_tasks: set[str]) -> bool:
@@ -1879,7 +1890,20 @@ def _run_phase(
     verdict: dict[str, Any] | None = None
     validated = "validate_phase" in ctx.bound
 
-    if validated and results:
+    # A phase is judged once, when it is finished: a run carrying only part of it
+    # would be scored against a goal its siblings have not yet built toward.
+    open_ids = (
+        open_in_phase(items, phase, {str(r.get("ticket")) for r in results} | {str(q["id"]) for q in quarantined})
+        if validated and results
+        else []
+    )
+
+    if open_ids:
+        verdict = record["phase_verdict"] = {
+            "goal_met": False,
+            "skipped": f"phase not finished: {len(open_ids)} open task(s): {', '.join(open_ids)}",
+        }
+    elif validated and results:
         phase_state = {
             "phase": {"id": phase, "goal": _phase_goal(initiative, phase)},
             "tasks": [
