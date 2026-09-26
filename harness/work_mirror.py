@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -92,3 +93,64 @@ def plan_mirror(
         for item in file_items
     ]
     return [u for u, _ in decisions if u is not None], [d for _, d in decisions if d is not None]
+
+
+USE_FILE = "use_file"
+USE_FILE_AND_UPSERT = "use_file_and_upsert"
+USE_STORE_REWRITE_FILE = "use_store_rewrite_file"
+AGREE = "agree"
+
+
+def authority_decision(work_state: str, file_state: str, row_state: str | None) -> str:
+    """work_state is 'files' or 'store'. Under 'files' a differing row is upserted, as _decide does without times.
+
+    USE_FILE is the files-mode result for a row newer than the file; that needs times this signature lacks.
+    """
+    if row_state is None:
+        return USE_FILE_AND_UPSERT
+    if row_state == file_state:
+        return AGREE
+    return USE_STORE_REWRITE_FILE if work_state == "store" else USE_FILE_AND_UPSERT
+
+
+def _without_cr(line: str) -> str:
+    return line[:-1] if line.endswith("\r") else line
+
+
+def _state_token(value: str) -> tuple[str, str, str]:
+    """(value, quote, tail) of a `state:` value: quotes and a ` #` comment are not part of the value."""
+    if value[:1] in ("'", '"') and value[0] in value[1:]:
+        end = value.index(value[0], 1) + 1
+        return (value[1 : end - 1], value[0], value[end:])
+    comment = re.search(r"\s#", value)
+    token = (value if comment is None else value[: comment.start()]).rstrip()
+    return (token, "", value[len(token) :])
+
+
+def set_frontmatter_state(text: str, new_state: str) -> str | None:
+    """text with only the first frontmatter `state:` value replaced; None if there is no such line. Splits on \\n only."""
+    lines = text.split("\n")
+    close = next((i for i, line in enumerate(lines[1:], 1) if _without_cr(line) == "---"), None)
+    if _without_cr(lines[0]) != "---" or close is None:
+        return None
+    at = next((i for i in range(1, close) if lines[i].startswith("state:")), None)
+    if at is None:
+        return None
+    line = lines[at]
+    cr = line[len(_without_cr(line)) :]
+    rest = _without_cr(line)[len("state:") :]
+    body = rest.lstrip()
+    value, quote, tail = _state_token(body)
+    if value == new_state:
+        return text
+    lead = rest[: len(rest) - len(body)] or " "
+    new_line = "state:" + lead + quote + new_state + quote + tail + cr
+    return "\n".join([*lines[:at], new_line, *lines[at + 1 :]])
+
+
+def check_expected_state(expected: str, actual: str | None) -> tuple[bool, str]:
+    """(allow, reason). The reason names both states; a missing row reads as 'no row'."""
+    if expected == actual:
+        return (True, "row state is " + repr(expected) + " as expected")
+    shown = "no row" if actual is None else repr(actual)
+    return (False, "expected state " + repr(expected) + " but store has " + shown)
