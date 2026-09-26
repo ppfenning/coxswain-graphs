@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,7 @@ from harness.store_read import calls as store_calls
 from harness.store_write import Store
 from runner import RunnerError
 from runner.claude_code_runner import (
+    _DIFF_CMD,
     ClaudeCodeRunner,
     _alt_model_for,
     _init_facts,
@@ -1334,6 +1337,10 @@ def test_permitted_prefixes_drop_the_bash_wrapping(fake_claude, tmp_path, repo) 
         "python3 -m pytest",
         "python -m ruff",
         "python3 -m ruff",
+        "uv run pytest",
+        "uv run --frozen pytest",
+        "uv run ruff",
+        "uv run --frozen ruff",
         "git status",
         "git diff",
         "git add",
@@ -1380,6 +1387,7 @@ def test_bash_is_pre_approved_for_the_checks_and_git_and_nothing_else(fake_claud
     argv = recorded(fake_claude)["argv"]
     i = argv.index("--allowedTools")
     allowed = argv[i + 1 : argv.index("--tools")]
+    scratch = _scratch_in(argv[argv.index("--system-prompt") + 1])
     assert allowed == [
         "Bash(pytest:*)",
         "Bash(ruff:*)",
@@ -1387,9 +1395,16 @@ def test_bash_is_pre_approved_for_the_checks_and_git_and_nothing_else(fake_claud
         "Bash(python3 -m pytest:*)",
         "Bash(python -m ruff:*)",
         "Bash(python3 -m ruff:*)",
+        "Bash(uv run pytest:*)",
+        "Bash(uv run --frozen pytest:*)",
+        "Bash(uv run ruff:*)",
+        "Bash(uv run --frozen ruff:*)",
         "Bash(git status:*)",
         "Bash(git diff:*)",
         "Bash(git add:*)",
+        f"Bash(git -C {scratch} status:*)",
+        f"Bash(git -C {scratch} diff:*)",
+        f"Bash(git -C {scratch} add:*)",
     ]
     assert argv[argv.index("--permission-mode") + 1] == "acceptEdits", "edits are still accepted up front"
 
@@ -2015,6 +2030,10 @@ def _system_prompt(record_path: Path) -> str:
     return argv[argv.index("--system-prompt") + 1]
 
 
+def _scratch_in(system: str) -> str:
+    return re.search(r"scratch checkout of the target repository at (.+?), at the commit", system).group(1)
+
+
 def test_the_builder_is_told_exactly_which_commands_it_may_run(fake_claude, tmp_path, repo) -> None:
     """Run 21's build was complete and was refused for evidence it was not allowed to produce."""
     _, record, _ = fake_claude
@@ -2043,17 +2062,70 @@ def test_the_permitted_list_is_the_list_that_is_enforced(fake_claude, tmp_path, 
     enforced = argv[argv.index("--allowedTools") + 1 : argv.index("--tools")]
     system = _system_prompt(record)
 
+    scratch = _scratch_in(system)
     assert enforced == [
         "Bash(uv:*)",
         "Bash(ruff:*)",
         "Bash(python -m ruff:*)",
         "Bash(python3 -m ruff:*)",
+        "Bash(uv run ruff:*)",
+        "Bash(uv run --frozen ruff:*)",
         "Bash(git status:*)",
         "Bash(git diff:*)",
         "Bash(git add:*)",
+        f"Bash(git -C {scratch} status:*)",
+        f"Bash(git -C {scratch} diff:*)",
+        f"Bash(git -C {scratch} add:*)",
     ]
     for name in enforced:
         assert f"`{name[len('Bash('):-len(':*)')]}`" in system
+
+
+def test_python_tool_checks_also_permit_the_uv_run_forms(fake_claude, tmp_path, repo) -> None:
+    _, record, _ = fake_claude
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Bash"]
+    runner.check_commands = ["pytest -q", "ruff check ."]
+    runner.run(role="build", schema=SCHEMA, prompt="build it")
+    argv = json.loads(record.read_text())["argv"]
+    enforced = argv[argv.index("--allowedTools") + 1 : argv.index("--tools")]
+    assert "Bash(uv run pytest:*)" in enforced
+    assert "Bash(uv run --frozen ruff:*)" in enforced
+
+
+def test_a_build_may_run_git_dash_c_on_its_own_scratch_and_nowhere_else(fake_claude, tmp_path, repo) -> None:
+    _, record, _ = fake_claude
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.tools["build"] = ["Read", "Bash"]
+    runner.run(role="build", schema=SCHEMA, prompt="build it")
+    argv = json.loads(record.read_text())["argv"]
+    enforced = argv[argv.index("--allowedTools") + 1 : argv.index("--tools")]
+    assert f"Bash(git -C {_scratch_in(_system_prompt(record))} diff:*)" in enforced
+    assert "Bash(git -C:*)" not in enforced
+    runner.tools["review_charter"] = ["Read", "Bash"]
+    runner.run(role="review_charter", schema=SCHEMA, prompt="review it")
+    argv = json.loads(record.read_text())["argv"]
+    assert not [name for name in argv[argv.index("--allowedTools") + 1 : argv.index("--tools")] if "git -C" in name]
+
+
+def test_a_scratch_path_a_prefix_rule_cannot_match_gets_no_git_dash_c(fake_claude, tmp_path) -> None:
+    runner = runner_for(fake_claude, tmp_path)
+    assert not [name for name in runner._allowed_bash(Path("/tmp/a b/tree")) if "git -C" in name]
+
+
+def test_a_scratch_links_the_target_repos_venv_and_dropping_it_keeps_the_target(fake_claude, tmp_path, repo) -> None:
+    """`.venv/` ignores directories only; the link must still stay out of the build's diff."""
+    (repo / ".venv").mkdir()
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    parent, scratch = runner._make_scratch("build")
+    try:
+        assert (scratch / ".venv").is_symlink()
+        assert (scratch / ".venv").resolve() == (repo / ".venv").resolve()
+        diff = subprocess.run(_DIFF_CMD, shell=True, cwd=scratch, capture_output=True, text=True)
+        assert (diff.returncode, diff.stdout) == (0, "")
+    finally:
+        runner._drop_scratch(parent, scratch)
+    assert (repo / ".venv").is_dir()
 
 
 def test_python_tool_checks_also_permit_the_python_m_form(fake_claude, tmp_path, repo) -> None:

@@ -10,6 +10,7 @@ __all__ = [
     "apply_patch",
     "create_worktree",
     "keep_worktree",
+    "link_venv",
     "normalise_patch",
     "prune_registrations",
     "remove_worktree",
@@ -115,6 +116,28 @@ def create_worktree(repo: Path, worktree: Path, *, branch: str, base: str | None
         cmd.append(base)
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def link_venv(repo: Path, worktree: Path) -> bool:
+    """Link `worktree/.venv` to the repo's `.venv` so `uv run --frozen` finds it; True if linked.
+
+    A `.venv/` ignore pattern matches directories only, and git sees this link
+    as a file, so `git add -A` would stage it into every patch. `/.venv` goes
+    into the shared `info/exclude` first; the main checkout ignores it too.
+    """
+    venv, link = Path(repo) / ".venv", Path(worktree) / ".venv"
+    if not venv.is_dir() or link.exists() or link.is_symlink():
+        return False
+    common = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--git-common-dir"], capture_output=True, text=True)
+    if common.returncode != 0:
+        return False
+    exclude = Path(worktree) / common.stdout.strip() / "info" / "exclude"
+    lines = exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
+    if "/.venv" not in lines:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text("\n".join([*lines, "/.venv"]) + "\n", encoding="utf-8")
+    link.symlink_to(venv.resolve())
+    return True
 
 
 def prune_registrations(repo: Path) -> tuple[bool, str]:
