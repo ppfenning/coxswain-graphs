@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.traces_url import TracesRoot, have_pyarrow, redact_url, resolve_traces_root
+from harness.traces_url import TracesRoot, _s3_options, have_pyarrow, redact_url, resolve_traces_root
 
 
 def _fs():
@@ -122,6 +122,42 @@ def test_region_and_endpoint_reach_the_s3_filesystem_from_env_only(monkeypatch, 
     monkeypatch.setattr(fs, "S3FileSystem", lambda **kwargs: seen.append(kwargs))
     resolve_traces_root("s3://bucket/p", Path("/runs"), env)
     assert seen == [expected]
+
+
+_BLOCK = {
+    "endpoint": "http://garage.lan:3900",
+    "region": "garage",
+    "access_key_env": "G_KEY",
+    "secret_key_env": "G_SECRET",
+    "path_style": True,
+}
+
+
+def test_the_block_gives_the_exact_kwargs():
+    assert _s3_options({"G_KEY": "k1", "G_SECRET": "s1"}, _BLOCK) == {
+        "scheme": "http",
+        "endpoint_override": "garage.lan:3900",
+        "region": "garage",
+        "access_key": "k1",
+        "secret_key": "s1",
+        "force_virtual_addressing": False,
+    }
+
+
+def test_a_missing_env_var_raises_naming_it():
+    with pytest.raises(ValueError, match="G_SECRET"):
+        _s3_options({"G_KEY": "k1"}, _BLOCK)
+
+
+def test_a_literal_secret_key_is_refused_without_its_value():
+    with pytest.raises(ValueError, match="secret_key") as err:
+        _s3_options({}, {**_BLOCK, "secret_key": "hunter2"})
+    assert "hunter2" not in str(err.value)
+
+
+def test_no_block_keeps_the_aws_env_behaviour():
+    env = {"AWS_REGION": "us-east-1", "AWS_ENDPOINT_URL": "http://minio:9000"}
+    assert _s3_options(env) == {"region": "us-east-1", "endpoint_override": "http://minio:9000"}
 
 
 def test_the_root_is_frozen():
