@@ -49,12 +49,19 @@ set by the driver or a human stays. cause_why stays null. The report gains one f
 rule-made cause, and changes the cause when the rule now says otherwise. Rows the backfill filled have a
 null cause_why, and model-made and human causes carry other text, so none of them are touched. The changes
 are counted in `cause_refilled_<cause>`, present only with the flag.
+
+`--recost-resumed` gives resumed calls their own cost, as harness/store_recost.py describes, reading each
+call's session id from its trace under `--traces-root` (default `<runs_dir>/traces`). The report gains
+`recosted_calls` and `recost_delta_usd`, present only with the flag. A rerun changes nothing. With `--dry-run`,
+which needs the flag, nothing else runs: the store is opened read-only and the command prints the count of calls
+it would change and the sum of their cost before and after.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import warnings
@@ -67,7 +74,8 @@ import yaml
 
 from harness.cause_rule import CAUSES, classify_cause
 from harness.store_migrate import open_store
-from harness.store_read import work_items
+from harness.store_read import connect_readonly, work_items
+from harness.store_recost import apply_recost, plan_recost, totals
 from harness.store_write import (
     _KEYS,
     _RUN_KEYS,
@@ -82,13 +90,14 @@ from harness.store_write import (
     split_phase_id,
     upsert_work_item,
 )
+from harness.traces_url import TracesRoot, resolve_traces_root
 from harness.work_mirror import plan_mirror
 
 TABLES = ("runs", "phases", "gate_decisions", "node_calls", "ledger", "attempts")
 _COUNTS = ("seen", "inserted", "already_present", "malformed")
 _USAGE_SUFFIX = ".usage.json"
 
-Report = dict[str, dict[str, int] | int | list[str] | list[Row]]
+Report = dict[str, dict[str, int] | int | float | list[str] | list[Row]]
 STAMPED_KEY = "runs_stamped_ended"
 STAMPED_STATUS = "backfilled"
 SKIPPED_KEY = "skipped_files"
@@ -100,6 +109,8 @@ WORK_ITEM_DISAGREEMENTS_KEY = "work_item_disagreements"
 MALFORMED_WORK_ITEMS_KEY = "malformed_work_items"
 WORK_ITEMS_BY = "backfill"
 NEVER_RECORDED_STATUS = "never_recorded"
+RECOSTED_KEY = "recosted_calls"
+RECOST_DELTA_KEY = "recost_delta_usd"
 CAUSE_FILLED_PREFIX = "cause_filled_"
 CAUSE_REFILLED_PREFIX = "cause_refilled_"
 RULE_WHY_PATTERN = "rule:%"  # what the driver writes to cause_why for a rule-made cause (harness/epic.py)
@@ -571,6 +582,12 @@ def _refill_causes(store: Store) -> dict[str, int]:
     return changed
 
 
+def _recost(store: Store, traces: TracesRoot | str) -> dict[str, int | float]:
+    changes = plan_recost(store.conn, traces)
+    _, before, after = totals(changes)
+    return {RECOSTED_KEY: apply_recost(store, changes), RECOST_DELTA_KEY: round(after - before, 6)}
+
+
 def backfill(
     store: Store,
     runs_dir: Path | str,
@@ -578,12 +595,14 @@ def backfill(
     ledger_path: Path | str,
     task_records_updated_at: str | None = None,
     refill_causes: bool = False,
+    recost_traces: TracesRoot | str | None = None,
 ) -> Report:
     """Import everything under the three paths, then stamp ended the runs that have a usage file.
 
     A second run inserts nothing: every row counts as already present, and no run is stamped twice.
     Task records are upserted, stamped `task_records_updated_at` or else each file's mtime.
     `refill_causes` also recomputes rule-made causes, reported as `cause_refilled_<cause>`.
+    `recost_traces`, a traces root, also recosts resumed calls, reported as `recosted_calls` and `recost_delta_usd`.
     """
     report = new_report()
     skipped = [p for p in run_files(runs_dir) if is_non_record(p.name)]
@@ -599,10 +618,12 @@ def backfill(
     refilled = (
         {f"{CAUSE_REFILLED_PREFIX}{c}": n for c, n in _refill_causes(store).items()} if refill_causes else {}
     )
+    recosted = _recost(store, recost_traces) if recost_traces is not None else {}
     return {
         **report,
         **caused,
         **refilled,
+        **recosted,
         STAMPED_KEY: stamped,
         SKIPPED_KEY: len(skipped),
         MALFORMED_KEY: malformed,
@@ -648,10 +669,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="also recompute causes whose cause_why starts 'rule:'; model-made and human causes stay",
     )
+    parser.add_argument(
+        "--recost-resumed",
+        action="store_true",
+        help="set each resumed call's cost_usd to its own spend; the reported figure moves to detail_json",
+    )
+    parser.add_argument("--traces-root", help="traces root or URL for --recost-resumed; default RUNS_DIR/traces")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --recost-resumed: print the calls it would change and their cost before and after; write nothing",
+    )
     args = parser.parse_args(argv)
+    if args.dry_run and not args.recost_resumed:
+        parser.error("--dry-run needs --recost-resumed")
+    traces = resolve_traces_root(args.traces_root, Path(args.runs_dir), os.environ) if args.recost_resumed else None
+    if args.dry_run:
+        conn = connect_readonly(args.store_url)
+        try:
+            n, before, after = totals(plan_recost(conn, traces))
+        finally:
+            conn.close()
+        shown = {"would_recost_calls": n, "cost_before_usd": round(before, 6), "cost_after_usd": round(after, 6)}
+        print(json.dumps(shown, indent=2))
+        return 0
     conn = open_store(args.store_url, datetime.now(UTC).isoformat())
     try:
-        report = backfill(Store(conn), args.runs_dir, args.work_dir, args.ledger, refill_causes=args.refill_causes)
+        report = backfill(
+            Store(conn), args.runs_dir, args.work_dir, args.ledger, refill_causes=args.refill_causes, recost_traces=traces
+        )
     finally:
         conn.close()
     print(json.dumps(report, indent=2, sort_keys=True))
