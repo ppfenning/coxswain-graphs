@@ -8,7 +8,7 @@ from pathlib import Path
 
 from core import workstore
 
-from harness.epic import _Ctx, rescue_task, with_stored_rescues
+from harness.epic import _Ctx, rescue_task, with_stored_causes, with_stored_rescues
 from harness.resume import load_result, save_result
 from harness.store_migrate import open_store
 from harness.store_write import Store
@@ -147,6 +147,36 @@ def test_a_stored_rescue_older_than_the_current_body_is_stamped_as_an_older_body
     row = {"run_id": "r", "phase_id": PHASE, "kind": "rescue_failed", "reason": "x", "ts": "2026-08-01", "cause": "code"}
 
     assert with_stored_rescues(item, [row])["attempts"][0]["body_sha"] == "before the current body"
+
+
+def test_a_causeless_file_attempt_takes_the_cause_of_the_store_row_for_its_run_and_phase() -> None:
+    item = {"body": BODY, "attempts": [{"run": "r-1", "phase": "p"}]}
+    row = {"run_id": "r-1", "phase_id": "p", "seq": 1, "cause": "harness"}
+
+    assert with_stored_causes(item, [row])["attempts"] == [{"run": "r-1", "phase": "p", "cause": "harness"}]
+
+
+def test_a_file_attempt_that_already_has_a_cause_keeps_it() -> None:
+    item = {"body": BODY, "attempts": [{"run": "r-1", "phase": "p", "cause": "code"}]}
+    row = {"run_id": "r-1", "phase_id": "p", "seq": 1, "cause": "harness"}
+
+    assert with_stored_causes(item, [row])["attempts"][0]["cause"] == "code"
+
+
+def test_a_file_attempt_with_no_store_row_is_unchanged() -> None:
+    item = {"body": BODY, "attempts": [{"run": "r-1", "phase": "p"}]}
+
+    assert with_stored_causes(item, []) == item
+
+
+def test_the_newest_seq_row_wins_when_a_run_and_phase_has_several() -> None:
+    item = {"body": BODY, "attempts": [{"run": "r-1", "phase": "p"}]}
+    rows = [
+        {"run_id": "r-1", "phase_id": "p", "seq": 2, "cause": "harness"},
+        {"run_id": "r-1", "phase_id": "p", "seq": 1, "cause": "code"},
+    ]
+
+    assert with_stored_causes(item, rows)["attempts"][0]["cause"] == "harness"
 
 
 def _probe_with(*attempts: dict) -> dict:

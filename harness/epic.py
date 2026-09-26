@@ -2634,6 +2634,19 @@ def _rescue_failed(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, reason: st
     return {"status": "rescue_failed", "reason": reason, "cause": cause}
 
 
+def with_stored_causes(item: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """`item` with each causeless file attempt given the cause of the store row for its run and phase, newest seq."""
+    newest = {(r["run_id"], r["phase_id"]): r["cause"] for r in sorted(rows, key=lambda r: r["seq"])}
+    return {
+        **item,
+        "attempts": [
+            {**a, "cause": newest[key]} if not a.get("cause") and newest.get(key) else a
+            for a in item["attempts"]
+            for key in [(a.get("run"), a.get("phase"))]
+        ],
+    }
+
+
 def with_stored_rescues(item: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """`item` with the store's `rescue_failed` attempts folded into its own, in ts order.
 
@@ -2666,6 +2679,16 @@ def _stored_rescues(ctx: _Ctx, task: str) -> list[dict[str, Any]]:
     mark = ctx.store.conn.dialect.placeholder
     sql = f"SELECT {', '.join(cols)} FROM attempts WHERE task_id = {mark} AND kind = {mark}"
     return [dict(zip(cols, row, strict=True)) for row in ctx.store.conn.query_all(sql, (task, rescue_select.RESCUE_KIND))]
+
+
+def _stored_causes(ctx: _Ctx, task: str) -> list[dict[str, Any]]:
+    """The store's attempt causes for `task`, any run and kind. Empty without a store."""
+    if ctx.store is None:
+        return []
+    cols = ("run_id", "phase_id", "seq", "cause")
+    mark = ctx.store.conn.dialect.placeholder
+    sql = f"SELECT {', '.join(cols)} FROM attempts WHERE task_id = {mark}"
+    return [dict(zip(cols, row, strict=True)) for row in ctx.store.conn.query_all(sql, (task,))]
 
 
 def _record_rescue_gate(ctx: _Ctx, phase: str, move: Mapping[str, Any], diff: Mapping[str, Any], minutes: float) -> None:
@@ -2740,7 +2763,8 @@ def rescue_task(ctx: _Ctx, item: Mapping[str, Any], *, phase: str) -> dict[str, 
     attempts = item.get("attempts") or []
     saved = load_result(ctx.runs_dir, attempts[-1]["run"], phase, task) if attempts else None
     patch = rescue_select.patch_of(saved)
-    ok, why = rescue_select.eligible(with_stored_rescues(item, _stored_rescues(ctx, task)), patch)
+    caused = with_stored_causes(item, _stored_causes(ctx, task))
+    ok, why = rescue_select.eligible(with_stored_rescues(caused, _stored_rescues(ctx, task)), patch)
     if not ok or patch is None:
         return {"status": "not_eligible", "why": why}
     if not item.get("path") and not _store_authoritative(ctx):
