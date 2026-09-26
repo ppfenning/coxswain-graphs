@@ -30,6 +30,10 @@ def test_a_configured_check_failure_is_code():
     assert classify_cause("unverified", "a configured check failed: pytest") == "code"
 
 
+def test_the_older_plural_configured_checks_failure_is_code():
+    assert classify_cause("unknown", "configured checks failed: tests — see evidence") == "code"
+
+
 def test_kind_no_work_is_ticket():
     assert classify_cause("no_work", "nothing to build") == "ticket"
 
