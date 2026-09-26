@@ -2183,6 +2183,16 @@ def _consolidation_pairs(
     return pairs
 
 
+def state_move_apply(path: str | None, state: str) -> dict[str, Any]:
+    """The `apply` payload the code arm reads; empty when no path is known, so the gate falls back to the model arm."""
+    return {"apply": {"path": str(path), "state": state}} if path else {}
+
+
+def item_apply(path: str | None, item: Mapping[str, Any]) -> dict[str, Any]:
+    """The `apply` payload for item_create and item_update; empty when no path is known."""
+    return {"apply": {"path": str(path), "item": dict(item)}} if path else {}
+
+
 def _build_batch(
     ctx: _Ctx,
     *,
@@ -2264,6 +2274,7 @@ def _build_batch(
             # `cox runs land` writes `done`, after the merge (tools #153).
             suggested_action=f"mark {task} approved",
         )
+        move = {**move, **state_move_apply((by_id.get(task) or {}).get("path"), "approved")}
         batch.append(move)
         slots[id(move)] = ("state_move", task)
 
