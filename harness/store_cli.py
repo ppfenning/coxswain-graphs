@@ -1,4 +1,4 @@
-"""python -m harness.store_cli: mark-landed, set-state, lease and regenerate-states commands against the run-record store."""
+"""python -m harness.store_cli: mark-landed, set-state, lease, record-action and regenerate-states commands against the run-record store."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import yaml
 
 from harness.cli import _read_profile, _storage_url
 from harness.store_cli_lease import lease_acquire, lease_release, lease_renew
-from harness.store_dialect import Connection, StoreDriverMissing
+from harness.store_dialect import Connection, StoreDriverMissing, insert_ignore, json_text
 from harness.store_landed import mark_landed
 from harness.store_migrate import MigrationError, open_store
 from harness.store_read import work_items
@@ -25,7 +25,8 @@ from harness.work_mirror import set_frontmatter_state
 
 # Contract read by coxswain-tools. Exit 0 and exit 3 print exactly one JSON object on stdout.
 # Exit 2 prints nothing on stdout. Help and every error go to stderr.
-# regenerate-states is the exception: it prints one plain line per change and no JSON, so agreement prints nothing.
+# regenerate-states is an exception: it prints one plain line per change and no JSON, so agreement prints nothing.
+# record-action is the other: it prints `recorded chair action <kind> <target>` and no JSON.
 EXIT_OK = 0
 EXIT_BAD_INPUT = 2
 EXIT_PRECONDITION = 3
@@ -132,6 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("holder")
     release.add_argument("epoch", type=int)
 
+    record = commands.add_parser("record-action", help="record one chair action line as a chair_actions row")
+    _common(record, top=False)
+    record.add_argument("--holder", required=True, type=_non_empty, help="the lease holder that took the action")
+    record.add_argument("action_json", metavar="json", help="the action line: an object with ts, epoch, kind and status")
+
     regen = commands.add_parser(
         "regenerate-states", help="report, or with --apply fix, ticket files whose state: differs from the store"
     )
@@ -214,6 +220,52 @@ def _regenerate(conn: Connection, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+CHAIR_ACTION_COLUMNS = ("ts", "epoch", "holder", "kind", "target", "status", "reason", "action_json")
+CHAIR_ACTION_KEY = ("ts", "holder", "kind", "target")
+_ACTION_REQUIRED = ("ts", "epoch", "kind", "status")
+
+
+def parse_action(text: str) -> dict[str, Any] | str:
+    """The action object, or a one-line reason it is refused."""
+    try:
+        action = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return f"the action is not JSON: {exc}"
+    if not isinstance(action, dict):
+        return "the action must be a JSON object"
+    missing = [k for k in _ACTION_REQUIRED if k not in action]
+    return f"the action lacks {', '.join(missing)}" if missing else action
+
+
+def action_target(action: Mapping[str, Any]) -> str:
+    """task_id, else initiative, else the first intake id, else the empty string."""
+    intake = action.get("intake_ids")
+    first = intake[0] if isinstance(intake, list) and intake else ""
+    return next((str(v) for v in (action.get("task_id"), action.get("initiative"), first) if v), "")
+
+
+def action_row(holder: str, action: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "ts": action["ts"],
+        "epoch": action["epoch"],
+        "holder": holder,
+        "kind": action["kind"],
+        "target": action_target(action),
+        "status": action["status"],
+        "reason": str(action.get("reason", "")),
+        "action_json": json_text(action),
+    }
+
+
+def _record_action(conn: Connection, holder: str, action: Mapping[str, Any]) -> int:
+    """Edge: insert the row, skipping one whose key is already there, and print the one line."""
+    row = action_row(holder, action)
+    sql = insert_ignore(conn.dialect, "chair_actions", CHAIR_ACTION_COLUMNS, CHAIR_ACTION_KEY)
+    conn.execute(sql, list(row.values()))
+    print(f"recorded chair action {row['kind']} {row['target']}")
+    return EXIT_OK
+
+
 def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[dict[str, Any], int]:
     """A missing task record is the empty object with exit 3."""
     if args.command == "mark-landed":
@@ -262,6 +314,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _fail("--store-url or --runs-dir is required")
     if args.command == "regenerate-states" and not (args.work_dir / args.initiative).is_dir():
         return _fail(f"no directory {args.work_dir / args.initiative}")
+    action = parse_action(args.action_json) if args.command == "record-action" else None
+    if isinstance(action, str):
+        return _fail(action)
     now = _now()
     profile = {} if args.provider_profile is None else _read_profile(args.provider_profile)
     url = resolve_store_url(args.store_url, profile, args.runs_dir)
@@ -272,6 +327,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "regenerate-states":
             return _regenerate(conn, args)
+        if action is not None:
+            return _record_action(conn, args.holder, action)
         payload, code = dispatch(conn, args, now)
     except _DB_ERRORS as exc:
         return _fail(f"cannot read the store: {exc}")
