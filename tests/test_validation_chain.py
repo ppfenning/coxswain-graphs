@@ -7,6 +7,8 @@ author, and a step never builds on an unvalidated handoff.
 
 from __future__ import annotations
 
+from unittest.mock import ANY
+
 import pytest
 
 from graphs._contract import ContractViolation, review_tier
@@ -242,7 +244,7 @@ def test_an_under_evidenced_handoff_revises_instead_of_quarantining(cart, plan_r
         },
     )
     assert [p["kind"] for p in result["proposals"]] == ["draft_pr_create"]
-    assert result["fix_loop"] == {"attempts": 2, "stopped": None, "continuations": 0}
+    assert result["fix_loop"] == {"attempts": 2, "stopped": None, "continuations": 0, "rounds": ANY}
     assert result["handoff"]["complete"] is True
 
     # No reviewer was bought for the change the shuttle had already refused.
@@ -340,7 +342,7 @@ def test_an_under_evidenced_handoff_costs_one_attempt_not_the_run(cart, plan_res
         fix_attempts=0,
     )
     assert result["proposals"] == []
-    assert result["fix_loop"] == {"attempts": 1, "stopped": "attempts_exhausted", "continuations": 0}
+    assert result["fix_loop"] == {"attempts": 1, "stopped": "attempts_exhausted", "continuations": 0, "rounds": ANY}
     assert result["review"]["verdict"] == "revise"
     assert result["review"]["findings"][0]["detail"] == "a test"
     # No second opinion was invented out of the shuttle's objection.
@@ -372,6 +374,7 @@ def test_a_budget_stop_on_a_retry_keeps_the_last_reviewed_build(cart, plan_respo
     assert result["fix_loop"] == {
         "attempts": 2, "stopped": "budget", "continuations": 0,
         "continuation_refused": "no session to resume",
+        "rounds": ANY,
     }
     assert result["build"]["patch"] == build_response["patch"]
     assert result["review"]["verdict"] == "revise"
