@@ -1,4 +1,4 @@
-"""python -m harness.store_cli: mark-landed, set-state and lease commands against the run-record store."""
+"""python -m harness.store_cli: mark-landed, set-state, lease and regenerate-states commands against the run-record store."""
 
 from __future__ import annotations
 
@@ -10,17 +10,22 @@ import sys
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+
+import yaml
 
 from harness.cli import _read_profile, _storage_url
 from harness.store_cli_lease import lease_acquire, lease_release, lease_renew
 from harness.store_dialect import Connection, StoreDriverMissing
 from harness.store_landed import mark_landed
 from harness.store_migrate import MigrationError, open_store
+from harness.store_read import work_items
 from harness.store_work_state import Mismatch, set_state
+from harness.work_mirror import set_frontmatter_state
 
 # Contract read by coxswain-tools. Exit 0 and exit 3 print exactly one JSON object on stdout.
 # Exit 2 prints nothing on stdout. Help and every error go to stderr.
+# regenerate-states is the exception: it prints one plain line per change and no JSON, so agreement prints nothing.
 EXIT_OK = 0
 EXIT_BAD_INPUT = 2
 EXIT_PRECONDITION = 3
@@ -125,7 +130,87 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("name")
     release.add_argument("holder")
     release.add_argument("epoch", type=int)
+
+    regen = commands.add_parser(
+        "regenerate-states", help="report, or with --apply fix, ticket files whose state: differs from the store"
+    )
+    _common(regen, top=False)
+    regen.add_argument("work_dir", type=Path, help="the work root holding <initiative>/<phase>/<task>.md")
+    regen.add_argument("--initiative", required=True, type=_non_empty)
+    regen.add_argument(
+        "--apply", action="store_true", help="rewrite each differing state: line; without it nothing is written"
+    )
     return ap
+
+
+class Change(NamedTuple):
+    name: str  # the key of the file text in the mapping given to plan_regenerate
+    task_id: str
+    file_state: str
+    store_state: str | None  # None: the store has no row for the task
+
+    @property
+    def skipped(self) -> bool:
+        return self.store_state is None
+
+
+def ticket_facts(name: str, text: str) -> tuple[str, str] | None:
+    """(task id, file state) from the frontmatter, the id falling back to the file stem; None if there is no state."""
+    lines = text.split("\n")
+    close = next((i for i, line in enumerate(lines[1:], 1) if line.rstrip("\r") == "---"), None)
+    if lines[0].rstrip("\r") != "---" or close is None:
+        return None
+    try:
+        data = yaml.safe_load("\n".join(lines[1:close]))
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("state"), str):
+        return None
+    return (str(data.get("id") or Path(name).stem), data["state"])
+
+
+def plan_regenerate(texts: Mapping[str, str], rows: Mapping[str, Mapping[str, Any]]) -> list[Change]:
+    """One Change per file whose state differs from its row, and one per file with no row. rows is keyed by task id."""
+    facts = [(name, ticket_facts(name, text)) for name, text in sorted(texts.items())]
+    return [
+        Change(name, task_id, state, None if row is None else row["state"])
+        for name, found in facts
+        if found is not None
+        for task_id, state in [found]
+        for row in [rows.get(task_id)]
+        if row is None or row["state"] != state
+    ]
+
+
+def format_change(change: Change) -> str:
+    if change.skipped:
+        return f"{change.task_id}: no row, skipped"
+    return f"{change.task_id}: file state {change.file_state}, store state {change.store_state}"
+
+
+def regenerate_states(conn: Connection, work_dir: Path, initiative: str, apply: bool) -> list[str]:
+    """The report lines. Edge: reads ticket files and the store's rows; only with apply does it write ticket files."""
+    paths = sorted(p for p in (work_dir / initiative).glob("*/*.md") if p.name != "initiative.md")
+    texts = {str(p): p.read_bytes().decode("utf-8") for p in paths}
+    rows = {row["task_id"]: row for row in work_items(conn, initiative)}
+    changes = plan_regenerate(texts, rows)
+    if apply:
+        for change in changes:
+            if change.store_state is not None:
+                new = set_frontmatter_state(texts[change.name], change.store_state)
+                if new is not None:
+                    Path(change.name).write_bytes(new.encode("utf-8"))
+    return [format_change(change) for change in changes]
+
+
+def _regenerate(conn: Connection, args: argparse.Namespace) -> int:
+    try:
+        lines = regenerate_states(conn, args.work_dir, args.initiative, args.apply)
+    except (OSError, UnicodeDecodeError) as exc:
+        return _fail(f"cannot read or write the ticket files: {exc}")
+    for line in lines:
+        print(line)
+    return EXIT_OK
 
 
 def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[dict[str, Any], int]:
@@ -174,6 +259,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return exc.code if isinstance(exc.code, int) else EXIT_BAD_INPUT
     if not args.store_url and args.runs_dir is None:
         return _fail("--store-url or --runs-dir is required")
+    if args.command == "regenerate-states" and not (args.work_dir / args.initiative).is_dir():
+        return _fail(f"no directory {args.work_dir / args.initiative}")
     now = _now()
     profile = {} if args.provider_profile is None else _read_profile(args.provider_profile)
     url = resolve_store_url(args.store_url, profile, args.runs_dir)
@@ -182,6 +269,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _OPEN_ERRORS as exc:
         return _fail(f"cannot open the store: {exc}")
     try:
+        if args.command == "regenerate-states":
+            return _regenerate(conn, args)
         payload, code = dispatch(conn, args, now)
     except _DB_ERRORS as exc:
         return _fail(f"cannot read the store: {exc}")
