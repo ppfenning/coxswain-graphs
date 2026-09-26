@@ -79,6 +79,21 @@ def test_a_preset_cause_is_untouched_in_both_columns(store, paths):
     assert causes(store.conn)["t-human"] == ("review", "human read the diff")
 
 
+def test_refill_causes_rewrites_rule_made_causes_only(store, paths):
+    stop = "node 'build' failed in claude: error_max_budget_usd"
+    store.record_attempt("run-a", "t-rule", 0, "p1", "no_work", stop, TS, cause="ticket", cause_why="rule: kind no_work")
+    store.record_attempt("run-a", "t-model", 0, "p1", "no_work", stop, TS, cause="ticket", cause_why="model: read the diff")
+    store.record_attempt("run-a", "t-human", 0, "p1", "no_work", stop, TS, cause="review", cause_why="human read the diff")
+    backfill(store, *paths)
+    assert causes(store.conn)["t-rule"] == ("ticket", "rule: kind no_work")
+    report = backfill(store, *paths, refill_causes=True)
+    after = causes(store.conn)
+    assert after["t-rule"] == ("harness", "rule: kind no_work")
+    assert after["t-model"] == ("ticket", "model: read the diff")
+    assert after["t-human"] == ("review", "human read the diff")
+    assert report["cause_refilled_harness"] == 1
+
+
 def test_a_second_run_fills_zero_rows_and_changes_nothing(store, paths):
     backfill(store, *paths)
     before = causes(store.conn)

@@ -21,6 +21,11 @@ def test_kind_infra_is_harness():
     assert classify_cause("infra", "the apply arm raised") == "harness"
 
 
+def test_a_no_work_that_hit_the_budget_limit_is_harness():
+    reason = "node 'build' failed in claude: error_max_budget_usd"
+    assert classify_cause("no_work", reason) == "harness"
+
+
 def test_a_configured_check_failure_is_code():
     assert classify_cause("unverified", "a configured check failed: pytest") == "code"
 
