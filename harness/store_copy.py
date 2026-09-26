@@ -22,6 +22,7 @@ import harness.store_ddl_0002 as ddl2
 import harness.store_ddl_0003 as ddl3
 import harness.store_ddl_0004 as ddl4
 import harness.store_ddl_0005 as ddl5
+import harness.store_ddl_0006 as ddl6
 from harness.store_dialect import Connection, insert_ignore
 from harness.store_migrate import open_store
 
@@ -36,6 +37,7 @@ _ORDER = (
     "phases",
     "tasks",
     "task_records",
+    "work_items",
     "attempts",
     "node_calls",
     "gate_decisions",
@@ -60,7 +62,7 @@ def tables() -> tuple[Table, ...]:
     added = {t: tuple(c for u, c in alters if u == t) for t, _ in alters}
     return tuple(
         (name, (*(c for c, _ in columns), *added.get(name, ())), key)
-        for name, columns, key in (*ddl1._TABLES, *ddl2._TABLES, *ddl4._TABLES)
+        for name, columns, key in (*ddl1._TABLES, *ddl2._TABLES, *ddl4._TABLES, *ddl6._TABLES)
     )
 
 

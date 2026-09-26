@@ -15,6 +15,7 @@ EXPECTED_ORDER = (
     "phases",
     "tasks",
     "task_records",
+    "work_items",
     "attempts",
     "node_calls",
     "gate_decisions",
@@ -40,6 +41,10 @@ SEED = {
     "gate_decisions": [{"run_id": "r1", "phase_id": "p1", "seq": 1, "kind": "merge", "applied": 1, "epoch": 3}],
     "ledger": [{"row_hash": "h1", "run_id": "r1", "kind": "merge", "epoch": 3, "row_json": "{}"}],
     "leases": [{"name": "epic", "holder": "me", "epoch": 4}],
+    "work_items": [
+        {"initiative": "i1", "task_id": "t1", "phase": "p1", "state": "ready", "needs_json": "[]",
+         "updated_at": "2026-09-25T00:00:00Z", "updated_by": "chair"},
+    ],
 }
 
 
