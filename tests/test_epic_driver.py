@@ -178,7 +178,7 @@ def initiative(*, two_phases: bool = True, done: tuple[str, ...] = ()) -> dict:
     ]
     if two_phases:
         items.append(
-            {"id": "t3-cutover", "phase": "p2-rollout", "state": "todo", "needs": ["t1-probe"],
+            {"id": "t3-cutover", "phase": "p2-rollout", "state": "ready", "needs": ["t1-probe"],
              "surfaces": [], "title": "cutover", "body": "move traffic"}
         )
     for item in items:
@@ -350,7 +350,7 @@ def test_phase_parents_drops_cross_phase_needs_whose_tasks_are_already_done() ->
     items = [
         {"id": "t1-probe", "phase": "p1-foundations", "state": "done", "needs": []},
         {"id": "t2-bench", "phase": "p2-rollout", "state": "done", "needs": []},
-        {"id": "t3-cutover", "phase": "p3-cutover", "state": "todo", "needs": ["t1-probe", "t2-bench"]},
+        {"id": "t3-cutover", "phase": "p3-cutover", "state": "ready", "needs": ["t1-probe", "t2-bench"]},
     ]
     assert phase_parents(items)["p3-cutover"] == set()
 
@@ -358,7 +358,7 @@ def test_phase_parents_drops_cross_phase_needs_whose_tasks_are_already_done() ->
 def test_phase_parents_keeps_a_single_unsatisfied_cross_phase_need() -> None:
     items = [
         {"id": "t1-probe", "phase": "p1-foundations", "state": "in_progress", "needs": []},
-        {"id": "t3-cutover", "phase": "p2-rollout", "state": "todo", "needs": ["t1-probe"]},
+        {"id": "t3-cutover", "phase": "p2-rollout", "state": "ready", "needs": ["t1-probe"]},
     ]
     assert phase_parents(items)["p2-rollout"] == {"p1-foundations"}
 
@@ -367,7 +367,7 @@ def test_phase_parents_still_reports_two_unsatisfied_parents() -> None:
     items = [
         {"id": "t1-probe", "phase": "p1-foundations", "state": "in_progress", "needs": []},
         {"id": "t0-seed", "phase": "p0-seed", "state": "pending", "needs": []},
-        {"id": "t3-cutover", "phase": "p2-rollout", "state": "todo", "needs": ["t1-probe", "t0-seed"]},
+        {"id": "t3-cutover", "phase": "p2-rollout", "state": "ready", "needs": ["t1-probe", "t0-seed"]},
     ]
     assert phase_parents(items)["p2-rollout"] == {"p1-foundations", "p0-seed"}
 
