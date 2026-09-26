@@ -222,6 +222,7 @@ class _Ctx:
     store: Store | None = None
     epoch: int | None = None
     lease_name: str | None = None
+    work_state: str = "files"
 
     # ── names, in one place, so the topology is readable ─────────────────────
     def phase_branch(self, phase: str) -> str:
@@ -774,6 +775,20 @@ def task_outcome(
 
 # ── the driver ──────────────────────────────────────────────────────────────
 
+WORK_STATES = ("files", "store")
+
+
+def checked_work_state(value: Any) -> str:
+    """`value` when it is one of WORK_STATES; anything else is refused, never read as the default."""
+    if value not in WORK_STATES:
+        raise ValueError(f"provider profile 'work_state' must be one of {', '.join(WORK_STATES)}, not {value!r}")
+    return str(value)
+
+
+def work_state_of(profile: Mapping[str, Any]) -> str:
+    """The profile's `work_state`: which side owns a task's state. An absent key means files."""
+    return checked_work_state(profile.get("work_state", "files"))
+
 
 def run_epic(
     *,
@@ -796,6 +811,7 @@ def run_epic(
     store: Store | None = None,
     epoch: int | None = None,
     lease_name: str | None = None,
+    work_state: str = "files",
 ) -> dict[str, Any]:
     """Drive a whole initiative: every phase, in dependency order, landing nothing.
 
@@ -824,6 +840,7 @@ def run_epic(
         raise ValueError(
             "the epic driver needs a store: phases, tasks, attempts, gate decisions and ledger rows are recorded there"
         )
+    work_state = checked_work_state(work_state)
     repo = Path(repo)
     ctx: _Ctx | None = None
     try:
@@ -857,6 +874,7 @@ def run_epic(
             store=store,
             epoch=epoch,
             lease_name=lease_name,
+            work_state=work_state,
             initiative_id=str(initiative.get("id")),
             # An unparented phase branches from the repository's default branch, read
             # once here so every phase in a run stacks on the same ground, whatever
@@ -1167,9 +1185,51 @@ def _upsert_row(store: Store, row: Mapping[str, Any]) -> None:
     )  # fmt: skip
 
 
-def _mirror_read(ctx: _Ctx, items: Sequence[Mapping[str, Any]]) -> None:
-    """Mirror the files' state into work_items. The files stay authoritative: `items` is never touched.
+def _repair_file_state(item: Mapping[str, Any], new_state: str) -> bool:
+    """Rewrite only the `state:` line of the item's work file, bytes otherwise kept. False when it could not."""
+    if not item.get("path"):
+        return False
+    path = Path(str(item["path"]))
+    try:
+        text = path.read_bytes().decode("utf-8")
+        repaired = work_mirror.set_frontmatter_state(text, new_state)
+        if repaired is None:
+            return False
+        if repaired != text:
+            path.write_bytes(repaired.encode("utf-8"))
+    except (OSError, UnicodeError):
+        return False
+    return True
 
+
+def _mirror_read_store(ctx: _Ctx, items: Sequence[dict[str, Any]], rows: Sequence[Mapping[str, Any]]) -> None:
+    """work_state: store. A row wins over its file: the file's state line is repaired and `items` follows the row.
+
+    `items` is the driver's own copy, so the ready and needs checks that read it see the store's state. A task with
+    no row is read from its file and upserted, as under files.
+    """
+    by_task = {row["task_id"]: row for row in rows}
+    times = _file_times(items)
+    for item in items:
+        task, file_state = item["id"], item["state"]
+        row = by_task.get(task)
+        row_state = None if row is None else row["state"]
+        decision = work_mirror.authority_decision("store", file_state, row_state)
+        if decision == work_mirror.USE_STORE_REWRITE_FILE:
+            if _repair_file_state(item, row_state):
+                _log.warning("work file state rewritten from the store: task=%s old=%s new=%s", task, file_state, row_state)
+            else:
+                _log.warning("work file state not rewritable, store state used: task=%s file=%s", task, file_state)
+            item["state"] = row_state
+        elif decision == work_mirror.USE_FILE_AND_UPSERT:
+            new = work_mirror.item_row(ctx.initiative_id, item, times.get(str(task)) or _now(), _mirror_by(ctx))
+            _upsert_row(ctx.store, new)
+
+
+def _mirror_read(ctx: _Ctx, items: Sequence[dict[str, Any]]) -> None:
+    """Mirror the files' state into work_items. Under work_state files the files stay authoritative: `items` is never touched.
+
+    Under work_state store a stored row wins: see `_mirror_read_store`. A ctx with no work_state reads as files.
     A store error is logged and swallowed here, at the edge, so it can never fail the run.
     """
     if ctx.store is None:
@@ -1180,6 +1240,9 @@ def _mirror_read(ctx: _Ctx, items: Sequence[Mapping[str, Any]]) -> None:
         from harness import store_read
 
         rows = store_read.work_items(ctx.store.conn, ctx.initiative_id)
+        if getattr(ctx, "work_state", "files") == "store":
+            _mirror_read_store(ctx, items, rows)
+            return
         upserts, disagreements = work_mirror.plan_mirror(
             ctx.initiative_id, items, rows, _file_times(items), _mirror_by(ctx), fallback_time=_now()
         )

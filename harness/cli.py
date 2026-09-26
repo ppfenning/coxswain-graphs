@@ -909,7 +909,7 @@ def _run_graph(
         # been chosen. Everything below this block (policy split, gate, record)
         # is therefore already done by the time run_epic returns, and this
         # branch returns instead of falling through to do it twice.
-        from harness.epic import run_epic
+        from harness.epic import run_epic, work_state_of
 
         if not args.initiative:
             parser.error("epic needs --initiative (a work/<initiative> directory)")
@@ -918,6 +918,11 @@ def _run_graph(
         try:
             initiative = workstore.read_initiative(args.initiative)
         except workstore.WorkStoreError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        try:
+            work_state = work_state_of(_read_profile(args.provider_profile))
+        except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
 
@@ -941,6 +946,7 @@ def _run_graph(
             store=store,
             epoch=epoch,
             lease_name=lease_name,
+            work_state=work_state,
         )
         totals = result.get("totals") or {}
         print(
