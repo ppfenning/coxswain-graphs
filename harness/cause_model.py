@@ -1,6 +1,6 @@
 """Fallback attempt-cause classifier for when `classify_cause` returns None.
 
-`build_prompt`, `one_line` and `parse_answer` are pure. `classify_with_model` is
+`build_prompt`, `cause_evidence`, `one_line` and `parse_answer` are pure. `classify_with_model` is
 the edge: it takes the runner as a parameter and raises only `LimitStop`.
 """
 
@@ -46,6 +46,18 @@ def build_prompt(reasoning: str, objections: Sequence[str]) -> str:
         f"Adversary objections:\n{listed}\n\n"
         "Return the cause and a one-line why."
     )
+
+
+def cause_evidence(reason: str, result: Mapping[str, Any] | None) -> tuple[str, list[str]]:
+    """(reasoning, objection claims) a task's result offers the classifier.
+
+    Without arbitration text the quarantine reason is the only account of why, and it is never empty.
+    """
+    arbitration = (result or {}).get("arbitration")
+    said = str(arbitration.get("reasoning") or "").strip() if isinstance(arbitration, Mapping) else ""
+    found = ((result or {}).get("adversary") or {}).get("objections") or []
+    claims = (str(o.get("claim") or "") if isinstance(o, Mapping) else str(o) for o in found)
+    return said or reason, [c.strip() for c in claims if c.strip()]
 
 
 def one_line(text: str) -> str:
