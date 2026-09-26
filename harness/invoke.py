@@ -129,7 +129,7 @@ def invoke_graphs(
             except (ContractViolation, RunnerError) as exc:
                 # continue-and-quarantine: this one is set aside with its
                 # diagnosis, the rest of the fan-out finishes.
-                failures.append(f"{invocation.id}: {exc}")
+                failures.append(f"{invocation.id}: {_bounded(str(exc))}")
     except SystemExit:
         # A SIGTERM arrives here as SystemExit (harness/cli.py `_exit_on_sigterm`):
         # drop the queue and leave; `main` stops the nodes already running.
@@ -143,6 +143,13 @@ def invoke_graphs(
     ordered = [results[key] for key in sorted(results)]
     proposals = [item for result in ordered for item in result.get("proposals", [])]
     return ordered, proposals, sorted(failures)
+
+
+def _bounded(text: str) -> str:
+    """`text` unchanged, or its first line (at most 200 chars) plus a note when it is over 2,000 chars or starts with `{`."""
+    if len(text) <= 2000 and not text.startswith("{"):
+        return text
+    return f"{(text.splitlines() or [''])[0][:200]} (message truncated)"
 
 
 def _refuse_malformed(invocations: Sequence[Invocation], *, specs: Mapping[str, GraphSpec]) -> None:
