@@ -1,4 +1,17 @@
-"""Resolve a traces URL to a pyarrow filesystem and root; `redact_url` is the only form of a URL to show."""
+"""Resolve a traces URL to a pyarrow filesystem and root; `redact_url` is the only form of a URL to show.
+
+The provider profile may carry an optional `object_store` block for an S3-compatible server:
+
+    object_store:
+      endpoint: http://garage.lan:3900      # no scheme defaults to https
+      region: garage                        # optional
+      access_key_env: GARAGE_ACCESS_KEY_ID  # the NAME of the env var holding the key, never the key
+      secret_key_env: GARAGE_SECRET_ACCESS_KEY
+      path_style: true                      # optional, default true
+
+Credentials come only from the environment. A literal `access_key`, `secret_key` or `secret` is refused.
+Without the block, the AWS_REGION, AWS_DEFAULT_REGION and AWS_ENDPOINT_URL variables apply.
+"""
 
 from __future__ import annotations
 
@@ -38,7 +51,35 @@ def redact_url(url: str) -> str:
     return scheme + rest.split("?", 1)[0].split("#", 1)[0]
 
 
-def _s3_options(env: Mapping[str, str]) -> dict[str, Any]:
+_LITERAL_KEYS = ("access_key", "secret_key", "secret")
+
+
+def _env_value(env: Mapping[str, str], name: str) -> str:
+    value = env.get(name)
+    if not value:
+        raise ValueError(f"object_store names env var {name}, which is not set")
+    return value
+
+
+def _block_options(env: Mapping[str, str], block: Mapping[str, Any]) -> dict[str, Any]:
+    literal = next((key for key in _LITERAL_KEYS if key in block), None)
+    if literal is not None:
+        raise ValueError(f"object_store must not hold a literal {literal}: name an env var in {literal}_env")
+    endpoint = block.get("endpoint")
+    parts = urlsplit(endpoint if endpoint and _SCHEME.match(endpoint) else f"https://{endpoint}")
+    # No *_env names leaves the credentials to pyarrow's default chain.
+    return {
+        **({"scheme": parts.scheme, "endpoint_override": parts.netloc + parts.path.rstrip("/")} if endpoint else {}),
+        **({"region": block["region"]} if block.get("region") else {}),
+        **({"access_key": _env_value(env, block["access_key_env"])} if block.get("access_key_env") else {}),
+        **({"secret_key": _env_value(env, block["secret_key_env"])} if block.get("secret_key_env") else {}),
+        "force_virtual_addressing": not block.get("path_style", True),
+    }
+
+
+def _s3_options(env: Mapping[str, str], object_store: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    if object_store:
+        return _block_options(env, object_store)
     region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION")
     endpoint = env.get("AWS_ENDPOINT_URL")
     return {
@@ -47,7 +88,12 @@ def _s3_options(env: Mapping[str, str]) -> dict[str, Any]:
     }
 
 
-def resolve_traces_root(url: str | None, runs_dir: Path, env: Mapping[str, str]) -> TracesRoot:
+def resolve_traces_root(
+    url: str | None,
+    runs_dir: Path,
+    env: Mapping[str, str],
+    object_store: Mapping[str, Any] | None = None,
+) -> TracesRoot:
     if not url:
         return _local(str(runs_dir / "traces"))
     if not _SCHEME.match(url):
@@ -68,7 +114,7 @@ def resolve_traces_root(url: str | None, runs_dir: Path, env: Mapping[str, str])
 
         prefix = parts.path.strip("/")
         path = f"{parts.netloc}/{prefix}" if prefix else parts.netloc
-        return TracesRoot(S3FileSystem(**_s3_options(env)), path)
+        return TracesRoot(S3FileSystem(**_s3_options(env, object_store)), path)
     raise ValueError(f"unsupported traces url scheme {parts.scheme!r}: {redact_url(url)}")
 
 
