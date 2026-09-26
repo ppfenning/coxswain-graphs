@@ -44,7 +44,7 @@ import logging
 import subprocess
 import sys
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -55,8 +55,9 @@ from core.manifest import append_ledger, build_manifest, gate_diff
 from core.workstore import WorkStoreError, record_attempt
 
 from graphs._contract import proposal
+from graphs.delivery import rescue_review
 from graphs.delivery.lifecycle_propose import DEFAULT_FIX_ATTEMPTS
-from harness import work_mirror
+from harness import rescue_checks, rescue_select, work_mirror
 from harness.autonomy import split_by_policy
 from harness.cause_model import cause_evidence, classify_with_model, one_line
 from harness.cause_rule import classify_cause
@@ -94,7 +95,7 @@ from harness.worktree import (
 from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import LimitStop, RunnerError
 
-__all__ = ["branch_action", "phase_order", "phase_parents", "run_epic"]
+__all__ = ["branch_action", "phase_order", "phase_parents", "rescue_task", "run_epic"]
 
 _log = logging.getLogger(__name__)
 
@@ -1062,9 +1063,10 @@ def _quarantine_task(
     phase: str,
     task: str,
     reason: str,
-    kind: Literal["refused", "no_work", "unverified", "infra"],
+    kind: Literal["refused", "no_work", "unverified", "infra", "rescue_failed"],
     detail: str | None = None,
     result: Mapping[str, Any] | None = None,
+    cause: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a task's quarantine entry AND leave a record on its own work item.
 
@@ -1098,13 +1100,16 @@ def _quarantine_task(
     text. A classifier failure records `unknown` and never blocks the
     quarantine. The session limit is not a failure of the task: it propagates
     before anything is written, so the run pauses with no attempt recorded.
+
+    `cause`, a (cause, cause_why) the caller already knows, replaces that judgment.
+    `rescue_task` passes it for `rescue_failed`, whose cause a rule fixed.
     """
     stale = _fenced(ctx)
     if stale is not None:
         # A stale leader records no attempt anywhere, so it is not an attempt either.
         return {"id": task, "phase": phase, "grain": "task", "reason": f"{stale}; not recorded: {reason}", "kind": "no_work"}
     # Before any write, so a `LimitStop` from the classifier leaves nothing half recorded.
-    judged = _cause_of(ctx.runner, kind, reason, result, task) if ctx.store is not None else None
+    judged = (cause or _cause_of(ctx.runner, kind, reason, result, task)) if ctx.store is not None else None
     patch_kept = kind in ("unverified", "infra")
     entry: dict[str, Any] = {"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": kind}
     if patch_kept:
@@ -2607,3 +2612,192 @@ def _rebase_base(item: Mapping[str, Any]) -> str:
     write from the one that was decided.
     """
     return str(item.get("suggested_action") or "").rsplit(" onto ", 1)[-1].strip()
+
+
+# ── rescue: a kept patch the harness, not the builder, failed to land ────────
+
+
+RESCUE_PRINCIPAL = "epic-swarm(rescue-review)"
+
+
+def _rescue_failed(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, reason: str, failed_checks: bool) -> dict[str, Any]:
+    """The task stays quarantined: a `rescue_failed` attempt carrying the rule's cause, and a quarantined task row."""
+    task = str(item["id"])
+    cause, cause_why = rescue_select.rescue_cause(failed_checks)
+    entry = _quarantine_task(
+        ctx, {task: dict(item)}, phase=phase, task=task, reason=reason, kind="rescue_failed", cause=(cause, cause_why)
+    )
+    _record_tasks(ctx, phase, [], [entry])
+    return {"status": "rescue_failed", "reason": reason, "cause": cause}
+
+
+def with_stored_rescues(item: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """`item` with the store's `rescue_failed` attempts folded into its own, in ts order.
+
+    core's ATTEMPT_KINDS has no `rescue_failed`, so the work file never holds one and the store row is the
+    record. A row no older than the first attempt on the current body is stamped with that body's sha.
+    """
+    current = workstore.body_sha(item["body"])
+    since = min((str(a.get("ts") or "") for a in item["attempts"] if a.get("body_sha", current) == current), default=None)
+    stored = [
+        {
+            "run": row["run_id"],
+            "phase": row["phase_id"],
+            "kind": row["kind"],
+            "reason": row["reason"],
+            "ts": row["ts"],
+            "cause": row["cause"],
+            "body_sha": current if since is not None and str(row["ts"]) >= since else "before the current body",
+        }
+        for row in rows
+        if row["kind"] == rescue_select.RESCUE_KIND
+    ]
+    return {**item, "attempts": sorted([*item["attempts"], *stored], key=lambda a: str(a.get("ts") or ""))}
+
+
+def _stored_rescues(ctx: _Ctx, task: str) -> list[dict[str, Any]]:
+    """The store's `rescue_failed` attempts for `task`, any run. Empty without a store."""
+    if ctx.store is None:
+        return []
+    cols = ("run_id", "phase_id", "kind", "reason", "ts", "cause")
+    mark = ctx.store.conn.dialect.placeholder
+    sql = f"SELECT {', '.join(cols)} FROM attempts WHERE task_id = {mark} AND kind = {mark}"
+    return [dict(zip(cols, row, strict=True)) for row in ctx.store.conn.query_all(sql, (task, rescue_select.RESCUE_KIND))]
+
+
+def _record_rescue_gate(ctx: _Ctx, phase: str, move: Mapping[str, Any], diff: Mapping[str, Any], minutes: float) -> None:
+    """Ledger the gate's decision on a rescue's move, as `_run_phase` ledgers a phase batch's.
+
+    Keyed per task, since the store ignores a second gate row under the same run, phase and seq.
+    """
+    task = str(move["target"])
+    manifest = build_manifest(
+        run_id=f"{ctx.run_id}:{phase}:{task}",
+        ts=_now(),
+        principal=RESCUE_PRINCIPAL,
+        cartridge=ctx.cartridge,
+        provider_profile=ctx.provider_profile,
+        proposals=[dict(move)],
+        gate_diffs=[dict(diff)],
+        human_minutes=minutes,
+        totals={"rescued": 1, "auto_applied": 0, "gated": 1},
+    )
+    if _fenced(ctx) is not None:
+        return
+    append_ledger(manifest, ledger_path=ctx.ledger_path)
+    if ctx.store is not None:
+        for row in ledger.read(ctx.ledger_path):
+            if row.get("run_id") == manifest["run_id"]:
+                ctx.store.record_ledger(row, epoch=ctx.epoch)
+        ctx.store.record_gate_decisions(ctx.run_id, f"{phase}:{task}", [diff], epoch=ctx.epoch)
+
+
+def _rescue_move(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, evidence: list[dict[str, Any]]) -> tuple[bool, str]:
+    """The approved task's `state_move`, through `split_by_policy` and `gate` as a build's is.
+
+    Executed on the built-in workstore arm whatever arm the cartridge names, so the write is code and never
+    a model call. The caller has already checked there is a work file or an authoritative store to write.
+    """
+    task = str(item["id"])
+    move = {
+        **proposal(
+            ctx.cartridge,
+            kind="state_move",
+            target=task,
+            evidence=evidence,
+            rationale=f"{task} was rescued: its kept patch passed the harness's checks and review",
+            suggested_action=f"mark {task} approved",
+        ),
+        **state_move_apply(item.get("path"), "approved"),
+    }
+    auto, gated = split_by_policy(
+        [move], cartridge=ctx.cartridge, ledger_path=ctx.ledger_path, provider_profile=ctx.provider_profile
+    )
+    decisions, minutes = gate(gated, assume=ctx.assume)
+    decision, edited = ("approved", False) if auto else (decisions[0][1], decisions[0][2])
+    kinds = ctx.cartridge.get("write_kinds") or {}
+    code_arm = replace(
+        ctx,
+        cartridge={**ctx.cartridge, "write_kinds": {**kinds, "state_move": {**(kinds.get("state_move") or {}), "apply_arm": "workstore"}}},
+    )
+    state = _Execution(landed={}, merged={}, moved={}, quarantined=[])
+    applied, detail = (
+        _execute(code_arm, move, slot="state_move", subject=task, phase=phase, state=state, by_id={task: dict(item)})
+        if decision == "approved"
+        else (False, "the gate refused the move")
+    )
+    if gated:
+        _record_rescue_gate(ctx, phase, move, gate_diff(move, decision, applied=applied, edited=edited), minutes)
+    return applied, detail
+
+
+def rescue_task(ctx: _Ctx, item: Mapping[str, Any], *, phase: str) -> dict[str, Any]:
+    """Harness checks on a quarantined task's kept patch, one review round, then a gated move to `approved` or `rescue_failed`."""
+    task = str(item["id"])
+    attempts = item.get("attempts") or []
+    saved = load_result(ctx.runs_dir, attempts[-1]["run"], phase, task) if attempts else None
+    patch = rescue_select.patch_of(saved)
+    ok, why = rescue_select.eligible(with_stored_rescues(item, _stored_rescues(ctx, task)), patch)
+    if not ok or patch is None:
+        return {"status": "not_eligible", "why": why}
+    if not item.get("path") and not _store_authoritative(ctx):
+        # With nothing to write in code, the workstore arm would fall back to a model call.
+        return {"status": "not_eligible", "why": "no work file to move and no authoritative store"}
+
+    def apply(worktree: Path, text: str) -> str | None:
+        link_venv(ctx.repo, worktree)  # as `_build_task` does, so the checks find the same interpreter
+        applied, detail = apply_patch(text, worktree)
+        return None if applied else detail
+
+    verified = rescue_checks.verify_patch(
+        ctx.repo, ctx.phase_branch(phase), patch, ctx.checks, apply=apply, workdir=ctx.worktree_root / ctx.run_id
+    )
+    if not verified["passed"]:
+        return _rescue_failed(ctx, item, phase=phase, reason=str(verified["reason"]), failed_checks=True)
+
+    rows = verified["rows"]
+    evidence = [*((saved or {}).get("evidence") or []), *rows]
+    _save_result(
+        ctx,
+        {**_without_cause(saved or {}), "initiative": ctx.initiative_id, "phase": phase, "evidence": evidence},
+        phase=phase,
+        task=task,
+    )
+    graph = rescue_review.run(
+        {
+            "run_id": f"{ctx.run_id}:{phase}:{task}",
+            "date": ctx.date,
+            "ticket": task,
+            "ticket_title": item.get("title") or "",
+            "ticket_body": item.get("body") or "",
+            "cartridge": ctx.cartridge,
+            "surfaces": list(item.get("surfaces") or []),
+            "patterns": list(item.get("patterns") or []),
+            "patch": patch,
+            "evidence": rows,
+        },
+        ctx.runner,
+    )
+    if graph.get("failed_node") or (graph.get("fix_loop") or {}).get("review_placeholder"):
+        return {"status": "review_failed", "why": str(graph.get("failed_node_reason") or "review placeholders")}
+    if graph.get("verdict") != "approve":
+        rationale = str((graph.get("review") or {}).get("rationale") or "no rationale given")
+        return _rescue_failed(ctx, item, phase=phase, reason=f"rescue review revised: {rationale}", failed_checks=False)
+
+    _save_result(
+        ctx, {**graph, "initiative": ctx.initiative_id, "phase": phase, "evidence": evidence}, phase=phase, task=task
+    )
+    applied, detail = _rescue_move(
+        ctx,
+        item,
+        phase=phase,
+        evidence=[
+            {"check": "review_charter verdict", "output": str((graph.get("review") or {}).get("verdict"))},
+            *({"check": row["command"], "output": row["output"]} for row in rows),
+        ],
+    )
+    if not applied:
+        _record_tasks(ctx, phase, [], [{"id": task, "grain": "task"}])
+        return {"status": "move_refused", "why": detail}
+    _record_tasks(ctx, phase, [{"id": task, "status": "approved", "state": "approved"}], [])
+    return {"status": "approved", "detail": detail}
