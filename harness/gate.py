@@ -5,11 +5,13 @@ from __future__ import annotations
 import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+from core import workstore
 from core.manifest import gate_diff
 
-__all__ = ["APPLY_SCHEMA", "apply_arm_for", "apply_decisions", "auto_apply", "gate"]
+__all__ = ["APPLY_SCHEMA", "apply_arm_for", "apply_decisions", "auto_apply", "gate", "workstore_route"]
 
 # What an apply arm must report back. Small on purpose: the arm says whether it
 # landed the write and names what it touched, and nothing else — a verbose arm
@@ -30,6 +32,49 @@ def apply_arm_for(kind: str, cartridge: dict[str, Any]) -> str | None:
     return spec.get("apply_arm") if isinstance(spec, Mapping) else None
 
 
+# The model-arm role for each kind the built-in workstore arm can carry out in code.
+_FALLBACK_ROLE = {
+    "state_move": "work_state_arm",
+    "item_create": "work_item_arm",
+    "item_update": "work_item_arm",
+}
+
+
+def workstore_route(kind: str, apply: object) -> tuple[str, dict[str, Any]]:
+    """Choose `state_move`, `item_create`, `item_update` or `fallback` from a kind and its `apply` payload.
+
+    A missing or wrong-typed field is never repaired: the route is `fallback`.
+    """
+    if not isinstance(apply, Mapping) or not isinstance(apply.get("path"), str):
+        return "fallback", {}
+    path = apply["path"]
+    if kind == "state_move" and isinstance(apply.get("state"), str):
+        return kind, {"path": path, "state": apply["state"]}
+    if kind in ("item_create", "item_update") and isinstance(apply.get("item"), dict):
+        return kind, {"path": path, "item": apply["item"]}
+    return "fallback", {}
+
+
+def _apply_workstore(route: str, fields: dict[str, Any]) -> tuple[bool, str]:
+    """The edge: perform the workstore write a route chose. Errors come back as values."""
+    path = fields["path"]
+    try:
+        if route == "state_move":
+            workstore.set_state(path, fields["state"])
+            return True, f"{path} moved to state '{fields['state']}'"
+        exists = Path(path).exists()
+        if route == "item_create" and exists:
+            return False, f"refused: {path} already exists"
+        if route == "item_update":
+            if not exists:
+                return False, f"refused: {path} does not exist"
+            workstore.read_item(path)
+        workstore.write_item(fields["item"], path)
+        return True, f"{path} {'created' if route == 'item_create' else 'updated'}"
+    except (OSError, ValueError, workstore.WorkStoreError) as error:
+        return False, str(error)
+
+
 def auto_apply(
     item: dict[str, Any],
     *,
@@ -40,13 +85,22 @@ def auto_apply(
 
     An apply arm is a ROLE, so the same runner that ran the read-only nodes runs
     the write. `pr` has no executor here and is handed back to the gate rather
-    than quietly reported as done.
+    than quietly reported as done. `workstore` is built in: it applies the
+    proposal's `apply` payload in code, and falls back to the model arm when
+    that payload is absent or malformed.
     """
     arm = apply_arm_for(item["kind"], cartridge)
     if arm in (None, "pr"):
         return False, f"no executable apply arm for '{item['kind']}' (arm: {arm})"
     if arm == "shell":
         return False, "shell-armed kinds are applied by the run path that owns them"
+    if arm == "workstore":
+        route, fields = workstore_route(item["kind"], item.get("apply"))
+        if route != "fallback":
+            return _apply_workstore(route, fields)
+        arm = _FALLBACK_ROLE.get(item["kind"])
+        if arm is None:
+            return False, f"the workstore arm does not apply to '{item['kind']}'"
     result = runner.run(
         role=arm,
         tier="standard",
