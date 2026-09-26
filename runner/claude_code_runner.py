@@ -262,6 +262,19 @@ _TRANSIENT_ERRORS = ("safeguards flagged", "reasoning_extraction", "error_max_st
 _LIMIT_BANNER_RE = re.compile(r"you've hit your session limit|usage limit", re.IGNORECASE)
 
 
+def is_limit_banner(payload: Mapping[str, Any]) -> bool:
+    """Pure: is the whole result text the account's limit banner?
+
+    An answer that merely mentions "usage limit" (a patch to limit handling)
+    is not the banner, so a structured answer, or result text that is a JSON
+    object, never is.
+    """
+    if isinstance(payload.get("structured_output"), dict):
+        return False
+    text = str(payload.get("result") or "").strip()
+    return not text.startswith("{") and _LIMIT_BANNER_RE.search(text) is not None
+
+
 def _is_transient(payload: Mapping[str, Any]) -> bool:
     """Pure: is this error about the call rather than about the node's work?
 
@@ -1266,7 +1279,7 @@ class ClaudeCodeRunner:
         # text is the banner. It is ledgered like every call that ends a node
         # — the invariant at the BudgetStop path above — and then pauses the
         # run instead of quarantining the task (arbiter, graphs-limit-pause-3).
-        if _LIMIT_BANNER_RE.search(str(payload.get("result") or "")):
+        if is_limit_banner(payload):
             self._append_call_ledger(call, ok=False, error="account session limit")
             raise LimitStop(detail=str(payload["result"]))
         data = payload.get("structured_output")
