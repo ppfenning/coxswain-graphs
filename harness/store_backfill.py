@@ -38,6 +38,11 @@ Attempts with a null cause get the rule in harness/cause_rule.py applied to kind
 when it matches nothing. No model is called. Only nulls are written, so a rerun fills nothing and a cause
 set by the driver or a human stays. cause_why stays null. The report gains one flat key per cause,
 `cause_filled_<cause>`, counting the rows filled; flat so `balanced` does not read them as import counts.
+
+`--refill-causes` also recomputes attempts whose cause_why starts `rule:`, the driver's mark for a
+rule-made cause, and changes the cause when the rule now says otherwise. Rows the backfill filled have a
+null cause_why, and model-made and human causes carry other text, so none of them are touched. The changes
+are counted in `cause_refilled_<cause>`, present only with the flag.
 """
 
 from __future__ import annotations
@@ -81,6 +86,8 @@ TASK_RECORDS_KEY = "task_records_imported"
 MALFORMED_TASK_RECORDS_KEY = "malformed_task_records"
 NEVER_RECORDED_STATUS = "never_recorded"
 CAUSE_FILLED_PREFIX = "cause_filled_"
+CAUSE_REFILLED_PREFIX = "cause_refilled_"
+RULE_WHY_PATTERN = "rule:%"  # what the driver writes to cause_why for a rule-made cause (harness/epic.py)
 
 
 class ArchiveRefused(RuntimeError):
@@ -451,17 +458,44 @@ def _fill_causes(store: Store) -> dict[str, int]:
     return filled
 
 
+def _refill_causes(store: Store) -> dict[str, int]:
+    """Recompute the cause of attempts whose cause_why starts `rule:`. Rows changed per new cause.
+
+    Model-made, human-made and null-why rows never match. A row the rule no longer matches keeps its cause.
+    The pattern is a parameter so the `%` is not read as a placeholder by the postgres driver.
+    """
+    mark = store.conn.dialect.placeholder
+    update = (
+        f"UPDATE attempts SET cause = {mark} WHERE run_id = {mark} AND task_id = {mark} AND seq = {mark} "
+        f"AND cause_why LIKE {mark} AND cause <> {mark}"
+    )
+    changed: dict[str, int] = {}
+    with store.conn.transaction():
+        pending = store.conn.query_all(
+            f"SELECT run_id, task_id, seq, kind, reason FROM attempts WHERE cause_why LIKE {mark} ORDER BY run_id, task_id, seq",
+            (RULE_WHY_PATTERN,),
+        )
+        for run_id, task_id, seq, kind, reason in pending:
+            cause = classify_cause(kind or "", reason or "")
+            if cause is not None:
+                n = store.conn.execute(update, (cause, run_id, task_id, seq, RULE_WHY_PATTERN, cause))
+                changed = {**changed, cause: changed.get(cause, 0) + n}
+    return changed
+
+
 def backfill(
     store: Store,
     runs_dir: Path | str,
     work_dir: Path | str,
     ledger_path: Path | str,
     task_records_updated_at: str | None = None,
+    refill_causes: bool = False,
 ) -> Report:
     """Import everything under the three paths, then stamp ended the runs that have a usage file.
 
     A second run inserts nothing: every row counts as already present, and no run is stamped twice.
     Task records are upserted, stamped `task_records_updated_at` or else each file's mtime.
+    `refill_causes` also recomputes rule-made causes, reported as `cause_refilled_<cause>`.
     """
     report = new_report()
     skipped = [p for p in run_files(runs_dir) if is_non_record(p.name)]
@@ -473,9 +507,13 @@ def backfill(
     task_records, bad_task_records = _import_task_records(store, Path(runs_dir), task_records_updated_at)
     stamped = _stamp_ended(store, Path(runs_dir))
     caused = cause_report(_fill_causes(store))
+    refilled = (
+        {f"{CAUSE_REFILLED_PREFIX}{c}": n for c, n in _refill_causes(store).items()} if refill_causes else {}
+    )
     return {
         **report,
         **caused,
+        **refilled,
         STAMPED_KEY: stamped,
         SKIPPED_KEY: len(skipped),
         MALFORMED_KEY: malformed,
@@ -513,10 +551,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("work_dir", help="directory of task markdown files")
     parser.add_argument("ledger", help="the ledger file, one JSON object per line")
     parser.add_argument("store_url", help="sqlite:///<absolute path> or postgresql://...")
+    parser.add_argument(
+        "--refill-causes",
+        action="store_true",
+        help="also recompute causes whose cause_why starts 'rule:'; model-made and human causes stay",
+    )
     args = parser.parse_args(argv)
     conn = open_store(args.store_url, datetime.now(UTC).isoformat())
     try:
-        report = backfill(Store(conn), args.runs_dir, args.work_dir, args.ledger)
+        report = backfill(Store(conn), args.runs_dir, args.work_dir, args.ledger, refill_causes=args.refill_causes)
     finally:
         conn.close()
     print(json.dumps(report, indent=2, sort_keys=True))
