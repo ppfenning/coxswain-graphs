@@ -31,7 +31,7 @@ def classify_cause(kind: str, reason: str) -> Cause | None:
         return "harness"
     if "worktree" in reason and "could not be" in reason:
         return "harness"
-    if "configured check failed" in reason:
+    if "configured check failed" in reason or "configured checks failed" in reason:
         return "code"
     if kind == "no_work":
         return "ticket"
