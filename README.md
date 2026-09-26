@@ -94,6 +94,7 @@ A graph is `run(args, runner) -> dict`. It owns sequence and nothing else:
 | `sweep` | ops | sweep_plan → sweep_apply → sweep_verify → [review pair]. One rule applied everywhere it matches; sweep_apply calls a model only when the rule can't be scripted, one build call, and sweep_verify runs no model at all |
 | `coxswain` | ops | one `dispatch` node over a driver-assembled docket. Selects; the harness invokes |
 | `review-diff` | delivery | review_charter → review_adversary → verify_evidence → [arbitrate]. Verdict and findings out, nothing written or pushed |
+| `rescue-review` | delivery | handoff → review_charter → review_adversary → [arbitrate] → emit. A patch that already exists, reviewed with the harness's own check results |
 
 Each graph's diagram is generated from its own docstring by `python -m harness.graphdoc`; the committed pages live under [`docs/graphs/`](docs/graphs/index.md).
 
