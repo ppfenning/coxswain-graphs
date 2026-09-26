@@ -31,7 +31,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
 
       # agent-cartridges is a PRIVATE sibling repo and the default GITHUB_TOKEN
@@ -65,10 +65,10 @@ jobs:
       - name: ruff (rules in pyproject.toml; pre-commit mirrors it)
         run: pip install ruff==0.16.6 && ruff check .
 
-  # The suite on Python 3.14, the version Pat wants as primary. Not in the branch
-  # ruleset, which requires `test` by name, so a red run here is a finding, not a
-  # merge block. Swapping which version `test` runs is a later step.
-  py314:
+  # The suite on Python 3.12, the supported floor. Not in the branch ruleset,
+  # which requires `test` by name, so a red run here is a finding, not a merge
+  # block.
+  py312:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.14"
+          python-version: "3.12"
           cache: pip
       - name: Check out the substrate (optional)
         if: env.SUBSTRATE_TOKEN != ''
