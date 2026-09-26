@@ -22,9 +22,21 @@ _LIMIT_MARKERS: tuple[str, ...] = (
     "usage limit",
 )
 
+# An expired or missing credential means the node never ran. Lowercase, matched
+# against the lowercased reason.
+_AUTH_MARKERS: tuple[str, ...] = (
+    "failed to authenticate",
+    "oauth session expired",
+    "not logged in",
+    "invalid api key",
+    "authentication_error",
+)
+
 
 def classify_cause(kind: str, reason: str) -> Cause | None:
-    """A budget, turn or session limit stop first, then harness, code, ticket; None when no rule matches."""
+    """An authentication failure first, then a budget, turn or session limit stop, then harness, code, ticket; None when no rule matches."""
+    if any(marker in reason.lower() for marker in _AUTH_MARKERS):
+        return "harness"
     if any(marker in reason.lower() for marker in _LIMIT_MARKERS):
         return "harness"
     if kind == "infra" or "patch did not apply" in reason:
