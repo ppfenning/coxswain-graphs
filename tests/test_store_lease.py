@@ -147,6 +147,27 @@ def test_epoch_never_decreases_across_a_mixed_sequence(conn):
     assert seen[-1] == 4
 
 
+def _held_at_epoch_three_by_a(conn):
+    for _ in range(3):
+        acquire(conn, NAME, "a", T0, 30)
+
+
+def test_steal_on_a_lease_held_by_a_at_epoch_three_gives_b_epoch_four(conn):
+    _held_at_epoch_three_by_a(conn)
+    assert acquire(conn, NAME, "b", T10, 30, steal=True) == LeaseResult(True, 4, "b")
+    assert _epoch(conn) == 4
+
+
+def test_a_renew_by_the_robbed_holder_at_epoch_three_fails(conn):
+    _held_at_epoch_three_by_a(conn)
+    acquire(conn, NAME, "b", T10, 30, steal=True)
+    assert renew(conn, NAME, "a", 3, T10, 30) is False
+
+
+def test_steal_on_a_free_lease_is_a_plain_acquire(conn):
+    assert acquire(conn, NAME, "b", T0, 30, steal=True) == LeaseResult(True, 1, "b")
+
+
 def test_no_sql_uses_a_forbidden_construct_and_placeholders_follow_the_dialect():
     assert [forbidden_constructs(s) for s in SQL] == [()] * len(SQL)
     assert all("?" not in _sql(POSTGRES, s) for s in SQL)
