@@ -33,9 +33,14 @@ _AUTH_MARKERS: tuple[str, ...] = (
 )
 
 
+def is_auth_failure(reason: str) -> bool:
+    """True when the reason carries an authentication marker; `classify_cause` asks the same."""
+    return any(marker in reason.lower() for marker in _AUTH_MARKERS)
+
+
 def classify_cause(kind: str, reason: str) -> Cause | None:
     """An authentication failure first, then a budget, turn or session limit stop, then harness, code, ticket; None when no rule matches."""
-    if any(marker in reason.lower() for marker in _AUTH_MARKERS):
+    if is_auth_failure(reason):
         return "harness"
     if any(marker in reason.lower() for marker in _LIMIT_MARKERS):
         return "harness"

@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 
 from harness import cause_rule
-from harness.cause_rule import CAUSES, classify_cause
+from harness.cause_rule import CAUSES, classify_cause, is_auth_failure
 
 
 def test_the_closed_set_of_causes():
@@ -32,6 +32,19 @@ def test_a_no_work_that_failed_to_authenticate_is_harness():
         '{"type":"error","error":{"type":"authentication_error","message":"OAuth session expired"}}'
     )
     assert classify_cause("no_work", reason) == "harness"
+
+
+def test_is_auth_failure_is_true_for_an_expired_session_failure():
+    reason = (
+        "graphs-todo-is-not-ready-core: node 'scope_epic' failed in claude: "
+        '{"subtype": "success", "result": "Failed to authenticate: OAuth session expired and could not be '
+        'refreshed", "num_turns": 1, "duration_ms": 40}'
+    )
+    assert is_auth_failure(reason) is True
+
+
+def test_is_auth_failure_is_false_for_a_failed_check():
+    assert is_auth_failure("x: node 'build' failed in claude: configured check failed") is False
 
 
 def test_a_no_work_with_no_authentication_marker_is_still_ticket():
