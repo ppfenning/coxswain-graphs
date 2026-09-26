@@ -1221,6 +1221,40 @@ def test_a_limitstop_halts_the_phase_before_the_next_task_in_batch_order(repo, c
     assert not t2_item.get("attempts")
 
 
+class AuthFailRunner(Runner):
+    """Every invocation fails the way a lapsed Claude login does."""
+
+    def run(self, *, role, **_):
+        raise RunnerError(
+            f"node '{role}' failed in claude: "
+            '{"subtype": "success", "result": "Failed to authenticate: OAuth session expired and could not '
+            'be refreshed", "num_turns": 1, "duration_ms": 40}'
+        )
+
+
+def test_a_phase_that_cannot_authenticate_stops_the_run_and_leaves_later_phases_alone(
+    repo, cart, tmp_path, capsys
+) -> None:
+    wi = tmp_path / "wi"
+    for phase, task, needs in (("p1-foundations", "t1-probe", "[]"), ("p2-rollout", "t3-cutover", "[t1-probe]")):
+        (wi / phase).mkdir(parents=True)
+        (wi / phase / f"{task}.md").write_text(
+            f"---\nid: {task}\nphase: {phase}\nstate: ready\nneeds: {needs}\nsurfaces: []\n"
+            f"title: {task}\n---\n\nbody of {task}\n"
+        )
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    work = workstore.read_initiative(wi)
+    result, _ = drive(repo, cart, tmp_path, runner=AuthFailRunner({}), work=work, run_id="epic-auth")
+
+    assert [p["phase"] for p in result["phases"]] == ["p1-foundations"]
+    assert result["phases"][0]["stopped"].startswith("the runner cannot authenticate: t1-probe: ")
+    assert [q["id"] for q in result["quarantined"]] == ["t1-probe"]
+    assert workstore.read_item(wi / "p2-rollout" / "t3-cutover.md")["state"] == "ready"
+    assert any(line.startswith("  run stopped:") for line in capsys.readouterr().out.splitlines())
+
+
 def test_an_ordinary_runnererror_still_quarantines_and_records_an_attempt(repo, cart, tmp_path) -> None:
     """`LimitStop`'s new catch does not change how any other `RunnerError` is handled."""
     wi = tmp_path / "wi"

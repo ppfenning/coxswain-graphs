@@ -60,7 +60,7 @@ from graphs.delivery.lifecycle_propose import DEFAULT_FIX_ATTEMPTS
 from harness import rescue_checks, rescue_select, work_mirror
 from harness.autonomy import split_by_policy
 from harness.cause_model import cause_evidence, classify_with_model, one_line
-from harness.cause_rule import classify_cause
+from harness.cause_rule import classify_cause, is_auth_failure
 from harness.checks import (
     HARNESS_FAULT_PREFIX,
     _tail_lines,
@@ -992,6 +992,9 @@ def run_epic(
             proposals.extend(record.pop("batch"))
             stacks_rebased += 1 if record.get("rebased") else 0
             add_phase(record)
+            if record.get("stopped"):
+                print(f"  run stopped: {record['stopped']}; later phases not run")
+                break
             if record["status"] == "complete":
                 complete.add(phase)
 
@@ -1756,6 +1759,10 @@ def _run_phase(
                     ctx, by_id, phase=phase, task=failure.split(":", 1)[0], reason=failure, kind="no_work"
                 )
             )
+        # A lapsed login fails every task in every later phase the same way.
+        first_auth = next((f for f in failures if is_auth_failure(f)), None)
+        if first_auth is not None:
+            record["stopped"] = f"the runner cannot authenticate: {first_auth[:200]}"
     # Every result — fresh or reused — is saved under THIS run, so the next
     # resume has one place to look and the record of what ran is complete.
     results = [*reused, *results]
