@@ -28,6 +28,7 @@ from runner.claude_code_runner import (
     _run_verify,
     _version_violations,
     apply_reported_patch,
+    call_cost,
     call_summary,
     files_touched_from_patch,
     is_safeguard_refusal,
@@ -1721,12 +1722,91 @@ def test_an_explicit_budget_on_the_resume_is_added_to_spent_too(sequenced_claude
     assert third[third.index("--max-budget-usd") + 1] == "3.4700", "0.97 spent plus the 2.50 override"
 
 
-def test_next_spent_accumulates_across_successes() -> None:
-    assert next_spent(next_spent(0.0, 0.02, stopped=False), 0.03, stopped=False) == 0.05
+def test_next_spent_is_the_reported_session_total() -> None:
+    assert next_spent(0.97) == 0.97
 
 
-def test_next_spent_on_a_stop_replaces_rather_than_adds() -> None:
-    assert next_spent(0.5, 0.97, stopped=True) == 0.97
+def test_a_first_call_costs_what_it_reported() -> None:
+    assert call_cost(0.0, 0.268, False) == 0.268
+
+
+def test_a_resumed_call_costs_the_rise_in_the_session_total() -> None:
+    assert call_cost(0.268, 0.361, True) == pytest.approx(0.093)
+
+
+def test_a_resumed_call_whose_total_fell_costs_what_it_reported() -> None:
+    assert call_cost(1.56, 0.67, True) == 0.67
+
+
+def test_a_resumed_thread_records_the_rise_and_budgets_on_the_session_total(sequenced_claude, tmp_path, conn) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    first, second = ({**OK, "total_cost_usd": usd} for usd in (0.30, 0.45))
+    set_sequence(first, second)
+    profile = {**PROFILE, "budget_usd": {"standard": 1.0}}
+    runner = ClaudeCodeRunner(
+        profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn)
+    )
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="build again", thread="T")
+
+    assert [c["cost_usd"] for c in runner.calls[:2]] == [0.30, pytest.approx(0.15)]
+    assert [r["cost_usd"] for r in _ledger_lines(conn, "r1")[:2]] == [0.30, pytest.approx(0.15)]
+    third = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[2])
+    assert third[third.index("--max-budget-usd") + 1] == "1.4500", "0.45 session total plus the 1.00 ceiling"
+
+
+def test_a_resumed_budget_stop_ledgers_the_rise_not_the_session_total(sequenced_claude, tmp_path, conn) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence({**OK, "total_cost_usd": 0.30}, {**REFUSED, "total_cost_usd": 0.45})
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn))
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    with pytest.raises(BudgetStop):
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+
+    assert [r["cost_usd"] for r in _ledger_lines(conn, "r1")] == [0.30, pytest.approx(0.15)]
+
+
+def test_a_resumed_thread_whose_total_fell_records_the_figure_itself(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence({**OK, "total_cost_usd": 0.30}, {**OK, "total_cost_usd": 0.10})
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+
+    assert [c["cost_usd"] for c in runner.calls] == [0.30, 0.10]
+
+
+def test_a_failed_attempt_does_not_move_the_baseline_the_next_success_is_priced_against(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    set_sequence({**OK, "total_cost_usd": 0.30}, {**SAFEGUARD, "total_cost_usd": 0.0}, {**OK, "total_cost_usd": 0.45})
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+
+    assert [c["cost_usd"] for c in runner.calls] == [0.30, pytest.approx(0.15)]
+    assert runner._threads["T"]["reported_usd"] == 0.45
+
+
+def test_a_resumed_success_without_a_total_keeps_the_session_total(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    untotalled = {k: v for k, v in OK.items() if k != "total_cost_usd"}
+    set_sequence({**OK, "total_cost_usd": 0.30}, untotalled, {**OK, "total_cost_usd": 0.45})
+    profile = {**PROFILE, "budget_usd": {"standard": 1.0}}
+    runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path)
+
+    for prompt in ("build it", "build more", "build again"):
+        runner.run(role="build", schema=SCHEMA, prompt=prompt, thread="T")
+
+    assert [c["cost_usd"] for c in runner.calls] == [0.30, None, pytest.approx(0.15)]
+    third = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[2])
+    assert third[third.index("--max-budget-usd") + 1] == "1.3000", "the missing total did not reset 0.30 to 0"
 
 
 # ── the ledger sees every billed attempt, not just the one that returns ─────
@@ -1820,7 +1900,7 @@ def test_a_patch_empty_retry_does_not_overwrite_the_failed_attempts_trace(tmp_pa
     assert ok_trace["structured_output"] == {"summary": "done"}
 
 
-def test_a_successful_resume_keeps_accumulating_spend(sequenced_claude, tmp_path, repo) -> None:
+def test_a_successful_resume_replaces_spend_with_the_reported_session_total(sequenced_claude, tmp_path, repo) -> None:
     script, set_sequence, _ = sequenced_claude
     argv_log = tmp_path / "argvs.jsonl"
     set_sequence(OK, REFUSED, OK, OK)
@@ -1834,8 +1914,8 @@ def test_a_successful_resume_keeps_accumulating_spend(sequenced_claude, tmp_path
     runner.run(role="build", schema=SCHEMA, prompt="again", thread="T")
 
     fourth = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[3])
-    assert fourth[fourth.index("--max-budget-usd") + 1] == "1.9900", \
-        "0.97 stop replaces call 1's 0.02, call 3's 0.02 success adds to reach 0.99, plus the 1.00 ceiling"
+    assert fourth[fourth.index("--max-budget-usd") + 1] == "1.0200", \
+        "call 3's 0.02 is a fresh session, so its total replaces the stop's 0.97, plus the 1.00 ceiling"
 
 
 def test_a_threaded_budget_stop_carries_the_scratch_as_a_partial_patch(sequenced_claude, tmp_path, repo) -> None:
@@ -1909,7 +1989,7 @@ def test_a_transient_failure_on_a_thread_retries_the_same_session_id(sequenced_c
 
     set_sequence(OK)
     runner.run(role="build", schema=SCHEMA, prompt="again", thread="T")
-    assert runner._threads["T"]["spent_usd"] == 0.04, "the failed attempt left the total untouched, only two successes counted"
+    assert runner._threads["T"]["spent_usd"] == 0.02, "the failed attempt left the total untouched, the session total is the last success's"
     third = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()][2]
     assert "--resume" in third and "--session-id" not in third, \
         "the counter only advanced once a call actually succeeded"

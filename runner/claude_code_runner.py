@@ -326,9 +326,23 @@ def _alt_model_for(tiers: Mapping[str, Any], tier: str, model: str) -> str:
     return names[(idx + 1) % len(names)]
 
 
-def next_spent(previous: float, reported_usd: float, stopped: bool) -> float:
-    """A stop's `total_cost_usd` is the session's, replacing; a success's is this call's, adding."""
-    return reported_usd if stopped else previous + reported_usd
+def next_spent(reported_usd: float) -> float:
+    """The CLI's `total_cost_usd` is the session's running total, so it replaces the spend and never adds."""
+    return reported_usd
+
+
+def call_cost(previous_reported: float, reported: float, resumed: bool) -> float:
+    """A resumed call's own cost is the rise in the session total; a fall means the session restarted."""
+    return reported if not resumed or reported < previous_reported else reported - previous_reported
+
+
+def thread_priced(previous_reported: float, reported: Any, resumed: bool) -> tuple[dict[str, float], float]:
+    """A threaded call's `cost_usd` override and the session's new last total; a missing total overrides nothing."""
+    return (
+        ({}, previous_reported)
+        if reported is None
+        else ({"cost_usd": call_cost(previous_reported, float(reported), resumed)}, float(reported))
+    )
 
 
 def _tool_result_text(content: Any) -> str:
@@ -1190,6 +1204,21 @@ class ClaudeCodeRunner:
             payload = self._payload(role, stdout)
             if not isinstance(payload, dict):
                 raise RunnerError(f"node '{role}': claude output is {type(payload).__name__}, expected an object")
+            # Wrong belief: a resumed call's `total_cost_usd` is its own spend.
+            # It is the session's running total: four resumed builds reported
+            # 0.268, 0.361, 0.449, 0.526 while their tokens priced at about
+            # 0.24, 0.12, 0.11, 0.10. The rises run 20-25% under the token price,
+            # so a resumed row is the CLI's own figure, not a re-pricing. A fall
+            # is read as a fresh session; that reads 1.56, 0.67, 0.86 as a
+            # restart then a 0.19 rise, and the store cannot say if it was one.
+            # Every threaded row is priced against the last total, but only a
+            # success or a budget stop moves that total.
+            priced: dict[str, float] = {}
+            reported_now = 0.0
+            if thread:
+                priced, reported_now = thread_priced(
+                    state.get("reported_usd", 0.0), payload.get("total_cost_usd"), state["calls"] > 0
+                )
             if not payload.get("is_error"):
                 if thread:
                     # Only a call that did not fail advances the thread's
@@ -1197,12 +1226,8 @@ class ClaudeCodeRunner:
                     # session behind for a `--resume` to find, so the retry
                     # must repeat the exact flags the failed attempt used.
                     state["calls"] += 1
-                    # A success's `total_cost_usd` is this call's own spend, not the
-                    # session's: three resumed builds on one ticket reported 1.56, 0.67,
-                    # 0.86 — falling then rising, which a cumulative figure cannot do.
-                    state["spent_usd"] = next_spent(
-                        state.get("spent_usd", 0.0), float(payload.get("total_cost_usd") or 0.0), stopped=False
-                    )
+                    state["reported_usd"] = reported_now
+                    state["spent_usd"] = next_spent(reported_now)
                 break
 
             # Name everything the CLI said about it. A bare `None` result was
@@ -1227,7 +1252,7 @@ class ClaudeCodeRunner:
                             role, tier, used_model, tools, payload, task,
                             ceiling_usd=shape_ceiling, ceiling_source=ceiling_source,
                         ),
-                        "id": call_id, **retry_extra,
+                        "id": call_id, **retry_extra, **priced,
                     },
                     ok=False, error=message,
                 )
@@ -1238,7 +1263,8 @@ class ClaudeCodeRunner:
                         # Leave `state` exactly as it was — same scratch, same
                         # `calls` — so a later `run(..., thread=same)` resumes
                         # this session instead of starting the node over.
-                        state["spent_usd"] = next_spent(state.get("spent_usd", 0.0), spent, stopped=True)
+                        state["reported_usd"] = reported_now
+                        state["spent_usd"] = next_spent(reported_now)
                         if state.get("scratch"):
                             partial_patch = _capture_diff(state["scratch"])
                     raise BudgetStop(
@@ -1278,7 +1304,7 @@ class ClaudeCodeRunner:
                         role, tier, used_model, tools, traced_payload, task,
                         ceiling_usd=shape_ceiling, ceiling_source=ceiling_source,
                     ),
-                    "id": call_id,
+                    "id": call_id, **priced,
                 },
                 ok=False, error=message,
             )
@@ -1292,6 +1318,7 @@ class ClaudeCodeRunner:
                 ceiling_usd=ceiling_usd, ceiling_source=ceiling_source,
             ),
             "id": call_id, **retry_extra,
+            **priced,
         }
         # The account's session limit arrives as a successful call whose whole
         # text is the banner. It is ledgered like every call that ends a node
