@@ -26,7 +26,7 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from datetime import date as date_type
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import core
 import yaml
@@ -37,7 +37,7 @@ from core.manifest import append_ledger, build_manifest
 from graphs._contract import ContractViolation
 from harness import CORE_SCHEMA, run_lease, store_traces
 from harness.autonomy import split_by_policy
-from harness.checks import all_passed, checks_evidence, run_checks
+from harness.checks import all_passed, checks_evidence, repo_checks, run_checks
 from harness.digest import build_digest
 from harness.escalate import escalate_self_modification
 from harness.gate import apply_decisions, auto_apply, gate
@@ -54,7 +54,7 @@ from harness.store_read import cost_by_model, run_summary
 from harness.store_write import Store
 from harness.traces_url import have_pyarrow, redact_url, resolve_traces_root
 from harness.worktree import apply_patch, create_worktree, keep_worktree, remove_worktree
-from runner.protocol import RunnerError
+from runner.protocol import LimitStop, RunnerError
 
 __all__ = ["main"]
 
@@ -190,10 +190,11 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "graph",
-        choices=sorted([*specs, "phase", "epic", "sweep"]),
+        choices=sorted([*specs, "phase", "epic", "rescue", "sweep"]),
         help=(
             "which graph to run ('phase' drives the lifecycle graph over one phase; "
             "'epic' drives a whole initiative, phase by phase, gating each one; "
+            "'rescue' runs one rescue of one quarantined task and prints its JSON report; "
             "'sweep' is registered for coxswain dispatch but not yet runnable standalone)"
         ),
     )
@@ -227,7 +228,8 @@ def _build_parser(specs: dict[str, GraphSpec]) -> argparse.ArgumentParser:
                 kwargs["type"] = int
             parser.add_argument(need.flag, **{k: v for k, v in kwargs.items() if v is not None})
 
-    parser.add_argument("--initiative", help="phase: path to the work/<initiative> directory")
+    parser.add_argument("--initiative", help="phase, epic, rescue: path to the work/<initiative> directory")
+    parser.add_argument("--task", help="rescue: id of the quarantined task to rescue")
     parser.add_argument("--phase-name", help="phase: which phase to run (default: the first with ready work)")
     parser.add_argument("--max-parallel", type=int, default=4, help="phase: how many tasks run at once")
     parser.add_argument("--scripted", metavar="JSON", help="run offline against canned node responses")
@@ -323,7 +325,7 @@ def _object_store(profile: Mapping[str, Any]) -> Mapping[str, Any] | None:
 
 def _principal(graph: str, specs: Mapping[str, GraphSpec], *, docket: str | None) -> str:
     """The run's principal, named as the manifest names it. `epic` is the driver's own constant."""
-    if graph == "epic":
+    if graph in ("epic", "rescue"):
         from harness.epic import PRINCIPAL
 
         return PRINCIPAL
@@ -340,7 +342,7 @@ def _register_graph(conn: Any, specs: Mapping[str, GraphSpec], graph: str, now: 
     unknown: no graph in this repository declares a loaded graph object yet. A spec that
     carries one on `.graph` is registered; one that does not leaves the run's graph_id empty.
     """
-    spec = specs.get("lifecycle" if graph in ("phase", "epic") else graph)
+    spec = specs.get("lifecycle" if graph in ("phase", "epic", "rescue") else graph)
     loaded = getattr(spec, "graph", None)
     return None if loaded is None else register(conn, derive_definition(loaded), now)
 
@@ -680,7 +682,17 @@ def _main(argv: list[str] | None) -> int:
     specs = discover()
     parser = _build_parser(specs)
     args = parser.parse_args(argv)
+    # A rescue's stdout is its JSON report and nothing else, since its caller parses all of it.
+    # Every other line the launch prints, the usage totals included, goes to stderr instead.
+    report_out = sys.stdout
+    quiet = contextlib.redirect_stdout(sys.stderr) if args.graph == "rescue" else contextlib.nullcontext()
+    with quiet:
+        return _launch(specs, parser, args, report_out=report_out)
 
+
+def _launch(
+    specs: dict[str, GraphSpec], parser: argparse.ArgumentParser, args: argparse.Namespace, *, report_out: TextIO
+) -> int:
     if not args.skills_root and not args.unverified_skills:
         parser.error("pass --skills-root at least once, or --unverified-skills to skip the check explicitly")
 
@@ -786,6 +798,20 @@ def _main(argv: list[str] | None) -> int:
     # Set only by a SIGTERM exit. The edge's one flag: the `finally` must quiet the workers before it frees the lease.
     terminated = False
     try:
+        if args.graph == "rescue":
+            # The rescue names its row's status itself: a LimitStop is `stopped` yet exits 0, since the report says so.
+            code, status = _run_rescue(
+                parser=parser,
+                args=args,
+                cartridge=cartridge,
+                runner=runner,
+                run_id=run_id,
+                store=store,
+                epoch=lease.epoch,
+                lease_name=name,
+                report_out=report_out,
+            )
+            return code
         code = _run_graph(
             specs=specs,
             parser=parser,
@@ -888,6 +914,99 @@ def _record_run_to_store(
         store.record_phase(row)
     except Exception as exc:
         print(f"store: could not record {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
+
+
+def _with_stored_causes(item: Mapping[str, Any], rows: Sequence[Sequence[Any]]) -> dict[str, Any]:
+    """`item` with each attempt's `cause` taken from the (run_id, ts, cause) row it matches; a work file holds no cause."""
+    causes = {(run, ts): cause for run, ts, cause in rows}
+    return {
+        **item,
+        "attempts": [{**a, "cause": causes.get((a.get("run"), a.get("ts")), a.get("cause"))} for a in item.get("attempts") or []],
+    }
+
+
+def _run_rescue(
+    *,
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    cartridge: Mapping[str, Any],
+    runner: Any,
+    run_id: str,
+    store: Store,
+    epoch: int | None,
+    lease_name: str | None,
+    report_out: TextIO,
+) -> tuple[int, str]:
+    """(exit, run status). Exit 0 with a JSON report for any answer, LimitStop included; 1 for a task not in the initiative."""
+    # Not module-level: harness/epic imports this package (see the epic branch of `_run_graph`).
+    from harness.epic import _Ctx, _git, _mirror_read, default_branch, rescue_task, work_state_of
+
+    for flag, value in (("--initiative", args.initiative), ("--task", args.task), ("--repo", args.repo)):
+        if not value:
+            parser.error(f"rescue needs {flag}")
+    try:
+        initiative = workstore.read_initiative(args.initiative)
+    except workstore.WorkStoreError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1, "failed"
+    found = next((i for i in initiative["items"] if str(i.get("id")) == args.task), None)
+    if found is None:
+        print(f"task {args.task} is not in {args.initiative}", file=sys.stderr)
+        return 1, "failed"
+    try:
+        work_state = work_state_of(_read_profile(args.provider_profile))
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1, "failed"
+
+    # The default branch, read as `run_epic` reads it, so a rescue checks against the ground an epic run would.
+    repo = Path(args.repo)
+    head_ok, head_out = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
+    origin_ok, origin_out = _git("-C", str(repo), "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    local_ok, local_out = _git("-C", str(repo), "for-each-ref", "--format=%(refname:short)", "refs/heads")
+    try:
+        agent_checks = (repo / ".agent-checks").read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        agent_checks = ""
+    ctx = _Ctx(
+        repo=repo,
+        cartridge=cartridge,
+        runner=runner,
+        specs={},
+        run_id=run_id,
+        date=args.date,
+        max_parallel=1,
+        ledger_path=Path(args.ledger),
+        provider_profile=_provider_profile_scope(args.provider_profile),
+        runs_dir=Path(args.runs_dir),
+        worktree_root=Path(
+            str(args.worktree_root or (cartridge.get("landing_areas") or {}).get("worktree_root", "~/worktrees"))
+        ).expanduser(),
+        assume=args.assume,
+        fix_attempts=args.fix_attempts,
+        repo_checks=repo_checks(agent_checks),
+        store=store,
+        epoch=epoch,
+        lease_name=lease_name,
+        work_state=work_state,
+        initiative_id=str(initiative.get("id")),
+        default_ref=default_branch(
+            origin_out.strip() if origin_ok else None,
+            set(local_out.split()) if local_ok else set(),
+            head_out.strip() if head_ok else "HEAD",
+        ),
+    )
+    # As `run_epic` does before any work: under work_state store the row's state wins, so the move's compare-and-set holds.
+    items = [dict(found)]
+    _mirror_read(ctx, items)
+    mark = store.conn.dialect.placeholder
+    stored = store.conn.query_all(f"SELECT run_id, ts, cause FROM attempts WHERE task_id = {mark}", (args.task,))
+    try:
+        report, status = rescue_task(ctx, _with_stored_causes(items[0], stored), phase=str(found["phase"])), "ok"
+    except LimitStop as exc:
+        report, status = {"status": "stopped", "why": exc.detail}, "stopped"
+    print(json.dumps(report, sort_keys=True), file=report_out)
+    return 0, status
 
 
 def _run_graph(
