@@ -1316,6 +1316,29 @@ def test_a_reviewer_is_told_which_commands_the_builder_could_run(fake_claude, tm
     assert "`python -m pytest`" in system
 
 
+def test_the_handoff_is_told_which_commands_the_builder_could_run(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.check_commands = ["pytest -q", "ruff check ."]
+    runner.run(role="handoff", schema=SCHEMA, prompt="go")
+    assert "could run only these shell commands" in _system_of(fake_claude)
+
+
+def test_permitted_prefixes_drop_the_bash_wrapping(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.check_commands = ["pytest -q", "ruff check ."]
+    assert runner.permitted_prefixes() == [
+        "pytest",
+        "ruff",
+        "python -m pytest",
+        "python3 -m pytest",
+        "python -m ruff",
+        "python3 -m ruff",
+        "git status",
+        "git diff",
+        "git add",
+    ]
+
+
 def test_a_reviewer_of_a_project_with_no_checks_is_told_nothing_about_commands(fake_claude, tmp_path, repo) -> None:
     runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
     runner.check_commands = []

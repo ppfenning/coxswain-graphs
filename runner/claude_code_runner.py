@@ -101,7 +101,7 @@ _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
 # the harness still applies the patch itself, in a worktree it owns.
 _PATCH_ROLES = frozenset({"build"})
 # Roles that judge a builder's evidence and so must know which commands it could run.
-_REVIEW_ROLES = frozenset({"review_charter", "review_adversary", "arbitrate", "evidence_verify"})
+_REVIEW_ROLES = frozenset({"review_charter", "review_adversary", "arbitrate", "evidence_verify", "handoff"})
 _VERIFY_TIMEOUT_S = 120
 _VERIFY_TOTAL_S = 300
 _VERIFY_TAIL_LINES = 40
@@ -861,9 +861,13 @@ class ClaudeCodeRunner:
         allowed += ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
         return list(dict.fromkeys(allowed))
 
+    def permitted_prefixes(self) -> list[str]:
+        """`_allowed_bash()` without the `Bash(` and `:*)` wrapping."""
+        return [name.removeprefix("Bash(").removesuffix(":*)") for name in self._allowed_bash()]
+
     def _permitted_commands(self) -> str:
-        """`_allowed_bash()` as backticked bare commands, for prose."""
-        return ", ".join(f"`{name[len('Bash('):-len(':*)')]}`" for name in self._allowed_bash())
+        """`permitted_prefixes()` as backticked bare commands, for prose."""
+        return ", ".join(f"`{prefix}`" for prefix in self.permitted_prefixes())
 
     def _workspace(self, scratch: Path | None = None, *, patches: bool = True, role: str | None = None) -> str:
         """Tell the node where the world is. It cannot find out on its own."""
