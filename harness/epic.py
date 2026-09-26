@@ -1587,13 +1587,23 @@ def _run_phase(
     attempts_by_id = {
         str(item["id"]): [a for a in (item.get("attempts") or []) if a.get("kind") != "infra"] for item in all_ready
     }
+    # A rewritten ticket starts a fresh count. Triage still gets the whole history for its repeat guard.
+    # An item with no `body` cannot be matched, so all its attempts count.
+    counted_by_id = {
+        str(item["id"]): (
+            workstore.attempts_on_current_body({**item, "attempts": attempts_by_id[str(item["id"])]})
+            if "body" in item
+            else attempts_by_id[str(item["id"])]
+        )
+        for item in all_ready
+    }
     # A capped task is launched into `triage` (docs/design/triage.md §1) rather
     # than quarantined outright: the graph classifies the attempt record and
     # emits by class, and only a class `triage` could not turn into a write —
     # or a repeated `(class, diagnosis)` it refuses to clear twice — still ends
     # up quarantined here, plainly, never through `_quarantine_task`.
     triage_batch: list[dict[str, Any]] = []
-    capped_ids = sorted(task_id for task_id, attempts in attempts_by_id.items() if len(attempts) >= ATTEMPT_CAP)
+    capped_ids = sorted(task_id for task_id, attempts in counted_by_id.items() if len(attempts) >= ATTEMPT_CAP)
     if capped_ids:
         all_ready_by_id = {str(item["id"]): item for item in all_ready}
         triaged, _, triage_failures = invoke_graphs(
@@ -1649,7 +1659,7 @@ def _run_phase(
                 emitted["ramp"] = _ticket_amend_ramp(old_body, new_body)
             triage_batch.append(emitted)
             print(f"  attempt cap: {task_id} launched triage -> {result.get('class')} ({emitted['kind']})")
-    ready = [item for item in all_ready if len(attempts_by_id[str(item["id"])]) < ATTEMPT_CAP]
+    ready = [item for item in all_ready if len(counted_by_id[str(item["id"])]) < ATTEMPT_CAP]
 
     by_id = {str(item["id"]): item for item in items}
     if hasattr(ctx.runner, "verify_by_task"):
