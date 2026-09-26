@@ -19,8 +19,8 @@ def _result(ok: bool, epoch: int | None, holder: str | None) -> dict[str, Any]:
     return {"ok": ok, "epoch": epoch, "holder": holder}
 
 
-def lease_acquire(conn: Connection, name: str, holder: str, now: str, ttl: int) -> dict[str, Any]:
-    taken = store_lease.acquire(conn, name, holder, now, ttl)
+def lease_acquire(conn: Connection, name: str, holder: str, now: str, ttl: int, steal: bool = False) -> dict[str, Any]:
+    taken = store_lease.acquire(conn, name, holder, now, ttl, steal=steal)
     return _result(taken.ok, taken.epoch, taken.holder)
 
 
