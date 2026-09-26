@@ -109,6 +109,7 @@ _VERIFY_TAIL_LINES = 40
 _DIFF_CMD = "git add -A && git diff --cached"
 # Checks led by one of these also run as `python -m <tool>`; builders reach for that form.
 _PY_TOOLS = frozenset({"pytest", "ruff"})
+_PLAIN_PATH = re.compile(r"[\w./-]+")  # no space, quote or glob: the only paths a `git -C` prefix rule may name
 
 
 def _capture_diff(scratch: Path) -> str:
@@ -814,6 +815,9 @@ class ClaudeCodeRunner:
         if proc.returncode != 0:
             shutil.rmtree(parent, ignore_errors=True)
             raise RunnerError(f"could not create a scratch worktree for '{role}': {(proc.stderr or '').strip()[:300]}")
+        from harness.worktree import link_venv  # here, not at the top: harness imports this module
+
+        link_venv(Path(self.repo_dir), scratch)
         return parent, scratch
 
     def _drop_scratch(self, parent: Path, scratch: Path) -> None:
@@ -862,26 +866,31 @@ class ClaudeCodeRunner:
         finally:
             self._drop_scratch(parent, scratch)
 
-    def _allowed_bash(self) -> list[str]:
+    def _allowed_bash(self, scratch: Path | None = None) -> list[str]:
         """The Bash prefixes this session permits, in `--allowedTools` form.
 
         One source for two consumers: `_argv` enforces this list and
         `_workspace` tells the node what is on it. Computing it twice is how a
-        builder ends up discovering the boundary by hitting it.
+        builder ends up discovering the boundary by hitting it. `git -C` is
+        allowed for the given scratch path only, never bare, and not at all
+        for a path a prefix rule cannot match unquoted.
         """
         firsts = [cmd.split()[0] for cmd in self.check_commands if cmd.split()]
         allowed = [f"Bash({w}:*)" for w in firsts]
         allowed += [f"Bash({py} -m {w}:*)" for w in firsts if w in _PY_TOOLS for py in ("python", "python3")]
+        allowed += [f"Bash(uv run {flags}{w}:*)" for w in firsts if w in _PY_TOOLS for flags in ("", "--frozen ")]
         allowed += ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
+        safe = scratch is not None and _PLAIN_PATH.fullmatch(str(scratch)) is not None
+        allowed += [f"Bash(git -C {scratch} {verb}:*)" for verb in ("status", "diff", "add")] if safe else []
         return list(dict.fromkeys(allowed))
 
-    def permitted_prefixes(self) -> list[str]:
+    def permitted_prefixes(self, scratch: Path | None = None) -> list[str]:
         """`_allowed_bash()` without the `Bash(` and `:*)` wrapping."""
-        return [name.removeprefix("Bash(").removesuffix(":*)") for name in self._allowed_bash()]
+        return [name.removeprefix("Bash(").removesuffix(":*)") for name in self._allowed_bash(scratch)]
 
-    def _permitted_commands(self) -> str:
+    def _permitted_commands(self, scratch: Path | None = None) -> str:
         """`permitted_prefixes()` as backticked bare commands, for prose."""
-        return ", ".join(f"`{prefix}`" for prefix in self.permitted_prefixes())
+        return ", ".join(f"`{prefix}`" for prefix in self.permitted_prefixes(scratch))
 
     def _workspace(self, scratch: Path | None = None, *, patches: bool = True, role: str | None = None) -> str:
         """Tell the node where the world is. It cannot find out on its own."""
@@ -937,7 +946,7 @@ class ClaudeCodeRunner:
                     "one of them before you produce the diff, a lint command as much as the tests: a "
                     "check you skip here fails after review and costs a whole rerun."
                 )
-            permitted = self._permitted_commands()
+            permitted = self._permitted_commands(scratch)
             lines.append(
                 f"The ONLY shell commands permitted in this session are: {permitted}. Anything "
                 "else is refused by the sandbox before it runs. If your task text asks you to "
@@ -959,10 +968,11 @@ class ClaudeCodeRunner:
             )
         if role in _REVIEW_ROLES and self.check_commands:
             lines.append(
-                f"The builder's session could run only these shell commands: {self._permitted_commands()}. "
+                f"The builder's session could run only these shell commands: {self._permitted_commands()}, "
+                "and `git -C <its own scratch>` with `status`, `diff` or `add`. "
                 "Output from any of them is valid evidence for a check: `pytest -q` and "
                 "`python -m pytest -q` are the same check. Never ask the builder for a command outside "
-                "this list (for example a `uv run ...` or `make ...` form), because it cannot run one. "
+                "this list (for example a `make ...` form), because it cannot run one. "
                 "If a ticket's done condition names such a command, judge the evidence from the "
                 "permitted form instead."
             )
@@ -1040,7 +1050,7 @@ class ClaudeCodeRunner:
         # verbs the diff needs — prefixes, so `pytest tests/x.py -q` passes —
         # and denied for everything else, which is what a scratch tree wants.
         if "Bash" in tools:
-            argv += ["--allowedTools", *self._allowed_bash()]
+            argv += ["--allowedTools", *self._allowed_bash(scratch if sealed else None)]
         # Last on purpose: `--tools` is variadic, and nothing may follow it that
         # could be mistaken for a tool name. The prompt travels on stdin.
         argv += ["--tools", *(tools or [""])]

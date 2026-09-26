@@ -34,7 +34,7 @@ from harness.checks import (
     repo_checks,
     run_checks,
 )
-from harness.worktree import apply_patch, create_worktree
+from harness.worktree import apply_patch, create_worktree, link_venv
 
 
 def _run(cmd: list[str], cwd) -> None:
@@ -363,6 +363,26 @@ def test_create_worktree_creates_it_at_head(tmp_path) -> None:
     assert ok, detail
     assert (worktree / "a.txt").read_text(encoding="utf-8") == "one\n"
     assert (worktree / ".git").exists()
+
+
+def test_create_worktree_alone_does_not_link_the_venv(tmp_path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".venv").mkdir()
+    ok, detail = create_worktree(repo, tmp_path / "wt", branch="review-diff-1")
+    assert ok, detail
+    assert not (tmp_path / "wt" / ".venv").exists()
+
+
+def test_link_venv_links_the_land_worktree_and_git_add_all_stages_nothing(tmp_path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".venv").mkdir()
+    worktree = tmp_path / "wt"
+    create_worktree(repo, worktree, branch="agents/run-1")
+    assert link_venv(repo, worktree)
+    assert (worktree / ".venv").is_symlink()
+    _run(["git", "add", "-A"], cwd=worktree)
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=worktree, capture_output=True, text=True)
+    assert status.stdout == ""
 
 
 def test_create_worktree_existing_branch_fails_with_gits_message(tmp_path) -> None:
