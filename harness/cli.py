@@ -315,6 +315,12 @@ def _traces_url(profile: Mapping[str, Any], runs_dir: Path | str) -> str | None:
     return url if isinstance(url, str) and url else None
 
 
+def _object_store(profile: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The profile's `object_store` block; None when absent or not a mapping."""
+    block = profile.get("object_store")
+    return block if isinstance(block, Mapping) else None
+
+
 def _principal(graph: str, specs: Mapping[str, GraphSpec], *, docket: str | None) -> str:
     """The run's principal, named as the manifest names it. `epic` is the driver's own constant."""
     if graph == "epic":
@@ -431,7 +437,13 @@ def _read_events(text: str) -> list[dict[str, Any]]:
     return events
 
 
-def _compact_traces(store: Store, run_id: str, runs_dir: Path, traces_url: str | None = None) -> None:
+def _compact_traces(
+    store: Store,
+    run_id: str,
+    runs_dir: Path,
+    traces_url: str | None = None,
+    object_store: Mapping[str, Any] | None = None,
+) -> None:
     """Write this run's trace files as one Parquet file; delete them only once write_run's row count equals the events read.
 
     Warns and never raises. Any failure leaves every loose file, so a rerun rewrites the same Parquet file.
@@ -462,7 +474,7 @@ def _compact_traces(store: Store, run_id: str, runs_dir: Path, traces_url: str |
             print("traces: not compacted, writing traces as Parquet needs pyarrow: install the traces extra", file=sys.stderr)
             return
         try:
-            root = resolve_traces_root(traces_url, runs_dir, os.environ)
+            root = resolve_traces_root(traces_url, runs_dir, os.environ, object_store)
             written = store_traces.write_run(root, day, run_id, calls)
         except store_traces.ParquetUnavailable as exc:
             print(f"traces: not compacted, {exc}", file=sys.stderr)
@@ -810,11 +822,13 @@ def _main(argv: list[str] | None) -> int:
             close()
         # Compaction only reads the store and moves files, so it never changes the exit code.
         try:
+            profile = _read_profile(args.provider_profile)
             _compact_traces(
                 store,
                 run_id,
                 Path(args.runs_dir),
-                _traces_url(_read_profile(args.provider_profile), args.runs_dir),
+                _traces_url(profile, args.runs_dir),
+                _object_store(profile),
             )
         except Exception as exc:
             print(f"traces: compaction failed: {' '.join(str(exc).split())}", file=sys.stderr)
