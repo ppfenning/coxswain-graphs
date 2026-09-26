@@ -1588,9 +1588,12 @@ def _run_phase(
     # because a refusal is not an attempt and must not grow the count it is
     # enforcing.
     # An `infra` attempt is the apply arm's own failure, not the task's, so it
-    # must not grow the count the cap enforces.
+    # must not grow the count the cap enforces. Nor does a `rescue_failed` one:
+    # a rescue checks work already built and is not a build.
+    not_a_build = {"infra", rescue_select.RESCUE_KIND}
     attempts_by_id = {
-        str(item["id"]): [a for a in (item.get("attempts") or []) if a.get("kind") != "infra"] for item in all_ready
+        str(item["id"]): [a for a in (item.get("attempts") or []) if a.get("kind") not in not_a_build]
+        for item in all_ready
     }
     # A rewritten ticket starts a fresh count. Triage still gets the whole history for its repeat guard.
     # An item with no `body` cannot be matched, so all its attempts count.
