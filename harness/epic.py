@@ -2626,7 +2626,7 @@ RESCUE_PRINCIPAL = "epic-swarm(rescue-review)"
 def _rescue_failed(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, reason: str, failed_checks: bool) -> dict[str, Any]:
     """The task stays quarantined: a `rescue_failed` attempt carrying the rule's cause, and a quarantined task row."""
     task = str(item["id"])
-    cause, cause_why = rescue_select.rescue_cause(failed_checks)
+    cause, cause_why = rescue_select.rescue_cause(failed_checks, reason)
     entry = _quarantine_task(
         ctx, {task: dict(item)}, phase=phase, task=task, reason=reason, kind="rescue_failed", cause=(cause, cause_why)
     )
@@ -2777,7 +2777,7 @@ def rescue_task(ctx: _Ctx, item: Mapping[str, Any], *, phase: str) -> dict[str, 
         return None if applied else detail
 
     verified = rescue_checks.verify_patch(
-        ctx.repo, ctx.phase_branch(phase), patch, ctx.checks, apply=apply, workdir=ctx.worktree_root / ctx.run_id
+        ctx.repo, ctx.default_ref, patch, ctx.checks, apply=apply, workdir=ctx.worktree_root / ctx.run_id
     )
     if not verified["passed"]:
         return _rescue_failed(ctx, item, phase=phase, reason=str(verified["reason"]), failed_checks=True)
