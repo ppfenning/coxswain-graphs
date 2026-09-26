@@ -57,7 +57,7 @@ from core.workstore import WorkStoreError, record_attempt
 from graphs._contract import proposal
 from graphs.delivery.lifecycle_propose import DEFAULT_FIX_ATTEMPTS
 from harness.autonomy import split_by_policy
-from harness.cause_model import classify_with_model, one_line
+from harness.cause_model import cause_evidence, classify_with_model, one_line
 from harness.cause_rule import classify_cause
 from harness.checks import (
     HARNESS_FAULT_PREFIX,
@@ -1098,13 +1098,9 @@ def _cause_of(runner: Any, kind: str, reason: str, result: Mapping[str, Any] | N
     ruled = classify_cause(kind, reason)
     if ruled is not None:
         return ruled, f"rule: kind {kind}"
-    arbitration = (result or {}).get("arbitration")
-    said = str(arbitration.get("reasoning") or "").strip() if isinstance(arbitration, Mapping) else ""
-    found = ((result or {}).get("adversary") or {}).get("objections") or []
-    claims = (str(o.get("claim") or "") if isinstance(o, Mapping) else str(o) for o in found)
+    reasoning, claims = cause_evidence(reason, result)
     try:
-        # With no arbitration text, the quarantine reason is the only account of why, and it is never empty.
-        return classify_with_model(runner, said or reason, [c.strip() for c in claims if c.strip()], task=task)
+        return classify_with_model(runner, reasoning, claims, task=task)
     except LimitStop:
         raise
     except Exception as exc:
