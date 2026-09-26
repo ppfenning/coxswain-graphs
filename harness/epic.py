@@ -2757,6 +2757,40 @@ def _rescue_move(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, evidence: li
     return applied, detail
 
 
+def _commit_patch(ctx: _Ctx, worktree: Path, patch: str, task: str) -> str | None:
+    """Apply `patch` in `worktree` and commit it as `epic <run>: <task>`. None on success, else why not."""
+    link_venv(ctx.repo, worktree)
+    ok, detail = apply_patch(patch, worktree)
+    if not ok:
+        return f"kept patch did not apply: {detail}"
+    ok, detail = _git(*_IDENTITY, "-C", str(worktree), "add", "-A")
+    if ok:
+        ok, detail = _git(
+            *_IDENTITY, "-C", str(worktree), "commit", "--allow-empty", "-q", "-m", f"epic {ctx.run_id}: {task}"
+        )
+    return None if ok else f"kept patch could not be committed: {detail}"
+
+
+def _land_branch(ctx: _Ctx, *, task: str, patch: str) -> str | None:
+    """`agents/<run>/<task>`: one commit on `default_ref` holding `patch`, the shape `cox runs land` takes.
+
+    None on success. Otherwise a harness-fault reason, with any half-made branch deleted.
+    """
+    branch = ctx.scratch_branch(task)
+    worktree = ctx.worktree_root / ctx.run_id / f"land-{task}"
+    ok, detail = create_worktree(ctx.repo, worktree, branch=branch, base=ctx.default_ref)
+    if not ok:
+        return f"{HARNESS_FAULT_PREFIX} branch {branch} could not be created: {detail}"
+    try:
+        why = _commit_patch(ctx, worktree, patch, task)
+    finally:
+        remove_worktree(ctx.repo, worktree)
+    if why is not None:
+        _git("-C", str(ctx.repo), "branch", "-D", branch)
+        return f"{HARNESS_FAULT_PREFIX} {why}"
+    return None
+
+
 def rescue_task(ctx: _Ctx, item: Mapping[str, Any], *, phase: str) -> dict[str, Any]:
     """Harness checks on a quarantined task's kept patch, one review round, then a gated move to `approved` or `rescue_failed`."""
     task = str(item["id"])
@@ -2811,6 +2845,10 @@ def rescue_task(ctx: _Ctx, item: Mapping[str, Any], *, phase: str) -> dict[str, 
         rationale = str((graph.get("review") or {}).get("rationale") or "no rationale given")
         return _rescue_failed(ctx, item, phase=phase, reason=f"rescue review revised: {rationale}", failed_checks=False)
 
+    # The branch precedes the gated move, so a refused move leaves it in place for the chair to land.
+    land_fault = _land_branch(ctx, task=task, patch=patch)
+    if land_fault is not None:
+        return _rescue_failed(ctx, item, phase=phase, reason=land_fault, failed_checks=False)
     _save_result(
         ctx, {**graph, "initiative": ctx.initiative_id, "phase": phase, "evidence": evidence}, phase=phase, task=task
     )
