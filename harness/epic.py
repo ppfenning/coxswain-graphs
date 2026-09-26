@@ -57,6 +57,8 @@ from core.workstore import WorkStoreError, record_attempt
 from graphs._contract import proposal
 from graphs.delivery.lifecycle_propose import DEFAULT_FIX_ATTEMPTS
 from harness.autonomy import split_by_policy
+from harness.cause_model import classify_with_model, one_line
+from harness.cause_rule import classify_cause
 from harness.checks import (
     HARNESS_FAULT_PREFIX,
     _tail_lines,
@@ -1022,6 +1024,7 @@ def _quarantine_task(
     reason: str,
     kind: Literal["refused", "no_work", "unverified", "infra"],
     detail: str | None = None,
+    result: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a task's quarantine entry AND leave a record on its own work item.
 
@@ -1047,11 +1050,21 @@ def _quarantine_task(
     `detail`, when given, is stored as the attempt's own `reason` in place of
     the terse one on `entry` — the next build's carried-forward brief gets the
     fuller text, the printed quarantine line stays short.
+
+    With a store, the attempt and the task record also carry a cause: the
+    deterministic rule first, the cheap classifier only when it has no answer.
+    `result`, the fix loop's own record of a refused build, supplies the
+    classifier's arbitration text; without it the quarantine reason is the
+    text. A classifier failure records `unknown` and never blocks the
+    quarantine. The session limit is not a failure of the task: it propagates
+    before anything is written, so the run pauses with no attempt recorded.
     """
     stale = _fenced(ctx)
     if stale is not None:
         # A stale leader records no attempt anywhere, so it is not an attempt either.
         return {"id": task, "phase": phase, "grain": "task", "reason": f"{stale}; not recorded: {reason}", "kind": "no_work"}
+    # Before any write, so a `LimitStop` from the classifier leaves nothing half recorded.
+    judged = _cause_of(ctx.runner, kind, reason, result, task) if ctx.store is not None else None
     patch_kept = kind in ("unverified", "infra")
     entry: dict[str, Any] = {"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": kind}
     if patch_kept:
@@ -1069,11 +1082,56 @@ def _quarantine_task(
                 ts=ts,
                 **({"patch_kept": True} if patch_kept else {}),
             )
-    if ctx.store is not None:
+    if ctx.store is not None and judged is not None:
         # The store's attempt exists whether or not the item has a file behind it.
+        cause, cause_why = judged
         seq = _next_attempt_seq(ctx.store, ctx.run_id, task)
-        ctx.store.record_attempt(ctx.run_id, task, seq, phase, kind, detail or reason, ts, epoch=ctx.epoch)
+        ctx.store.record_attempt(
+            ctx.run_id, task, seq, phase, kind, detail or reason, ts, epoch=ctx.epoch, cause=cause, cause_why=cause_why
+        )
+        _record_task_cause(ctx, phase, task, cause, cause_why)
     return entry
+
+
+def _cause_of(runner: Any, kind: str, reason: str, result: Mapping[str, Any] | None, task: str) -> tuple[str, str]:
+    """(cause, why): the rule first, then the model. Only `LimitStop` escapes: the account's limit is not the task's cause."""
+    ruled = classify_cause(kind, reason)
+    if ruled is not None:
+        return ruled, f"rule: kind {kind}"
+    arbitration = (result or {}).get("arbitration")
+    said = str(arbitration.get("reasoning") or "").strip() if isinstance(arbitration, Mapping) else ""
+    found = ((result or {}).get("adversary") or {}).get("objections") or []
+    claims = (str(o.get("claim") or "") if isinstance(o, Mapping) else str(o) for o in found)
+    try:
+        # With no arbitration text, the quarantine reason is the only account of why, and it is never empty.
+        return classify_with_model(runner, said or reason, [c.strip() for c in claims if c.strip()], task=task)
+    except LimitStop:
+        raise
+    except Exception as exc:
+        return "unknown", one_line(f"classifier failed: {type(exc).__name__}: {exc}")
+
+
+def _record_task_cause(ctx: _Ctx, phase: str, task: str, cause: str, cause_why: str) -> None:
+    """Put the cause on this run's saved result, which mirrors it into the store row: file and row stay equal.
+
+    A task with no saved result gets a minimal result-shaped one. A failure is a warning, never a block.
+    """
+    if ctx.store is None:
+        return
+    try:
+        saved = load_result(ctx.runs_dir, ctx.run_id, phase, task) or {
+            "ticket": task,
+            "initiative": ctx.initiative_id,
+            "phase": phase,
+        }
+        _save_result(ctx, {**saved, "cause": cause, "cause_why": cause_why}, phase=phase, task=task)
+    except Exception as exc:
+        _log.warning("cause for %s/%s/%s not recorded on the task record: %r", ctx.run_id, phase, task, exc)
+
+
+def _without_cause(saved: Mapping[str, Any]) -> dict[str, Any]:
+    """A saved result as a later run reuses it. Its cause names the run that quarantined it, not this one."""
+    return {k: v for k, v in saved.items() if k not in ("cause", "cause_why")}
 
 
 def _next_attempt_seq(store: Store, run_id: str, task: str) -> int:
@@ -1435,7 +1493,7 @@ def _run_phase(
         for task in ready:
             saved = load_result(ctx.runs_dir, ctx.resume_from, phase, str(task["id"]))
             if reusable(saved):
-                reused.append(saved)
+                reused.append(_without_cause(saved))
                 print(f"  reused {task['id']} from {ctx.resume_from} (approved patch, no model call)")
             else:
                 to_run.append(task)
@@ -1575,7 +1633,9 @@ def _run_phase(
                     "status": "quarantined",
                 }
             )
-            quarantined.append(_quarantine_task(ctx, by_id, phase=phase, task=task, reason=refused, kind="refused"))
+            quarantined.append(
+                _quarantine_task(ctx, by_id, phase=phase, task=task, reason=refused, kind="refused", result=result)
+            )
             continue
 
         build = _build_task(ctx, phase=phase, task=task, result=result, verify=_verify_of(by_id, task))
