@@ -102,6 +102,49 @@ def test_initiative_text_omits_intake_when_none_given() -> None:
     assert "intake:" not in text
 
 
+def _frontmatter(title: str) -> dict:
+    idea = {"id": "regatta", "title": title, "budget_usd": 500, "why": "because races drift"}
+    text = initiative_decompose.initiative_text(idea, ["p1"], {"p1": "foundations"}, "coxswain-graphs")
+    return yaml.safe_load(text.split("---\n")[1])
+
+
+def test_a_title_starting_with_a_backtick_round_trips_through_yaml() -> None:
+    assert _frontmatter("`tick` the cache")["title"] == "`tick` the cache"
+
+
+def test_a_plain_title_renders_unquoted() -> None:
+    idea = {"id": "regatta", "title": "Route sync", "budget_usd": 500, "why": "because races drift"}
+    text = initiative_decompose.initiative_text(idea, ["p1"], {"p1": "foundations"}, "coxswain-graphs")
+    assert "\ntitle: Route sync\n" in text
+
+
+def test_a_title_with_a_colon_and_space_round_trips_through_yaml() -> None:
+    assert _frontmatter("Fix parser: short rows")["title"] == "Fix parser: short rows"
+
+
+def test_a_non_ascii_title_renders_unquoted_and_unescaped() -> None:
+    idea = {"id": "regatta", "title": "Café sync — phase 2", "budget_usd": 500, "why": "because races drift"}
+    text = initiative_decompose.initiative_text(idea, ["p1"], {"p1": "foundations"}, "coxswain-graphs")
+    assert "\ntitle: Café sync — phase 2\n" in text
+
+
+def test_id_repo_budget_and_intake_round_trip_through_yaml_with_no_document_marker() -> None:
+    idea = {"id": "2026", "title": "Route sync", "budget_usd": 12.5, "why": "because races drift"}
+    text = initiative_decompose.initiative_text(
+        idea, ["p1"], {"p1": "foundations"}, "coxswain-graphs", intake="intake/regatta.md"
+    )
+    assert (yaml.safe_load(text.split("---\n")[1]), "..." in text) == (
+        {
+            "id": "2026",
+            "title": "Route sync",
+            "repo": "coxswain-graphs",
+            "budget_usd": 12.5,
+            "intake": "intake/regatta.md",
+        },
+        False,
+    )
+
+
 def test_emit_writes_initiative_md_as_one_more_proposal(cart) -> None:
     result = decompose(cart)
     initiative = next(p for p in result["proposals"] if p["target"] == "initiative")
