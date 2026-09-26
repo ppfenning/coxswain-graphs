@@ -1,9 +1,17 @@
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from harness.traces_url import TracesRoot, _s3_options, have_pyarrow, redact_url, resolve_traces_root
+from harness.traces_url import (
+    TracesRoot,
+    _plugin_for,
+    _s3_options,
+    have_pyarrow,
+    redact_url,
+    resolve_traces_root,
+)
 
 
 def _fs():
@@ -52,6 +60,66 @@ def test_userinfo_is_refused_without_the_secret_in_the_error():
 def test_an_unknown_scheme_is_refused():
     with pytest.raises(ValueError, match="ftp"):
         resolve_traces_root("ftp://host/x", Path("/r"), {})
+
+
+def _registered(monkeypatch, **filesystems):
+    """Patch the entry-point read so each scheme loads a plugin that records its calls and returns its answer."""
+    calls = []
+
+    def entry(scheme, answer):
+        def filesystem(url, env, block):
+            calls.append((scheme, url, env, block))
+            return answer
+
+        return SimpleNamespace(name=scheme, load=lambda: SimpleNamespace(filesystem=filesystem))
+
+    entries = {scheme: entry(scheme, answer) for scheme, answer in filesystems.items()}
+    monkeypatch.setattr("harness.traces_url._storage_plugins", lambda: entries)
+    return calls
+
+
+def test_a_plugin_under_the_scheme_gets_url_env_and_block_and_supplies_the_root(monkeypatch):
+    fake_fs = object()
+    calls = _registered(monkeypatch, memfs=(fake_fs, "bucket/p"))
+    env, block = {"K": "v"}, {"endpoint": "e"}
+    root = resolve_traces_root("memfs://bucket/p", Path("/r"), env, block)
+    assert calls == [("memfs", "memfs://bucket/p", env, block)]
+    assert root == TracesRoot(fake_fs, "bucket/p")
+
+
+def test_a_scheme_with_no_plugin_is_refused_naming_the_scheme_and_the_group(monkeypatch):
+    _registered(monkeypatch)
+    with pytest.raises(ValueError) as err:
+        resolve_traces_root("fake://b/p", Path("/r"), {})
+    assert str(err.value) == (
+        "unknown traces URL scheme 'fake': no plugin registered under the coxswain.storage entry-point group"
+    )
+
+
+def test_the_lookup_returns_the_registered_loadable_and_refuses_the_rest():
+    loadable = object()
+    assert _plugin_for("fake", {"fake": loadable}) is loadable
+    with pytest.raises(ValueError, match="'other'"):
+        _plugin_for("other", {"fake": loadable})
+
+
+def test_a_plugin_under_s3_is_not_called_and_the_built_in_branch_is_taken(monkeypatch):
+    fs = _fs()
+    calls = _registered(monkeypatch, s3=(object(), "plugin/path"))
+    built = object()
+    monkeypatch.setattr(fs, "S3FileSystem", lambda **kwargs: built)
+    root = resolve_traces_root("s3://bucket/p", Path("/runs"), {})
+    assert calls == []
+    assert root == TracesRoot(built, "bucket/p")
+
+
+def test_a_plugin_under_file_is_not_called_and_the_built_in_branch_is_taken(monkeypatch):
+    fs = _fs()
+    calls = _registered(monkeypatch, file=(object(), "plugin/path"))
+    root = resolve_traces_root("file:///var/traces", Path("/runs"), {})
+    assert calls == []
+    assert isinstance(root.fs, fs.LocalFileSystem)
+    assert root.path == "/var/traces"
 
 
 def test_an_s3_url_with_no_bucket_is_refused():

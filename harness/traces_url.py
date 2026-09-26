@@ -11,10 +11,16 @@ The provider profile may carry an optional `object_store` block for an S3-compat
 
 Credentials come only from the environment. A literal `access_key`, `secret_key` or `secret` is refused.
 Without the block, the AWS_REGION, AWS_DEFAULT_REGION and AWS_ENDPOINT_URL variables apply.
+
+Plain paths, `file://` and `s3://` are built in and cannot be overridden. Any other scheme is
+served by a plugin: an entry point in the `coxswain.storage` group whose name is the URL scheme.
+It loads to an object with `filesystem(url, env, block) -> (pyarrow FileSystem, path)`. `block` is
+the provider profile's `object_store` mapping or None. Credentials are read from `env`, never from `block`.
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import re
 from collections.abc import Mapping
@@ -27,6 +33,7 @@ if TYPE_CHECKING:
     from pyarrow.fs import FileSystem
 
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+STORAGE_ENTRY_POINT_GROUP = "coxswain.storage"
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,20 @@ def _s3_options(env: Mapping[str, str], object_store: Mapping[str, Any] | None =
     }
 
 
+def _storage_plugins() -> Mapping[str, Any]:
+    return {entry.name: entry for entry in importlib.metadata.entry_points(group=STORAGE_ENTRY_POINT_GROUP)}
+
+
+def _plugin_for(scheme: str, plugins: Mapping[str, Any]) -> Any:
+    """The loadable registered under `scheme`, else the refusal that names the scheme and the group."""
+    if scheme not in plugins:
+        raise ValueError(
+            f"unknown traces URL scheme {scheme!r}: "
+            f"no plugin registered under the {STORAGE_ENTRY_POINT_GROUP} entry-point group"
+        )
+    return plugins[scheme]
+
+
 def resolve_traces_root(
     url: str | None,
     runs_dir: Path,
@@ -115,7 +136,8 @@ def resolve_traces_root(
         prefix = parts.path.strip("/")
         path = f"{parts.netloc}/{prefix}" if prefix else parts.netloc
         return TracesRoot(S3FileSystem(**_s3_options(env, object_store)), path)
-    raise ValueError(f"unsupported traces url scheme {parts.scheme!r}: {redact_url(url)}")
+    fs, path = _plugin_for(parts.scheme, _storage_plugins()).load().filesystem(url, env, object_store)
+    return TracesRoot(fs, path)
 
 
 def _local(path: str) -> TracesRoot:
