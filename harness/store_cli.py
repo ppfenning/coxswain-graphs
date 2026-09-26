@@ -1,4 +1,4 @@
-"""python -m harness.store_cli: mark-landed and lease commands against the run-record store."""
+"""python -m harness.store_cli: mark-landed, set-state and lease commands against the run-record store."""
 
 from __future__ import annotations
 
@@ -17,12 +17,14 @@ from harness.store_cli_lease import lease_acquire, lease_release, lease_renew
 from harness.store_dialect import Connection, StoreDriverMissing
 from harness.store_landed import mark_landed
 from harness.store_migrate import MigrationError, open_store
+from harness.store_work_state import set_state
 
 # Contract read by coxswain-tools. Exit 0 and exit 3 print exactly one JSON object on stdout.
 # Exit 2 prints nothing on stdout. Help and every error go to stderr.
 EXIT_OK = 0
 EXIT_BAD_INPUT = 2
 EXIT_PRECONDITION = 3
+WORK_STATES = ("ready", "approved", "done", "dropped")
 
 _DB_ERRORS: tuple[type[BaseException], ...] = (sqlite3.Error,)
 try:  # the postgres driver is an optional extra
@@ -60,6 +62,12 @@ def _iso_time(text: str) -> str:
     return text
 
 
+def _non_empty(text: str) -> str:
+    if not text.strip():
+        raise argparse.ArgumentTypeError("must not be empty")
+    return text
+
+
 def _common(parser: argparse.ArgumentParser, *, top: bool) -> None:
     """Leaf parsers default to SUPPRESS so a flag given before the subcommand survives."""
 
@@ -86,6 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
         landed.add_argument(name)
     landed.add_argument("--pr", required=True, help="pull request URL")
     landed.add_argument("--at", required=True, type=_iso_time, help="landed time, ISO 8601")
+
+    state = commands.add_parser("set-state", help="upsert one work item's state")
+    _common(state, top=False)
+    state.add_argument("initiative")
+    state.add_argument("task")
+    state.add_argument("state", choices=WORK_STATES)
+    state.add_argument("--by", required=True, type=_non_empty, help="who made the change")
+    state.add_argument("--phase", help="phase for a new row; ignored when the row exists")
 
     lease = commands.add_parser("lease", help="acquire, renew or release a named lease")
     actions = lease.add_subparsers(dest="action", required=True)
@@ -116,6 +132,9 @@ def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[dict
     if args.command == "mark-landed":
         record = mark_landed(conn, args.run_id, args.phase, args.task, args.pr, args.at)
         return ({}, EXIT_PRECONDITION) if record is None else (record, EXIT_OK)
+    if args.command == "set-state":
+        row = set_state(conn, args.initiative, args.task, args.state, args.by, args.phase, now)
+        return ({}, EXIT_PRECONDITION) if row is None else (row, EXIT_OK)
     if args.action == "acquire":
         result = lease_acquire(conn, args.name, args.holder, now, args.ttl)
     elif args.action == "renew":
@@ -132,6 +151,8 @@ def _now() -> str:
 def _refusal(args: argparse.Namespace) -> str:
     if args.command == "mark-landed":
         return f"no task record for run {args.run_id} phase {args.phase} task {args.task}"
+    if args.command == "set-state":
+        return f"no work item {args.task} in initiative {args.initiative} and --phase was not given"
     return f"lease {args.name} refused for holder {args.holder}"
 
 
