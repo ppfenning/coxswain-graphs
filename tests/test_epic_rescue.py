@@ -81,6 +81,32 @@ def test_passing_checks_and_approving_reviewers_approve_the_task_through_the_gat
     assert _one(ctx, "SELECT state FROM tasks WHERE run_id = 'rescue-1'") == ("approved",)
 
 
+BRANCH = f"agents/rescue-1/{TASK}"
+
+
+def test_an_approved_rescue_leaves_one_commit_on_its_agents_branch_holding_the_patch(repo, cart, tmp_path) -> None:  # noqa: F811
+    ctx, item, _ = _setup(repo, cart, tmp_path, new_file_patch("t1-probe.txt"))
+
+    assert _rescue(ctx, item, Runner({}))["status"] == "approved"
+
+    assert git("rev-list", "--count", f"main..{BRANCH}", cwd=repo) == "1"
+    assert git("log", "--format=%s", f"main..{BRANCH}", cwd=repo) == f"epic rescue-1: {TASK}"
+    assert git("show", f"{BRANCH}:t1-probe.txt", cwd=repo) == "ok"
+    assert git("diff", "--name-only", "main", BRANCH, cwd=repo) == "t1-probe.txt"
+
+
+def test_a_rescue_whose_branch_cannot_be_made_records_a_harness_rescue_failed_and_moves_nothing(repo, cart, tmp_path) -> None:  # noqa: F811
+    ctx, item, path = _setup(repo, cart, tmp_path, new_file_patch("t1-probe.txt"))
+    git("branch", BRANCH, "main", cwd=repo)
+
+    result = _rescue(ctx, item, Runner({}))
+
+    assert (result["status"], result["cause"]) == ("rescue_failed", "harness")
+    assert result["reason"].startswith("harness fault: branch agents/rescue-1/t1-probe could not be created")
+    assert workstore.read_item(path)["state"] == "ready"
+    assert _one(ctx, "SELECT COUNT(*) FROM gate_decisions") == (0,)
+
+
 def test_a_gate_that_refuses_the_move_leaves_the_task_where_it_was(repo, cart, tmp_path) -> None:  # noqa: F811
     runner = Runner({})
     ctx, item, path = _setup(repo, cart, tmp_path, new_file_patch("t1-probe.txt"), assume="r")
@@ -138,6 +164,7 @@ def test_reviewers_who_revise_record_a_review_rescue_failed(repo, cart, tmp_path
     assert _one(ctx, "SELECT kind, cause, cause_why FROM attempts") == ("rescue_failed", "review", "rule: rescue review revised")
     assert workstore.read_item(path)["state"] == "ready"
     assert _one(ctx, "SELECT COUNT(*) FROM gate_decisions") == (0,)
+    assert git("branch", "--list", "agents/*", cwd=repo) == ""
 
 
 def test_a_last_attempt_with_cause_code_is_not_eligible_and_asks_nobody(repo, cart, tmp_path) -> None:  # noqa: F811
