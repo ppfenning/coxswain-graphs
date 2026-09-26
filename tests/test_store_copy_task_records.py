@@ -49,7 +49,7 @@ def rows(url):
 
 def test_task_records_arrive_unchanged(src_url, dst_url):
     report = sc.copy(src_url, dst_url, T0)
-    assert report["task_records"] == {"source": 3, "copied": 3, "present": 0}
+    assert report["task_records"] == {"source": 3, "copied": 3, "refreshed": 0, "present": 0}
     assert rows(dst_url) == rows(src_url)
     assert rows(dst_url)[0][3] == json.loads(NESTED)
 
@@ -57,5 +57,5 @@ def test_task_records_arrive_unchanged(src_url, dst_url):
 def test_a_second_copy_does_not_duplicate_task_records(src_url, dst_url):
     sc.copy(src_url, dst_url, T0)
     again = sc.copy(src_url, dst_url, T0)
-    assert again["task_records"] == {"source": 3, "copied": 0, "present": 3}
+    assert again["task_records"] == {"source": 3, "copied": 0, "refreshed": 3, "present": 3}
     assert len(rows(dst_url)) == 3
