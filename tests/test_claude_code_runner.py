@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -33,6 +34,7 @@ from runner.claude_code_runner import (
     apply_reported_patch,
     call_cost,
     call_summary,
+    child_env,
     files_touched_from_patch,
     is_safeguard_refusal,
     next_spent,
@@ -72,9 +74,12 @@ def fake_claude(tmp_path: Path):
         encoding="utf-8",
     )
     script = tmp_path / "claude"
+    shell_file = tmp_path / "shell.txt"
     # stdin must pass straight through to the recorder — a heredoc here would
     # replace it, which is precisely the thing one of the tests checks.
-    script.write_text(f"#!/bin/sh\npython3 {helper} \"$@\"\ncat {output}\n", encoding="utf-8")
+    script.write_text(
+        f"#!/bin/sh\nprintf %s \"$SHELL\" > {shell_file}\npython3 {helper} \"$@\"\ncat {output}\n", encoding="utf-8"
+    )
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
 
     def set_output(payload) -> None:
@@ -99,6 +104,25 @@ def runner_for(fake_claude, tmp_path: Path, **kwargs) -> ClaudeCodeRunner:
 def recorded(fake_claude) -> dict:
     _, record, _ = fake_claude
     return json.loads(record.read_text(encoding="utf-8"))
+
+
+ENVIRON = {"SHELL": "/usr/bin/zsh", "PATH": "p"}
+
+
+def test_child_env_sets_shell_to_bash_and_keeps_the_rest() -> None:
+    assert child_env(ENVIRON, "/bin/bash") == {"SHELL": "/bin/bash", "PATH": "p"}
+    assert ENVIRON == {"SHELL": "/usr/bin/zsh", "PATH": "p"}
+
+
+def test_child_env_without_bash_returns_the_environ_unchanged() -> None:
+    assert child_env(ENVIRON, None) == {"SHELL": "/usr/bin/zsh", "PATH": "p"}
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")
+def test_the_child_sees_bash_as_its_shell(fake_claude, tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    runner_for(fake_claude, tmp_path).run(role="plan", schema=SCHEMA, prompt="go")
+    assert (tmp_path / "shell.txt").read_text(encoding="utf-8").endswith("bash")
 
 
 # ── the invocation ───────────────────────────────────────────────────────────
