@@ -1257,9 +1257,43 @@ def _mirror_read(ctx: _Ctx, items: Sequence[dict[str, Any]]) -> None:
         _log.warning("work_items mirror (read) failed for %s: %s: %s", ctx.initiative_id, type(exc).__name__, exc)
 
 
+def _store_authoritative(ctx: _Ctx) -> bool:
+    return ctx.store is not None and getattr(ctx, "work_state", "files") == "store"
+
+
+def _store_first(ctx: _Ctx, item: dict[str, Any], state: str) -> str | None:
+    """work_state: store. Move `item` to `state` in the store, compare-and-set on the state the mover read.
+
+    None when the store accepted, so the arm may now write the file. Otherwise the refusal reason: the arm must not run.
+    A mismatch adopts the store's state into `item`, as `_mirror_read_store` does. A store error refuses the move.
+    """
+    from harness import store_work_state  # not module level: see `_mirror_read`
+
+    task, expected = item.get("id"), str(item["state"])
+    try:
+        written = store_work_state.set_state(
+            ctx.store.conn, ctx.initiative_id, str(task), state, _mirror_by(ctx), item.get("phase"), _now(), expected=expected
+        )
+    except Exception as exc:
+        reason = f"state move refused, store write failed: {type(exc).__name__}: {exc}"
+        _log.warning("%s: task=%s", reason, task)
+        return reason
+    if not isinstance(written, store_work_state.Mismatch):
+        return None
+    _, why = work_mirror.check_expected_state(expected, written.current)
+    reason = f"state move refused: {why}"
+    _log.warning("%s: task=%s", reason, task)
+    if written.current is not None:
+        item["state"] = written.current
+    return reason
+
+
 def _mirror_write(ctx: _Ctx, item: Mapping[str, Any] | None, state: str) -> None:
-    """Upsert one task's work_items row after an arm wrote `state` to its file. Errors are logged, never raised."""
-    if ctx.store is None or item is None:
+    """Upsert one task's work_items row after an arm wrote `state` to its file. Errors are logged, never raised.
+
+    Under work_state store the row was already written by `_store_first`, before the file, so nothing is upserted.
+    """
+    if ctx.store is None or item is None or _store_authoritative(ctx):
         return
     try:
         _upsert_row(ctx.store, work_mirror.item_row(ctx.initiative_id, {**item, "state": state}, _now(), _mirror_by(ctx)))
@@ -2496,6 +2530,12 @@ def _execute(
     # already reviewed, adversaried and arbitrated; a `RunnerError` here is the
     # arm's own infrastructure failing, not the task, so it quarantines the
     # task as `infra` and lets the phase continue rather than crashing `run_epic`.
+    if slot == "state_move" and _store_authoritative(ctx) and by_id.get(subject) is not None:
+        # The store moves first; the arm writes the file's `state:` line only once the store has accepted.
+        refused = _store_first(ctx, by_id[subject], "approved")
+        if refused is not None:
+            state.moved[subject] = False
+            return False, refused
     try:
         applied, detail = auto_apply(dict(item), cartridge=ctx.cartridge, runner=ctx.runner)
     except LimitStop:
