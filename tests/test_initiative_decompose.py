@@ -143,6 +143,30 @@ def test_task_ids_and_files_are_prefixed_with_the_initiative_id(cart) -> None:
     assert [t["id"] for t in result["tasks"]] == ["regatta-t1", "regatta-t2", "regatta-t3"]
 
 
+def test_prefixed_adds_the_initiative_id_to_a_bare_id() -> None:
+    assert initiative_decompose._prefixed("init", "a") == "init-a"
+
+
+def test_prefixed_leaves_an_already_prefixed_id_alone() -> None:
+    assert initiative_decompose._prefixed("init", "init-a") == "init-a"
+
+
+def test_ids_and_needs_the_model_already_prefixed_stay_single_prefixed(cart) -> None:
+    answer = dict(
+        DECOMPOSITION,
+        tasks=[
+            dict(t, id=f"regatta-{t['id']}", needs=[f"regatta-{n}" for n in t["needs"]])
+            for t in DECOMPOSITION["tasks"]
+        ],
+    )
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "initiative_id": "regatta"},
+        ScriptedRunner({"decompose": answer}),
+    )
+    assert [t["id"] for t in result["tasks"]] == ["regatta-t1", "regatta-t2", "regatta-t3"]
+    assert next(t for t in result["tasks"] if t["id"] == "regatta-t3")["needs"] == ["regatta-t1", "regatta-t2"]
+
+
 # ── the adversary on the DAG ───────────────────────────────────────────────
 
 
