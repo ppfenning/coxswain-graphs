@@ -49,6 +49,7 @@ __all__ = [
     "summary_row",
     "task_record",
     "task_records",
+    "work_items",
 ]
 
 Row = dict[str, Any]
@@ -71,7 +72,8 @@ _LEASE_COLS = ("name", "holder", "epoch", "heartbeat_at", "expires_at")
 _GRAPH_COLS = ("graph_id", "name", "version", "content_hash", "registered_at", "definition_json")
 _NODE_COLS = ("graph_id", "node_id", "ord", "role", "default_tier", "default_class", "output_schema_hash")
 _TASK_RECORD_COLS = ("run_id", "phase_id", "task_id", "record_json", "updated_at")
-_JSON_COLS = frozenset({"decision_json", "detail_json", "row_json", "definition_json", "record_json"})
+_WORK_ITEM_COLS = ("initiative", "task_id", "phase", "state", "needs_json", "updated_at", "updated_by")
+_JSON_COLS = frozenset({"decision_json", "detail_json", "row_json", "definition_json", "record_json", "needs_json"})
 
 
 class StoreVersionError(RuntimeError):
@@ -281,6 +283,14 @@ def task_records(conn: Connection, run_id: str) -> dict[tuple[str, str], Row]:
     sql = f"{_select(_TASK_RECORD_COLS, 'task_records')} WHERE run_id = {p} ORDER BY phase_id, task_id"
     rows = (_dict(_TASK_RECORD_COLS, r) for r in conn.query_all(sql, (run_id,)))
     return {(r["phase_id"], r["task_id"]): r["record_json"] for r in rows}
+
+
+def work_items(conn: Connection, initiative: str) -> list[Row]:
+    """An initiative's work_items rows in task_id order, needs_json decoded and keyed as `needs`."""
+    p = conn.dialect.placeholder
+    sql = f"{_select(_WORK_ITEM_COLS, 'work_items')} WHERE initiative = {p} ORDER BY task_id"
+    rows = (_dict(_WORK_ITEM_COLS, r) for r in conn.query_all(sql, (initiative,)))
+    return [{("needs" if k == "needs_json" else k): v for k, v in r.items()} for r in rows]
 
 
 def read_trace(root: str | Path, run_id: str, call_id: str) -> list[Row]:
