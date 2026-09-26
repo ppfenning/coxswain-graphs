@@ -1,5 +1,6 @@
 from core.workstore import body_sha
 
+from harness.checks import HARNESS_FAULT_PREFIX
 from harness.rescue_select import RESCUE_KIND, eligible, patch_of, rescue_cause
 
 PATCH = "diff --git a/x b/x\n"
@@ -76,3 +77,13 @@ def test_a_failed_check_is_a_code_cause():
 
 def test_a_review_revise_is_a_review_cause():
     assert rescue_cause(False) == ("review", "rule: rescue review revised")
+
+
+def test_a_harness_fault_reason_is_a_harness_cause():
+    reason = f"{HARNESS_FAULT_PREFIX} worktree add failed: no such ref"
+    assert rescue_cause(True, reason) == ("harness", "rule: rescue harness fault")
+
+
+def test_any_other_reason_keeps_the_rule_for_its_flag():
+    assert rescue_cause(True, "check failed: bad output") == ("code", "rule: rescue checks failed")
+    assert rescue_cause(False, "rescue review revised: x") == ("review", "rule: rescue review revised")
