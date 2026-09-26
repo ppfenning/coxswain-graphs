@@ -267,6 +267,11 @@ def _stack_repo_count(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping
     return len(repos) or 1
 
 
+def _prefixed(initiative_id: str, task_id: str) -> str:
+    """Scope a task id to its initiative once; an id the model already prefixed is kept."""
+    return task_id if task_id.startswith(f"{initiative_id}-") else f"{initiative_id}-{task_id}"
+
+
 def _apply_challenge(tasks: list[dict[str, Any]], challenge: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Drop edges the adversary showed were not real; add ones it showed were.
 
@@ -355,7 +360,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 
     if initiative_id:
         tasks = [
-            dict(t, id=f"{initiative_id}-{t['id']}", needs=[f"{initiative_id}-{n}" for n in t["needs"]])
+            dict(t, id=_prefixed(initiative_id, t["id"]), needs=[_prefixed(initiative_id, n) for n in t["needs"]])
             for t in tasks
         ]
 
