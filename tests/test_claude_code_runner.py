@@ -1302,6 +1302,34 @@ def test_the_builder_is_handed_the_projects_check_commands_verbatim(fake_claude,
     assert "exactly: `pytest" not in argv[argv.index("--system-prompt") + 1], "only the builder runs anything"
 
 
+def _system_of(fake_claude) -> str:
+    argv = recorded(fake_claude)["argv"]
+    return argv[argv.index("--system-prompt") + 1]
+
+
+def test_a_reviewer_is_told_which_commands_the_builder_could_run(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.check_commands = ["pytest -q", "ruff check ."]
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
+    system = _system_of(fake_claude)
+    assert "could run only these shell commands" in system
+    assert "`python -m pytest`" in system
+
+
+def test_a_reviewer_of_a_project_with_no_checks_is_told_nothing_about_commands(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.check_commands = []
+    runner.run(role="review_charter", schema=SCHEMA, prompt="go")
+    assert "could run only these shell commands" not in _system_of(fake_claude)
+
+
+def test_a_non_review_role_is_not_told_the_builders_commands(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    runner.check_commands = ["pytest -q", "ruff check ."]
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    assert "could run only these shell commands" not in _system_of(fake_claude)
+
+
 def test_the_builder_is_told_to_run_every_check_and_may_run_the_lint_command(fake_claude, tmp_path, repo) -> None:
     """A lint error the builder never ran fails after review and costs a rerun (B023, 2026-09-23)."""
     runner = runner_for(fake_claude, tmp_path, repo_dir=repo)

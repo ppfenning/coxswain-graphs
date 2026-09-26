@@ -100,6 +100,8 @@ _WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"})
 # transcribes the diff git computes. The scratch is thrown away afterwards —
 # the harness still applies the patch itself, in a worktree it owns.
 _PATCH_ROLES = frozenset({"build"})
+# Roles that judge a builder's evidence and so must know which commands it could run.
+_REVIEW_ROLES = frozenset({"review_charter", "review_adversary", "arbitrate", "evidence_verify"})
 _VERIFY_TIMEOUT_S = 120
 _VERIFY_TOTAL_S = 300
 _VERIFY_TAIL_LINES = 40
@@ -859,7 +861,11 @@ class ClaudeCodeRunner:
         allowed += ["Bash(git status:*)", "Bash(git diff:*)", "Bash(git add:*)"]
         return list(dict.fromkeys(allowed))
 
-    def _workspace(self, scratch: Path | None = None, *, patches: bool = True) -> str:
+    def _permitted_commands(self) -> str:
+        """`_allowed_bash()` as backticked bare commands, for prose."""
+        return ", ".join(f"`{name[len('Bash('):-len(':*)')]}`" for name in self._allowed_bash())
+
+    def _workspace(self, scratch: Path | None = None, *, patches: bool = True, role: str | None = None) -> str:
         """Tell the node where the world is. It cannot find out on its own."""
         lines = [
             "<workspace>",
@@ -913,9 +919,7 @@ class ClaudeCodeRunner:
                     "one of them before you produce the diff, a lint command as much as the tests: a "
                     "check you skip here fails after review and costs a whole rerun."
                 )
-            permitted = ", ".join(
-                f"`{name[len('Bash('):-len(':*)')]}`" for name in self._allowed_bash()
-            )
+            permitted = self._permitted_commands()
             lines.append(
                 f"The ONLY shell commands permitted in this session are: {permitted}. Anything "
                 "else is refused by the sandbox before it runs. If your task text asks you to "
@@ -934,6 +938,15 @@ class ClaudeCodeRunner:
                 "diff, return. Do not re-read a file, do not explore for context you were already "
                 "given, and do not polish. A session that exceeds its budget is stopped and the task "
                 "is quarantined, so a finished-but-plain patch beats an unfinished perfect one."
+            )
+        if role in _REVIEW_ROLES and self.check_commands:
+            lines.append(
+                f"The builder's session could run only these shell commands: {self._permitted_commands()}. "
+                "Output from any of them is valid evidence for a check: `pytest -q` and "
+                "`python -m pytest -q` are the same check. Never ask the builder for a command outside "
+                "this list (for example a `uv run ...` or `make ...` form), because it cannot run one. "
+                "If a ticket's done condition names such a command, judge the evidence from the "
+                "permitted form instead."
             )
         if self.repo_dir or scratch is not None:
             where = scratch if scratch is not None else self.repo_dir
@@ -1061,7 +1074,8 @@ class ClaudeCodeRunner:
         spent_usd: float = 0.0, effort: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         system = "\n\n".join(
-            part for part in (self._read_context(packs), self._workspace(scratch, patches=patches), self.extra_system) if part
+            part for part in (self._read_context(packs), self._workspace(scratch, patches=patches, role=role), self.extra_system)
+            if part
         )
         if role in _PATCH_ROLES and scratch is not None and self.repo_dir:
             # The plan was written in the phase worktree and may cite its paths;
