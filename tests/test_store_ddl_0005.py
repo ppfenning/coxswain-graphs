@@ -25,12 +25,12 @@ def test_a_database_at_version_four_gains_two_nullable_columns_and_old_rows_read
     try:
         assert migrate(c, NOW1, default_modules()[:4]) == 4
         c.execute("INSERT INTO attempts (run_id, task_id, seq) VALUES ('r1', 't1', 1)")
-        assert migrate(c, NOW2, default_modules()) == 5
-        assert check_version(c) == (5, 5)
+        assert migrate(c, NOW2, default_modules()) == 6
+        assert check_version(c) == (6, 6)
         found = shape(c)
         assert [found[n] for n in NEW] == [("TEXT", True, None)] * 2
         assert c.query_all("SELECT run_id, cause, cause_why FROM attempts") == [("r1", None, None)]
-        assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[4:] == [(5, NOW2)]
+        assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[4:5] == [(5, NOW2)]
     finally:
         c.close()
 
@@ -39,7 +39,7 @@ def test_applying_again_changes_nothing(store_conn):
     store_conn.execute("INSERT INTO attempts (run_id, task_id, seq, cause) VALUES ('r1', 't1', 1, 'x')")
     versions = store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")
     columns = shape(store_conn)
-    assert migrate(store_conn, NOW2, default_modules()) == 5
+    assert migrate(store_conn, NOW2, default_modules()) == 6
     assert store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version") == versions
     assert shape(store_conn) == columns
     assert store_conn.query_all("SELECT cause, cause_why FROM attempts") == [("x", None)]

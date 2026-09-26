@@ -191,12 +191,12 @@ def test_a_store_migrated_from_version_two_reads_an_existing_run_with_host_null(
     real = default_modules()
     assert migrate(conn, NOW, real[:2]) == 2
     conn.execute("INSERT INTO runs (run_id, status) VALUES ('r1', 'done')")
-    assert migrate(conn, NOW, real) == 5
+    assert migrate(conn, NOW, real) == 6
     assert conn.query_all("SELECT run_id, status, host FROM runs") == [("r1", "done", None)]
 
 
 def test_a_fresh_store_is_at_the_newest_version_and_runs_has_a_host_column(store_conn):
-    assert check_version(store_conn) == (5, 5)
+    assert check_version(store_conn) == (6, 6)
     assert store_conn.query_all("SELECT host FROM runs") == []
 
 
