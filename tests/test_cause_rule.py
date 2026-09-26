@@ -26,6 +26,18 @@ def test_a_no_work_that_hit_the_budget_limit_is_harness():
     assert classify_cause("no_work", reason) == "harness"
 
 
+def test_a_no_work_that_failed_to_authenticate_is_harness():
+    reason = (
+        "node 'build' failed in claude: Failed to authenticate. API Error: 401 "
+        '{"type":"error","error":{"type":"authentication_error","message":"OAuth session expired"}}'
+    )
+    assert classify_cause("no_work", reason) == "harness"
+
+
+def test_a_no_work_with_no_authentication_marker_is_still_ticket():
+    assert classify_cause("no_work", "scope found nothing to build") == "ticket"
+
+
 def test_a_configured_check_failure_is_code():
     assert classify_cause("unverified", "a configured check failed: pytest") == "code"
 
