@@ -109,6 +109,51 @@ def test_lease_release_prints_exactly_ok_epoch_holder_and_frees_the_name(url, ru
     assert (code, one_object(out)) == (0, {"ok": True, "epoch": 2, "holder": "b"})
 
 
+ACTION = json.dumps(
+    {"ts": "2026-09-26T00:00:00Z", "epoch": 4, "kind": "land", "status": "done", "reason": "merged", "task_id": "t1"}
+)
+
+
+def test_record_action_writes_one_row_with_the_target_and_a_repeat_writes_nothing_more(url, run):
+    code, out, err = run(url, "record-action", "--holder", "chair-a", ACTION)
+    assert (code, out, err) == (0, "recorded chair action land t1\n", "")
+    rows = "SELECT ts, epoch, holder, kind, target, status, reason FROM chair_actions"
+    expected = [("2026-09-26T00:00:00Z", 4, "chair-a", "land", "t1", "done", "merged")]
+    assert with_conn(url, lambda c: c.query_all(rows)) == expected
+    assert run(url, "record-action", "--holder", "chair-a", ACTION)[0] == 0
+    assert with_conn(url, lambda c: c.query_all(rows)) == expected
+
+
+def test_record_action_target_falls_back_to_initiative_then_the_first_intake_id_then_empty(url, run):
+    base = {"ts": "2026-09-26T00:00:00Z", "epoch": 4, "status": "recorded"}
+    lines = [
+        {**base, "kind": "launch_epic", "initiative": "i1", "intake_ids": ["a"]},
+        {**base, "kind": "launch_decompose", "intake_ids": ["a", "b"]},
+        {**base, "kind": "standby"},
+    ]
+    outs = [run(url, "record-action", "--holder", "h", json.dumps(line))[1] for line in lines]
+    assert outs == [
+        "recorded chair action launch_epic i1\n",
+        "recorded chair action launch_decompose a\n",
+        "recorded chair action standby \n",
+    ]
+
+
+def test_exit_two_on_an_action_line_without_kind_and_nothing_is_written(url, run):
+    line = json.dumps({"ts": "2026-09-26T00:00:00Z", "epoch": 4, "status": "done"})
+    code, out, err = run(url, "record-action", "--holder", "chair-a", line)
+    assert (code, out) == (2, "")
+    assert err == "error: the action lacks kind\n"
+    assert with_conn(url, lambda c: c.query_all("SELECT COUNT(*) FROM chair_actions")) == [(0,)]
+
+
+def test_exit_two_on_an_action_line_that_is_not_json(run, tmp_path):
+    code, out, err = run(f"sqlite:///{tmp_path / 'cox.db'}", "record-action", "--holder", "chair-a", "{nope")
+    assert (code, out) == (2, "")
+    assert err.startswith("error: the action is not JSON")
+    assert not (tmp_path / "cox.db").exists()
+
+
 def test_exit_three_when_mark_landed_finds_no_record_prints_the_empty_object(url, run):
     code, out, err = run(url, "mark-landed", "r1", "p1", "missing", "--pr", PR, "--at", AT)
     assert (code, one_object(out)) == (3, {})

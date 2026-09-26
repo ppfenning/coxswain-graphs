@@ -21,6 +21,7 @@ EXPECTED_ORDER = (
     "gate_decisions",
     "ledger",
     "leases",
+    "chair_actions",
 )
 
 SEED = {
@@ -41,6 +42,10 @@ SEED = {
     "gate_decisions": [{"run_id": "r1", "phase_id": "p1", "seq": 1, "kind": "merge", "applied": 1, "epoch": 3}],
     "ledger": [{"row_hash": "h1", "run_id": "r1", "kind": "merge", "epoch": 3, "row_json": "{}"}],
     "leases": [{"name": "epic", "holder": "me", "epoch": 4}],
+    "chair_actions": [
+        {"ts": "2026-09-26T00:00:00Z", "epoch": 4, "holder": "me", "kind": "land", "target": "t1", "status": "done",
+         "reason": "merged", "action_json": '{"kind": "land"}'},
+    ],
     "work_items": [
         {"initiative": "i1", "task_id": "t1", "phase": "p1", "state": "ready", "needs_json": "[]",
          "updated_at": "2026-09-25T00:00:00Z", "updated_by": "chair"},
@@ -159,6 +164,17 @@ def test_every_source_row_lands_in_the_destination(src_url, dst_url):
             ("c2", 0.5, 0, None),
         ]
         assert json.loads(dst.query_one("SELECT definition_json FROM graphs")[0]) == {"x": 1}
+    finally:
+        dst.close()
+
+
+def test_a_chair_actions_row_is_in_the_destination_after_a_copy(src_url, dst_url):
+    sc.copy(src_url, dst_url, T0)
+    dst = open_store(dst_url, T0)
+    try:
+        assert dst.query_all("SELECT ts, epoch, holder, kind, target, status FROM chair_actions") == [
+            ("2026-09-26T00:00:00Z", 4, "me", "land", "t1", "done")
+        ]
     finally:
         dst.close()
 

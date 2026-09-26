@@ -44,7 +44,7 @@ def test_work_items_has_the_listed_columns_all_not_null_and_composite_key():
 
 
 def test_a_fresh_store_reaches_the_newest_version(store_conn):
-    assert check_version(store_conn) == (6, 6)
+    assert check_version(store_conn) == (7, 7)
     assert store_conn.query_all("SELECT initiative FROM work_items") == []
 
 
@@ -67,7 +67,7 @@ def test_a_database_at_version_five_applies_only_0006():
     try:
         assert migrate(c, NOW1, default_modules()[:5]) == 5
         c.execute("INSERT INTO runs (run_id) VALUES ('r1')")
-        assert migrate(c, NOW2, default_modules()) == 6
+        assert migrate(c, NOW2, default_modules()[:6]) == 6
         assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[5:] == [(6, NOW2)]
         assert c.query_all("SELECT run_id FROM runs") == [("r1",)]
         assert c.query_all("SELECT COUNT(*) FROM work_items") == [(0,)]
@@ -79,9 +79,9 @@ def test_applying_again_is_a_no_op():
     c = open_store("sqlite:///:memory:", NOW1)
     try:
         insert(c, "i1", "t1")
-        assert migrate(c, NOW2, default_modules()) == 6
+        assert migrate(c, NOW2, default_modules()) == 7
         versions = c.query_all("SELECT version FROM schema_version ORDER BY version")
-        assert versions == [(1,), (2,), (3,), (4,), (5,), (6,)]
+        assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
         assert c.query_all("SELECT COUNT(*) FROM work_items") == [(1,)]
     finally:
         c.close()
