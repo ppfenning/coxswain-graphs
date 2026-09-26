@@ -496,6 +496,20 @@ def prune_missing(missing: list[str], facts: dict[str, str]) -> tuple[list[str],
     return kept, discharged
 
 
+_COMMAND_WORDS = frozenset({"uv", "python", "python3", "grep", "rg", "make", "npm", "bash", "sh", "cat", "sed", "cox", "git"})
+_BACKTICK_SPAN_RE = re.compile(r"`([^`]+)`")
+
+
+def impossible_evidence(item: str, prefixes: Sequence[str]) -> bool:
+    """True when a backticked command in `item` starts with none of the build session's permitted `prefixes`."""
+    spans = (span.strip() for span in _BACKTICK_SPAN_RE.findall(item))
+    return any(
+        span.split()[0] in _COMMAND_WORDS and not any(span.startswith(prefix) for prefix in prefixes)
+        for span in spans
+        if span
+    )
+
+
 _SIZE_TARGET_RE = re.compile(r"~\s*(\d+)\s*lines", re.IGNORECASE)
 
 
@@ -1134,6 +1148,14 @@ def _handoff(
     # it is sitting in `facts` unread. If discharging clears the list, the
     # handoff was complete all along.
     kept, discharged = prune_missing(list(handoff.get("missing") or []), measured_facts(build, facts))
+    # Evidence that asks for a command the build's session cannot run is not a
+    # gap another build attempt can close; discharge it rather than loop on it.
+    permitted = getattr(runner, "permitted_prefixes", None)
+    prefixes = permitted() if callable(permitted) else []
+    if prefixes:
+        impossible = [item for item in kept if impossible_evidence(item, prefixes)]
+        kept = [item for item in kept if item not in impossible]
+        discharged = [*discharged, *(f"{item} (not runnable in the build's session)" for item in impossible)]
     handoff["missing"] = kept
     handoff["discharged"] = discharged
     if not kept:
