@@ -7,6 +7,8 @@ from typing import Any
 
 from core.workstore import attempts_on_current_body
 
+from harness.checks import HARNESS_FAULT_PREFIX
+
 RESCUE_KIND = "rescue_failed"
 
 
@@ -31,8 +33,10 @@ def eligible(item: Mapping[str, Any], patch: str | None) -> tuple[bool, str]:
     return True, "harness cause, patch kept"
 
 
-def rescue_cause(failed_checks: bool) -> tuple[str, str]:
-    """The rule-made (cause, cause_why) for a rescue_failed attempt."""
+def rescue_cause(failed_checks: bool, reason: str = "") -> tuple[str, str]:
+    """The rule-made (cause, cause_why) for a rescue_failed attempt. A harness-fault reason is the harness's own."""
+    if reason.startswith(HARNESS_FAULT_PREFIX):
+        return "harness", "rule: rescue harness fault"
     if failed_checks:
         return "code", "rule: rescue checks failed"
     return "review", "rule: rescue review revised"

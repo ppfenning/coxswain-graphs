@@ -104,6 +104,29 @@ def test_a_failing_check_records_a_code_rescue_failed_and_asks_no_reviewer(repo,
     assert runner.calls == []
 
 
+def test_a_patch_that_applies_to_main_passes_when_the_phase_branch_already_holds_the_change(repo, cart, tmp_path) -> None:  # noqa: F811
+    runner = Runner({})
+    ctx, item, _ = _setup(repo, cart, tmp_path, new_file_patch("t1-probe.txt"))
+    git("checkout", f"epic/demo-initiative/{PHASE}", cwd=repo)
+    (repo / "t1-probe.txt").write_text("stale\n")
+    git("add", "t1-probe.txt", cwd=repo)
+    git("commit", "-m", "stale copy of the change", cwd=repo)
+    git("checkout", "main", cwd=repo)
+
+    assert _rescue(ctx, item, runner)["status"] == "approved"
+
+
+def test_a_worktree_add_failure_records_a_harness_rescue_failed(repo, cart, tmp_path) -> None:  # noqa: F811
+    runner = Runner({})
+    ctx, item, _ = _setup(repo, cart, tmp_path, new_file_patch("t1-probe.txt"))
+
+    result = _rescue(replace(ctx, default_ref="no-such-ref"), item, runner)
+
+    assert (result["status"], result["cause"]) == ("rescue_failed", "harness")
+    assert result["reason"].startswith("harness fault: worktree add failed")
+    assert _one(ctx, "SELECT kind, cause, cause_why FROM attempts") == ("rescue_failed", "harness", "rule: rescue harness fault")
+
+
 def test_reviewers_who_revise_record_a_review_rescue_failed(repo, cart, tmp_path) -> None:  # noqa: F811
     runner = Runner({}, review={TASK: REVISE})
     ctx, item, path = _setup(repo, cart, tmp_path, new_file_patch("t1-probe.txt"))
