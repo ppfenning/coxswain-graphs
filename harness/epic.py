@@ -83,7 +83,14 @@ from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
 from harness.store_lease import assert_epoch
 from harness.store_write import Store, upsert_work_item
-from harness.worktree import apply_patch, create_worktree, keep_worktree, prune_registrations, remove_worktree
+from harness.worktree import (
+    apply_patch,
+    create_worktree,
+    keep_worktree,
+    link_venv,
+    prune_registrations,
+    remove_worktree,
+)
 from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import LimitStop, RunnerError
 
@@ -487,6 +494,7 @@ def _build_task(
     if not ok:
         record["quarantine"] = f"worktree {branch} could not be created: {detail}"
         return record
+    link_venv(ctx.repo, worktree)
 
     ok, detail = apply_patch(patch, worktree)
     record["evidence"].append(
