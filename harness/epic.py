@@ -566,6 +566,7 @@ def _lifecycle_invocation(
         args={
             "date": ctx.date,
             "ticket": task["id"],
+            "work_item": True,
             "ticket_title": task.get("title") or "",
             "ticket_body": body,
             "cartridge": ctx.cartridge,

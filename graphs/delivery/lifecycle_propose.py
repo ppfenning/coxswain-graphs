@@ -1632,6 +1632,8 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
     raw_build_budget_usd = args.get("build_budget_usd")
     build_budget_usd = None if raw_build_budget_usd is None else float(raw_build_budget_usd)
 
+    is_work_item = bool(args.get("work_item"))
+
     context = list(cartridge.get("context") or [])
     proposals: list[dict[str, Any]] = []
 
@@ -1666,22 +1668,25 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
         scope["shape"] = shape
         scope["landing"] = landing
 
-        proposals.append(
-            proposal(
-                cartridge,
-                kind="item_create",
-                target=str(scope.get("parent_epic") or ticket),
-                evidence=[
-                    {"check": "epic_threshold", "output": f"{shape} ({len(scope.get('tickets') or [])} tickets, {len(scope.get('phases') or [])} phases, {len(scope.get('repos') or [])} repos)"},
-                    {"check": "work_routing", "output": f"state '{scope.get('state')}' lands in {landing}"},
-                ],
-                rationale=str(scope.get("rationale", "")),
-                suggested_action=(
-                    f"file as {shape} in {landing}"
-                    + (f", attached to {scope['parent_epic']}" if scope.get("parent_epic") else "")
-                ),
+        # A ticket that is already a work item must not propose filing itself: the
+        # workstore arm has no apply block to route, falls back, and writes nothing.
+        if not is_work_item:
+            proposals.append(
+                proposal(
+                    cartridge,
+                    kind="item_create",
+                    target=str(scope.get("parent_epic") or ticket),
+                    evidence=[
+                        {"check": "epic_threshold", "output": f"{shape} ({len(scope.get('tickets') or [])} tickets, {len(scope.get('phases') or [])} phases, {len(scope.get('repos') or [])} repos)"},
+                        {"check": "work_routing", "output": f"state '{scope.get('state')}' lands in {landing}"},
+                    ],
+                    rationale=str(scope.get("rationale", "")),
+                    suggested_action=(
+                        f"file as {shape} in {landing}"
+                        + (f", attached to {scope['parent_epic']}" if scope.get("parent_epic") else "")
+                    ),
+                )
             )
-        )
 
     bound = cartridge.get("skills") or {}
     surfaces = list(args.get("surfaces") or [])
