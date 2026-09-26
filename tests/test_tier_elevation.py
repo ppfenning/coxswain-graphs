@@ -7,6 +7,8 @@ protocol's real keyword-only signature. A fake that accepts any keyword let a
 
 from __future__ import annotations
 
+from unittest.mock import ANY
+
 import pytest
 
 from graphs.delivery import lifecycle_propose
@@ -129,5 +131,5 @@ def test_an_escalated_build_that_hits_its_budget_resumes_at_the_escalated_tier(
     runner = scripted(plan_response, [build_response, stop, rebuilt(build_response, PATCH_2)], [REVISE, review_response])
     result = lifecycle_propose.run(args(cartridge), runner)
     assert build_tiers(runner) == ["standard", "deep", "deep"]
-    assert result["fix_loop"] == {"attempts": 2, "stopped": None, "continuations": 1}
+    assert result["fix_loop"] == {"attempts": 2, "stopped": None, "continuations": 1, "rounds": ANY}
     assert escalation_rows(result) == [{"check": "tier escalation", "output": ESCALATED}]
