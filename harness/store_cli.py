@@ -117,6 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
     acquire.add_argument("name")
     acquire.add_argument("holder")
     acquire.add_argument("--ttl", type=_positive_seconds, required=True, help="seconds")
+    acquire.add_argument("--steal", action="store_true", help="take a lease another holder still holds, at epoch + 1")
 
     renew = actions.add_parser("renew")
     _common(renew, top=False)
@@ -224,7 +225,7 @@ def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[dict
             return {"actual": row.current, "expected": args.expect}, EXIT_PRECONDITION
         return ({}, EXIT_PRECONDITION) if row is None else (row, EXIT_OK)
     if args.action == "acquire":
-        result = lease_acquire(conn, args.name, args.holder, now, args.ttl)
+        result = lease_acquire(conn, args.name, args.holder, now, args.ttl, steal=args.steal)
     elif args.action == "renew":
         result = lease_renew(conn, args.name, args.holder, args.epoch, now, args.ttl)
     else:

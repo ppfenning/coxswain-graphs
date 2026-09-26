@@ -24,6 +24,9 @@ _TAKE = (
     "UPDATE leases SET holder = ?, epoch = epoch + 1, heartbeat_at = ?, expires_at = ? "
     "WHERE name = ? AND (expires_at <= ? OR holder = ?)"
 )
+_STEAL = (
+    "UPDATE leases SET holder = ?, epoch = epoch + 1, heartbeat_at = ?, expires_at = ? WHERE name = ? AND epoch = ?"
+)
 _RENEW = (
     "UPDATE leases SET heartbeat_at = ?, expires_at = ? WHERE name = ? AND holder = ? AND epoch = ? AND expires_at > ?"
 )
@@ -31,7 +34,7 @@ _RELEASE = "UPDATE leases SET expires_at = ? WHERE name = ? AND holder = ? AND e
 _READ = "SELECT name, holder, epoch, heartbeat_at, expires_at FROM leases WHERE name = ?"
 _FENCE = "SELECT 1 FROM leases WHERE name = ? AND epoch = ? AND expires_at > ?"
 
-SQL = (_TAKE, _RENEW, _RELEASE, _READ, _FENCE)
+SQL = (_TAKE, _STEAL, _RENEW, _RELEASE, _READ, _FENCE)
 
 
 @dataclass(frozen=True)
@@ -70,10 +73,11 @@ def _read(conn: Connection, name: str) -> tuple[Any, ...] | None:
     return conn.query_one(_sql(conn.dialect, _READ), (name,))
 
 
-def acquire(conn: Connection, name: str, holder: str, now: str, ttl: int) -> LeaseResult:
+def acquire(conn: Connection, name: str, holder: str, now: str, ttl: int, steal: bool = False) -> LeaseResult:
     """Take a free or expired lease, or renew-with-increment one already held by `holder`.
 
-    A refusal, including a lost insert race, is a result with ok False and the current holder.
+    With `steal`, a lease held by another live holder is replaced at epoch + 1 in one UPDATE on the epoch read.
+    A refusal, including a lost insert race or a lost steal, is a result with ok False and the current holder.
     """
     at, until = _stamp(now), _expiry(now, ttl)
     with conn.transaction():
@@ -84,6 +88,12 @@ def acquire(conn: Connection, name: str, holder: str, now: str, ttl: int) -> Lea
         if conn.execute(insert, (name, holder, 1, at, until)) == 1:
             return LeaseResult(True, 1, holder)
         row = _read(conn, name)
+        # Updating on the epoch just read is what stops two stealers both winning: the loser matches no row.
+        if steal and row is not None:
+            seen = int(row[2])
+            if conn.execute(_sql(conn.dialect, _STEAL), (holder, at, until, name, seen)) == 1:
+                return LeaseResult(True, seen + 1, holder)
+            row = _read(conn, name)
         return LeaseResult(False, None if row is None else int(row[2]), None if row is None else row[1])
 
 
