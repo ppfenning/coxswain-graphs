@@ -22,6 +22,7 @@ _KEYS: dict[str, tuple[str, ...]] = {
     "phases": ("run_id", "phase_id"),
     "tasks": ("run_id", "task_id"),
     "task_records": ("run_id", "phase_id", "task_id"),
+    "work_items": ("initiative", "task_id"),
     "attempts": ("run_id", "task_id", "seq"),
     "node_calls": ("call_id",),
     "ledger": ("row_hash",),
@@ -138,6 +139,43 @@ def task_record_row(run_id: str, phase_id: str, task_id: str, record: Mapping[st
         "record_json": dict(record),
         "updated_at": updated_at,
     }
+
+
+def work_item_row(
+    initiative: str,
+    task_id: str,
+    phase: str,
+    state: str,
+    needs: Sequence[str],
+    updated_at: str,
+    updated_by: str,
+) -> Row:
+    """A work_items row; needs stays a list here and `_params` encodes it into needs_json."""
+    return {
+        "initiative": initiative,
+        "task_id": task_id,
+        "phase": phase,
+        "state": state,
+        "needs_json": list(needs),
+        "updated_at": updated_at,
+        "updated_by": updated_by,
+    }
+
+
+def upsert_work_item(
+    conn: Connection,
+    initiative: str,
+    task_id: str,
+    phase: str,
+    state: str,
+    needs: Sequence[str],
+    updated_at: str,
+    updated_by: str,
+) -> int:
+    """Save a work item, replacing phase, state, needs_json, updated_at and updated_by when the key is there."""
+    row = work_item_row(initiative, task_id, phase, state, needs, updated_at, updated_by)
+    sql = upsert(conn.dialect, "work_items", list(row), _KEYS["work_items"])
+    return conn.execute(sql, _params(row))
 
 
 def task_cause(record: Mapping[str, Any]) -> tuple[str | None, str | None]:
