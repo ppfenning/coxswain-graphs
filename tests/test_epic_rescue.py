@@ -12,12 +12,17 @@ from harness.epic import _Ctx, rescue_task, with_stored_rescues
 from harness.resume import load_result, save_result
 from harness.store_migrate import open_store
 from harness.store_write import Store
+from tests.test_epic_attempt_cap import TRIAGE_SPECS, _amend_cart
 from tests.test_epic_driver import (  # noqa: F401 -- cart and repo are fixtures
     PROFILE,
     REVISE,
     Runner,
+    TriageAttemptRunner,
+    builds_per_task,
     cart,
+    drive,
     git,
+    initiative,
     new_file_patch,
     repo,
 )
@@ -142,3 +147,29 @@ def test_a_stored_rescue_older_than_the_current_body_is_stamped_as_an_older_body
     row = {"run_id": "r", "phase_id": PHASE, "kind": "rescue_failed", "reason": "x", "ts": "2026-08-01", "cause": "code"}
 
     assert with_stored_rescues(item, [row])["attempts"][0]["body_sha"] == "before the current body"
+
+
+def _probe_with(*attempts: dict) -> dict:
+    """One ready task, `t1-probe`, carrying `attempts` on its current body."""
+    work = initiative(two_phases=False)
+    task = next(item for item in work["items"] if item["id"] == "t1-probe")
+    task["attempts"] = [{"run": f"epic-prior-{n}", "phase": PHASE, "body_sha": SHA, **a} for n, a in enumerate(attempts)]
+    return work
+
+
+def test_a_rescue_failed_attempt_beside_one_build_attempt_does_not_cap_the_task_and_it_builds(repo, cart, tmp_path) -> None:  # noqa: F811
+    work = _probe_with({"reason": "check failed: bad output"}, {"kind": "rescue_failed", "reason": "check failed: bad output"})
+    result, runner = drive(repo, cart, tmp_path, work=work)
+
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+    assert not any(call["role"] == "triage" for call in runner.calls)
+    assert builds_per_task(runner)["t1-probe"] == 1
+
+
+def test_two_build_attempts_on_the_current_body_still_cap_the_task_and_it_goes_to_triage(repo, cart, tmp_path) -> None:  # noqa: F811
+    work = _probe_with({"reason": "check failed: bad output"}, {"reason": "check failed: bad output"})
+    runner = TriageAttemptRunner({})
+    drive(repo, _amend_cart(cart), tmp_path, runner=runner, work=work, specs=TRIAGE_SPECS)
+
+    assert any(call["role"] == "triage" for call in runner.calls)
+    assert "t1-probe" not in builds_per_task(runner)
