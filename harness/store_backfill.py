@@ -34,6 +34,12 @@ caller's `task_records_updated_at` or the file's mtime. A file that is not a JSO
 a warning and named in `malformed_task_records`. Task_records is not in TABLES: its counts are two
 report keys, not a per-table dict, so `balanced` and `archive_imported` are unaffected.
 
+Work item files `<work_dir>/<initiative>/<phase>/<task>.md` are mirrored into work_items by harness/work_mirror.py
+with updated_by `backfill` and each file's mtime as its time. initiative.md is not a task. A stored row newer
+than its file with a different state is left alone and listed in `work_item_disagreements`; the rest are upserted,
+so a rerun leaves the same rows and a file with unreadable frontmatter or no id or state is skipped with a warning
+and named in `malformed_work_items`. The three keys are flat, like the task record keys, so `balanced` ignores them.
+
 Attempts with a null cause get the rule in harness/cause_rule.py applied to kind and reason, or `unknown`
 when it matches nothing. No model is called. Only nulls are written, so a rerun fills nothing and a cause
 set by the driver or a human stays. cause_why stays null. The report gains one flat key per cause,
@@ -57,8 +63,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from harness.cause_rule import CAUSES, classify_cause
 from harness.store_migrate import open_store
+from harness.store_read import work_items
 from harness.store_write import (
     _KEYS,
     _RUN_KEYS,
@@ -71,19 +80,25 @@ from harness.store_write import (
     phase_row,
     run_row,
     split_phase_id,
+    upsert_work_item,
 )
+from harness.work_mirror import plan_mirror
 
 TABLES = ("runs", "phases", "gate_decisions", "node_calls", "ledger", "attempts")
 _COUNTS = ("seen", "inserted", "already_present", "malformed")
 _USAGE_SUFFIX = ".usage.json"
 
-Report = dict[str, dict[str, int] | int | list[str]]
+Report = dict[str, dict[str, int] | int | list[str] | list[Row]]
 STAMPED_KEY = "runs_stamped_ended"
 STAMPED_STATUS = "backfilled"
 SKIPPED_KEY = "skipped_files"
 MALFORMED_KEY = "malformed_run_files"
 TASK_RECORDS_KEY = "task_records_imported"
 MALFORMED_TASK_RECORDS_KEY = "malformed_task_records"
+WORK_ITEMS_KEY = "work_items_upserted"
+WORK_ITEM_DISAGREEMENTS_KEY = "work_item_disagreements"
+MALFORMED_WORK_ITEMS_KEY = "malformed_work_items"
+WORK_ITEMS_BY = "backfill"
 NEVER_RECORDED_STATUS = "never_recorded"
 CAUSE_FILLED_PREFIX = "cause_filled_"
 CAUSE_REFILLED_PREFIX = "cause_refilled_"
@@ -244,6 +259,30 @@ def task_record_paths(runs_dir: Path | str) -> list[tuple[Path, str, str, str]]:
     return [(p, p.parts[-4], p.parts[-2], p.stem) for p in sorted(Path(runs_dir).glob("*/tasks/*/*.json"))]
 
 
+def parse_work_item(doc: Any, phase_dir: str) -> Row | None:
+    """`{id, phase, state, needs}` from task frontmatter, or None without an id or a state.
+
+    A missing phase is the name of the phase directory the file sits in. needs must be absent or a list.
+    """
+    if not isinstance(doc, dict):
+        return None
+    item_id, state = _text(doc.get("id")), _text(doc.get("state"))
+    needs = [] if doc.get("needs") is None else doc["needs"]
+    if item_id is None or state is None or not isinstance(needs, list):
+        return None
+    return {
+        "id": item_id,
+        "phase": _text(doc.get("phase")) or phase_dir,
+        "state": state,
+        "needs": [str(n) for n in needs],
+    }
+
+
+def work_item_paths(work_dir: Path | str) -> list[tuple[Path, str, str]]:
+    """`(path, initiative, phase_dir)` for each `<work_dir>/<initiative>/<phase>/<task>.md`, sorted. initiative.md is not a task."""
+    return [(p, p.parts[-3], p.parts[-2]) for p in sorted(Path(work_dir).glob("*/*/*.md")) if p.name != "initiative.md"]
+
+
 # ── report ───────────────────────────────────────────────────────────────────
 
 
@@ -254,7 +293,7 @@ def new_report() -> Report:
 def balanced(report: Report) -> bool:
     """True when every table has seen minus malformed equal to inserted plus already present. An empty report is not.
 
-    Only the per-table dicts are import counts. `runs_stamped_ended`, `skipped_files`, `malformed_run_files` and the task record keys are not.
+    Only the per-table dicts are import counts. `runs_stamped_ended`, `skipped_files`, `malformed_run_files`, the task record keys and the work item keys are not.
     """
     tables = [t for t in report.values() if isinstance(t, dict)]
     return bool(tables) and all(t["seen"] - t["malformed"] == t["inserted"] + t["already_present"] for t in tables)
@@ -420,6 +459,55 @@ def _import_task_records(store: Store, runs_dir: Path, updated_at: str | None) -
     return written, malformed
 
 
+def _read_work_item(path: Path, phase_dir: str) -> Row | None:
+    """The task file's item, or None when its frontmatter cannot be read or has no id or state."""
+    from core.workstore import WorkStoreError, read_item
+
+    try:
+        return parse_work_item(read_item(path), phase_dir)
+    except (WorkStoreError, OSError, ValueError, yaml.YAMLError):
+        return None
+
+
+def _import_work_items(store: Store, work_dir: Path) -> tuple[int, list[Row], list[str]]:
+    """Mirror each task file's state into work_items. Returns rows upserted, disagreements and files skipped.
+
+    A stored row newer than its file with a different state is left alone and reported. The clock is not read:
+    every stamp is a file mtime or a stored time. A file that cannot be read is warned about and named, never fatal.
+    """
+    read = [
+        (path, initiative, _read_work_item(path, phase_dir))
+        for path, initiative, phase_dir in work_item_paths(work_dir)
+    ]
+    skipped = [path.relative_to(work_dir).as_posix() for path, _, item in read if item is None]
+    for name in skipped:
+        warnings.warn(f"work item skipped, frontmatter unreadable or without id or state: {name}", stacklevel=2)
+    upserted = 0
+    disagreements: list[Row] = []
+    for initiative in sorted({i for _, i, item in read if item is not None}):
+        found = [
+            (item, _mtime_iso(path.stat().st_mtime)) for path, i, item in read if i == initiative and item is not None
+        ]
+        times = {item["id"]: mtime for item, mtime in found}
+        with store.conn.transaction():
+            rows, disagreed = plan_mirror(
+                initiative, [item for item, _ in found], work_items(store.conn, initiative), times, WORK_ITEMS_BY
+            )
+            for row in rows:
+                upserted += upsert_work_item(
+                    store.conn,
+                    initiative,
+                    row["task_id"],
+                    row["phase"],
+                    row["state"],
+                    row["needs"],
+                    row["updated_at"],
+                    row["updated_by"],
+                )
+        disagreements = [*disagreements, *disagreed]
+    return upserted, disagreements, [f"{name}: no readable id and state" for name in skipped]
+
+
 def _ended_at(latest_ts: str | None, mtime: float) -> str:
     """The latest call ts when the run has calls, else the usage file's mtime as ISO UTC."""
     return latest_ts if latest_ts is not None else _mtime_iso(mtime)
@@ -504,6 +592,7 @@ def backfill(
     _import_calls(store, report, files)
     _import_ledger(store, report, Path(ledger_path))
     _import_attempts(store, report, Path(work_dir))
+    work_upserted, work_disagreements, bad_work_items = _import_work_items(store, Path(work_dir))
     task_records, bad_task_records = _import_task_records(store, Path(runs_dir), task_records_updated_at)
     stamped = _stamp_ended(store, Path(runs_dir))
     caused = cause_report(_fill_causes(store))
@@ -519,6 +608,9 @@ def backfill(
         MALFORMED_KEY: malformed,
         TASK_RECORDS_KEY: task_records,
         MALFORMED_TASK_RECORDS_KEY: bad_task_records,
+        WORK_ITEMS_KEY: work_upserted,
+        WORK_ITEM_DISAGREEMENTS_KEY: work_disagreements,
+        MALFORMED_WORK_ITEMS_KEY: bad_work_items,
     }
 
 
