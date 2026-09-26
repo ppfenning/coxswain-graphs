@@ -148,18 +148,24 @@ UNBUILDABLE_SCHEMA = {
 }
 
 
+def _scalar(value: Any) -> str:
+    """One YAML flow scalar, quoted only when YAML requires it."""
+    dumped = yaml.safe_dump(value, default_flow_style=True, allow_unicode=True, width=10_000)
+    return dumped.strip().removesuffix("...").rstrip()
+
+
 def initiative_text(
     idea: Mapping[str, Any], phases: Sequence[str], goals: Mapping[str, str], repo: str, *, intake: str | None = None
 ) -> str:
     """The `initiative.md` shape every hand-written initiative in the workspace carries."""
     goal_lines = "\n".join(f"- {phase_id}: {goals.get(phase_id, '')}" for phase_id in phases)
-    intake_line = f"intake: {intake}\n" if intake else ""
+    intake_line = f"intake: {_scalar(intake)}\n" if intake else ""
     return (
         "---\n"
-        f"id: {idea.get('id')}\n"
-        f"title: {idea.get('title')}\n"
-        f"repo: {repo}\n"
-        f"budget_usd: {idea.get('budget_usd')}\n"
+        f"id: {_scalar(idea.get('id'))}\n"
+        f"title: {_scalar(idea.get('title'))}\n"
+        f"repo: {_scalar(repo)}\n"
+        f"budget_usd: {_scalar(idea.get('budget_usd'))}\n"
         f"{intake_line}"
         "---\n\n"
         f"{idea.get('why', '')}\n\n"
