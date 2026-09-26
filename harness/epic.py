@@ -1273,7 +1273,7 @@ def _store_authoritative(ctx: _Ctx) -> bool:
 def _store_first(ctx: _Ctx, item: dict[str, Any], state: str) -> str | None:
     """work_state: store. Move `item` to `state` in the store, compare-and-set on the state the mover read.
 
-    None when the store accepted, so the arm may now write the file. Otherwise the refusal reason: the arm must not run.
+    None when the store accepted, so the driver writes the file line itself. Otherwise the refusal reason: nothing else runs.
     A mismatch adopts the store's state into `item`, as `_mirror_read_store` does. A store error refuses the move.
     """
     from harness import store_work_state  # not module level: see `_mirror_read`
@@ -2540,11 +2540,15 @@ def _execute(
     # arm's own infrastructure failing, not the task, so it quarantines the
     # task as `infra` and lets the phase continue rather than crashing `run_epic`.
     if slot == "state_move" and _store_authoritative(ctx) and by_id.get(subject) is not None:
-        # The store moves first; the arm writes the file's `state:` line only once the store has accepted.
+        # The store's acceptance is the move. The file is a cache, so no arm runs; the driver writes its line.
         refused = _store_first(ctx, by_id[subject], "approved")
         if refused is not None:
             state.moved[subject] = False
             return False, refused
+        if not _repair_file_state(by_id[subject], "approved"):
+            _log.warning("store moved %s to approved; file state line not written, regenerate-states repairs it", subject)
+        state.moved[subject] = True
+        return True, "store moved to approved; file state line written"
     try:
         applied, detail = auto_apply(dict(item), cartridge=ctx.cartridge, runner=ctx.runner)
     except LimitStop:

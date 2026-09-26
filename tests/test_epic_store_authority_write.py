@@ -55,20 +55,35 @@ def _move(ctx, item, monkeypatch, events):
     return state, result
 
 
-def test_a_matching_move_writes_the_store_then_the_file(store_conn, item, monkeypatch):
+def test_a_matching_move_writes_the_store_then_the_driver_writes_the_file_with_no_arm(store_conn, item, monkeypatch):
     ctx = _ctx(store_conn, "store")
     _put(ctx, item, "ready")
     events: list = []
     real = sws.set_state
     monkeypatch.setattr(sws, "set_state", lambda *a, **k: events.append(("store", k["expected"])) or real(*a, **k))
     state, result = _move(ctx, item, monkeypatch, events)
-    assert events == [("store", "ready"), ("arm", "approved", READY)]
-    assert result == (True, "stub arm")
+    assert events == [("store", "ready")]
+    assert result == (True, "store moved to approved; file state line written")
     assert state.moved == {"t1": True}
     assert (_row_state(ctx), Path(item["path"]).read_bytes()) == ("approved", APPROVED)
     assert {r["task_id"]: r["updated_by"] for r in read.work_items(store_conn, INITIATIVE)}[
         "t1"
     ] == f"epic-driver:{RUN}"
+
+
+def test_a_failed_file_write_still_applies_warns_and_leaves_the_store_moved(store_conn, item, monkeypatch, caplog):
+    ctx = _ctx(store_conn, "store")
+    _put(ctx, item, "ready")
+    Path(item["path"]).unlink()
+    events: list = []
+    with caplog.at_level(logging.WARNING, logger=epic._log.name):
+        state, (ok, detail) = _move(ctx, item, monkeypatch, events)
+    assert (ok, events, state.moved) == (True, [], {"t1": True})
+    assert detail == "store moved to approved; file state line written"
+    assert _row_state(ctx) == "approved"
+    assert not Path(item["path"]).exists()
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "regenerate-states" in caplog.records[0].getMessage()
 
 
 def test_a_mismatch_refuses_names_both_states_and_leaves_the_file_and_the_row(store_conn, item, monkeypatch, caplog):
