@@ -1,4 +1,4 @@
-"""python -m harness.store_cli: mark-landed, set-state, lease, record-action and regenerate-states commands against the run-record store."""
+"""python -m harness.store_cli: mark-landed, set-state, lease, host, record-action and regenerate-states commands against the run-record store."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import yaml
 from harness.cli import _read_profile, _storage_url
 from harness.store_cli_lease import lease_acquire, lease_release, lease_renew
 from harness.store_dialect import Connection, StoreDriverMissing, insert_ignore, json_text
+from harness.store_hosts import HOST_STATES, host_beat, host_list, host_set_state, host_upsert
 from harness.store_landed import mark_landed
 from harness.store_migrate import MigrationError, open_store
 from harness.store_read import work_items
@@ -72,6 +73,16 @@ def _non_empty(text: str) -> str:
     if not text.strip():
         raise argparse.ArgumentTypeError("must not be empty")
     return text
+
+
+def _versions(text: str) -> dict[str, Any]:
+    try:
+        value = json.loads(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not JSON: {text!r}") from None
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return value
 
 
 def _common(parser: argparse.ArgumentParser, *, top: bool) -> None:
@@ -132,6 +143,31 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("name")
     release.add_argument("holder")
     release.add_argument("epoch", type=int)
+
+    host = commands.add_parser("host", help="upsert, beat, set-state or list the hosts table")
+    host_actions = host.add_subparsers(dest="action", required=True)
+
+    upsert_host = host_actions.add_parser("upsert", help="insert or overwrite a host, keeping its last beat")
+    _common(upsert_host, top=False)
+    upsert_host.add_argument("name", type=_non_empty)
+    upsert_host.add_argument("--ssh", required=True, type=_non_empty)
+    upsert_host.add_argument("--capacity", required=True, type=int)
+    upsert_host.add_argument("--state", choices=HOST_STATES, default="active")
+    upsert_host.add_argument("--by", required=True, type=_non_empty, help="who made the change")
+
+    beat = host_actions.add_parser("beat", help="stamp a host's beat time and what it reports")
+    _common(beat, top=False)
+    beat.add_argument("name")
+    beat.add_argument("--versions", required=True, type=_versions, help="a JSON object: what the host reports")
+
+    host_state = host_actions.add_parser("set-state", help="change a host's state")
+    _common(host_state, top=False)
+    host_state.add_argument("name")
+    host_state.add_argument("state", choices=HOST_STATES)
+    host_state.add_argument("--by", required=True, type=_non_empty, help="who made the change")
+
+    listing = host_actions.add_parser("list", help="print every host, by name")
+    _common(listing, top=False)
 
     record = commands.add_parser("record-action", help="record one chair action line as a chair_actions row")
     _common(record, top=False)
@@ -266,7 +302,20 @@ def _record_action(conn: Connection, holder: str, action: Mapping[str, Any]) -> 
     return EXIT_OK
 
 
-def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[dict[str, Any], int]:
+def _host(conn: Connection, args: argparse.Namespace, now: str) -> tuple[Any, int]:
+    """An unknown host is the empty object with exit 3; list is the array of rows."""
+    if args.action == "list":
+        return host_list(conn), EXIT_OK
+    if args.action == "upsert":
+        return host_upsert(conn, args.name, args.ssh, args.capacity, args.state, args.by, now), EXIT_OK
+    if args.action == "beat":
+        row = host_beat(conn, args.name, args.versions, now)
+    else:
+        row = host_set_state(conn, args.name, args.state, args.by, now)
+    return ({}, EXIT_PRECONDITION) if row is None else (row, EXIT_OK)
+
+
+def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[Any, int]:
     """A missing task record is the empty object with exit 3."""
     if args.command == "mark-landed":
         record = mark_landed(conn, args.run_id, args.phase, args.task, args.pr, args.at)
@@ -276,6 +325,8 @@ def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[dict
         if isinstance(row, Mismatch):
             return {"actual": row.current, "expected": args.expect}, EXIT_PRECONDITION
         return ({}, EXIT_PRECONDITION) if row is None else (row, EXIT_OK)
+    if args.command == "host":
+        return _host(conn, args, now)
     if args.action == "acquire":
         result = lease_acquire(conn, args.name, args.holder, now, args.ttl, steal=args.steal)
     elif args.action == "renew":
@@ -290,6 +341,8 @@ def _now() -> str:
 
 
 def _refusal(args: argparse.Namespace, payload: Mapping[str, Any]) -> str:
+    if args.command == "host":
+        return f"no host {args.name}"
     if args.command == "mark-landed":
         return f"no task record for run {args.run_id} phase {args.phase} task {args.task}"
     if args.command == "set-state" and "actual" in payload:

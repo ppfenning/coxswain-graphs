@@ -25,6 +25,7 @@ import harness.store_ddl_0004 as ddl4
 import harness.store_ddl_0005 as ddl5
 import harness.store_ddl_0006 as ddl6
 import harness.store_ddl_0007 as ddl7
+import harness.store_ddl_0008 as ddl8
 from harness.store_dialect import Connection, insert_ignore, upsert
 from harness.store_migrate import open_store
 
@@ -46,10 +47,11 @@ _ORDER = (
     "ledger",
     "leases",
     "chair_actions",
+    "hosts",
 )
 
 # Tables whose rows change after they are first written. Every other table in _ORDER is append-only.
-_REFRESH = frozenset({"runs", "phases", "tasks", "task_records", "work_items", "leases"})
+_REFRESH = frozenset({"runs", "phases", "tasks", "task_records", "work_items", "leases", "hosts"})
 
 
 class CopyCheckFailed(Exception):
@@ -68,7 +70,7 @@ def tables() -> tuple[Table, ...]:
     added = {t: tuple(c for u, c in alters if u == t) for t, _ in alters}
     return tuple(
         (name, (*(c for c, _ in columns), *added.get(name, ())), key)
-        for name, columns, key in (*ddl1._TABLES, *ddl2._TABLES, *ddl4._TABLES, *ddl6._TABLES, *ddl7._TABLES)
+        for name, columns, key in (*ddl1._TABLES, *ddl2._TABLES, *ddl4._TABLES, *ddl6._TABLES, *ddl7._TABLES, *ddl8._TABLES)
     )
 
 

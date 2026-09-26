@@ -22,6 +22,7 @@ EXPECTED_ORDER = (
     "ledger",
     "leases",
     "chair_actions",
+    "hosts",
 )
 
 SEED = {
@@ -45,6 +46,10 @@ SEED = {
     "chair_actions": [
         {"ts": "2026-09-26T00:00:00Z", "epoch": 4, "holder": "me", "kind": "land", "target": "t1", "status": "done",
          "reason": "merged", "action_json": '{"kind": "land"}'},
+    ],
+    "hosts": [
+        {"name": "jarvis", "ssh": "jarvis", "capacity": 8, "state": "active", "beat_at": "", "versions_json": "{}",
+         "updated_at": "2026-09-26T00:00:00Z", "updated_by": "chair"},
     ],
     "work_items": [
         {"initiative": "i1", "task_id": "t1", "phase": "p1", "state": "ready", "needs_json": "[]",
@@ -175,6 +180,18 @@ def test_a_chair_actions_row_is_in_the_destination_after_a_copy(src_url, dst_url
         assert dst.query_all("SELECT ts, epoch, holder, kind, target, status FROM chair_actions") == [
             ("2026-09-26T00:00:00Z", 4, "me", "land", "t1", "done")
         ]
+    finally:
+        dst.close()
+
+
+def test_a_changed_host_state_is_refreshed_in_the_destination(src_url, dst_url):
+    sc.copy(src_url, dst_url, T0)
+    _update_source(src_url, "UPDATE hosts SET state = 'draining' WHERE name = 'jarvis'")
+    again = sc.copy(src_url, dst_url, T0)
+    assert (again["hosts"]["copied"], again["hosts"]["refreshed"]) == (0, 1)
+    dst = open_store(dst_url, T0)
+    try:
+        assert dst.query_one("SELECT state FROM hosts WHERE name = 'jarvis'") == ("draining",)
     finally:
         dst.close()
 

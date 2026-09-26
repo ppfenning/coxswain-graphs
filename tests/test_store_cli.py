@@ -279,3 +279,57 @@ def test_without_a_flag_or_a_profile_value_the_store_is_cox_db_in_the_runs_dir()
 
 def test_an_empty_flag_and_an_empty_profile_value_fall_through():
     assert resolve_store_url("", {"storage_url": ""}, "/runs") == "sqlite:////runs/cox.db"
+
+
+VERSIONS = '{"cox": "0.20.0", "login_ok": true}'
+
+
+def test_host_beat_sets_beat_at_and_versions_on_an_upserted_host(url, run, at):
+    at(T20)
+    code, out, _ = run(url, "host", "upsert", "jarvis", "--ssh", "jarvis", "--capacity", "8", "--by", "chair")
+    assert (code, one_object(out)["beat_at"]) == (0, "")
+    at(T40)
+    code, out, _ = run(url, "host", "beat", "jarvis", "--versions", VERSIONS)
+    assert (code, one_object(out)) == (
+        0,
+        {
+            "name": "jarvis",
+            "ssh": "jarvis",
+            "capacity": 8,
+            "state": "active",
+            "beat_at": T40,
+            "versions_json": {"cox": "0.20.0", "login_ok": True},
+            "updated_at": T20,
+            "updated_by": "chair",
+        },
+    )
+
+
+def test_host_set_state_changes_only_state_updated_at_and_updated_by(url, run, at):
+    at(T20)
+    run(url, "host", "upsert", "jarvis", "--ssh", "jarvis", "--capacity", "8", "--by", "chair")
+    run(url, "host", "beat", "jarvis", "--versions", VERSIONS)
+    _, before, _ = run(url, "host", "list")
+    at(T40)
+    code, out, _ = run(url, "host", "set-state", "jarvis", "draining", "--by", "pat")
+    assert code == 0
+    changed = {"state": "draining", "updated_at": T40, "updated_by": "pat"}
+    assert one_object(out) == {**json.loads(before)[0], **changed}
+
+
+def test_host_set_state_outside_the_three_exits_two_with_nothing_on_stdout(url, run):
+    code, out, _ = run(url, "host", "set-state", "jarvis", "parked", "--by", "chair")
+    assert (code, out) == (2, "")
+
+
+def test_host_beat_on_an_unknown_host_exits_three_with_the_empty_object(url, run):
+    code, out, err = run(url, "host", "beat", "nobody", "--versions", "{}")
+    assert (code, one_object(out)) == (3, {})
+    assert err.startswith("error: no host nobody")
+
+
+def test_host_list_prints_every_host_by_name(url, run):
+    for name in ("b", "a"):
+        run(url, "host", "upsert", name, "--ssh", name, "--capacity", "1", "--by", "chair")
+    code, out, _ = run(url, "host", "list")
+    assert (code, [r["name"] for r in one_object(out)]) == (0, ["a", "b"])
