@@ -548,6 +548,30 @@ def _claims(adversary: Mapping[str, Any] | None) -> set[str]:
     }
 
 
+def round_summary(
+    attempt: int,
+    source: str,
+    review: Mapping[str, Any],
+    adversary: Mapping[str, Any] | None,
+    arbitration: Mapping[str, Any] | str | None,
+    verdict: str,
+) -> dict[str, Any]:
+    """One handoff or review round, reduced to who spoke and how it ended.
+
+    A skipped-arbiter marker is a string, not a decision, and reads as None.
+    """
+    return {
+        "attempt": attempt,
+        "source": source,
+        "verdict": verdict,
+        "findings": [str(f.get("charter_principle")) for f in review.get("findings") or [] if isinstance(f, Mapping)],
+        "objections": len(adversary.get("objections") or []) if adversary else 0,
+        "arbitration": (
+            arbitration.get("decision", arbitration.get("verdict")) if isinstance(arbitration, Mapping) else None
+        ),
+    }
+
+
 def _arbiter_scope(verdict: str, arbitration: Mapping[str, Any] | None) -> set[str] | None:
     """Backticked, path-shaped tokens in a revise arbitration's `reasoning`
     (a `/` or a file suffix); None outside that case. Backticked identifiers
@@ -1852,6 +1876,8 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
     tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
 
     handoff: dict[str, Any] | None = None
+    # Declared here, not beside `standing`: the first pass below appends to it.
+    rounds: list[dict[str, Any]] = []
     try:
         if not frozen and "handoff" in bound:
             handoff = _handoff(runner, context=context, ticket=ticket_text, plan=plan, build=build, facts=facts, ticket_id=ticket)
@@ -1872,6 +1898,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
             adversary, arbitration, verdict, review_placeholder, review_quarantine = None, None, "revise", False, False
         elif handoff is not None and not handoff.get("complete"):
             review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _handoff_critique(handoff)
+            rounds.append(round_summary(1, "handoff", review, adversary, arbitration, verdict))
         else:
             review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _review_round(
                 runner,
@@ -1885,6 +1912,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
                 attempt=1,
                 task_id=ticket,
             )
+            rounds.append(round_summary(1, "review", review, adversary, arbitration, verdict))
     except _NodeFailure as exc:
         return _infra_result(run_id=run_id, date=date, ticket=ticket, scope=scope, build=build, handoff=handoff, exc=exc)
     # Carried across every round: an abstention two rounds ago is still an
@@ -2006,6 +2034,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
                 # for a change the shuttle has already refused to hand over.
                 if not handoff.get("complete"):
                     review, adversary, arbitration, verdict, review_placeholder, review_quarantine = _handoff_critique(handoff)
+                    rounds.append(round_summary(int(attempts), "handoff", review, adversary, arbitration, verdict))
                     any_review_placeholder = any_review_placeholder or review_placeholder
                     prior_handoff = True
                     # No reviewer has seen this build yet, so the round costs
@@ -2027,6 +2056,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
                 attempt=int(attempts),
                 task_id=ticket,
             )
+            rounds.append(round_summary(int(attempts), "review", review, adversary, arbitration, verdict))
         except _NodeFailure as exc:
             return _infra_result(run_id=run_id, date=date, ticket=ticket, scope=scope, build=build, handoff=handoff, exc=exc)
         any_review_placeholder = any_review_placeholder or review_placeholder
@@ -2157,6 +2187,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
             "attempts": attempts,
             "stopped": stopped,
             "continuations": continuations,
+            "rounds": rounds,
             **({"continuation_refused": continuation_refused} if continuation_refused is not None else {}),
             **({"review_placeholder": True} if any_review_placeholder else {}),
         },
