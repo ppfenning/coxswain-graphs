@@ -75,3 +75,63 @@ def test_loaders_read_the_fixture_tree(tree):
     ]
     assert [c.id for c in bf.load_calls(calls)] == ["c1", "c2", "c3"]
     assert bf.read_events(loose / "r1-trace" / "build-1.jsonl") == _events(3)
+
+
+def _archived(run_id="r1", day="2026/09/24", src_bytes=100) -> bf.ArchivedRun:
+    return bf.ArchivedRun(run_id, day, src_bytes, {"a": 3, "b": 2, "c": 4})
+
+
+def test_unequal_calls_names_the_calls_that_differ_and_counts_a_missing_call_as_zero():
+    assert bf.unequal_calls({"a": 3, "b": 2}, {"a": 3, "b": 2, "x": 9}) == ()
+    assert bf.unequal_calls({"a": 3, "b": 2, "c": 1}, {"a": 4, "b": 2}) == ("a", "c")
+
+
+def test_verified_counts_give_prune():
+    assert bf.prune_verdict(_archived(), {"a": 3, "b": 2, "c": 4}) == bf.PRUNE
+
+
+def test_more_parquet_events_than_the_sources_still_give_prune():
+    assert bf.prune_verdict(_archived(), {"a": 3, "b": 5, "c": 4}) == bf.PRUNE
+
+
+def test_a_missing_parquet_gives_keep_with_no_parquet():
+    assert bf.prune_verdict(_archived(), None) == bf.Verdict(False, "no parquet")
+
+
+def test_an_unreadable_parquet_gives_keep_with_the_error():
+    assert bf.prune_verdict(_archived(), "bad footer") == bf.Verdict(False, "unreadable: bad footer")
+
+
+def test_one_call_short_of_three_keeps_the_whole_run_and_names_the_call():
+    verdict = bf.prune_verdict(_archived(), {"a": 3, "b": 1, "c": 4})
+    assert not verdict.prune
+    assert "call b" in verdict.reason
+
+
+def test_a_call_absent_from_the_parquet_keeps_the_run_and_names_the_call():
+    verdict = bf.prune_verdict(_archived(), {"a": 3, "b": 2})
+    assert not verdict.prune
+    assert "call c" in verdict.reason
+
+
+def _rows():
+    return [
+        (_archived("r2", "2026/09/25", 50), bf.PRUNE),
+        (_archived("r3", "2026/09/24", 7), bf.Verdict(False, "no parquet")),
+        (_archived("r1", "2026/09/24", 100), bf.PRUNE),
+    ]
+
+
+def test_report_lines_sort_by_day_then_run_id_and_total_only_pruned_bytes():
+    assert bf.report_lines(_rows(), dry_run=True) == [
+        "r1 2026/09/24 100 prune",
+        "r3 2026/09/24 7 keep: no parquet",
+        "r2 2026/09/25 50 prune",
+        "total would free: 150 bytes",
+    ]
+
+
+def test_dry_and_real_report_lines_differ_only_in_the_total_label():
+    dry, real = bf.report_lines(_rows(), dry_run=True), bf.report_lines(_rows(), dry_run=False)
+    assert dry[:-1] == real[:-1]
+    assert real[-1] == "total freed: 150 bytes"
