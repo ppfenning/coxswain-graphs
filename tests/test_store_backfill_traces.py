@@ -196,6 +196,8 @@ def test_a_run_with_no_parquet_keeps_its_sources(repacked):
 
 
 def test_one_call_short_in_the_parquet_keeps_every_source_of_the_run(repacked):
+    """No --calls-dir or --store-url is given, so both of r1's loose sources are unresolved and the verdict
+    falls back to comparing totals; short by the dropped row, it keeps the run and names a source."""
     traces = resolve_traces_root(str(repacked), Path("."), {})
     path = str(_parquet(repacked, "r1"))
     rows = st._parquet_rows(traces, path)
@@ -204,7 +206,7 @@ def test_one_call_short_in_the_parquet_keeps_every_source_of_the_run(repacked):
     before = _sources(repacked)
     lines = _prune(repacked)
     assert lines[0].startswith("r1 2026/08/31 ")
-    assert "keep: call r1-review-1 has fewer parquet events" in lines[0]
+    assert "keep: source build-1.jsonl could not be resolved to a call id" in lines[0]
     assert [s for s in _sources(repacked) if "r1-trace" in s] == [s for s in before if "r1-trace" in s]
     assert len([s for s in _sources(repacked) if "r1-trace" in s]) == 2
     assert lines[1].endswith(" prune")
@@ -234,6 +236,41 @@ def test_older_than_skips_a_young_day_without_reporting_it(repacked):
     lines = _prune(repacked, older_than=10)
     assert [line.split()[0] for line in lines[:-1]] == ["r1"]
     assert _sources(repacked) == ["archive/2026/09/25/r2-trace/build-1.jsonl"]
+
+
+def test_uuid_parquet_call_ids_resolve_through_calls_dir_and_still_prune(repacked, tmp_path):
+    """r1's Parquet rows carry UUIDs, as a repack matched to a calls file would write, while its archived
+    sources still sit under their old synthetic-style names; prune must resolve each source to its UUID
+    through --calls-dir rather than look it up by the synthetic id, and still prune once they match."""
+    traces = resolve_traces_root(str(repacked), Path("."), {})
+    path = str(_parquet(repacked, "r1"))
+    rows = st._parquet_rows(traces, path)
+    uuids = {
+        "r1-build-1": "11111111-1111-4111-8111-111111111111",
+        "r1-review-1": "22222222-2222-4222-8222-222222222222",
+    }
+    st._put(traces, path, st._table([{**r, "call_id": uuids[r["call_id"]]} for r in rows]))
+    calls = tmp_path / "calls"
+    _write_calls(
+        calls,
+        "r1",
+        [
+            {
+                "id": uuids["r1-build-1"],
+                "role": "build",
+                "ts": "2026-08-31T00:00:00Z",
+                "trace": "r1-trace/build-1.jsonl",
+            },
+            {
+                "id": uuids["r1-review-1"],
+                "role": "review",
+                "ts": "2026-08-31T00:01:00Z",
+                "trace": "r1-trace/review-1.jsonl",
+            },
+        ],
+    )
+    lines = bf.prune(traces, repacked, TODAY, 0, False, calls)
+    assert next(line for line in lines if line.startswith("r1 ")).endswith(" prune")
 
 
 def test_the_prune_subcommand_dry_run_exits_zero_and_repack_still_parses(repacked, capsys):
