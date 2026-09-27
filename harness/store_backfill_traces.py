@@ -3,6 +3,7 @@
 Usage: python -m harness.store_backfill_traces TRACES_ROOT [--loose-root DIR] [--calls-dir DIR]
        python -m harness.store_backfill_traces relink TRACES_ROOT [--store-url URL] [--dry-run]
        python -m harness.store_backfill_traces prune TRACES_ROOT [--dry-run] [--older-than DAYS]
+           [--calls-dir DIR] [--store-url URL]
 
 Two sources feed a run. LOOSE_ROOT holds <run_id>-trace/<role>-<n>.jsonl, one stream event per
 line and no timestamps. Day and call id come from CALLS_DIR/<run_id>.calls.jsonl, matched on the
@@ -29,14 +30,17 @@ rerun finds nothing left to do.
 to avoid: "the synthetic id is the id the store knows". Only a call imported without an id has a
 `legacy:` id, and the backfill above cannot know it, so the two never join until relink runs.
 
-`prune` deletes archived sources and nothing else. It walks TRACES_ROOT/archive/YYYY/MM/DD/ and counts
-events per call in each run's archived sources. A loose file counts under <run_id>-<role>-<n>, the id
-an unmatched trace gets. It reads each run's Parquet file under TRACES_ROOT, never under archive/.
-A run is pruned only when that file has at least the archived event count for every call. A run short
-in any one call keeps every source, not only that call's. A day directory goes once its last source is
-gone, then its month and year if empty. `--older-than DAYS` leaves younger days out of the run and the
-report. Wrong belief to avoid: "a kept run means the repack failed". A call the repack matched to an
-id from a calls file is stored under that id, so prune sees it as short and keeps the run.
+`prune` deletes archived sources and nothing else. It walks TRACES_ROOT/archive/YYYY/MM/DD/ and, for
+each loose file, resolves the call id the repack wrote it under: a match in `--calls-dir`'s calls file,
+else the store's `legacy:` id after relink (`--store-url`), else the source is unresolved. It reads each
+run's Parquet file under TRACES_ROOT, never under archive/, and compares the archived event count for
+every resolved call against the Parquet's count for that call id; a run short in any one resolved call
+keeps every source, not only that call's. A run with an unresolved source instead compares its total
+archived event count against the Parquet's total row count, and prunes only on an exact match; short of
+that it keeps the run and names the source it could not resolve. A day directory goes once its last
+source is gone, then its month and year if empty. `--older-than DAYS` leaves younger days out of the run
+and the report. Wrong belief to avoid: "a kept run always means the repack failed". Without `--calls-dir`
+or `--store-url` every loose source is unresolved, so a run only prunes when its totals match exactly.
 """
 
 from __future__ import annotations
@@ -146,12 +150,16 @@ class RelinkReport:
 
 @dataclass(frozen=True)
 class ArchivedRun:
-    """One archived run. `day` is YYYY/MM/DD. `events` is the event count per call, summed over its archived sources."""
+    """One archived run. `day` is YYYY/MM/DD. `events` holds each resolved call's count, summed over its archived
+    sources. `total_events` sums every archived source regardless of resolution. `unresolved` names the archived
+    source files (sorted) whose call id repack's calls file and the store's legacy ids could not identify."""
 
     run_id: str
     day: str
     src_bytes: int
     events: Mapping[str, int]
+    total_events: int = 0
+    unresolved: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -293,12 +301,34 @@ def unequal_calls(expected: Mapping[str, int], got: Mapping[str, int]) -> tuple[
     return tuple(sorted(c for c, n in expected.items() if got.get(c, 0) != n))
 
 
+def _calls_by_trace(calls: Sequence[Call]) -> dict[tuple[str, str], str]:
+    """(run_id, trace file name) to call id, the same key `plan_moves` matches a trace file on."""
+    return {(c.run_id, c.trace.rsplit("/", 1)[-1]): c.id for c in calls}
+
+
+def resolve_call_id(
+    run_id: str, name: str, calls_by_trace: Mapping[tuple[str, str], str], legacy_by_key: Mapping[str, str]
+) -> str | None:
+    """The id the repack wrote this source's events under, or None when neither path names it.
+
+    Mirrors `plan_moves`'s match on (run_id, trace file name) first, then `relink_map`'s synthetic
+    key for a store `legacy:` id. Never falls back to the synthetic id itself: a source this misses
+    is unresolved, not synthetic.
+    """
+    call_id = calls_by_trace.get((run_id, name))
+    return call_id if call_id is not None else legacy_by_key.get(f"{run_id}-{Path(name).stem}")
+
+
 def prune_verdict(archived: ArchivedRun, parquet_counts: Mapping[str, int] | str | None) -> Verdict:
     """`parquet_counts` is None when the file is missing and an error string when it is unreadable."""
     if parquet_counts is None:
         return Verdict(False, "no parquet")
     if isinstance(parquet_counts, str):
         return Verdict(False, f"unreadable: {parquet_counts}")
+    if archived.unresolved:
+        if sum(parquet_counts.values()) == archived.total_events:
+            return PRUNE
+        return Verdict(False, f"source {archived.unresolved[0]} could not be resolved to a call id")
     short = [c for c in unequal_calls(archived.events, parquet_counts) if parquet_counts.get(c, 0) < archived.events[c]]
     return Verdict(False, f"call {short[0]} has fewer parquet events than its archived sources") if short else PRUNE
 
@@ -316,11 +346,16 @@ def report_lines(rows: Sequence[tuple[ArchivedRun, Verdict]], dry_run: bool) -> 
 
 @dataclass(frozen=True)
 class _ArchivedFile:
+    """`events` holds only resolved calls; `total` counts every event in this file regardless of resolution.
+    `unresolved` is this file's name when a loose file's call id could not be resolved, else None."""
+
     run_id: str
     day: str
     path: Path
     size: int
     events: Mapping[str, int]
+    total: int
+    unresolved: str | None = None
 
 
 def _archive_days(root: Path, today: date, older_than: int) -> list[tuple[str, Path]]:
@@ -342,19 +377,22 @@ def _archive_days(root: Path, today: date, older_than: int) -> list[tuple[str, P
     ]
 
 
-def _archived_file(path: Path, day: str) -> _ArchivedFile | None:
+def _archived_file(
+    path: Path, day: str, calls_by_trace: Mapping[tuple[str, str], str], legacy_by_key: Mapping[str, str]
+) -> _ArchivedFile | None:
     """Run id and event count per call of one archived source, or None for a file that is not a source."""
     size = path.stat().st_size
     if path.name.endswith(store_traces.SUFFIX):
-        events = Counter(r["call_id"] for r in store_traces.read_legacy_file(path))
-        return _ArchivedFile(path.name.removesuffix(store_traces.SUFFIX), day, path, size, dict(events))
+        events = dict(Counter(r["call_id"] for r in store_traces.read_legacy_file(path)))
+        return _ArchivedFile(path.name.removesuffix(store_traces.SUFFIX), day, path, size, events, sum(events.values()))
     parsed = parse_trace_name(path.name)
     if parsed is None or not path.parent.name.endswith(TRACE_DIR_SUFFIX):
         return None
     run_id = path.parent.name.removesuffix(TRACE_DIR_SUFFIX)
     lines = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
-    # The repack names an unmatched call this way. A call it matched to a calls-file id is not found by this name.
-    return _ArchivedFile(run_id, day, path, size, {f"{run_id}-{parsed[0]}-{parsed[1]}": lines})
+    call_id = resolve_call_id(run_id, path.name, calls_by_trace, legacy_by_key)
+    events = {call_id: lines} if call_id is not None else {}
+    return _ArchivedFile(run_id, day, path, size, events, lines, None if call_id is not None else path.name)
 
 
 def _archived_run(files: Sequence[_ArchivedFile]) -> tuple[ArchivedRun, tuple[Path, ...]]:
@@ -365,19 +403,33 @@ def _archived_run(files: Sequence[_ArchivedFile]) -> tuple[ArchivedRun, tuple[Pa
             min(f.day for f in files),
             sum(f.size for f in files),
             {c: sum(f.events.get(c, 0) for f in files) for c in sorted(call_ids)},
+            sum(f.total for f in files),
+            tuple(sorted(f.unresolved for f in files if f.unresolved is not None)),
         ),
         tuple(f.path for f in files),
     )
 
 
-def scan_archive(base: Path, today: date, older_than: int) -> list[tuple[ArchivedRun, tuple[Path, ...]]]:
-    """Archived runs under base/archive/ with each run's source paths, sorted by run id. `today` is passed in."""
+def scan_archive(
+    base: Path,
+    today: date,
+    older_than: int,
+    calls_by_trace: Mapping[tuple[str, str], str] | None = None,
+    legacy_by_key: Mapping[str, str] | None = None,
+) -> list[tuple[ArchivedRun, tuple[Path, ...]]]:
+    """Archived runs under base/archive/ with each run's source paths, sorted by run id. `today` is passed in.
+
+    `calls_by_trace` and `legacy_by_key` resolve a loose source's real call id; a source neither names is
+    unresolved rather than assumed synthetic.
+    """
     root = base / ARCHIVE_DIR
+    by_trace = calls_by_trace or {}
+    by_legacy = legacy_by_key or {}
     files = [
         found
         for day, d in _archive_days(root, today, older_than)
         for path in sorted([*d.glob(f"*{store_traces.SUFFIX}"), *d.glob(f"*{TRACE_DIR_SUFFIX}/*.jsonl")])
-        if (found := _archived_file(path, day)) is not None
+        if (found := _archived_file(path, day, by_trace, by_legacy)) is not None
     ]
     return [_archived_run([f for f in files if f.run_id == run_id]) for run_id in sorted({f.run_id for f in files})]
 
@@ -404,9 +456,23 @@ def _drop_empty_parents(root: Path, path: Path) -> None:
             return
 
 
-def prune(traces: TracesRoot, base: Path, today: date, older_than: int, dry_run: bool) -> list[str]:
-    """Delete the archived sources of every verified run unless `dry_run`. Returns the report lines."""
-    scanned = scan_archive(base, today, older_than)
+def prune(
+    traces: TracesRoot,
+    base: Path,
+    today: date,
+    older_than: int,
+    dry_run: bool,
+    calls_dir: Path | None = None,
+    legacy_calls: Sequence[Call] = (),
+) -> list[str]:
+    """Delete the archived sources of every verified run unless `dry_run`. Returns the report lines.
+
+    `calls_dir` and `legacy_calls` resolve a loose source to the call id the repack wrote it under,
+    the same way `backfill` and `relink` derive it; neither given, every loose source is unresolved.
+    """
+    calls_by_trace = _calls_by_trace(load_calls(calls_dir)) if calls_dir is not None else {}
+    legacy_by_key = relink_map(legacy_calls)
+    scanned = scan_archive(base, today, older_than, calls_by_trace, legacy_by_key)
     rows = [(run, prune_verdict(run, _parquet_counts(traces, run.run_id))) for run, _ in scanned]
     if not dry_run:
         for (_, paths), (_, verdict) in zip(scanned, rows):
@@ -609,13 +675,26 @@ def prune_main(argv: Sequence[str]) -> int:
     ap.add_argument("traces_root", help="local trace store root holding the Parquet files and archive/")
     ap.add_argument("--dry-run", action="store_true", help="report what would be deleted and delete nothing")
     ap.add_argument("--older-than", type=int, default=0, metavar="DAYS", help="leave archived days younger than DAYS")
+    ap.add_argument(
+        "--calls-dir", type=Path, default=None, help="directory of <run_id>.calls.jsonl files, to resolve a source's id"
+    )
+    ap.add_argument("--store-url", default=None, help="store URL to resolve a source's legacy call id after relink")
     args = ap.parse_args(argv)
     if not have_pyarrow():
         print("error: pyarrow is not installed", file=sys.stderr)
         return 2
     try:
         traces = resolve_traces_root(args.traces_root, Path("."), {})
-        lines = prune(traces, _local_dir(traces), datetime.now(UTC).date(), args.older_than, args.dry_run)
+        legacy_calls = load_legacy_calls(args.store_url) if args.store_url else []
+        lines = prune(
+            traces,
+            _local_dir(traces),
+            datetime.now(UTC).date(),
+            args.older_than,
+            args.dry_run,
+            args.calls_dir,
+            legacy_calls,
+        )
     except (ValueError, FileNotFoundError, store_traces.TracesUnavailable) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
