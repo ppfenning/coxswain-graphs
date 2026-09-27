@@ -2,6 +2,7 @@
 
 Usage: python -m harness.store_backfill_traces TRACES_ROOT [--loose-root DIR] [--calls-dir DIR]
        python -m harness.store_backfill_traces relink TRACES_ROOT [--store-url URL] [--dry-run]
+       python -m harness.store_backfill_traces prune TRACES_ROOT [--dry-run] [--older-than DAYS]
 
 Two sources feed a run. LOOSE_ROOT holds <run_id>-trace/<role>-<n>.jsonl, one stream event per
 line and no timestamps. Day and call id come from CALLS_DIR/<run_id>.calls.jsonl, matched on the
@@ -12,7 +13,7 @@ dated by the earliest source day, or by the day of a Parquet file the run alread
 
 Sources move to TRACES_ROOT/archive/, keeping their YYYY/MM/DD path, only after the Parquet file
 reads back with the same event count for every call. Readers list YYYY/MM/DD only, so archive/ is
-never read. Nothing is ever deleted. On a mismatch the sources stay and the Parquet file is kept.
+never read. The repack never deletes. On a mismatch the sources stay and the Parquet file is kept.
 A call whose events differ between two sources is a conflict: nothing is written or moved.
 
 Wrong belief to avoid: "write_run replaces by call_id, so a rerun is safe". It replaces only inside
@@ -27,6 +28,15 @@ rerun finds nothing left to do.
 `legacy:` id the store holds for the same call, matched on the call's "trace" file name. Wrong belief
 to avoid: "the synthetic id is the id the store knows". Only a call imported without an id has a
 `legacy:` id, and the backfill above cannot know it, so the two never join until relink runs.
+
+`prune` deletes archived sources and nothing else. It walks TRACES_ROOT/archive/YYYY/MM/DD/ and counts
+events per call in each run's archived sources. A loose file counts under <run_id>-<role>-<n>, the id
+an unmatched trace gets. It reads each run's Parquet file under TRACES_ROOT, never under archive/.
+A run is pruned only when that file has at least the archived event count for every call. A run short
+in any one call keeps every source, not only that call's. A day directory goes once its last source is
+gone, then its month and year if empty. `--older-than DAYS` leaves younger days out of the run and the
+report. Wrong belief to avoid: "a kept run means the repack failed". A call the repack matched to an
+id from a calls file is stored under that id, so prune sees it as short and keeps the run.
 """
 
 from __future__ import annotations
@@ -39,7 +49,7 @@ import sys
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from functools import reduce
 from pathlib import Path
 from typing import Any
@@ -304,6 +314,108 @@ def report_lines(rows: Sequence[tuple[ArchivedRun, Verdict]], dry_run: bool) -> 
     return [*lines, f"total {label}: {freed} bytes"]
 
 
+@dataclass(frozen=True)
+class _ArchivedFile:
+    run_id: str
+    day: str
+    path: Path
+    size: int
+    events: Mapping[str, int]
+
+
+def _archive_days(root: Path, today: date, older_than: int) -> list[tuple[str, Path]]:
+    """(YYYY/MM/DD, directory) for each archived day at least `older_than` days before `today`. Bad dates are skipped."""
+
+    def day_of(parts: Sequence[str]) -> date | None:
+        try:
+            return date(*(int(p) for p in parts))
+        except ValueError:
+            return None
+
+    dirs = [(d.relative_to(root).parts, d) for d in sorted(root.glob("*/*/*")) if d.is_dir()]
+    return [
+        ("/".join(parts), d)
+        for parts, d in dirs
+        if all(part.isdigit() for part in parts)
+        and (when := day_of(parts)) is not None
+        and (older_than <= 0 or today - when >= timedelta(days=older_than))
+    ]
+
+
+def _archived_file(path: Path, day: str) -> _ArchivedFile | None:
+    """Run id and event count per call of one archived source, or None for a file that is not a source."""
+    size = path.stat().st_size
+    if path.name.endswith(store_traces.SUFFIX):
+        events = Counter(r["call_id"] for r in store_traces.read_legacy_file(path))
+        return _ArchivedFile(path.name.removesuffix(store_traces.SUFFIX), day, path, size, dict(events))
+    parsed = parse_trace_name(path.name)
+    if parsed is None or not path.parent.name.endswith(TRACE_DIR_SUFFIX):
+        return None
+    run_id = path.parent.name.removesuffix(TRACE_DIR_SUFFIX)
+    lines = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+    # The repack names an unmatched call this way. A call it matched to a calls-file id is not found by this name.
+    return _ArchivedFile(run_id, day, path, size, {f"{run_id}-{parsed[0]}-{parsed[1]}": lines})
+
+
+def _archived_run(files: Sequence[_ArchivedFile]) -> tuple[ArchivedRun, tuple[Path, ...]]:
+    call_ids = set().union(*(f.events for f in files))
+    return (
+        ArchivedRun(
+            files[0].run_id,
+            min(f.day for f in files),
+            sum(f.size for f in files),
+            {c: sum(f.events.get(c, 0) for f in files) for c in sorted(call_ids)},
+        ),
+        tuple(f.path for f in files),
+    )
+
+
+def scan_archive(base: Path, today: date, older_than: int) -> list[tuple[ArchivedRun, tuple[Path, ...]]]:
+    """Archived runs under base/archive/ with each run's source paths, sorted by run id. `today` is passed in."""
+    root = base / ARCHIVE_DIR
+    files = [
+        found
+        for day, d in _archive_days(root, today, older_than)
+        for path in sorted([*d.glob(f"*{store_traces.SUFFIX}"), *d.glob(f"*{TRACE_DIR_SUFFIX}/*.jsonl")])
+        if (found := _archived_file(path, day)) is not None
+    ]
+    return [_archived_run([f for f in files if f.run_id == run_id]) for run_id in sorted({f.run_id for f in files})]
+
+
+def _parquet_counts(traces: TracesRoot, run_id: str) -> dict[str, int] | str | None:
+    """Events per call in the run's Parquet files. None when there is none, an error string when one will not read."""
+    paths = store_traces._find_parquet(traces, run_id)
+    if not paths:
+        return None
+    try:
+        return dict(Counter(r["call_id"] for path in paths for r in store_traces._parquet_rows(traces, path)))
+    except Exception as exc:
+        return str(exc) or type(exc).__name__
+
+
+def _drop_empty_parents(root: Path, path: Path) -> None:
+    """Remove each directory above `path` that is now empty, stopping at `root` or the first one still in use."""
+    for d in path.parents:
+        if d == root:
+            return
+        try:
+            d.rmdir()
+        except OSError:
+            return
+
+
+def prune(traces: TracesRoot, base: Path, today: date, older_than: int, dry_run: bool) -> list[str]:
+    """Delete the archived sources of every verified run unless `dry_run`. Returns the report lines."""
+    scanned = scan_archive(base, today, older_than)
+    rows = [(run, prune_verdict(run, _parquet_counts(traces, run.run_id))) for run, _ in scanned]
+    if not dry_run:
+        for (_, paths), (_, verdict) in zip(scanned, rows):
+            for path in paths if verdict.prune else ():
+                path.unlink()
+                _drop_empty_parents(base / ARCHIVE_DIR, path)
+    return report_lines(rows, dry_run)
+
+
 def group_by_run(runs: Sequence[RunSources]) -> dict[str, RunSources]:
     return {
         run_id: reduce(_combine, [r for r in runs if r.run_id == run_id]) for run_id in sorted({r.run_id for r in runs})
@@ -489,10 +601,34 @@ def relink_main(argv: Sequence[str]) -> int:
     return 1 if report.mismatches else 0
 
 
+def prune_main(argv: Sequence[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="python -m harness.store_backfill_traces prune",
+        description="Delete archived trace sources whose Parquet file holds every event",
+    )
+    ap.add_argument("traces_root", help="local trace store root holding the Parquet files and archive/")
+    ap.add_argument("--dry-run", action="store_true", help="report what would be deleted and delete nothing")
+    ap.add_argument("--older-than", type=int, default=0, metavar="DAYS", help="leave archived days younger than DAYS")
+    args = ap.parse_args(argv)
+    if not have_pyarrow():
+        print("error: pyarrow is not installed", file=sys.stderr)
+        return 2
+    try:
+        traces = resolve_traces_root(args.traces_root, Path("."), {})
+        lines = prune(traces, _local_dir(traces), datetime.now(UTC).date(), args.older_than, args.dry_run)
+    except (ValueError, FileNotFoundError, store_traces.TracesUnavailable) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print("\n".join(lines))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     given = sys.argv[1:] if argv is None else list(argv)
     if given[:1] == ["relink"]:
         return relink_main(given[1:])
+    if given[:1] == ["prune"]:
+        return prune_main(given[1:])
     ap = argparse.ArgumentParser(prog="python -m harness.store_backfill_traces", description=__doc__.splitlines()[0])
     ap.add_argument("traces_root", help="local trace store root; Parquet is written here and sources archived under it")
     ap.add_argument("--loose-root", type=Path, default=None, help="directory of <run_id>-trace directories")

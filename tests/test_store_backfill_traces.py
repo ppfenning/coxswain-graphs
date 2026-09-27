@@ -1,9 +1,12 @@
 import json
+from datetime import date
 from pathlib import Path
 
 import pytest
 
 from harness import store_backfill_traces as bf
+from harness import store_traces as st
+from harness.traces_url import resolve_traces_root
 
 INIT = {"type": "system", "subtype": "init", "model": "claude-haiku-4-5-20251001", "claude_code_version": "2.1.280"}
 
@@ -135,3 +138,107 @@ def test_dry_and_real_report_lines_differ_only_in_the_total_label():
     dry, real = bf.report_lines(_rows(), dry_run=True), bf.report_lines(_rows(), dry_run=False)
     assert dry[:-1] == real[:-1]
     assert real[-1] == "total freed: 150 bytes"
+
+
+TODAY = date(2026, 9, 27)
+
+
+@pytest.fixture
+def repacked(tmp_path):
+    """r1 has two calls and is archived under 2026/08/31, 27 days old. r2 has one call under 2026/09/25."""
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("zstandard")
+    loose, root = tmp_path / "loose", tmp_path / "traces"
+    _write_trace(loose, "r1", "build-1.jsonl", _events(3))
+    _write_trace(loose, "r1", "review-1.jsonl", _events(2))
+    _write_trace(loose, "r2", "build-1.jsonl", _events(4))
+    days = {"r1": "2026-08-31", "r2": "2026-09-25"}
+    report = bf.backfill(str(root), loose, None, lambda p: days[p.parent.name.removesuffix("-trace")])
+    assert report.archived == 3
+    return root
+
+
+def _prune(root: Path, older_than: int = 0, dry_run: bool = False) -> list[str]:
+    return bf.prune(resolve_traces_root(str(root), Path("."), {}), root, TODAY, older_than, dry_run)
+
+
+def _sources(root: Path) -> list[str]:
+    return [p.relative_to(root).as_posix() for p in sorted((root / bf.ARCHIVE_DIR).rglob("*.jsonl"))]
+
+
+def _size(root: Path, run_id: str) -> int:
+    return sum(p.stat().st_size for p in (root / bf.ARCHIVE_DIR).rglob("*.jsonl") if p.parent.name == f"{run_id}-trace")
+
+
+def _parquet(root: Path, run_id: str) -> Path:
+    return next(root.glob(f"*/*/*/{run_id}.parquet"))
+
+
+def test_prune_deletes_the_sources_of_verified_runs_and_reports_the_bytes_freed(repacked):
+    r1, r2 = _size(repacked, "r1"), _size(repacked, "r2")
+    assert _prune(repacked) == [
+        f"r1 2026/08/31 {r1} prune",
+        f"r2 2026/09/25 {r2} prune",
+        f"total freed: {r1 + r2} bytes",
+    ]
+    assert _sources(repacked) == []
+    assert _parquet(repacked, "r1").exists()
+
+
+def test_a_run_with_no_parquet_keeps_its_sources(repacked):
+    _parquet(repacked, "r1").unlink()
+    before = _sources(repacked)
+    lines = _prune(repacked)
+    assert lines[0] == f"r1 2026/08/31 {_size(repacked, 'r1')} keep: no parquet"
+    assert lines[1].endswith(" prune")
+    assert [s for s in _sources(repacked) if "r1-trace" in s] == [s for s in before if "r1-trace" in s]
+    assert not [s for s in _sources(repacked) if "r2-trace" in s]
+
+
+def test_one_call_short_in_the_parquet_keeps_every_source_of_the_run(repacked):
+    traces = resolve_traces_root(str(repacked), Path("."), {})
+    path = str(_parquet(repacked, "r1"))
+    rows = st._parquet_rows(traces, path)
+    dropped = next(i for i, r in enumerate(rows) if r["call_id"] == "r1-review-1")
+    st._put(traces, path, st._table(rows[:dropped] + rows[dropped + 1 :]))
+    before = _sources(repacked)
+    lines = _prune(repacked)
+    assert lines[0].startswith("r1 2026/08/31 ")
+    assert "keep: call r1-review-1 has fewer parquet events" in lines[0]
+    assert [s for s in _sources(repacked) if "r1-trace" in s] == [s for s in before if "r1-trace" in s]
+    assert len([s for s in _sources(repacked) if "r1-trace" in s]) == 2
+    assert lines[1].endswith(" prune")
+
+
+def test_a_dry_run_deletes_nothing_and_its_run_lines_match_the_real_run(repacked):
+    before = _sources(repacked)
+    dry = _prune(repacked, dry_run=True)
+    assert _sources(repacked) == before
+    assert dry[-1].startswith("total would free: ")
+    real = _prune(repacked)
+    assert real[-1].startswith("total freed: ")
+    assert dry[:-1] == real[:-1]
+    assert _sources(repacked) == []
+
+
+def test_an_emptied_day_is_removed_with_its_empty_month_and_a_non_empty_day_stays(repacked):
+    _parquet(repacked, "r2").unlink()
+    _prune(repacked)
+    archive = repacked / bf.ARCHIVE_DIR
+    assert not (archive / "2026" / "08").exists()
+    assert (archive / "2026" / "09" / "25" / "r2-trace" / "build-1.jsonl").exists()
+    assert archive.exists()
+
+
+def test_older_than_skips_a_young_day_without_reporting_it(repacked):
+    lines = _prune(repacked, older_than=10)
+    assert [line.split()[0] for line in lines[:-1]] == ["r1"]
+    assert _sources(repacked) == ["archive/2026/09/25/r2-trace/build-1.jsonl"]
+
+
+def test_the_prune_subcommand_dry_run_exits_zero_and_repack_still_parses(repacked, capsys):
+    before = _sources(repacked)
+    assert bf.main(["prune", str(repacked), "--dry-run"]) == 0
+    assert "total would free: " in capsys.readouterr().out
+    assert _sources(repacked) == before
+    assert bf.main([str(repacked)]) == 0
