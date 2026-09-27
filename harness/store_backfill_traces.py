@@ -37,7 +37,7 @@ import re
 import shutil
 import sys
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import reduce
@@ -132,6 +132,27 @@ class RelinkReport:
 
     changed: tuple[tuple[str, int], ...] = ()
     mismatches: tuple[Mismatch, ...] = ()
+
+
+@dataclass(frozen=True)
+class ArchivedRun:
+    """One archived run. `day` is YYYY/MM/DD. `events` is the event count per call, summed over its archived sources."""
+
+    run_id: str
+    day: str
+    src_bytes: int
+    events: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """Prune the archived sources, or keep them for `reason`."""
+
+    prune: bool
+    reason: str = ""
+
+
+PRUNE = Verdict(True)
 
 
 @dataclass(frozen=True)
@@ -257,6 +278,32 @@ def _combine(a: RunSources, b: RunSources) -> RunSources:
     )
 
 
+def unequal_calls(expected: Mapping[str, int], got: Mapping[str, int]) -> tuple[str, ...]:
+    """Sorted calls whose count in `got` differs from `expected`. A call missing from `got` counts as zero."""
+    return tuple(sorted(c for c, n in expected.items() if got.get(c, 0) != n))
+
+
+def prune_verdict(archived: ArchivedRun, parquet_counts: Mapping[str, int] | str | None) -> Verdict:
+    """`parquet_counts` is None when the file is missing and an error string when it is unreadable."""
+    if parquet_counts is None:
+        return Verdict(False, "no parquet")
+    if isinstance(parquet_counts, str):
+        return Verdict(False, f"unreadable: {parquet_counts}")
+    short = [c for c in unequal_calls(archived.events, parquet_counts) if parquet_counts.get(c, 0) < archived.events[c]]
+    return Verdict(False, f"call {short[0]} has fewer parquet events than its archived sources") if short else PRUNE
+
+
+def report_lines(rows: Sequence[tuple[ArchivedRun, Verdict]], dry_run: bool) -> list[str]:
+    """One line per run, sorted by day then run id, then a total of the bytes of pruned runs only."""
+    ordered = sorted(rows, key=lambda row: (row[0].day, row[0].run_id))
+    lines = [
+        f"{run.run_id} {run.day} {run.src_bytes} " + ("prune" if v.prune else f"keep: {v.reason}") for run, v in ordered
+    ]
+    freed = sum(run.src_bytes for run, v in ordered if v.prune)
+    label = "would free" if dry_run else "freed"
+    return [*lines, f"total {label}: {freed} bytes"]
+
+
 def group_by_run(runs: Sequence[RunSources]) -> dict[str, RunSources]:
     return {
         run_id: reduce(_combine, [r for r in runs if r.run_id == run_id]) for run_id in sorted({r.run_id for r in runs})
@@ -290,7 +337,7 @@ def _convert(traces: TracesRoot, base: Path, run: RunSources) -> RunResult:
     rows = store_traces.write_run(traces, day, run.run_id, run.calls) if run.calls else 0
     seen = Counter(r["call_id"] for r in store_traces.iter_run(traces, run.run_id))
     got = {call_id: seen[call_id] for call_id in run.expected}
-    verified = got == run.expected
+    verified = not unequal_calls(run.expected, got)
     moved = _archive(base, run.sources) if verified else 0
     parquet = Path(store_traces.run_parquet(traces.path, day, run.run_id))
     return RunResult(
