@@ -222,7 +222,11 @@ def test_exit_two_on_a_non_integer_epoch(capsys):
     assert out == "" and "invalid int value" in err
 
 
-def test_help_goes_to_stderr_and_stdout_stays_empty(capsys):
+def test_help_goes_to_stderr_and_stdout_stays_empty(capsys, monkeypatch):
+    # Python 3.14 argparse can colour help by environment, which puts escape codes before "usage:".
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("PYTHON_COLORS", raising=False)
     assert main(["--help"]) == 0
     out, err = capsys.readouterr()
     assert out == "" and err.startswith("usage:")
