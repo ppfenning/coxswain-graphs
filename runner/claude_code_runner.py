@@ -438,6 +438,7 @@ def _call_fields(
     *,
     ceiling_usd: float | None = None,
     ceiling_source: str = "profile",
+    hard_ceiling_usd: float | None = None,
 ) -> dict[str, Any]:
     """The one shape a call is recorded in — success or failure alike."""
     usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
@@ -450,6 +451,7 @@ def _call_fields(
         "cost_usd": payload.get("total_cost_usd"),
         "ceiling_usd": ceiling_usd,
         "ceiling_source": ceiling_source,
+        **({"hard_ceiling_usd": hard_ceiling_usd} if hard_ceiling_usd is not None else {}),
         "turns": payload.get("num_turns"),
         "duration_ms": payload.get("duration_ms"),
         # Split, not summed: a cache read costs a tenth of a fresh token,
@@ -610,6 +612,9 @@ class ClaudeCodeRunner:
         # a 101-turn build that finished anyway.
         self.budget_usd = {str(k): float(v) for k, v in (self.profile.get("budget_usd") or {}).items()}
         self.role_budget_usd = {str(k): float(v) for k, v in (self.profile.get("role_budget_usd") or {}).items()}
+        # A hard runaway ceiling per role (Pat, 2026-09-28): when a role has one, it is the only per-call stop, and the
+        # shape ceiling above becomes a guide that is ledgered and minimised, never enforced. The weekly cap bounds the rest.
+        self.role_ceiling_usd = {str(k): float(v) for k, v in (self.profile.get("role_ceiling_usd") or {}).items()}
         # The operator's per-node spend cap (docs/design/cost-bounds.md §1), set
         # by the harness after construction, like `runs_dir`/`run_id`. Unset
         # means the shape ceiling above is the only limit, exactly as before.
@@ -798,6 +803,11 @@ class ClaudeCodeRunner:
         if budget is None:
             budget = self.budget_usd.get(tier)
         return budget, "profile"
+
+    def _stop_limit(self, role: str | None, shape_ceiling: float | None) -> float | None:
+        """The per-call stop before any operator cap: the role's hard runaway ceiling when it has one, else the shape ceiling."""
+        hard = self.role_ceiling_usd.get(role) if role is not None else None
+        return hard if hard is not None else shape_ceiling
 
     @staticmethod
     def _read_context(context: Sequence[str]) -> str:
@@ -1032,7 +1042,7 @@ class ClaudeCodeRunner:
             *_ISOLATION,
         ]
         ceiling, _ = self._shape_ceiling(role, tier, model, budget_usd)
-        effective, _ = _effective_limit(ceiling, self.node_cap_usd)
+        effective, _ = _effective_limit(self._stop_limit(role, ceiling), self.node_cap_usd)
         if effective is not None:
             # Resuming a stopped session may see the ceiling as covering the
             # whole session's spend rather than this invocation's, so the
@@ -1251,11 +1261,15 @@ class ClaudeCodeRunner:
             # the whole diagnosis of a build failure once; never again.
             detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
             shape_ceiling, ceiling_source = self._shape_ceiling(role, tier, used_model, budget_usd)
-            _, cap_governs = _effective_limit(shape_ceiling, self.node_cap_usd)
+            stop_limit = self._stop_limit(role, shape_ceiling)
+            _, cap_governs = _effective_limit(stop_limit, self.node_cap_usd)
             cap_stop = cap_governs and detail.get("subtype") == "error_max_budget_usd"
             if cap_stop:
                 detail["subtype"] = "error_spend_cap"
             message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
+            if not cap_stop and role in self.role_ceiling_usd and detail.get("subtype") == "error_max_budget_usd":
+                guide_txt = f"${shape_ceiling:.4f}" if shape_ceiling is not None else "none"
+                message += f" (runaway ceiling ${stop_limit:.2f}; guide {guide_txt})"
             if cap_stop:
                 ceiling_txt = f"${shape_ceiling:.4f}" if shape_ceiling is not None else "none"
                 message += f" (cap ${self.node_cap_usd:.4f} < shape ceiling {ceiling_txt})"
@@ -1268,6 +1282,7 @@ class ClaudeCodeRunner:
                         **_call_fields(
                             role, tier, used_model, tools, payload, task,
                             ceiling_usd=shape_ceiling, ceiling_source=ceiling_source,
+                            hard_ceiling_usd=self.role_ceiling_usd.get(role) if role is not None else None,
                         ),
                         "id": call_id, **retry_extra, **priced,
                     },
@@ -1333,6 +1348,7 @@ class ClaudeCodeRunner:
             **_call_fields(
                 role, tier, used_model, tools, payload, task,
                 ceiling_usd=ceiling_usd, ceiling_source=ceiling_source,
+                hard_ceiling_usd=self.role_ceiling_usd.get(role) if role is not None else None,
             ),
             "id": call_id, **retry_extra,
             **priced,
