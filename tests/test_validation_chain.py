@@ -7,6 +7,8 @@ author, and a step never builds on an unvalidated handoff.
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
 from unittest.mock import ANY
 
 import pytest
@@ -455,6 +457,123 @@ def test_the_continuation_cap_recommends_a_split(cart, plan_response) -> None:
     assert "src/other.py" in message
     continuation_calls = [c for c in scripted.calls if "Continue from exactly where you stopped" in c["prompt"]]
     assert len(continuation_calls) == lifecycle_propose.CONTINUATIONS_MAX
+
+
+# ── the checkpoint go/no-go: resume, re-scope, re-ground, or split ──────────
+
+
+def _checkpoint_stop(patch: str, *, checkpoint_index: int, num_turns: int = 5, session: str = "sess-1") -> BudgetStop:
+    return BudgetStop(
+        role="build", thread="T-1", session=session, spent_usd=0.4,
+        detail="node 'build' failed in claude: {\"subtype\": \"error_max_budget_usd\"}",
+        partial_patch=patch, checkpoint_index=checkpoint_index, num_turns=num_turns,
+    )
+
+
+LAST_CHECKPOINT = len(lifecycle_propose.CHECKPOINT_FRACTIONS) - 1
+
+
+def test_a_checkpoint_with_a_grown_diff_no_outside_files_and_passing_checks_resumes(
+    cart, plan_response, build_response
+) -> None:
+    """A first checkpoint has nothing to compare against, so its diff always reads as grown."""
+    stop = _checkpoint_stop(PARTIAL_IN_SURFACE, checkpoint_index=0)
+    result, scripted = run(cart, plan_response, [stop, build_response], surfaces=["src/a.py"])
+    assert result["fix_loop"]["stopped"] is None
+    assert result["review"]["verdict"] == "approve"
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 2
+    assert "Continue from exactly where you stopped" in build_calls[1]["prompt"]
+
+
+def test_a_checkpoint_touching_a_file_outside_surfaces_revises_with_re_scope(cart, plan_response) -> None:
+    stop = _checkpoint_stop(PARTIAL_OUTSIDE_SURFACE, checkpoint_index=0)
+    result, scripted = run(cart, plan_response, build_response=stop, surfaces=["src/a.py"])
+    assert result["fix_loop"]["stopped"] == "checkpoint"
+    assert "re-scope" in result["fix_loop"]["checkpoint_reason"]
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 1
+
+
+def test_two_checkpoints_with_an_unchanged_diff_revise_with_re_ground(cart, plan_response) -> None:
+    """The second checkpoint's patch is byte-identical to the first's: no progress since."""
+    first = _checkpoint_stop(PARTIAL_IN_SURFACE, checkpoint_index=0)
+    second = _checkpoint_stop(PARTIAL_IN_SURFACE, checkpoint_index=1)
+    result, scripted = run(cart, plan_response, [first, second], surfaces=["src/a.py"])
+    assert result["fix_loop"]["stopped"] == "checkpoint"
+    assert "re-ground" in result["fix_loop"]["checkpoint_reason"]
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 2
+
+
+# Edits a file that already exists at the repo's HEAD: it applies only in a
+# real checkout of that repo, never in a bare `git init` scratch.
+EDIT_EXISTING_FILE = (
+    "diff --git a/src/a.py b/src/a.py\n"
+    "--- a/src/a.py\n"
+    "+++ b/src/a.py\n"
+    "@@ -1 +1,2 @@\n"
+    " old line\n"
+    "+partial line\n"
+)
+
+
+def _repo_with_existing_file(path: Path) -> Path:
+    for args in (["init", "-q"], ["config", "user.email", "t@example.com"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=path, check=True)
+    (path / "src").mkdir()
+    (path / "src" / "a.py").write_text("old line\n")
+    subprocess.run(["git", "add", "src/a.py"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=path, check=True)
+    return path
+
+
+def _run_at_last_checkpoint(cart, plan_response, build, repo: Path, check_cmd: str):
+    cart["landing_areas"]["checks"] = [{"name": "grep", "cmd": check_cmd}]
+    scripted = ScriptedRunner({"plan": plan_response, "build": build, "review_charter": APPROVE})
+    scripted.repo_dir = str(repo)
+    result = lifecycle_propose.run(
+        {"run_id": "r", "date": "2026-08-30", "ticket": "T-1", "cartridge": cart, "surfaces": ["src/a.py"]},
+        scripted,
+    )
+    return result, scripted
+
+
+def test_the_last_checkpoint_editing_an_existing_file_with_passing_checks_resumes(
+    cart, plan_response, build_response, tmp_path
+) -> None:
+    """The check reads the base file and the partial edit together, so it passes only in a real worktree."""
+    pytest.importorskip("core")
+    repo = _repo_with_existing_file(tmp_path)
+    stop = _checkpoint_stop(EDIT_EXISTING_FILE, checkpoint_index=LAST_CHECKPOINT)
+    result, scripted = _run_at_last_checkpoint(
+        cart, plan_response, [stop, build_response], repo, "grep -q '^old line$' src/a.py && grep -q '^partial line$' src/a.py"
+    )
+    assert result["fix_loop"]["stopped"] is None
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert "Continue from exactly where you stopped" in build_calls[1]["prompt"]
+    branches = subprocess.run(["git", "branch", "--list", "checkpoint-*"], cwd=repo, capture_output=True, text=True)
+    assert branches.stdout == ""
+
+
+def test_the_last_checkpoint_with_checks_still_failing_revises_with_split(cart, plan_response, tmp_path) -> None:
+    pytest.importorskip("core")
+    repo = _repo_with_existing_file(tmp_path)
+    stop = _checkpoint_stop(EDIT_EXISTING_FILE, checkpoint_index=LAST_CHECKPOINT)
+    result, scripted = _run_at_last_checkpoint(cart, plan_response, stop, repo, "grep -q '^finished line$' src/a.py")
+    assert result["fix_loop"]["stopped"] == "checkpoint"
+    assert "split" in result["fix_loop"]["checkpoint_reason"]
+    build_calls = [c for c in scripted.calls if c["role"] == "build"]
+    assert len(build_calls) == 1
+
+
+def test_a_final_ceiling_stop_with_no_checkpoint_index_still_goes_through_continue_ok(cart, plan_response) -> None:
+    """No `checkpoint_index` at all: the existing final-ceiling path, unchanged."""
+    stop = _stop_with_patch(PARTIAL_OUTSIDE_SURFACE)
+    assert stop.checkpoint_index is None
+    with pytest.raises(RunnerError) as excinfo:
+        run(cart, plan_response, build_response=stop, surfaces=["src/a.py"])
+    assert "re-scope" in str(excinfo.value)
 
 
 # ── gating the plan competition on tier ─────────────────────────────────────
