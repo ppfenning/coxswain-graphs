@@ -493,6 +493,11 @@ def _effective_limit(shape_ceiling: float | None, node_cap: float | None) -> tup
     return shape_ceiling, False
 
 
+def _checkpoint_target(fractions: tuple[float, ...] | None, index: int, guide: float | None) -> float | None:
+    """fractions[index] times the guide, as an absolute session total; None with no fractions left or no guide."""
+    return fractions[index] * guide if fractions and guide is not None and index < len(fractions) else None
+
+
 def _init_facts(init: object) -> tuple[str | None, str | None]:
     """(claude_code_version, model) from the stream's init event; None for each one missing."""
     if not isinstance(init, Mapping):
@@ -843,7 +848,7 @@ class ClaudeCodeRunner:
         """The thread's state, created on first use: a session id and, given a repository, a scratch."""
         state = self._threads.get(name)
         if state is None:
-            state = {"session": str(uuid.uuid4()), "parent": None, "scratch": None, "calls": 0}
+            state = {"session": str(uuid.uuid4()), "parent": None, "scratch": None, "calls": 0, "checkpoint_index": 0}
             if self.repo_dir:
                 state["parent"], state["scratch"] = self._make_scratch(role)
             self._threads[name] = state
@@ -1021,7 +1026,7 @@ class ClaudeCodeRunner:
         lines.append("</workspace>")
         return "\n".join(lines)
 
-    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None, spent_usd: float = 0.0, effort: str | None = None) -> list[str]:
+    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None, spent_usd: float = 0.0, effort: str | None = None, checkpoint_fractions: tuple[float, ...] | None = None, checkpoint_index: int = 0) -> list[str]:
         argv = [
             self.claude_bin,
             "-p",
@@ -1044,7 +1049,16 @@ class ClaudeCodeRunner:
         # fresh slice must cover at least the ceiling either way. Each slice
         # stops at the guide, a go/no-go checkpoint for the harness; a role's
         # runaway ceiling caps the session's cumulative spend across slices.
-        limit = None if effective is None else spent_usd + effective
+        # A caller with checkpoint fractions wants the guide crossed several
+        # times over one session, so the sent limit is that absolute multiple
+        # of the guide instead — until the last position is used up, when the
+        # session reverts to the plain slice-at-the-guide behavior above. The
+        # operator's node cap still bounds a checkpoint, as it bounds a slice.
+        target = _checkpoint_target(checkpoint_fractions, checkpoint_index, ceiling)
+        if target is not None:
+            limit, _ = _effective_limit(target, self.node_cap_usd)
+        else:
+            limit = None if effective is None else spent_usd + effective
         hard = self.role_ceiling_usd.get(role) if role is not None else None
         if hard is not None:
             limit = hard if limit is None else min(limit, hard)
@@ -1118,6 +1132,7 @@ class ClaudeCodeRunner:
         self, *, role: str, tier: str, model: str, tools: Sequence[str], schema: Mapping[str, Any], prompt: str,
         packs: Sequence[str], scratch: Path | None, patches: bool, session: Sequence[str], budget_usd: float | None = None,
         spent_usd: float = 0.0, effort: str | None = None,
+        checkpoint_fractions: tuple[float, ...] | None = None, checkpoint_index: int = 0,
     ) -> subprocess.CompletedProcess[str]:
         system = "\n\n".join(
             part for part in (self._read_context(packs), self._workspace(scratch, patches=patches, role=role), self.extra_system)
@@ -1130,6 +1145,7 @@ class ClaudeCodeRunner:
         argv = self._argv(
             model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role,
             session=session, budget_usd=budget_usd, spent_usd=spent_usd, effort=effort,
+            checkpoint_fractions=checkpoint_fractions, checkpoint_index=checkpoint_index,
         )
         try:
             return subprocess.run(
@@ -1177,6 +1193,7 @@ class ClaudeCodeRunner:
         budget_usd: float | None = None,
         task: str | None = None,
         router_decision: RouterDecision | None = None,
+        checkpoint_fractions: tuple[float, ...] | None = None,
     ) -> NodeResult:
         requested_tier = tier or DEFAULT_TIER
         resolution = self._resolve_tier(role, tier, hints)
@@ -1207,6 +1224,7 @@ class ClaudeCodeRunner:
                     role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
                     spent_usd=state.get("spent_usd", 0.0), effort=effort,
+                    checkpoint_fractions=checkpoint_fractions, checkpoint_index=state.get("checkpoint_index", 0),
                 )
                 if role in _PATCH_ROLES and state.get("scratch"):
                     has_scratch = True
@@ -1218,6 +1236,7 @@ class ClaudeCodeRunner:
                     proc = self._invoke(
                         role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                         scratch=scratch, patches=True, session=(), budget_usd=budget_usd, effort=effort,
+                        checkpoint_fractions=checkpoint_fractions,
                     )
                     if role in _PATCH_ROLES and scratch:
                         has_scratch = True
@@ -1263,14 +1282,20 @@ class ClaudeCodeRunner:
             # the whole diagnosis of a build failure once; never again.
             detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
             shape_ceiling, ceiling_source = self._shape_ceiling(role, tier, used_model, budget_usd)
-            _, cap_governs = _effective_limit(shape_ceiling, self.node_cap_usd)
+            # The cap governs when it is below the number actually sent: the
+            # checkpoint target while one is live, the shape ceiling otherwise.
+            target = _checkpoint_target(checkpoint_fractions, state.get("checkpoint_index", 0) if thread else 0, shape_ceiling)
+            _, cap_governs = _effective_limit(shape_ceiling if target is None else target, self.node_cap_usd)
             cap_stop = cap_governs and detail.get("subtype") == "error_max_budget_usd"
             if cap_stop:
                 detail["subtype"] = "error_spend_cap"
             message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
             hard = self.role_ceiling_usd.get(role) if role is not None else None
             session_total = reported_now if thread else float(payload.get("total_cost_usd") or 0.0)
-            if not cap_stop and hard is not None and detail.get("subtype") == "error_max_budget_usd" and session_total >= hard:
+            runaway_stop = (
+                not cap_stop and hard is not None and detail.get("subtype") == "error_max_budget_usd" and session_total >= hard
+            )
+            if runaway_stop:
                 message += f" (runaway ceiling ${hard:.2f} reached)"
             if cap_stop:
                 ceiling_txt = f"${shape_ceiling:.4f}" if shape_ceiling is not None else "none"
@@ -1293,6 +1318,7 @@ class ClaudeCodeRunner:
                 if payload.get("subtype") == "error_max_budget_usd":
                     spent = float(payload.get("total_cost_usd") or 0.0)
                     partial_patch = ""
+                    stopped_index = None
                     if thread:
                         # Leave `state` exactly as it was — same scratch, same
                         # `calls` — so a later `run(..., thread=same)` resumes
@@ -1301,6 +1327,16 @@ class ClaudeCodeRunner:
                         state["spent_usd"] = next_spent(reported_now)
                         if state.get("scratch"):
                             partial_patch = _capture_diff(state["scratch"])
+                        # A checkpoint just crossed advances the thread's own
+                        # counter, so the next `run(..., thread=same)` targets
+                        # the following fraction; past the last one, later
+                        # stops fall back to the plain final-ceiling shape. A
+                        # stop at the node cap, or at a role's runaway ceiling
+                        # sitting below the target, crossed no checkpoint —
+                        # cumulative spend never reached `fractions[i]*guide`.
+                        if target is not None and not cap_stop and not runaway_stop:
+                            stopped_index = state["checkpoint_index"]
+                            state["checkpoint_index"] = stopped_index + 1
                     raise BudgetStop(
                         role=role,
                         thread=thread,
@@ -1308,6 +1344,8 @@ class ClaudeCodeRunner:
                         spent_usd=spent,
                         detail=message,
                         partial_patch=partial_patch,
+                        checkpoint_index=stopped_index,
+                        num_turns=payload.get("num_turns"),
                     )
                 raise RunnerError(message)
 
