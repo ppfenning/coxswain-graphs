@@ -67,9 +67,13 @@ Deferred (see graphs/lifecycle-propose.md): intake queue, verification, retro.
 from __future__ import annotations
 
 import re
+import subprocess
 from collections.abc import Mapping, Sequence
 from difflib import SequenceMatcher
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Literal, NamedTuple
+from uuid import uuid4
 
 from graphs._contract import (
     ContractViolation,
@@ -80,6 +84,7 @@ from graphs._contract import (
     require_cartridge,
     review_tier,
 )
+from graphs.delivery.checkpoint import CheckpointSignals, Decision, Revise, checkpoint_decision
 from graphs.delivery.phase_validate import _PLACEHOLDER_MARKERS
 from runner.decision_log import RouterDecision
 from runner.decision_source import DecisionSource, ask
@@ -297,6 +302,13 @@ NO_PROGRESS_RATIO = 0.98
 # past this the task is too large for the slice it was given, and that is a
 # scoping problem, not a reason to keep burning budget on the same session.
 CONTINUATIONS_MAX = 2
+
+# The table `checkpoint_decision` judges a checkpoint's position against:
+# `ClaudeCodeRunner._shape_checkpoint`'s default. It is NOT always the
+# runner's table. Once a role's bounds row is proven (`n >= 20`) the runner
+# uses that row's fractions, and a row of another length moves the "last
+# checkpoint" this graph sees. `BudgetStop` carries no fractions to read back.
+CHECKPOINT_FRACTIONS = (1.0, 2.0)
 
 
 def is_test_path(path: str) -> bool:
@@ -647,6 +659,27 @@ def _is_budget_stop(exc: Exception) -> bool:
     return "error_max_budget_usd" in str(exc).lower()
 
 
+def _touched_paths(patch: str) -> list[str]:
+    """Every path a unified diff's `+++` lines name."""
+    return [
+        _diff_path(line[len("+++ ") :].strip())
+        for line in (patch or "").splitlines()
+        if line.startswith("+++ ")
+    ]
+
+
+def _files_outside_surfaces(touched: Sequence[str], surfaces: Sequence[str]) -> list[str]:
+    """`touched` paths not named in `surfaces`; empty whenever `surfaces` is empty.
+
+    A surface written `path (new)` names the path; the marker is the
+    decompose's note that the file does not exist yet, not part of it.
+    """
+    if not surfaces:
+        return []
+    declared = {re.sub(r"\s*\([^)]*\)\s*$", "", str(s_)) for s_ in surfaces}
+    return [path for path in touched if path not in declared]
+
+
 def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int,
                  hard_ceiling: float | None = None) -> tuple[bool, str]:
     """Whether a budget-stopped build is worth resuming, and why not when it isn't.
@@ -659,21 +692,13 @@ def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int,
     if not stop.session:
         return False, "no session to resume"
 
-    touched = [
-        _diff_path(line[len("+++ ") :].strip())
-        for line in (stop.partial_patch or "").splitlines()
-        if line.startswith("+++ ")
-    ]
-    if surfaces:
-        # A surface written `path (new)` names the path; the marker is the
-        # decompose's note that the file does not exist yet, not part of it.
-        declared = {re.sub(r"\s*\([^)]*\)\s*$", "", str(s_)) for s_ in surfaces}
-        outside = [path for path in touched if path not in declared]
-        if outside:
-            return False, (
-                f"partial work touches {outside[0]} outside the task's surfaces: "
-                "re-scope the task"
-            )
+    touched = _touched_paths(stop.partial_patch or "")
+    outside = _files_outside_surfaces(touched, surfaces)
+    if outside:
+        return False, (
+            f"partial work touches {outside[0]} outside the task's surfaces: "
+            "re-scope the task"
+        )
 
     if not (stop.partial_patch or "").strip():
         if continuations == 0:
@@ -702,6 +727,113 @@ def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int,
         "continuation cap reached with partial work: split recommended — "
         f"done: {', '.join(touched)}; untouched: {', '.join(untouched)}"
     )
+
+
+class _CheckpointContext(NamedTuple):
+    """What a checkpoint needs beyond the stop, read once from the unwrapped runner.
+
+    `repo_dir` is the checkout the build session's scratch was cut from
+    (`ClaudeCodeRunner.repo_dir`, which the epic driver points at the phase
+    worktree), so the partial patch is a diff against its `HEAD`. The two
+    budget maps are the profile half of `ClaudeCodeRunner._shape_ceiling`.
+    """
+
+    checks: tuple[Mapping[str, Any], ...]
+    repo_dir: str | None
+    role_budget_usd: Mapping[str, float]
+    tier_budget_usd: Mapping[str, float]
+
+
+def _checkpoint_context(cartridge: Mapping[str, Any], raw_runner: Any) -> _CheckpointContext:
+    """The ticket's named checks and the runner facts a checkpoint reads.
+
+    Read off the raw runner, not the `_Elevated` wrapper, which forwards no
+    attributes: a `getattr` through it finds nothing.
+    """
+    repo_dir = getattr(raw_runner, "repo_dir", None)
+    return _CheckpointContext(
+        checks=tuple((cartridge.get("landing_areas") or {}).get("checks") or ()),
+        repo_dir=str(repo_dir) if repo_dir else None,
+        role_budget_usd=dict(getattr(raw_runner, "role_budget_usd", None) or {}),
+        tier_budget_usd=dict(getattr(raw_runner, "budget_usd", None) or {}),
+    )
+
+
+def _guide_usd(ctx: _CheckpointContext, budget_usd: float | None, tier: str) -> float | None:
+    """The per-slice guide the checkpoint fractions multiply, not the runaway ceiling.
+
+    The profile branch of `ClaudeCodeRunner._shape_ceiling`: a call's own
+    budget, else the role's, else the tier's. A proven bounds row can replace
+    it inside the runner, keyed by a model this graph never sees.
+    """
+    if budget_usd is not None:
+        return budget_usd
+    role = ctx.role_budget_usd.get("build")
+    return role if role is not None else ctx.tier_budget_usd.get(tier)
+
+
+def _checkpoint_checks_pass(patch: str, checks: Sequence[Mapping[str, Any]], repo_dir: str | None) -> bool:
+    """The ticket's named checks, run in a worktree of `repo_dir` at `HEAD` holding `patch`.
+
+    A real checkout, as `review_entry._verify_evidence` and the epic driver's
+    task step make one: `create_worktree`, `link_venv`, `apply_patch`, then
+    `run_checks`. A bare `apply_patch` scratch has no project behind it, so a
+    patch editing an existing file will not even apply there. With no checks,
+    or no repository to check out, there is nothing that can fail: the split
+    rule needs failing checks, not unmeasured ones. A patch that does not
+    apply to `HEAD` fails. The worktree and its branch are removed on the way out.
+
+    Imported here, not at module level: `harness` imports this module (via
+    `harness.epic` -> `graphs.delivery.rescue_review`), so a top-level
+    `from harness.checks import ...` here is circular.
+    """
+    if not checks or not repo_dir:
+        return True
+    from harness.checks import all_passed, run_checks
+    from harness.worktree import apply_patch, create_worktree, link_venv, remove_worktree
+
+    repo = Path(repo_dir)
+    branch = f"checkpoint-{uuid4().hex[:8]}"
+    with TemporaryDirectory() as scratch:
+        worktree = Path(scratch) / "worktree"
+        made, _detail = create_worktree(repo, worktree, branch=branch, base="HEAD")
+        if not made:
+            return True
+        try:
+            link_venv(repo, worktree)
+            applied, _detail = apply_patch(patch or "", worktree)
+            return applied and all_passed(run_checks(worktree, checks))
+        finally:
+            remove_worktree(repo, worktree)
+            subprocess.run(["git", "-C", str(repo), "branch", "-D", branch], capture_output=True, text=True)
+
+
+def _checkpoint_call(
+    stop: BudgetStop,
+    *,
+    surfaces: list[str],
+    ctx: _CheckpointContext,
+    guide_usd: float | None,
+    previous_patch: str | None,
+) -> Decision:
+    """The `CheckpointSignals` a checkpoint stop carries, judged by `checkpoint_decision`.
+
+    `diff_grew` compares this stop's patch to the one recorded at the
+    previous checkpoint on the same thread; a first checkpoint has nothing to
+    compare against, so it reads as grown. The rules themselves live in
+    `graphs/delivery/checkpoint.py` and are not repeated here.
+    """
+    touched = _touched_paths(stop.partial_patch or "")
+    signals = CheckpointSignals(
+        spend_usd=stop.spent_usd or 0.0,
+        guide_usd=guide_usd or 0.0,
+        checkpoint_index=stop.checkpoint_index or 0,
+        turns=stop.num_turns or 0,
+        diff_grew=previous_patch is None or stop.partial_patch != previous_patch,
+        checks_pass=_checkpoint_checks_pass(stop.partial_patch or "", ctx.checks, ctx.repo_dir),
+        files_outside_surfaces=tuple(_files_outside_surfaces(touched, surfaces)),
+    )
+    return checkpoint_decision(signals, CHECKPOINT_FRACTIONS)
 
 
 def _tier_for(role: str, literal: str | None, ticket_tiers: Mapping[str, str]) -> str | None:
@@ -815,20 +947,40 @@ def _resume_build(
     surfaces: list[str],
     stop: BudgetStop,
     continuations: int,
+    checkpoint: _CheckpointContext | None = None,
+    previous_checkpoint_patch: str | None = None,
     tier: str = "standard",
-) -> tuple[dict[str, Any] | None, int, str, BudgetStop]:
+) -> tuple[dict[str, Any] | None, int, str, BudgetStop, str | None, str | None]:
     """Decide go/no-go on a budget stop and, on go, resume until one finishes
     or the cap refuses another.
 
+    A stop with `checkpoint_index` set is judged by `checkpoint_decision`
+    instead of `_continue_ok`, whatever the continuation count or role
+    ceiling — a checkpoint `Revise` is a no-go regardless of both. A stop
+    with no `checkpoint_index` (the final-ceiling stop) goes through
+    `_continue_ok` exactly as before.
+
     Returns the finished build (`None` on no-go), the updated continuation
-    count, the no-go reason (empty on go), and the last `BudgetStop` seen —
-    the caller needs it to report what a first-build no-go could not keep.
+    count, the no-go reason (empty on go), the last `BudgetStop` seen, the
+    previous-checkpoint patch updated for the next stop on this thread, and a
+    checkpoint revise reason — set only when the no-go came from a
+    checkpoint's own `Revise`, so the caller knows not to raise.
     """
+    ctx = checkpoint if checkpoint is not None else _checkpoint_context({}, None)
     while True:
         hard = (getattr(runner, "role_ceiling_usd", None) or {}).get("build")
-        go, reason = _continue_ok(stop, surfaces=surfaces, continuations=continuations, hard_ceiling=hard)
-        if not go:
-            return None, continuations, reason, stop
+        if stop.checkpoint_index is not None:
+            decision = _checkpoint_call(
+                stop, surfaces=surfaces, ctx=ctx, guide_usd=_guide_usd(ctx, budget_usd, tier),
+                previous_patch=previous_checkpoint_patch,
+            )
+            if isinstance(decision, Revise):
+                return None, continuations, "", stop, previous_checkpoint_patch, decision.reason
+            previous_checkpoint_patch = stop.partial_patch
+        else:
+            go, reason = _continue_ok(stop, surfaces=surfaces, continuations=continuations, hard_ceiling=hard)
+            if not go:
+                return None, continuations, reason, stop, previous_checkpoint_patch, None
         try:
             build = runner.run(
                 role="build",
@@ -852,7 +1004,7 @@ def _resume_build(
             stop = exc
             continue
         continuations += 1
-        return dict(build), continuations, "", stop
+        return dict(build), continuations, "", stop, previous_checkpoint_patch, None
 
 
 def _critique(
@@ -1646,11 +1798,13 @@ def run(
     """
     ticket_tiers = dict(args.get("tier") or {})
     asking = runner if decision_source is None else _Asking(runner, decision_source)
-    return _run(args, _Elevated(asking, ticket_tiers) if ticket_tiers else asking, ticket_tiers)
+    return _run(args, _Elevated(asking, ticket_tiers) if ticket_tiers else asking, ticket_tiers, raw_runner=runner)
 
 
-def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str, str]) -> dict[str, Any]:
-    """The graph body; `runner` already carries the ticket's tiers."""
+def _run(
+    args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str, str], *, raw_runner: Any = None
+) -> dict[str, Any]:
+    """The graph body; `runner` already carries the ticket's tiers, `raw_runner` is the one before wrapping."""
     cartridge = require_cartridge(args)
     run_id, date, ticket = require(args, "run_id", "date", "ticket")
     # The work item's own words travel with its id. Traced plan nodes spent
@@ -1777,6 +1931,9 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
     # builder's reasoning is the failure the seat exists to prevent.
     continuations = 0
     continuation_refused: str | None = None
+    checkpoint = _checkpoint_context(cartridge, raw_runner)
+    previous_checkpoint_patch: str | None = None
+    checkpoint_reason: str | None = None
     try:
         build = runner.run(
             role="build",
@@ -1796,27 +1953,32 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
             ),
         )
     except BudgetStop as exc:
-        resumed, continuations, reason, stop = _resume_build(
+        resumed, continuations, reason, stop, previous_checkpoint_patch, checkpoint_reason = _resume_build(
             runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
             surfaces=surfaces, stop=exc, continuations=continuations,
+            checkpoint=checkpoint, previous_checkpoint_patch=previous_checkpoint_patch,
         )
         if resumed is None:
-            # There is no reviewed build yet to keep — nothing to idle. The
-            # reason travels on the exception itself, since no result is
-            # returned for a `continuation_refused` field to live on.
-            raise BudgetStop(
-                role=stop.role,
-                thread=stop.thread,
-                session=stop.session,
-                spent_usd=stop.spent_usd,
-                partial_patch=stop.partial_patch,
-                detail=f"{stop.detail} — continuation refused: {reason}",
-            ) from stop
-        build = resumed
+            if checkpoint_reason is not None:
+                build = {"patch": stop.partial_patch or "", "summary": "", "files_touched": [], "commands_run": []}
+            else:
+                # There is no reviewed build yet to keep — nothing to idle. The
+                # reason travels on the exception itself, since no result is
+                # returned for a `continuation_refused` field to live on.
+                raise BudgetStop(
+                    role=stop.role,
+                    thread=stop.thread,
+                    session=stop.session,
+                    spent_usd=stop.spent_usd,
+                    partial_patch=stop.partial_patch,
+                    detail=f"{stop.detail} — continuation refused: {reason}",
+                ) from stop
+        else:
+            build = resumed
 
     # A patch that does not parse is asked again once, with the reason
     # attached, and never chased further: the second answer is final.
-    truncation = patch_parses(build.get("patch") or "")
+    truncation = patch_parses(build.get("patch") or "") if checkpoint_reason is None else None
     if truncation is not None:
         try:
             build = runner.run(
@@ -1837,26 +1999,31 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
                 ),
             )
         except BudgetStop as exc:
-            resumed, continuations, reason, stop = _resume_build(
+            resumed, continuations, reason, stop, previous_checkpoint_patch, checkpoint_reason = _resume_build(
                 runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
                 surfaces=surfaces, stop=exc, continuations=continuations,
+                checkpoint=checkpoint, previous_checkpoint_patch=previous_checkpoint_patch,
             )
             if resumed is None:
-                raise BudgetStop(
-                    role=stop.role,
-                    thread=stop.thread,
-                    session=stop.session,
-                    spent_usd=stop.spent_usd,
-                    partial_patch=stop.partial_patch,
-                    detail=f"{stop.detail} — continuation refused: {reason}",
-                ) from stop
-            build = resumed
-        truncation = patch_parses(build.get("patch") or "")
+                if checkpoint_reason is not None:
+                    build = {"patch": stop.partial_patch or "", "summary": "", "files_touched": [], "commands_run": []}
+                else:
+                    raise BudgetStop(
+                        role=stop.role,
+                        thread=stop.thread,
+                        session=stop.session,
+                        spent_usd=stop.spent_usd,
+                        partial_patch=stop.partial_patch,
+                        detail=f"{stop.detail} — continuation refused: {reason}",
+                    ) from stop
+            else:
+                build = resumed
+        truncation = patch_parses(build.get("patch") or "") if checkpoint_reason is None else None
     patch_truncated = truncation is not None
 
     # A patch whose files diverge from `files_touched`, or whose contract
     # commands are missing or unevidenced, is asked again once, named.
-    invalid = None if patch_truncated else _build_output_valid(build, ticket_text)
+    invalid = None if (patch_truncated or checkpoint_reason is not None) else _build_output_valid(build, ticket_text)
     if invalid is not None:
         try:
             build = runner.run(
@@ -1870,19 +2037,24 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
                 ),
             )
         except BudgetStop as exc:
-            resumed, continuations, reason, stop = _resume_build(
+            resumed, continuations, reason, stop, previous_checkpoint_patch, checkpoint_reason = _resume_build(
                 runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
                 surfaces=surfaces, stop=exc, continuations=continuations,
+                checkpoint=checkpoint, previous_checkpoint_patch=previous_checkpoint_patch,
             )
             if resumed is None:
-                raise BudgetStop(
-                    role=stop.role, thread=stop.thread, session=stop.session, spent_usd=stop.spent_usd,
-                    partial_patch=stop.partial_patch, detail=f"{stop.detail} — continuation refused: {reason}",
-                ) from stop
-            build = resumed
-        invalid = _build_output_valid(build, ticket_text)
+                if checkpoint_reason is not None:
+                    build = {"patch": stop.partial_patch or "", "summary": "", "files_touched": [], "commands_run": []}
+                else:
+                    raise BudgetStop(
+                        role=stop.role, thread=stop.thread, session=stop.session, spent_usd=stop.spent_usd,
+                        partial_patch=stop.partial_patch, detail=f"{stop.detail} — continuation refused: {reason}",
+                    ) from stop
+            else:
+                build = resumed
+        invalid = _build_output_valid(build, ticket_text) if checkpoint_reason is None else None
     build_output_invalid = invalid is not None
-    frozen = patch_truncated or build_output_invalid
+    frozen = patch_truncated or build_output_invalid or checkpoint_reason is not None
 
     facts = _change_facts(build)
     tier = review_tier(cartridge, change_facts=facts, surfaces=surfaces, patterns=patterns)
@@ -1901,7 +2073,14 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
         # under-evidenced would buy an opinion about the wrong thing. A patch still
         # truncated after its one retry never buys a review either — there is
         # nothing yet that applies.
-        if patch_truncated:
+        if checkpoint_reason is not None:
+            review = {
+                "verdict": "revise",
+                "rationale": checkpoint_reason,
+                "findings": [{"charter_principle": "checkpoint", "detail": checkpoint_reason, "file": ""}],
+            }
+            adversary, arbitration, verdict, review_placeholder, review_quarantine = None, None, "revise", False, False
+        elif patch_truncated:
             review, adversary, arbitration = _patch_truncated_review(truncation), None, None
             verdict, review_placeholder, review_quarantine = "revise", False, False
         elif build_output_invalid:
@@ -1942,7 +2121,8 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
     # against — the loop never gets a chance to start. A patch truncated twice
     # is the same shape: nothing to send back and revise.
     stopped: str | None = (
-        "patch_truncated" if patch_truncated
+        "checkpoint" if checkpoint_reason is not None
+        else "patch_truncated" if patch_truncated
         else "build_output_invalid" if build_output_invalid
         else "harness fault: review placeholders" if review_quarantine
         else None
@@ -1996,19 +2176,25 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
                 ),
             )
         except BudgetStop as exc:
-            resumed, continuations, reason, _stop = _resume_build(
+            resumed, continuations, reason, _stop, previous_checkpoint_patch, stop_checkpoint_reason = _resume_build(
                 runner, context=context, ticket=ticket, budget_usd=build_budget_usd,
                 surfaces=surfaces, stop=exc, continuations=continuations, tier=retry_tier,
+                checkpoint=checkpoint, previous_checkpoint_patch=previous_checkpoint_patch,
             )
             if resumed is None:
                 # The retry spent the budget without returning a patch, and a
-                # continuation was refused. `build` and `review` still
-                # describe the last patch actually reviewed — that is the
-                # thing worth keeping, not an exception that loses it along
-                # with everything the run already earned.
+                # continuation was refused (or a checkpoint revised). `build`
+                # and `review` still describe the last patch actually
+                # reviewed — that is the thing worth keeping, not an
+                # exception that loses it along with everything the run
+                # already earned.
                 attempts += 1
-                stopped = "budget"
-                continuation_refused = reason
+                if stop_checkpoint_reason is not None:
+                    stopped = "checkpoint"
+                    checkpoint_reason = stop_checkpoint_reason
+                else:
+                    stopped = "budget"
+                    continuation_refused = reason
                 break
             retry = resumed
         attempts += 1
@@ -2201,6 +2387,7 @@ def _run(args: Mapping[str, Any], runner: NodeRunner, ticket_tiers: Mapping[str,
             "continuations": continuations,
             "rounds": rounds,
             **({"continuation_refused": continuation_refused} if continuation_refused is not None else {}),
+            **({"checkpoint_reason": checkpoint_reason} if checkpoint_reason is not None else {}),
             **({"review_placeholder": True} if any_review_placeholder else {}),
         },
         "proposals": proposals,
