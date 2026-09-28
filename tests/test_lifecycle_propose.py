@@ -1184,3 +1184,12 @@ def test_the_build_retry_after_an_invalid_patch_declares_hints_and_no_tier(
     first, second = roles(scripted, "build")
     assert first["tier"] == "standard", "the first build call is not one of this ticket's sites"
     assert (second["hints"], second["tier"]) == (Hints(lines_changed=2), None)
+
+
+def test_under_a_runaway_ceiling_a_build_resumes_past_the_continuation_count_until_the_failsafe() -> None:
+    patch = "--- a/x.py\n+++ b/x.py\n+x\n"
+    under = lifecycle_propose.BudgetStop(role="build", thread="t", spent_usd=4.2, detail="ceiling", session="s1", partial_patch=patch)
+    over = lifecycle_propose.BudgetStop(role="build", thread="t", spent_usd=6.0, detail="ceiling", session="s1", partial_patch=patch)
+    go, _ = lifecycle_propose._continue_ok(under, surfaces=["x.py"], continuations=5, hard_ceiling=6.0)
+    stop, why = lifecycle_propose._continue_ok(over, surfaces=["x.py"], continuations=5, hard_ceiling=6.0)
+    assert (go, stop, why.startswith("the $6.00 runaway ceiling was reached")) == (True, False, True)

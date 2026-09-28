@@ -834,11 +834,28 @@ def test_a_call_level_budget_overrides_the_role_ceiling(fake_claude, tmp_path) -
     assert argv[argv.index("--max-budget-usd") + 1] == "2.5000"
 
 
-def test_a_role_runaway_ceiling_is_the_stop_and_the_role_budget_only_a_guide(fake_claude, tmp_path) -> None:
+def test_a_slice_stops_at_the_guide_under_a_runaway_ceiling(fake_claude, tmp_path) -> None:
     script, _, _ = fake_claude
     runner = ClaudeCodeRunner(
         {**PROFILE, "role_budget_usd": {"build": 0.6}, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path
     )
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.6000"
+
+
+def test_a_resumed_slice_never_passes_the_runaway_ceiling(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner(
+        {**PROFILE, "role_budget_usd": {"build": 0.6}, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path
+    )
+    argv = runner._argv(model="sonnet", tier="standard", tools=[], schema=SCHEMA, system="", role="build", spent_usd=5.8)
+    assert argv[argv.index("--max-budget-usd") + 1] == "6.0000"
+
+
+def test_a_role_with_only_a_runaway_ceiling_stops_there(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path)
     runner.run(role="build", schema=SCHEMA, prompt="go")
     argv = recorded(fake_claude)["argv"]
     assert argv[argv.index("--max-budget-usd") + 1] == "6.0000"
