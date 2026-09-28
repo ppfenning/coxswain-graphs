@@ -47,6 +47,10 @@ from runner.decision_log import RouterDecision, to_row
 from runner.protocol import BudgetStop, Capability, ProviderProfile, resolve_profile
 from runner.scripted import ScriptedRunner
 
+# An empty tuple has no checkpoint left to target, so the session keeps the
+# plain slice: spent plus the guide. Spend-accounting tests read it off argv.
+PLAIN_SLICE: tuple[float, ...] = ()
+
 PROFILE = {
     "profile": "fake-claude-code",
     "runner": "claude-code",
@@ -943,6 +947,50 @@ def test_a_strict_level_picks_the_strict_column(fake_claude, tmp_path) -> None:
     assert runner.calls[-1]["ceiling_source"] == "bounds:strict"
 
 
+def test_a_bounds_row_with_enough_history_and_checkpoint_fractions_records_bounds(fake_claude, tmp_path) -> None:
+    bounds = _bounds_file(tmp_path, [{
+        "role": "build", "model": "sonnet", "n": 25, "strict": 0.1, "moderate": 0.2, "liberal": 0.6,
+        "checkpoint_fractions": [1.0, 3.0],
+    }])
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.cost_bounds_path = bounds
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["checkpoint_fractions"] == [1.0, 3.0]
+    assert runner.calls[-1]["checkpoint_source"] == "bounds"
+
+
+def test_a_bounds_row_with_too_little_history_records_the_default_checkpoint_fractions(fake_claude, tmp_path) -> None:
+    bounds = _bounds_file(tmp_path, [{
+        "role": "build", "model": "sonnet", "n": 10, "strict": 0.1, "moderate": 0.2, "liberal": 0.6,
+        "checkpoint_fractions": [1.0, 3.0],
+    }])
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.cost_bounds_path = bounds
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["checkpoint_fractions"] == [1.0, 2.0]
+    assert runner.calls[-1]["checkpoint_source"] == "default"
+
+
+def test_a_bounds_row_with_no_checkpoint_fractions_field_records_the_default(fake_claude, tmp_path) -> None:
+    bounds = _bounds_file(tmp_path, [{"role": "build", "model": "sonnet", "n": 25, "strict": 0.1, "moderate": 0.2, "liberal": 0.6}])
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.cost_bounds_path = bounds
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["checkpoint_fractions"] == [1.0, 2.0]
+    assert runner.calls[-1]["checkpoint_source"] == "default"
+
+
+def test_no_bounds_file_records_the_default_checkpoint_fractions(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_budget_usd": {"build": 0.6}}, claude_bin=str(script), cwd=tmp_path)
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    assert runner.calls[-1]["checkpoint_fractions"] == [1.0, 2.0]
+    assert runner.calls[-1]["checkpoint_source"] == "default"
+
+
 def test_a_node_cap_below_the_shape_ceiling_becomes_the_effective_limit(fake_claude, tmp_path) -> None:
     script, _, _ = fake_claude
     runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 2.0}}, claude_bin=str(script), cwd=tmp_path)
@@ -1717,7 +1765,7 @@ def test_a_budget_stop_on_a_thread_carries_the_session_and_spend(sequenced_claud
     assert stop.session == argv[argv.index("--session-id") + 1]
     assert stop.spent_usd == 0.97
     assert isinstance(stop, RunnerError)
-    assert stop.checkpoint_index is None, "no checkpoint_fractions was given"
+    assert stop.checkpoint_index is None, "PROFILE sets no guide, so the (1.0, 2.0) default has no target to cross"
     assert stop.num_turns == 24
 
 
@@ -1803,6 +1851,39 @@ def test_a_role_ceiling_between_two_checkpoints_is_not_counted_as_a_crossing(seq
     assert second.value.checkpoint_index is None, "spend never reached the second checkpoint"
 
 
+_GUIDE_ROW = {"role": "build", "model": "sonnet", "strict": 0.5, "moderate": 0.5, "liberal": 0.5}
+
+
+@pytest.mark.parametrize(("rows", "second_limit"), [
+    ([{**_GUIDE_ROW, "n": 25, "checkpoint_fractions": [1.0, 3.0]}], "1.5000"),
+    ([{**_GUIDE_ROW, "n": 10, "checkpoint_fractions": [1.0, 3.0]}], "1.0000"),
+    ([{**_GUIDE_ROW, "n": 25}], "1.0000"),
+    (None, "1.0000"),
+])
+def test_the_resolved_fractions_set_each_checkpoint_on_the_session(sequenced_claude, tmp_path, rows, second_limit) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence({**REFUSED, "total_cost_usd": 0.5}, {**REFUSED, "total_cost_usd": float(second_limit)})
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 0.5}}, claude_bin=str(script), cwd=tmp_path)
+    runner.cost_bounds_path = _bounds_file(tmp_path, rows) if rows is not None else None
+
+    with pytest.raises(BudgetStop) as first:
+        runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    with pytest.raises(BudgetStop) as second:
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
+
+    limits = [a[a.index("--max-budget-usd") + 1] for a in map(json.loads, argv_log.read_text(encoding="utf-8").splitlines())]
+    assert limits == ["0.5000", second_limit], "1.0x the 0.5 guide, then the second fraction of it"
+    assert (first.value.checkpoint_index, second.value.checkpoint_index) == (0, 1)
+
+
+def test_a_callers_own_fractions_are_recorded_as_the_caller_s(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+    runner.run(role="build", schema=SCHEMA, prompt="go", checkpoint_fractions=(1.0,))
+    assert (runner.calls[-1]["checkpoint_fractions"], runner.calls[-1]["checkpoint_source"]) == ([1.0], "caller")
+
+
 def test_a_budget_stop_without_a_thread_has_no_session(sequenced_claude, tmp_path) -> None:
     script, set_sequence, _ = sequenced_claude
     set_sequence(REFUSED)
@@ -1866,10 +1947,10 @@ def test_a_resumed_thread_sends_spent_plus_the_ceiling(sequenced_claude, tmp_pat
     profile = {**PROFILE, "budget_usd": {"standard": 1.0}}
     runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
 
-    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T", checkpoint_fractions=PLAIN_SLICE)
     with pytest.raises(BudgetStop):
-        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
-    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T")
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T", checkpoint_fractions=PLAIN_SLICE)
+    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T", checkpoint_fractions=PLAIN_SLICE)
 
     third = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[2])
     assert third[third.index("--max-budget-usd") + 1] == "1.9700", "0.97 spent plus the 1.00 ceiling"
@@ -1882,10 +1963,10 @@ def test_an_explicit_budget_on_the_resume_is_added_to_spent_too(sequenced_claude
     profile = {**PROFILE, "budget_usd": {"standard": 1.0}}
     runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
 
-    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T", checkpoint_fractions=PLAIN_SLICE)
     with pytest.raises(BudgetStop):
-        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
-    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T", budget_usd=2.5)
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T", checkpoint_fractions=PLAIN_SLICE)
+    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T", budget_usd=2.5, checkpoint_fractions=PLAIN_SLICE)
 
     third = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[2])
     assert third[third.index("--max-budget-usd") + 1] == "3.4700", "0.97 spent plus the 2.50 override"
@@ -1917,9 +1998,8 @@ def test_a_resumed_thread_records_the_rise_and_budgets_on_the_session_total(sequ
         profile, claude_bin=str(script), cwd=tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn)
     )
 
-    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
-    runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
-    runner.run(role="build", schema=SCHEMA, prompt="build again", thread="T")
+    for prompt in ("build it", "build more", "build again"):
+        runner.run(role="build", schema=SCHEMA, prompt=prompt, thread="T", checkpoint_fractions=PLAIN_SLICE)
 
     assert [c["cost_usd"] for c in runner.calls[:2]] == [0.30, pytest.approx(0.15)]
     assert [r["cost_usd"] for r in _ledger_lines(conn, "r1")[:2]] == [0.30, pytest.approx(0.15)]
@@ -1971,7 +2051,7 @@ def test_a_resumed_success_without_a_total_keeps_the_session_total(sequenced_cla
     runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path)
 
     for prompt in ("build it", "build more", "build again"):
-        runner.run(role="build", schema=SCHEMA, prompt=prompt, thread="T")
+        runner.run(role="build", schema=SCHEMA, prompt=prompt, thread="T", checkpoint_fractions=PLAIN_SLICE)
 
     assert [c["cost_usd"] for c in runner.calls] == [0.30, None, pytest.approx(0.15)]
     third = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[2])
@@ -2076,11 +2156,11 @@ def test_a_successful_resume_replaces_spend_with_the_reported_session_total(sequ
     profile = {**PROFILE, "budget_usd": {"standard": 1.0}}
     runner = ClaudeCodeRunner(profile, claude_bin=str(script), cwd=tmp_path, repo_dir=repo)
 
-    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T")
+    runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T", checkpoint_fractions=PLAIN_SLICE)
     with pytest.raises(BudgetStop):
-        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
-    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T")
-    runner.run(role="build", schema=SCHEMA, prompt="again", thread="T")
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T", checkpoint_fractions=PLAIN_SLICE)
+    runner.run(role="build", schema=SCHEMA, prompt="retry", thread="T", checkpoint_fractions=PLAIN_SLICE)
+    runner.run(role="build", schema=SCHEMA, prompt="again", thread="T", checkpoint_fractions=PLAIN_SLICE)
 
     fourth = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[3])
     assert fourth[fourth.index("--max-budget-usd") + 1] == "1.0200", \
