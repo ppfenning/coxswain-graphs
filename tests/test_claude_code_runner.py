@@ -1717,6 +1717,90 @@ def test_a_budget_stop_on_a_thread_carries_the_session_and_spend(sequenced_claud
     assert stop.session == argv[argv.index("--session-id") + 1]
     assert stop.spent_usd == 0.97
     assert isinstance(stop, RunnerError)
+    assert stop.checkpoint_index is None, "no checkpoint_fractions was given"
+    assert stop.num_turns == 24
+
+
+def test_checkpoint_fractions_stop_the_session_in_order(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    first_stop = {
+        "type": "result", "is_error": True, "subtype": "error_max_budget_usd",
+        "result": "the session reached its budget ceiling", "num_turns": 10, "total_cost_usd": 0.5,
+    }
+    second_stop = {
+        "type": "result", "is_error": True, "subtype": "error_max_budget_usd",
+        "result": "the session reached its budget ceiling", "num_turns": 20, "total_cost_usd": 1.0,
+    }
+    set_sequence(first_stop, second_stop)
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 0.5}}, claude_bin=str(script), cwd=tmp_path)
+
+    with pytest.raises(BudgetStop) as first:
+        runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T", checkpoint_fractions=(1.0, 2.0))
+    with pytest.raises(BudgetStop) as second:
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T", checkpoint_fractions=(1.0, 2.0))
+
+    assert first.value.checkpoint_index == 0
+    assert first.value.num_turns == 10
+    assert second.value.checkpoint_index == 1
+    assert second.value.num_turns == 20
+    calls_argv = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+    assert calls_argv[0][calls_argv[0].index("--max-budget-usd") + 1] == "0.5000", "1.0x the 0.5 guide"
+    assert calls_argv[1][calls_argv[1].index("--max-budget-usd") + 1] == "1.0000", "2.0x the 0.5 guide"
+
+
+def test_a_node_cap_below_the_checkpoint_bounds_it_and_is_named_as_the_cause(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence({**REFUSED, "total_cost_usd": 2.0})
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 3.0}}, claude_bin=str(script), cwd=tmp_path)
+    runner.node_cap_usd = 2.0
+
+    with pytest.raises(BudgetStop) as stop:
+        runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T", checkpoint_fractions=(1.0, 2.0))
+
+    argv = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[0])
+    assert argv[argv.index("--max-budget-usd") + 1] == "2.0000", "the 2.00 cap, not 1.0x the 3.00 guide"
+    assert "error_spend_cap" in stop.value.detail
+    assert stop.value.checkpoint_index is None, "a cap stop crossed no checkpoint"
+
+
+def test_a_stop_past_the_last_checkpoint_is_the_plain_final_ceiling_stop(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence({**REFUSED, "total_cost_usd": 0.5}, {**REFUSED, "total_cost_usd": 1.0})
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 0.5}}, claude_bin=str(script), cwd=tmp_path)
+
+    with pytest.raises(BudgetStop):
+        runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T", checkpoint_fractions=(1.0,))
+    with pytest.raises(BudgetStop) as past:
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T", checkpoint_fractions=(1.0,))
+
+    second = json.loads(argv_log.read_text(encoding="utf-8").splitlines()[1])
+    assert second[second.index("--max-budget-usd") + 1] == "1.0000", "0.50 spent plus the 0.50 guide"
+    assert past.value.checkpoint_index is None
+    assert past.value.num_turns == 24
+
+
+def test_a_role_ceiling_between_two_checkpoints_is_not_counted_as_a_crossing(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, _ = sequenced_claude
+    argv_log = tmp_path / "argvs.jsonl"
+    set_sequence({**REFUSED, "total_cost_usd": 1.0}, {**REFUSED, "total_cost_usd": 1.5})
+    runner = ClaudeCodeRunner(
+        {**PROFILE, "budget_usd": {"standard": 1.0}, "role_ceiling_usd": {"build": 1.5}},
+        claude_bin=str(script), cwd=tmp_path,
+    )
+
+    with pytest.raises(BudgetStop) as first:
+        runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T", checkpoint_fractions=(1.0, 2.0))
+    with pytest.raises(BudgetStop) as second:
+        runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T", checkpoint_fractions=(1.0, 2.0))
+
+    assert first.value.checkpoint_index == 0, "1.0x the guide sits below the 1.5 role ceiling"
+    calls_argv = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+    assert calls_argv[1][calls_argv[1].index("--max-budget-usd") + 1] == "1.5000", \
+        "clamped to the role ceiling, short of 2.0x the guide"
+    assert second.value.checkpoint_index is None, "spend never reached the second checkpoint"
 
 
 def test_a_budget_stop_without_a_thread_has_no_session(sequenced_claude, tmp_path) -> None:
