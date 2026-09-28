@@ -439,6 +439,8 @@ def _call_fields(
     ceiling_usd: float | None = None,
     ceiling_source: str = "profile",
     hard_ceiling_usd: float | None = None,
+    checkpoint_fractions: tuple[float, ...] | None = None,
+    checkpoint_source: str = "default",
 ) -> dict[str, Any]:
     """The one shape a call is recorded in — success or failure alike."""
     usage = payload.get("usage") if isinstance(payload.get("usage"), Mapping) else {}
@@ -452,6 +454,8 @@ def _call_fields(
         "ceiling_usd": ceiling_usd,
         "ceiling_source": ceiling_source,
         **({"hard_ceiling_usd": hard_ceiling_usd} if hard_ceiling_usd is not None else {}),
+        "checkpoint_fractions": list(checkpoint_fractions) if checkpoint_fractions else None,
+        "checkpoint_source": checkpoint_source,
         "turns": payload.get("num_turns"),
         "duration_ms": payload.get("duration_ms"),
         # Split, not summed: a cache read costs a tenth of a fresh token,
@@ -809,6 +813,18 @@ class ClaudeCodeRunner:
         if budget is None:
             budget = self.budget_usd.get(tier)
         return budget, "profile"
+
+    def _shape_checkpoint(
+        self, role: str | None, model: str, fractions: tuple[float, ...] | None
+    ) -> tuple[tuple[float, ...], str]:
+        """A caller's own tuple wins; else the bounds row's when proven (`n >= 20`); else the (1.0, 2.0) default."""
+        if fractions is not None:
+            return fractions, "caller"
+        row = self._bounds_row(role, model)
+        raw = row.get("checkpoint_fractions") if row is not None and (row.get("n") or 0) >= 20 else None
+        if raw:
+            return tuple(float(x) for x in raw), "bounds"
+        return (1.0, 2.0), "default"
 
     @staticmethod
     def _read_context(context: Sequence[str]) -> str:
@@ -1217,6 +1233,7 @@ class ClaudeCodeRunner:
         for attempt in (1, 2):
             call_id = first_call_id if attempt == 1 else str(uuid.uuid4())
             used_model = attempt_model
+            resolved_fractions, checkpoint_source = self._shape_checkpoint(role, used_model, checkpoint_fractions)
             if thread:
                 state = self._thread(thread, role)
                 session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
@@ -1224,7 +1241,7 @@ class ClaudeCodeRunner:
                     role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
                     spent_usd=state.get("spent_usd", 0.0), effort=effort,
-                    checkpoint_fractions=checkpoint_fractions, checkpoint_index=state.get("checkpoint_index", 0),
+                    checkpoint_fractions=resolved_fractions, checkpoint_index=state.get("checkpoint_index", 0),
                 )
                 if role in _PATCH_ROLES and state.get("scratch"):
                     has_scratch = True
@@ -1236,7 +1253,7 @@ class ClaudeCodeRunner:
                     proc = self._invoke(
                         role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                         scratch=scratch, patches=True, session=(), budget_usd=budget_usd, effort=effort,
-                        checkpoint_fractions=checkpoint_fractions,
+                        checkpoint_fractions=resolved_fractions,
                     )
                     if role in _PATCH_ROLES and scratch:
                         has_scratch = True
@@ -1284,7 +1301,7 @@ class ClaudeCodeRunner:
             shape_ceiling, ceiling_source = self._shape_ceiling(role, tier, used_model, budget_usd)
             # The cap governs when it is below the number actually sent: the
             # checkpoint target while one is live, the shape ceiling otherwise.
-            target = _checkpoint_target(checkpoint_fractions, state.get("checkpoint_index", 0) if thread else 0, shape_ceiling)
+            target = _checkpoint_target(resolved_fractions, state.get("checkpoint_index", 0) if thread else 0, shape_ceiling)
             _, cap_governs = _effective_limit(shape_ceiling if target is None else target, self.node_cap_usd)
             cap_stop = cap_governs and detail.get("subtype") == "error_max_budget_usd"
             if cap_stop:
@@ -1310,6 +1327,7 @@ class ClaudeCodeRunner:
                             role, tier, used_model, tools, payload, task,
                             ceiling_usd=shape_ceiling, ceiling_source=ceiling_source,
                             hard_ceiling_usd=self.role_ceiling_usd.get(role) if role is not None else None,
+                            checkpoint_fractions=resolved_fractions, checkpoint_source=checkpoint_source,
                         ),
                         "id": call_id, **retry_extra, **priced,
                     },
@@ -1375,6 +1393,7 @@ class ClaudeCodeRunner:
                     **_call_fields(
                         role, tier, used_model, tools, traced_payload, task,
                         ceiling_usd=shape_ceiling, ceiling_source=ceiling_source,
+                        checkpoint_fractions=resolved_fractions, checkpoint_source=checkpoint_source,
                     ),
                     "id": call_id, **priced,
                 },
@@ -1389,6 +1408,7 @@ class ClaudeCodeRunner:
                 role, tier, used_model, tools, payload, task,
                 ceiling_usd=ceiling_usd, ceiling_source=ceiling_source,
                 hard_ceiling_usd=self.role_ceiling_usd.get(role) if role is not None else None,
+                checkpoint_fractions=resolved_fractions, checkpoint_source=checkpoint_source,
             ),
             "id": call_id, **retry_extra,
             **priced,
