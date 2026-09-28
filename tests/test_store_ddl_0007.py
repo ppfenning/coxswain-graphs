@@ -38,11 +38,12 @@ def test_a_database_at_version_six_gains_chair_actions_and_keeps_work_items():
         )
         before = c.query_all("PRAGMA table_info(work_items)")
         assert c.query_all("SELECT name FROM sqlite_master WHERE name = 'chair_actions'") == []
-        assert migrate(c, NOW2, default_modules()) == 8
+        assert migrate(c, NOW2, default_modules()) == 9
         assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[6:7] == [(7, NOW2)]
         assert [r[1] for r in c.query_all("PRAGMA table_info(chair_actions)")] == COLUMNS
         assert c.query_all("SELECT COUNT(*) FROM chair_actions") == [(0,)]
-        assert c.query_all("PRAGMA table_info(work_items)") == before
+        # migration 0009 appends more work_items columns later; only the original seven stay unchanged.
+        assert c.query_all("PRAGMA table_info(work_items)")[:7] == before
         assert c.query_all("SELECT initiative, task_id, state FROM work_items") == [("i1", "t1", "ready")]
     finally:
         c.close()

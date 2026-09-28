@@ -31,9 +31,12 @@ def insert(conn, initiative, task_id, state="open", needs=None):
 
 
 # SQLite only: PRAGMA table_info has no Postgres counterpart.
+# Migrated only through 0006: migration 0009 later adds more work_items columns,
+# so a fully-migrated store is not this migration's own shape.
 def test_work_items_has_the_listed_columns_all_not_null_and_composite_key():
-    c = open_store("sqlite:///:memory:", NOW1)
+    c = connect("sqlite:///:memory:")
     try:
+        assert migrate(c, NOW1, default_modules()[:6]) == 6
         rows = c.query_all("PRAGMA table_info(work_items)")
         assert [r[1] for r in rows] == COLUMNS
         assert [r[2] for r in rows] == ["TEXT"] * 7
@@ -44,7 +47,7 @@ def test_work_items_has_the_listed_columns_all_not_null_and_composite_key():
 
 
 def test_a_fresh_store_reaches_the_newest_version(store_conn):
-    assert check_version(store_conn) == (8, 8)
+    assert check_version(store_conn) == (9, 9)
     assert store_conn.query_all("SELECT initiative FROM work_items") == []
 
 
@@ -79,9 +82,9 @@ def test_applying_again_is_a_no_op():
     c = open_store("sqlite:///:memory:", NOW1)
     try:
         insert(c, "i1", "t1")
-        assert migrate(c, NOW2, default_modules()) == 8
+        assert migrate(c, NOW2, default_modules()) == 9
         versions = c.query_all("SELECT version FROM schema_version ORDER BY version")
-        assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)]
+        assert versions == [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)]
         assert c.query_all("SELECT COUNT(*) FROM work_items") == [(1,)]
     finally:
         c.close()
