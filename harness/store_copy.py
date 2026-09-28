@@ -26,6 +26,7 @@ import harness.store_ddl_0005 as ddl5
 import harness.store_ddl_0006 as ddl6
 import harness.store_ddl_0007 as ddl7
 import harness.store_ddl_0008 as ddl8
+import harness.store_ddl_0009 as ddl9
 from harness.store_dialect import Connection, insert_ignore, upsert
 from harness.store_migrate import open_store
 
@@ -66,7 +67,7 @@ class CopyCheckFailed(Exception):
 def tables() -> tuple[Table, ...]:
     """(name, column names, key) for every table the DDL modules create, migration ALTER columns included."""
     # The list must follow every migration's ALTERs: a column left out is dropped silently and the copy holds NULL.
-    alters = (*ddl2._ADDED, *ddl3._ADDED, *ddl5._ADDED)
+    alters = (*ddl2._ADDED, *ddl3._ADDED, *ddl5._ADDED, *ddl9._ADDED)
     added = {t: tuple(c for u, c in alters if u == t) for t, _ in alters}
     return tuple(
         (name, (*(c for c, _ in columns), *added.get(name, ())), key)
