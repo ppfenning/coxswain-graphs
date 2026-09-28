@@ -94,3 +94,10 @@ def test_release_with_the_matching_holder_clears_the_claim(store_conn):
     claim(store_conn, "i1", "t1", "alice", 30, T0)
     assert release(store_conn, "i1", "t1", "alice") is True
     assert _claim_cols(store_conn, "i1", "t1") == {"holder": None, "epoch": 1, "expires_at": None}
+
+
+def test_an_upsert_without_a_stamp_is_written_with_the_write_time_and_this_module_as_author(store_conn):
+    bare = {k: v for k, v in ROW.items() if k not in ("updated_at", "updated_by")}
+    assert upsert(store_conn, bare)
+    (stored,) = read(store_conn)
+    assert stored["updated_at"] and stored["updated_by"] == "store_queue"

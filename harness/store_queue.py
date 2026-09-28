@@ -19,7 +19,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from harness.store_dialect import Connection, connect, json_load, json_text
@@ -74,8 +74,10 @@ def _insert_row(row: Row) -> Row:
         "surfaces_json": row.get("surfaces"),
         "body": row.get("body"),
         "extra_json": row.get("extra"),
-        "updated_at": row.get("updated_at"),
-        "updated_by": row.get("updated_by"),
+        # Every work_items column is NOT NULL (migration 0006); a caller that sends no stamp, as tools' `route import`
+        # rows do, gets the write time and this module's name rather than a refused row.
+        "updated_at": row.get("updated_at") or datetime.now(UTC).isoformat(),
+        "updated_by": row.get("updated_by") or "store_queue",
     }
 
 
