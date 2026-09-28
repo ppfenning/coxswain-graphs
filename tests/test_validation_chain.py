@@ -7,6 +7,7 @@ author, and a step never builds on an unvalidated handoff.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import ANY
@@ -47,7 +48,7 @@ def bind(cart, *roles):
     return cart
 
 
-def run(cart, plan_response, build_response, extra=None, **args):
+def run(cart, plan_response, build_response, extra=None, runs_dir=None, **args):
     responses = {
         "plan": plan_response,
         "build": build_response,
@@ -55,6 +56,8 @@ def run(cart, plan_response, build_response, extra=None, **args):
         **(extra or {}),
     }
     scripted = ScriptedRunner(responses)
+    if runs_dir is not None:
+        scripted.runs_dir = runs_dir
     result = lifecycle_propose.run(
         {"run_id": "r", "date": "2026-08-30", "ticket": "T-1", "cartridge": cart, **args}, scripted
     )
@@ -473,37 +476,56 @@ def _checkpoint_stop(patch: str, *, checkpoint_index: int, num_turns: int = 5, s
 LAST_CHECKPOINT = len(lifecycle_propose.CHECKPOINT_FRACTIONS) - 1
 
 
+def _ledger_lines(runs_dir: Path, run_id: str = "r") -> list[dict]:
+    path = runs_dir / f"{run_id}.checkpoints.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def test_a_checkpoint_with_a_grown_diff_no_outside_files_and_passing_checks_resumes(
-    cart, plan_response, build_response
+    cart, plan_response, build_response, tmp_path
 ) -> None:
     """A first checkpoint has nothing to compare against, so its diff always reads as grown."""
     stop = _checkpoint_stop(PARTIAL_IN_SURFACE, checkpoint_index=0)
-    result, scripted = run(cart, plan_response, [stop, build_response], surfaces=["src/a.py"])
+    result, scripted = run(cart, plan_response, [stop, build_response], surfaces=["src/a.py"], runs_dir=tmp_path)
     assert result["fix_loop"]["stopped"] is None
     assert result["review"]["verdict"] == "approve"
     build_calls = [c for c in scripted.calls if c["role"] == "build"]
     assert len(build_calls) == 2
     assert "Continue from exactly where you stopped" in build_calls[1]["prompt"]
+    lines = _ledger_lines(tmp_path)
+    assert len(lines) == 1
+    assert lines[0]["decision"] == "resume"
+    assert "reason" not in lines[0]
 
 
-def test_a_checkpoint_touching_a_file_outside_surfaces_revises_with_re_scope(cart, plan_response) -> None:
+def test_a_checkpoint_touching_a_file_outside_surfaces_revises_with_re_scope(cart, plan_response, tmp_path) -> None:
     stop = _checkpoint_stop(PARTIAL_OUTSIDE_SURFACE, checkpoint_index=0)
-    result, scripted = run(cart, plan_response, build_response=stop, surfaces=["src/a.py"])
+    result, scripted = run(cart, plan_response, build_response=stop, surfaces=["src/a.py"], runs_dir=tmp_path)
     assert result["fix_loop"]["stopped"] == "checkpoint"
     assert "re-scope" in result["fix_loop"]["checkpoint_reason"]
     build_calls = [c for c in scripted.calls if c["role"] == "build"]
     assert len(build_calls) == 1
+    lines = _ledger_lines(tmp_path)
+    assert len(lines) == 1
+    assert lines[0]["decision"] == "revise"
+    assert "re-scope" in lines[0]["reason"]
 
 
-def test_two_checkpoints_with_an_unchanged_diff_revise_with_re_ground(cart, plan_response) -> None:
+def test_two_checkpoints_with_an_unchanged_diff_revise_with_re_ground(cart, plan_response, tmp_path) -> None:
     """The second checkpoint's patch is byte-identical to the first's: no progress since."""
     first = _checkpoint_stop(PARTIAL_IN_SURFACE, checkpoint_index=0)
     second = _checkpoint_stop(PARTIAL_IN_SURFACE, checkpoint_index=1)
-    result, scripted = run(cart, plan_response, [first, second], surfaces=["src/a.py"])
+    result, scripted = run(cart, plan_response, [first, second], surfaces=["src/a.py"], runs_dir=tmp_path)
     assert result["fix_loop"]["stopped"] == "checkpoint"
     assert "re-ground" in result["fix_loop"]["checkpoint_reason"]
     build_calls = [c for c in scripted.calls if c["role"] == "build"]
     assert len(build_calls) == 2
+    # Two checkpoints on the same run append two lines, not one overwritten line.
+    lines = _ledger_lines(tmp_path)
+    assert len(lines) == 2
+    assert lines[0]["decision"] == "resume"
+    assert lines[1]["decision"] == "revise"
+    assert "re-ground" in lines[1]["reason"]
 
 
 # Edits a file that already exists at the repo's HEAD: it applies only in a
