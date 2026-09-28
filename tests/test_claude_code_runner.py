@@ -834,6 +834,35 @@ def test_a_call_level_budget_overrides_the_role_ceiling(fake_claude, tmp_path) -
     assert argv[argv.index("--max-budget-usd") + 1] == "2.5000"
 
 
+def test_a_role_runaway_ceiling_is_the_stop_and_the_role_budget_only_a_guide(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner(
+        {**PROFILE, "role_budget_usd": {"build": 0.6}, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path
+    )
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "6.0000"
+
+
+def test_a_role_without_a_runaway_ceiling_keeps_its_shape_ceiling(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner(
+        {**PROFILE, "budget_usd": {"standard": 0.35}, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path
+    )
+    runner.run(role="plan", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.3500"
+
+
+def test_an_operator_cap_below_the_runaway_ceiling_still_binds(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path)
+    runner.node_cap_usd = 2.0
+    runner.run(role="build", schema=SCHEMA, prompt="go")
+    argv = recorded(fake_claude)["argv"]
+    assert argv[argv.index("--max-budget-usd") + 1] == "2.0000"
+
+
 def _bounds_file(tmp_path: Path, rows: list[dict]) -> Path:
     path = tmp_path / "bounds.json"
     path.write_text(json.dumps({"generated": "2026-09-16", "db": "stats.db", "rows": rows}), encoding="utf-8")
