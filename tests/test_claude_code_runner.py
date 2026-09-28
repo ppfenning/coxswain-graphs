@@ -854,7 +854,24 @@ def test_a_resumed_slice_never_passes_the_runaway_ceiling(fake_claude, tmp_path)
         {**PROFILE, "role_budget_usd": {"build": 0.6}, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path
     )
     argv = runner._argv(model="sonnet", tier="standard", tools=[], schema=SCHEMA, system="", role="build", spent_usd=5.8)
-    assert argv[argv.index("--max-budget-usd") + 1] == "6.0000"
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.2000"
+
+
+def test_a_session_past_the_runaway_ceiling_sends_nothing_left(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path)
+    argv = runner._argv(model="sonnet", tier="standard", tools=[], schema=SCHEMA, system="", role="build", spent_usd=6.4)
+    assert argv[argv.index("--max-budget-usd") + 1] == "0.0000"
+
+
+def test_a_thread_that_spent_the_runaway_ceiling_stops_without_calling_the_cli(fake_claude, tmp_path) -> None:
+    script, record, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path)
+    state = runner._thread("T-1", "build")
+    state["calls"], state["spent_usd"] = 3, 6.1
+    with pytest.raises(BudgetStop, match=r"runaway ceiling \$6.00 reached"):
+        runner.run(role="build", schema=SCHEMA, prompt="again", thread="T-1", task="t1")
+    assert not record.exists()
 
 
 def test_a_role_with_only_a_runaway_ceiling_stops_there(fake_claude, tmp_path) -> None:
@@ -1846,8 +1863,8 @@ def test_a_role_ceiling_between_two_checkpoints_is_not_counted_as_a_crossing(seq
 
     assert first.value.checkpoint_index == 0, "1.0x the guide sits below the 1.5 role ceiling"
     calls_argv = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
-    assert calls_argv[1][calls_argv[1].index("--max-budget-usd") + 1] == "1.5000", \
-        "clamped to the role ceiling, short of 2.0x the guide"
+    assert calls_argv[1][calls_argv[1].index("--max-budget-usd") + 1] == "0.5000", \
+        "clamped to what is left of the role ceiling after the first call's $1.00, short of 2.0x the guide"
     assert second.value.checkpoint_index is None, "spend never reached the second checkpoint"
 
 
