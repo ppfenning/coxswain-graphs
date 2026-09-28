@@ -57,6 +57,8 @@ class BudgetStop(RunnerError):
         spent_usd: float,
         detail: str,
         partial_patch: str = "",
+        checkpoint_index: int | None = None,
+        num_turns: int | None = None,
     ) -> None:
         self.role = role
         self.thread = thread
@@ -64,6 +66,8 @@ class BudgetStop(RunnerError):
         self.spent_usd = spent_usd
         self.partial_patch = partial_patch
         self.detail = detail
+        self.checkpoint_index = checkpoint_index
+        self.num_turns = num_turns
         super().__init__(detail)
 
 
