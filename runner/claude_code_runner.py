@@ -1077,7 +1077,10 @@ class ClaudeCodeRunner:
             limit = None if effective is None else spent_usd + effective
         hard = self.role_ceiling_usd.get(role) if role is not None else None
         if hard is not None:
-            limit = hard if limit is None else min(limit, hard)
+            # --max-budget-usd bounds one invocation, not the session, so the runaway ceiling sends what is left of
+            # it: on 2026-09-28 a resumed build spent $16.39 over four calls that were each sent $6.
+            remaining = max(hard - spent_usd, 0.0)
+            limit = remaining if limit is None else min(limit, remaining)
         if limit is not None:
             argv += ["--max-budget-usd", f"{limit:.4f}"]
         if system:
@@ -1237,6 +1240,21 @@ class ClaudeCodeRunner:
             if thread:
                 state = self._thread(thread, role)
                 session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
+                hard = self.role_ceiling_usd.get(role) if role is not None else None
+                spent_so_far = state.get("spent_usd", 0.0)
+                if hard is not None and spent_so_far >= hard:
+                    # The session already spent the runaway ceiling: no call is made, and the stop reads like one
+                    # the CLI raised at the ceiling, so the lifecycle quarantines it with its split advice.
+                    raise BudgetStop(
+                        role=role,
+                        thread=thread,
+                        session=state["session"],
+                        spent_usd=spent_so_far,
+                        detail=f"node '{role}' not started: the session has spent ${spent_so_far:.2f} "
+                        f"(runaway ceiling ${hard:.2f} reached)",
+                        partial_patch=_capture_diff(state["scratch"]) if state.get("scratch") else "",
+                        checkpoint_index=None,
+                    )
                 proc = self._invoke(
                     role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
