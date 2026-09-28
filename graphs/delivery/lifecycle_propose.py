@@ -66,9 +66,11 @@ Deferred (see graphs/lifecycle-propose.md): intake queue, verification, retro.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -84,7 +86,13 @@ from graphs._contract import (
     require_cartridge,
     review_tier,
 )
-from graphs.delivery.checkpoint import CheckpointSignals, Decision, Revise, checkpoint_decision
+from graphs.delivery.checkpoint import (
+    CheckpointSignals,
+    Decision,
+    Revise,
+    checkpoint_decision,
+    checkpoint_ledger_line,
+)
 from graphs.delivery.phase_validate import _PLACEHOLDER_MARKERS
 from runner.decision_log import RouterDecision
 from runner.decision_source import DecisionSource, ask
@@ -742,20 +750,29 @@ class _CheckpointContext(NamedTuple):
     repo_dir: str | None
     role_budget_usd: Mapping[str, float]
     tier_budget_usd: Mapping[str, float]
+    runs_dir: Path | None
+    run_id: str
+    task: str
 
 
-def _checkpoint_context(cartridge: Mapping[str, Any], raw_runner: Any) -> _CheckpointContext:
+def _checkpoint_context(cartridge: Mapping[str, Any], raw_runner: Any, run_id: str, ticket: Any) -> _CheckpointContext:
     """The ticket's named checks and the runner facts a checkpoint reads.
 
     Read off the raw runner, not the `_Elevated` wrapper, which forwards no
-    attributes: a `getattr` through it finds nothing.
+    attributes: a `getattr` through it finds nothing. `runs_dir` is the same
+    attribute `ClaudeCodeRunner` kept for the old per-call `calls.jsonl`
+    ledger; nothing reads that ledger any more, so this is its only reader now.
     """
     repo_dir = getattr(raw_runner, "repo_dir", None)
+    runs_dir = getattr(raw_runner, "runs_dir", None)
     return _CheckpointContext(
         checks=tuple((cartridge.get("landing_areas") or {}).get("checks") or ()),
         repo_dir=str(repo_dir) if repo_dir else None,
         role_budget_usd=dict(getattr(raw_runner, "role_budget_usd", None) or {}),
         tier_budget_usd=dict(getattr(raw_runner, "budget_usd", None) or {}),
+        runs_dir=Path(runs_dir) if runs_dir else None,
+        run_id=run_id,
+        task=str(ticket),
     )
 
 
@@ -808,6 +825,24 @@ def _checkpoint_checks_pass(patch: str, checks: Sequence[Mapping[str, Any]], rep
             subprocess.run(["git", "-C", str(repo), "branch", "-D", branch], capture_output=True, text=True)
 
 
+def _append_checkpoint_ledger(ctx: _CheckpointContext, signals: CheckpointSignals, decision: Decision) -> None:
+    """Append one ledger line for this checkpoint to `<runs_dir>/<run_id>.checkpoints.jsonl`.
+
+    A no-op when the context carries no `runs_dir` — a caller that never set
+    one (most tests) gets no file rather than a path built from `None`. The
+    file is opened in append mode only: this writer never rewrites what is
+    already on disk. A reader lives in `cox stats`, in coxswain-tools.
+    """
+    if ctx.runs_dir is None:
+        return
+    line = checkpoint_ledger_line(
+        ts=datetime.now(UTC).isoformat(), task=ctx.task, role="build", signals=signals, decision=decision
+    )
+    path = ctx.runs_dir / f"{ctx.run_id}.checkpoints.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line) + "\n")
+
+
 def _checkpoint_call(
     stop: BudgetStop,
     *,
@@ -821,7 +856,8 @@ def _checkpoint_call(
     `diff_grew` compares this stop's patch to the one recorded at the
     previous checkpoint on the same thread; a first checkpoint has nothing to
     compare against, so it reads as grown. The rules themselves live in
-    `graphs/delivery/checkpoint.py` and are not repeated here.
+    `graphs/delivery/checkpoint.py` and are not repeated here. Every decision
+    reached, Resume or Revise, is appended to the run's checkpoint ledger.
     """
     touched = _touched_paths(stop.partial_patch or "")
     signals = CheckpointSignals(
@@ -833,7 +869,9 @@ def _checkpoint_call(
         checks_pass=_checkpoint_checks_pass(stop.partial_patch or "", ctx.checks, ctx.repo_dir),
         files_outside_surfaces=tuple(_files_outside_surfaces(touched, surfaces)),
     )
-    return checkpoint_decision(signals, CHECKPOINT_FRACTIONS)
+    decision = checkpoint_decision(signals, CHECKPOINT_FRACTIONS)
+    _append_checkpoint_ledger(ctx, signals, decision)
+    return decision
 
 
 def _tier_for(role: str, literal: str | None, ticket_tiers: Mapping[str, str]) -> str | None:
@@ -966,7 +1004,7 @@ def _resume_build(
     checkpoint revise reason — set only when the no-go came from a
     checkpoint's own `Revise`, so the caller knows not to raise.
     """
-    ctx = checkpoint if checkpoint is not None else _checkpoint_context({}, None)
+    ctx = checkpoint if checkpoint is not None else _checkpoint_context({}, None, "", ticket)
     while True:
         hard = (getattr(runner, "role_ceiling_usd", None) or {}).get("build")
         if stop.checkpoint_index is not None:
@@ -1931,7 +1969,7 @@ def _run(
     # builder's reasoning is the failure the seat exists to prevent.
     continuations = 0
     continuation_refused: str | None = None
-    checkpoint = _checkpoint_context(cartridge, raw_runner)
+    checkpoint = _checkpoint_context(cartridge, raw_runner, run_id, ticket)
     previous_checkpoint_patch: str | None = None
     checkpoint_reason: str | None = None
     try:

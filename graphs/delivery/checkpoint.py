@@ -16,8 +16,16 @@ reads the `Revise` acts on the text. This module does not import or call
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
-__all__ = ["CheckpointSignals", "Decision", "Resume", "Revise", "checkpoint_decision"]
+__all__ = [
+    "CheckpointSignals",
+    "Decision",
+    "Resume",
+    "Revise",
+    "checkpoint_decision",
+    "checkpoint_ledger_line",
+]
 
 
 @dataclass(frozen=True)
@@ -64,3 +72,26 @@ def checkpoint_decision(signals: CheckpointSignals, fractions: tuple[float, ...]
     if signals.checkpoint_index == len(fractions) - 1 and not signals.checks_pass:
         return Revise("split: runaway checkpoint reached with the named checks still failing")
     return Resume()
+
+
+def checkpoint_ledger_line(*, ts: str, task: str, role: str, signals: CheckpointSignals, decision: Decision) -> dict[str, Any]:
+    """One ledger record for a checkpoint call: signals plus the decision reached on them.
+
+    A `Revise` carries its `reason`; a `Resume` carries no `reason` key at all,
+    rather than one holding `None` — the ledger's reader should not have to
+    tell "no reason" apart from "reason not yet filled in".
+    """
+    line = {
+        "ts": ts,
+        "task": task,
+        "role": role,
+        "checkpoint_index": signals.checkpoint_index,
+        "spend_usd": signals.spend_usd,
+        "guide_usd": signals.guide_usd,
+        "turns": signals.turns,
+        "diff_grew": signals.diff_grew,
+        "checks_pass": signals.checks_pass,
+        "files_outside_surfaces": list(signals.files_outside_surfaces),
+        "decision": "resume" if isinstance(decision, Resume) else "revise",
+    }
+    return line if isinstance(decision, Resume) else {**line, "reason": decision.reason}
