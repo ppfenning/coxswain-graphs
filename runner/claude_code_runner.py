@@ -612,8 +612,9 @@ class ClaudeCodeRunner:
         # a 101-turn build that finished anyway.
         self.budget_usd = {str(k): float(v) for k, v in (self.profile.get("budget_usd") or {}).items()}
         self.role_budget_usd = {str(k): float(v) for k, v in (self.profile.get("role_budget_usd") or {}).items()}
-        # A hard runaway ceiling per role (Pat, 2026-09-28): when a role has one, it is the only per-call stop, and the
-        # shape ceiling above becomes a guide that is ledgered and minimised, never enforced. The weekly cap bounds the rest.
+        # A hard runaway ceiling per role (Pat, 2026-09-28): a failsafe on the session's cumulative spend. The shape
+        # ceiling above stays the size of each slice, so the harness gets a go/no-go checkpoint at every guide's worth
+        # of spend, well before the failsafe; the weekly cap bounds everything else.
         self.role_ceiling_usd = {str(k): float(v) for k, v in (self.profile.get("role_ceiling_usd") or {}).items()}
         # The operator's per-node spend cap (docs/design/cost-bounds.md §1), set
         # by the harness after construction, like `runs_dir`/`run_id`. Unset
@@ -803,11 +804,6 @@ class ClaudeCodeRunner:
         if budget is None:
             budget = self.budget_usd.get(tier)
         return budget, "profile"
-
-    def _stop_limit(self, role: str | None, shape_ceiling: float | None) -> float | None:
-        """The per-call stop before any operator cap: the role's hard runaway ceiling when it has one, else the shape ceiling."""
-        hard = self.role_ceiling_usd.get(role) if role is not None else None
-        return hard if hard is not None else shape_ceiling
 
     @staticmethod
     def _read_context(context: Sequence[str]) -> str:
@@ -1042,12 +1038,18 @@ class ClaudeCodeRunner:
             *_ISOLATION,
         ]
         ceiling, _ = self._shape_ceiling(role, tier, model, budget_usd)
-        effective, _ = _effective_limit(self._stop_limit(role, ceiling), self.node_cap_usd)
-        if effective is not None:
-            # Resuming a stopped session may see the ceiling as covering the
-            # whole session's spend rather than this invocation's, so the
-            # fresh slice must cover at least the ceiling either way.
-            argv += ["--max-budget-usd", f"{spent_usd + effective:.4f}"]
+        effective, _ = _effective_limit(ceiling, self.node_cap_usd)
+        # Resuming a stopped session may see the ceiling as covering the
+        # whole session's spend rather than this invocation's, so the
+        # fresh slice must cover at least the ceiling either way. Each slice
+        # stops at the guide, a go/no-go checkpoint for the harness; a role's
+        # runaway ceiling caps the session's cumulative spend across slices.
+        limit = None if effective is None else spent_usd + effective
+        hard = self.role_ceiling_usd.get(role) if role is not None else None
+        if hard is not None:
+            limit = hard if limit is None else min(limit, hard)
+        if limit is not None:
+            argv += ["--max-budget-usd", f"{limit:.4f}"]
         if system:
             argv += ["--system-prompt", system]
         # A builder's scratch is the only repository tree it may touch. Granting
@@ -1261,15 +1263,15 @@ class ClaudeCodeRunner:
             # the whole diagnosis of a build failure once; never again.
             detail = {k: payload.get(k) for k in ("subtype", "result", "errors", "num_turns", "duration_ms") if payload.get(k) is not None}
             shape_ceiling, ceiling_source = self._shape_ceiling(role, tier, used_model, budget_usd)
-            stop_limit = self._stop_limit(role, shape_ceiling)
-            _, cap_governs = _effective_limit(stop_limit, self.node_cap_usd)
+            _, cap_governs = _effective_limit(shape_ceiling, self.node_cap_usd)
             cap_stop = cap_governs and detail.get("subtype") == "error_max_budget_usd"
             if cap_stop:
                 detail["subtype"] = "error_spend_cap"
             message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
-            if not cap_stop and role in self.role_ceiling_usd and detail.get("subtype") == "error_max_budget_usd":
-                guide_txt = f"${shape_ceiling:.4f}" if shape_ceiling is not None else "none"
-                message += f" (runaway ceiling ${stop_limit:.2f}; guide {guide_txt})"
+            hard = self.role_ceiling_usd.get(role) if role is not None else None
+            session_total = reported_now if thread else float(payload.get("total_cost_usd") or 0.0)
+            if not cap_stop and hard is not None and detail.get("subtype") == "error_max_budget_usd" and session_total >= hard:
+                message += f" (runaway ceiling ${hard:.2f} reached)"
             if cap_stop:
                 ceiling_txt = f"${shape_ceiling:.4f}" if shape_ceiling is not None else "none"
                 message += f" (cap ${self.node_cap_usd:.4f} < shape ceiling {ceiling_txt})"

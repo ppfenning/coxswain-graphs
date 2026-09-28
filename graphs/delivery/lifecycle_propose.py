@@ -647,7 +647,8 @@ def _is_budget_stop(exc: Exception) -> bool:
     return "error_max_budget_usd" in str(exc).lower()
 
 
-def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int) -> tuple[bool, str]:
+def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int,
+                 hard_ceiling: float | None = None) -> tuple[bool, str]:
     """Whether a budget-stopped build is worth resuming, and why not when it isn't.
 
     A fact-only check — no model is asked whether to continue, so it costs
@@ -683,10 +684,20 @@ def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int) -
             "body is the problem"
         )
 
+    untouched = [surface for surface in surfaces if surface not in touched]
+    if hard_ceiling is not None:
+        # A role with a runaway ceiling (Pat, 2026-09-28) resumes at every checkpoint that passes the checks above,
+        # as many times as it takes, until its session's cumulative spend reaches the failsafe.
+        if (stop.spent_usd or 0.0) < hard_ceiling:
+            return True, ""
+        return False, (
+            f"the ${hard_ceiling:.2f} runaway ceiling was reached with partial work: split recommended — "
+            f"done: {', '.join(touched)}; untouched: {', '.join(untouched)}"
+        )
+
     if continuations < CONTINUATIONS_MAX:
         return True, ""
 
-    untouched = [surface for surface in surfaces if surface not in touched]
     return False, (
         "continuation cap reached with partial work: split recommended — "
         f"done: {', '.join(touched)}; untouched: {', '.join(untouched)}"
@@ -814,7 +825,8 @@ def _resume_build(
     the caller needs it to report what a first-build no-go could not keep.
     """
     while True:
-        go, reason = _continue_ok(stop, surfaces=surfaces, continuations=continuations)
+        hard = (getattr(runner, "role_ceiling_usd", None) or {}).get("build")
+        go, reason = _continue_ok(stop, surfaces=surfaces, continuations=continuations, hard_ceiling=hard)
         if not go:
             return None, continuations, reason, stop
         try:
