@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -80,6 +80,7 @@ def auto_apply(
     *,
     cartridge: dict[str, Any],
     runner: Any,
+    wait_if_paused: Callable[[], None] | None = None,
 ) -> tuple[bool, str]:
     """Execute a proposal the policy cleared, through the arm the cartridge names.
 
@@ -88,6 +89,11 @@ def auto_apply(
     than quietly reported as done. `workstore` is built in: it applies the
     proposal's `apply` payload in code, and falls back to the model arm when
     that payload is absent or malformed.
+
+    `wait_if_paused` reaches the model-arm call the same way it reaches any other
+    node: a caller with a pause boundary to honor passes it through; a caller
+    with none (the `workstore` route never calls `runner.run` at all) leaves it
+    unused.
     """
     arm = apply_arm_for(item["kind"], cartridge)
     if arm in (None, "pr"):
@@ -105,6 +111,7 @@ def auto_apply(
         role=arm,
         tier="standard",
         schema=APPLY_SCHEMA,
+        wait_if_paused=wait_if_paused,
         context=list(cartridge.get("context") or []),
         # The rationale travels too: for an item_create it IS the body the arm
         # writes, and an arm handed only the action and the evidence was left
