@@ -688,6 +688,71 @@ def _files_outside_surfaces(touched: Sequence[str], surfaces: Sequence[str]) -> 
     return [path for path in touched if path not in declared]
 
 
+_SCRATCH_SUFFIXES = (".diff", ".patch", ".out", ".log", ".orig", ".rej")
+_SCRATCH_SUBSTRINGS = ("scratch", "probe", "debug")
+
+
+def _is_scratch_name(path: str) -> bool:
+    """Whether `path`'s own basename marks it as build scratch, not part of the change.
+
+    A leading underscore, one of the diff/patch/log-family suffixes, or the
+    literal substring `scratch`, `probe`, or `debug` anywhere in the name —
+    matched case-as-written, with no folding beyond that.
+    """
+    name = path.rsplit("/", 1)[-1]
+    return name.startswith("_") or name.endswith(_SCRATCH_SUFFIXES) or any(token in name for token in _SCRATCH_SUBSTRINGS)
+
+
+def _is_tracked(repo_dir: str | None, path: str) -> bool:
+    """Whether `path` is tracked in `repo_dir`'s index; `True` when that cannot be checked.
+
+    A path this graph cannot verify against a real worktree is left as
+    tracked, today's behavior, so the scratch exemption below only ever
+    fires where a repository can prove the file is the build's own.
+    """
+    if not repo_dir:
+        return True
+    result = subprocess.run(
+        ["git", "-C", repo_dir, "ls-files", "--error-unmatch", path],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def _scratch_ignored(outside: Sequence[str], repo_dir: str | None) -> list[str]:
+    """`outside` files that are the build's own scratch: scratch-named and untracked.
+
+    A tracked file keeps counting toward `files_outside_surfaces` regardless
+    of its name: `debug.py` already in the repository is not a probe the
+    build dropped, it is a file the build touched.
+    """
+    return [path for path in outside if _is_scratch_name(path) and not _is_tracked(repo_dir, path)]
+
+
+_SCRATCH_SECTION_RE = re.compile(
+    r"(?:^diff --git \S+ \S+\n(?:(?!^---).*\n)*)?^--- \S.*\n^\+\+\+ (\S+).*\n",
+    re.MULTILINE,
+)
+
+
+def _drop_scratch(patch: str, names: Sequence[str]) -> str:
+    """`patch` with every named file's diff section removed, other sections untouched.
+
+    A scratch file's hunk never reaches `_checkpoint_checks_pass`: a probe or
+    a stray `.log` diff is not part of the ticket's own checks, whatever the
+    worktree it was cut from.
+    """
+    if not names or not patch:
+        return patch
+    drop = set(names)
+    sections = [(match.start(), _diff_path(match.group(1))) for match in _SCRATCH_SECTION_RE.finditer(patch)]
+    if not sections:
+        return patch
+    ends = [start for start, _ in sections[1:]] + [len(patch)]
+    prefix = patch[: sections[0][0]]
+    return prefix + "".join(patch[start:end] for (start, path), end in zip(sections, ends) if path not in drop)
+
+
 def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int,
                  hard_ceiling: float | None = None) -> tuple[bool, str]:
     """Whether a budget-stopped build is worth resuming, and why not when it isn't.
@@ -860,14 +925,18 @@ def _checkpoint_call(
     reached, Resume or Revise, is appended to the run's checkpoint ledger.
     """
     touched = _touched_paths(stop.partial_patch or "")
+    outside = _files_outside_surfaces(touched, surfaces)
+    scratch = _scratch_ignored(outside, ctx.repo_dir)
+    checked_patch = _drop_scratch(stop.partial_patch or "", scratch)
     signals = CheckpointSignals(
         spend_usd=stop.spent_usd or 0.0,
         guide_usd=guide_usd or 0.0,
         checkpoint_index=stop.checkpoint_index or 0,
         turns=stop.num_turns or 0,
         diff_grew=previous_patch is None or stop.partial_patch != previous_patch,
-        checks_pass=_checkpoint_checks_pass(stop.partial_patch or "", ctx.checks, ctx.repo_dir),
-        files_outside_surfaces=tuple(_files_outside_surfaces(touched, surfaces)),
+        checks_pass=_checkpoint_checks_pass(checked_patch, ctx.checks, ctx.repo_dir),
+        files_outside_surfaces=tuple(f for f in outside if f not in scratch),
+        scratch_ignored=tuple(scratch),
     )
     decision = checkpoint_decision(signals, CHECKPOINT_FRACTIONS)
     _append_checkpoint_ledger(ctx, signals, decision)
