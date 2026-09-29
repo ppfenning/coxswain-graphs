@@ -81,6 +81,32 @@ def test_an_unknown_run_has_no_summary_and_a_run_with_no_calls_sums_to_zero(conn
     assert (s["calls"], s["cost_usd"], s["turns"], s["cache_share"]) == (0, 0.0, 0, None)
 
 
+def test_build_task_history_sums_build_cost_counts_files_touched_and_keeps_the_window(conn):
+    put(
+        conn, "task_records", run_id="r1", phase_id="p1", task_id="hin",
+        record_json=json_text({"change_facts": {"files_touched": ["a.py", "b.py"]}}),
+        updated_at="2026-09-10T00:00:00Z",
+    )  # fmt: skip
+    put(
+        conn, "task_records", run_id="r2", phase_id="p1", task_id="hout",
+        record_json=json_text({"change_facts": {"files_touched": ["c.py"]}}),
+        updated_at="2026-08-01T00:00:00Z",
+    )  # fmt: skip
+    call(conn, "hc1", "r1", 10, "build", "sonnet", "mid", 1.25, 100, 0, 50, phase_id="p1", task_id="hin")
+    call(conn, "hc2", "r1", 11, "plan", "sonnet", "mid", 9.0, 100, 0, 50, phase_id="p1", task_id="hin")
+    call(conn, "hc3", "r2", 12, "build", "sonnet", "mid", 3.0, 100, 0, 50, phase_id="p1", task_id="hout")
+    history = read.build_task_history(conn, "demo-repo", "2026-09-01T00:00:00Z")
+    assert history == [("demo-repo", 2, 1.25)]
+
+
+def test_build_task_history_skips_a_row_with_no_files_touched(conn):
+    put(
+        conn, "task_records", run_id="r1", phase_id="p1", task_id="hbare",
+        record_json=json_text({"n": "no change_facts yet"}), updated_at="2026-09-10T00:00:00Z",
+    )
+    assert read.build_task_history(conn, "demo-repo", "2026-09-01T00:00:00Z") == []
+
+
 def test_postgres_decimal_sums_come_back_as_int_and_float():
     s = read.summary_row("r", (2, Decimal("1.5"), Decimal(3), Decimal(400), Decimal(100), Decimal(9)))
     assert s == {

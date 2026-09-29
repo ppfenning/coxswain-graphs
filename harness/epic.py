@@ -45,7 +45,7 @@ import subprocess
 import sys
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
@@ -56,6 +56,7 @@ from core.workstore import WorkStoreError, record_attempt
 
 from graphs._contract import proposal
 from graphs.delivery import rescue_review
+from graphs.delivery.budget_estimate import estimate_budget
 from graphs.delivery.lifecycle_propose import DEFAULT_FIX_ATTEMPTS
 from harness import rescue_checks, rescue_select, work_mirror
 from harness.autonomy import split_by_policy
@@ -577,9 +578,50 @@ def _verify_of(by_id: Mapping[str, Mapping[str, Any]], task: str) -> list[str]:
     return [str(c) for c in (by_id.get(task) or {}).get("verify") or []]
 
 
+_BUDGET_HISTORY_DAYS = 30
+
+
+def _budget_history(ctx: _Ctx) -> list[tuple[str, int, float]]:
+    """The last 30 days of landed build-task cost history for this run's repo, empty with no store.
+
+    `ctx.date` bounds the window, never the wall clock, so an estimate stays
+    reproducible from the run's own recorded inputs rather than from when it
+    happened to run. Both `ctx.store` and `ctx.repo` are read with `getattr`:
+    `_lifecycle_invocation` is also called, in its own unit test, against a
+    bare stand-in object that carries neither, and that case gets no history
+    rather than an `AttributeError`.
+    """
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return []
+    # Not a module-level import: harness/__init__ imports this module, so a
+    # top-level store_read import would pull in store_traces earlier than
+    # `python -m harness.store_traces` expects, and it warns a second line on
+    # stderr when that happens.
+    from harness import store_read
+
+    since_date = datetime.fromisoformat(ctx.date).date() - timedelta(days=_BUDGET_HISTORY_DAYS)
+    since = f"{since_date.isoformat()}T00:00:00+00:00"
+    return store_read.build_task_history(store.conn, str(getattr(ctx, "repo", "")), since)
+
+
 def _lifecycle_invocation(
     ctx: _Ctx, task: Mapping[str, Any], *, body: str, fix_attempts: int | None
 ) -> Invocation:
+    # Every build task resolves a budget and where it came from, never
+    # nothing. A ticket's own `budget_usd` wins outright and is checked
+    # against the cartridge's `build_budget_usd_max` cap further up in
+    # `run_phase` (the `over_budget`/`runnable` split), before this function
+    # is ever called, and never through `_quarantine_task` here. An estimate
+    # is already clamped to [1.00, 4.00], so it can never reach that cap or
+    # the quarantine path either.
+    if task.get("budget_usd") is not None:
+        build_budget_usd, build_budget_source = task["budget_usd"], "ticket"
+    else:
+        build_budget_usd, _source = estimate_budget(
+            _budget_history(ctx), str(getattr(ctx, "repo", "")), len(task.get("surfaces") or [])
+        )
+        build_budget_source = "estimate"
     return Invocation(
         id=str(task["id"]),
         graph=LIFECYCLE,
@@ -594,7 +636,8 @@ def _lifecycle_invocation(
             "patterns": list(task.get("patterns") or []),
             "tier": dict(task.get("tier") or {}),
             **({"fix_attempts": fix_attempts} if fix_attempts is not None else {}),
-            **({"build_budget_usd": task["budget_usd"]} if task.get("budget_usd") is not None else {}),
+            "build_budget_usd": build_budget_usd,
+            "build_budget_source": build_budget_source,
         },
     )
 
