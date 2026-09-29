@@ -1228,6 +1228,7 @@ class ClaudeCodeRunner:
         task: str | None = None,
         router_decision: RouterDecision | None = None,
         checkpoint_fractions: tuple[float, ...] | None = None,
+        wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
         requested_tier = tier or DEFAULT_TIER
         resolution = self._resolve_tier(role, tier, hints)
@@ -1292,6 +1293,8 @@ class ClaudeCodeRunner:
                         partial_patch=_capture_diff(state["scratch"]) if state.get("scratch") else "",
                         checkpoint_index=reached_index,
                     )
+                if wait_if_paused is not None:
+                    wait_if_paused()
                 proc = self._invoke(
                     role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,

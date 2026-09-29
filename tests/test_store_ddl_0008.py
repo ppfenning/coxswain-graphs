@@ -33,8 +33,10 @@ def test_a_database_at_version_seven_gains_hosts_and_keeps_chair_actions():
         assert migrate(c, NOW1, default_modules()[:7]) == 7
         before = c.query_all("PRAGMA table_info(chair_actions)")
         assert c.query_all("SELECT name FROM sqlite_master WHERE name = 'hosts'") == []
-        assert migrate(c, NOW2, default_modules()) == 9
-        assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[7:] == [(8, NOW2), (9, NOW2)]
+        assert migrate(c, NOW2, default_modules()) == 10
+        assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[7:] == [
+            (8, NOW2), (9, NOW2), (10, NOW2),
+        ]
         assert [r[1] for r in c.query_all("PRAGMA table_info(hosts)")] == COLUMNS
         assert c.query_all("SELECT COUNT(*) FROM hosts") == [(0,)]
         assert c.query_all("PRAGMA table_info(chair_actions)") == before

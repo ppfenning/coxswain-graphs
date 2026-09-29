@@ -11,7 +11,7 @@ without any test noticing.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from runner.protocol import NodeResult, RunnerError
@@ -46,11 +46,16 @@ class ScriptedRunner:
         thread: str | None = None,
         budget_usd: float | None = None,
         task: str | None = None,
+        wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
         # `task` is not recorded on `.calls` — this double replays graphs whose
         # existing assertions read that dict verbatim, and stamping `task_id`
         # onto a call record is `ClaudeCodeRunner`'s own contract, not this one's.
         record = {"role": role, "tier": tier, "prompt": prompt, "context": list(context), "thread": thread, "budget_usd": budget_usd}
+        if wait_if_paused is not None:
+            wait_if_paused()
+        record["wait_if_paused_given"] = wait_if_paused is not None
+        record["wait_if_paused_calls"] = 1 if wait_if_paused is not None else 0
         self.calls.append({**record, "hints": hints} if hints is not None else record)
         queued = self._responses.get(role)
         if not queued:
