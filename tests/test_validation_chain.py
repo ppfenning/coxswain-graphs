@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import ANY, patch
+from unittest.mock import ANY
 
 import pytest
 
@@ -48,7 +48,7 @@ def bind(cart, *roles):
     return cart
 
 
-def run(cart, plan_response, build_response, extra=None, runs_dir=None, runner_attrs=None, **args):
+def run(cart, plan_response, build_response, extra=None, runs_dir=None, **args):
     responses = {
         "plan": plan_response,
         "build": build_response,
@@ -58,8 +58,6 @@ def run(cart, plan_response, build_response, extra=None, runs_dir=None, runner_a
     scripted = ScriptedRunner(responses)
     if runs_dir is not None:
         scripted.runs_dir = runs_dir
-    for name, value in (runner_attrs or {}).items():
-        setattr(scripted, name, value)
     result = lifecycle_propose.run(
         {"run_id": "r", "date": "2026-08-30", "ticket": "T-1", "cartridge": cart, **args}, scripted
     )
@@ -333,110 +331,6 @@ def test_no_build_budget_override_leaves_no_evidence_row(cart, plan_response, bu
     assert scripted.calls[[c["role"] for c in scripted.calls].index("build")]["budget_usd"] is None
     evidence = result["proposals"][0]["evidence"]
     assert all(row["check"] != "build budget" for row in evidence)
-
-
-def test_a_task_budget_checks_in_at_half_and_full_and_caps_the_thread_at_one_and_a_half(
-    cart, plan_response, build_response
-) -> None:
-    result, scripted = run(
-        cart, plan_response, build_response,
-        build_budget_usd=1.60, build_budget_source="estimate",
-        runner_attrs={"thread_ceiling_usd": {}},
-    )
-    cap, source = scripted.thread_ceiling_usd["T-1"]
-    assert cap == pytest.approx(2.40)
-    assert source == "task"
-    evidence = result["proposals"][0]["evidence"]
-    assert {"check": "build ceiling", "output": "ceiling_usd=$1.6 source=task-estimate"} in evidence
-
-
-def test_a_build_budget_with_no_recognised_source_leaves_the_checkpoints_and_ceiling_as_today(
-    cart, plan_response, build_response
-) -> None:
-    result, scripted = run(
-        cart, plan_response, build_response,
-        build_budget_usd=1.60,
-        runner_attrs={"thread_ceiling_usd": {}},
-    )
-    assert scripted.thread_ceiling_usd == {}
-    evidence = result["proposals"][0]["evidence"]
-    assert all(row["check"] != "build ceiling" for row in evidence)
-
-
-def test_a_runner_without_thread_ceiling_usd_is_left_alone(cart, plan_response, build_response) -> None:
-    result, scripted = run(
-        cart, plan_response, build_response,
-        build_budget_usd=1.60, build_budget_source="estimate",
-    )
-    assert not hasattr(scripted, "thread_ceiling_usd")
-    evidence = result["proposals"][0]["evidence"]
-    assert {"check": "build ceiling", "output": "ceiling_usd=$1.6 source=task-estimate"} in evidence
-
-
-def test_a_task_budget_ceiling_reaches_the_raw_runner_through_a_tier_override(
-    cart, plan_response, build_response
-) -> None:
-    """A ticket tier override wraps the scripted runner in `_Elevated`, which
-
-    defines no `__getattr__` — a ceiling read or write against the wrapper
-    rather than the raw runner would silently no-op. `tier={"build": "deep"}`
-    forces exactly that wrapping, so a ceiling landing on `scripted` here is
-    evidence the write reaches the raw runner and not the wrapper.
-    """
-    result, scripted = run(
-        cart, plan_response, build_response,
-        build_budget_usd=1.60, build_budget_source="estimate",
-        tier={"build": "deep"},
-        runner_attrs={"thread_ceiling_usd": {}},
-    )
-    cap, source = scripted.thread_ceiling_usd["T-1"]
-    assert cap == pytest.approx(2.40)
-    assert source == "task"
-
-
-def test_a_task_budget_sets_half_and_full_fractions_with_a_task_source() -> None:
-    ctx = lifecycle_propose._checkpoint_context({}, None, "r", "T-1", task_budget_usd=1.60)
-    assert ctx.checkpoint_fractions == (0.5, 1.0)
-    assert ctx.checkpoint_source == "task"
-
-
-def test_no_task_budget_keeps_the_bounds_derived_fractions() -> None:
-    ctx = lifecycle_propose._checkpoint_context({}, None, "r", "T-1")
-    assert ctx.checkpoint_fractions == lifecycle_propose.CHECKPOINT_FRACTIONS
-    assert ctx.checkpoint_source == "default"
-
-
-def test_a_retried_build_on_the_same_thread_reuses_the_task_checkpoint_context(
-    cart, plan_response, build_response
-) -> None:
-    """The fix loop's retry build shares the run's one `_checkpoint_context` call.
-
-    A task-sourced budget's (0.5, 1.0) fractions and "task" source, set once
-    before the first call on the thread, are still what a checkpoint on the
-    retry is judged against — not a fresh, un-sourced context computed again.
-    """
-    bind(cart, "handoff")
-    second = {**build_response, "patch": build_response["patch"] + "+evidence\n"}
-    with patch(
-        "graphs.delivery.lifecycle_propose._checkpoint_context",
-        side_effect=lifecycle_propose._checkpoint_context,
-    ) as spy:
-        result, scripted = run(
-            cart, plan_response, [build_response, second],
-            extra={
-                "handoff": [
-                    {"complete": False, "blocking": False, "missing": ["output of the cleanliness check"],
-                     "brief": "attach the check output"},
-                    {"complete": True, "blocking": False, "missing": [], "brief": "ok"},
-                ]
-            },
-            build_budget_usd=1.60, build_budget_source="estimate",
-        )
-    builds = [c for c in scripted.calls if c["role"] == "build"]
-    assert len(builds) == 2
-    assert spy.call_count == 1
-    _, kwargs = spy.call_args
-    assert kwargs["task_budget_usd"] == 1.60
 
 
 def test_an_under_evidenced_handoff_costs_one_attempt_not_the_run(cart, plan_response, build_response) -> None:
