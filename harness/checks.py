@@ -14,6 +14,7 @@ before the gate sees it. `repo_checks` parses a repository's own root
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -46,6 +47,44 @@ _TAIL_CHARS = 2000
 _TAIL_LINES = 20
 _TRUNCATION_MARKER = f"... [truncated to last {_TAIL_LINES} lines]"
 _LINT_NAMES = frozenset({"lint", "ruff"})
+
+# pytest's own exit code for "the command ran, but collected zero tests" —
+# distinct from a real failure, which exits 1, and from a collection error,
+# which exits 2 or 4.
+_PYTEST_NO_TESTS_EXIT_CODE = 5
+_SKIPPED_NO_PYTHON_TESTS = "skipped: no Python tests"
+_TEST_FILE_GLOBS = ("test_*.py", "*_test.py")
+_EXCLUDED_DIR_NAMES = frozenset({".venv", "target", "node_modules"})
+
+
+def _is_pytest_cmd(cmd: str) -> bool:
+    """Whether `cmd`'s own program is pytest, not merely a command that mentions it.
+
+    Matches `pytest -q` and any absolute or relative path ending `/pytest`;
+    a command that happens to print the word "pytest" does not count.
+    """
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    return bool(tokens) and Path(tokens[0]).name == "pytest"
+
+
+def _has_python_tests(worktree: Path) -> bool:
+    """True iff `worktree` holds a `test_*.py` or `*_test.py` file, at any depth.
+
+    A match under a `.venv`, `target`, or `node_modules` directory component
+    does not count — those are vendored or built trees, not the repository's
+    own tests.
+    """
+    for pattern in _TEST_FILE_GLOBS:
+        for path in worktree.rglob(pattern):
+            if not path.is_file():
+                continue
+            parent_parts = path.relative_to(worktree).parts[:-1]
+            if _EXCLUDED_DIR_NAMES.isdisjoint(parent_parts):
+                return True
+    return False
 
 
 def _parse_counts(output: str) -> dict[str, int]:
@@ -176,12 +215,20 @@ def run_checks(
         combined = (proc.stdout or "") + (proc.stderr or "")
         not_found = proc.returncode == 127
         error = f"command not found: {cmd}" if not_found else None
+        no_tests_ran = (
+            error is None
+            and proc.returncode == _PYTEST_NO_TESTS_EXIT_CODE
+            and _is_pytest_cmd(cmd)
+            and not _has_python_tests(worktree)
+        )
+        passed = True if no_tests_ran else proc.returncode == 0
+        outcome = "skipped" if no_tests_ran else check_outcome(proc.returncode, error)
         results.append(
             {
                 "name": name,
                 "cmd": cmd,
-                "passed": proc.returncode == 0,
-                "outcome": check_outcome(proc.returncode, error),
+                "passed": passed,
+                "outcome": outcome,
                 "error": error,
                 "exit_code": proc.returncode,
                 "counts": _parse_counts(combined),
@@ -206,6 +253,9 @@ def checks_evidence(
     """
     rows: list[dict[str, str]] = []
     for result in results:
+        if result.get("outcome") == "skipped":
+            rows.append({"check": f"{prefix}:{result['name']}", "output": _SKIPPED_NO_PYTHON_TESTS})
+            continue
         counts = result.get("counts") or {}
         counted = ", ".join(f"{v} {k}" for k, v in counts.items())
         verdict = "pass" if result.get("passed") else "FAIL"
