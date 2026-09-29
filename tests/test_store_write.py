@@ -234,8 +234,9 @@ def test_gate_rows_number_the_decisions_and_flatten_flags():
 
 def test_every_builder_emits_exactly_the_tables_columns(conn):
     migrated = {"graph_id", "node_id"}
-    # paused_at (migration 0010) is not yet wired into run_row: that is the pause-flag-store task's job.
-    assert set(run_row(RUN)) == cols(conn, "runs") - {"paused_at"}
+    # paused_at (migration 0010) and short_id (migration 0011) are not yet wired into run_row: those are
+    # the pause-flag-store task's and the short-id-allocation task's jobs.
+    assert set(run_row(RUN)) == cols(conn, "runs") - {"paused_at", "short_id"}
     assert set(phase_row(PHASE)) == cols(conn, "phases")
     assert set(task_row("r", "p", "t", "s", "u")) == cols(conn, "tasks")
     assert set(attempt_row("r", "t", 0, "p", "k", None, "ts")) == cols(conn, "attempts")
