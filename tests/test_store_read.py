@@ -415,6 +415,16 @@ def test_every_reader_sends_portable_queries_with_one_postgres_placeholder_per_p
         assert sql.count("%s") == len(params) and "?" not in sql
 
 
+def _drop_interpreter_machinery(names: set[str]) -> set[str]:
+    """Names a fresh interpreter loads that are not an import: __main__, _virtualenv, editable
+
+    finders, cython_runtime, and the sitecustomize/usercustomize modules `site` imports at
+    interpreter start-up when the system or user ships one.
+    """
+    machinery = {"cython_runtime", "sitecustomize", "usercustomize"}
+    return {n for n in names if not n.startswith("_") and n not in machinery}
+
+
 def _third_party_roots_with_the_harness_package_stubbed():
     """Import harness.store_read in a fresh interpreter whose `harness` is an empty package.
 
@@ -430,9 +440,7 @@ def _third_party_roots_with_the_harness_package_stubbed():
         "print(sorted({m.split('.')[0] for m in sys.modules if m.split('.')[0] not in sys.stdlib_module_names}))\n"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
-    # Interpreter and virtualenv machinery (__main__, _virtualenv, editable finders, cython_runtime) is not an import.
-    # site.py imports sitecustomize at interpreter startup, before store_read runs, so store_read does not pull it in.
-    return {n for n in ast.literal_eval(out) if not n.startswith("_") and n not in ("cython_runtime", "sitecustomize")}
+    return _drop_interpreter_machinery(set(ast.literal_eval(out)))
 
 
 def test_store_read_and_what_it_imports_pull_no_module_outside_harness_and_runner():
@@ -484,6 +492,10 @@ def test_importing_store_read_pulls_only_stdlib_harness_and_runner_modules():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
     names = set(ast.literal_eval(out))
-    # Interpreter and virtualenv machinery (__main__, _virtualenv, editable finders, cython_runtime) is not an import.
-    imported = {n for n in names if not n.startswith("_") and n != "cython_runtime"}
+    imported = _drop_interpreter_machinery(names)
     assert imported - {"harness", "runner"} == set()
+
+
+def test_the_machinery_filter_drops_site_hooks_cython_runtime_and_virtualenv_leaving_harness():
+    names = {"sitecustomize", "usercustomize", "cython_runtime", "_virtualenv", "harness"}
+    assert _drop_interpreter_machinery(names) == {"harness"}
