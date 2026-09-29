@@ -1,4 +1,4 @@
-"""python -m harness.store_cli: mark-landed, set-state, lease, host, record-action and regenerate-states commands against the run-record store."""
+"""python -m harness.store_cli: mark-landed, set-state, lease, host, pause, resume, record-action and regenerate-states commands against the run-record store."""
 
 from __future__ import annotations
 
@@ -20,12 +20,13 @@ from harness.store_dialect import Connection, StoreDriverMissing, insert_ignore,
 from harness.store_hosts import HOST_STATES, host_beat, host_list, host_set_state, host_upsert
 from harness.store_landed import mark_landed
 from harness.store_migrate import MigrationError, open_store
+from harness.store_pause import clear_paused, set_paused
 from harness.store_read import work_items
 from harness.store_work_state import Mismatch, set_state
 from harness.work_mirror import set_frontmatter_state
 
-# Contract read by coxswain-tools. Exit 0 and exit 3 print exactly one JSON object on stdout.
-# Exit 2 prints nothing on stdout. Help and every error go to stderr.
+# Contract read by coxswain-tools (pause and resume among them). Exit 0 and exit 3 print
+# exactly one JSON object on stdout. Exit 2 prints nothing on stdout. Help and every error go to stderr.
 # regenerate-states is an exception: it prints one plain line per change and no JSON, so agreement prints nothing.
 # record-action is the other: it prints `recorded chair action <kind> <target>` and no JSON.
 EXIT_OK = 0
@@ -169,6 +170,15 @@ def build_parser() -> argparse.ArgumentParser:
     listing = host_actions.add_parser("list", help="print every host, by name")
     _common(listing, top=False)
 
+    pause = commands.add_parser("pause", help="set a run's paused_at to now")
+    _common(pause, top=False)
+    pause.add_argument("run_id")
+    pause.add_argument("--reason", help="optional free-text reason, echoed back in the JSON")
+
+    resume = commands.add_parser("resume", help="clear a run's paused_at")
+    _common(resume, top=False)
+    resume.add_argument("run_id")
+
     record = commands.add_parser("record-action", help="record one chair action line as a chair_actions row")
     _common(record, top=False)
     record.add_argument("--holder", required=True, type=_non_empty, help="the lease holder that took the action")
@@ -302,6 +312,12 @@ def _record_action(conn: Connection, holder: str, action: Mapping[str, Any]) -> 
     return EXIT_OK
 
 
+def _run_exists(conn: Connection, run_id: str) -> bool:
+    """True when `runs` has a row for `run_id`, regardless of its paused_at or status."""
+    p = conn.dialect.placeholder
+    return conn.query_one(f"SELECT 1 FROM runs WHERE run_id = {p}", (run_id,)) is not None
+
+
 def _host(conn: Connection, args: argparse.Namespace, now: str) -> tuple[Any, int]:
     """An unknown host is the empty object with exit 3; list is the array of rows."""
     if args.action == "list":
@@ -327,6 +343,16 @@ def dispatch(conn: Connection, args: argparse.Namespace, now: str) -> tuple[Any,
         return ({}, EXIT_PRECONDITION) if row is None else (row, EXIT_OK)
     if args.command == "host":
         return _host(conn, args, now)
+    if args.command == "pause":
+        if not _run_exists(conn, args.run_id):
+            return {"ok": False, "run": args.run_id, "paused": None, "reason": None}, EXIT_PRECONDITION
+        set_paused(conn, args.run_id, now)
+        return {"ok": True, "run": args.run_id, "paused": now, "reason": args.reason}, EXIT_OK
+    if args.command == "resume":
+        if not _run_exists(conn, args.run_id):
+            return {"ok": False, "run": args.run_id, "paused": None, "reason": None}, EXIT_PRECONDITION
+        clear_paused(conn, args.run_id)
+        return {"ok": True, "run": args.run_id, "paused": None}, EXIT_OK
     if args.action == "acquire":
         result = lease_acquire(conn, args.name, args.holder, now, args.ttl, steal=args.steal)
     elif args.action == "renew":
@@ -349,6 +375,8 @@ def _refusal(args: argparse.Namespace, payload: Mapping[str, Any]) -> str:
         return f"work item {args.task} is in state {payload['actual'] or 'no row'}, expected {payload['expected']}"
     if args.command == "set-state":
         return f"no work item {args.task} in initiative {args.initiative} and --phase was not given"
+    if args.command in ("pause", "resume"):
+        return f"no run {args.run_id}"
     return f"lease {args.name} refused for holder {args.holder}"
 
 
