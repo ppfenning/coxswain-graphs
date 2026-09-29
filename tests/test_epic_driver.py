@@ -1457,6 +1457,57 @@ def test_a_build_budget_over_the_cap_is_quarantined_and_the_sibling_still_lands(
     assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
 
 
+def _budget_ctx(repo, cart, store=None, *, date="2026-09-28"):
+    from harness.epic import _Ctx
+
+    return _Ctx(
+        repo=repo, cartridge=cart, runner=None, specs={}, run_id="r", date=date,
+        max_parallel=1, ledger_path=Path("/tmp/ledger.jsonl"), provider_profile="p",
+        runs_dir=Path("/tmp/runs"), worktree_root=Path("/tmp/worktrees"), assume=None,
+        fix_attempts=None, initiative_id="i", default_ref="HEAD", store=store,
+    )
+
+
+def test_a_tickets_own_budget_reaches_the_lifecycle_and_never_consults_history(repo, cart, monkeypatch) -> None:
+    from harness import store_read
+
+    read_calls: list[tuple] = []
+    monkeypatch.setattr(store_read, "build_task_history", lambda *a: read_calls.append(a) or [])
+    store = Store(open_store("sqlite:///:memory:", datetime.now(UTC).isoformat()))
+    ctx = _budget_ctx(repo, cart, store)
+    inv = _lifecycle_invocation(
+        ctx, {"id": "t1-probe", "surfaces": ["a.py"], "budget_usd": 2.0}, body="", fix_attempts=None
+    )
+    assert read_calls == []
+    assert inv.args["build_budget_usd"] == 2.0
+    assert inv.args["build_budget_source"] == "ticket"
+
+
+def test_an_unbudgeted_item_gets_a_history_backed_estimate(repo, cart) -> None:
+    from graphs.delivery.budget_estimate import estimate_budget
+
+    store = Store(open_store("sqlite:///:memory:", datetime.now(UTC).isoformat()))
+    history = [(str(repo), 1, round(1.00 + 0.10 * i, 2)) for i in range(10)]
+    for i, (_repo_name, surfaces_count, cost) in enumerate(history):
+        store.record_task_record(
+            "past-run", "p1", f"t{i}",
+            {"change_facts": {"files_touched": [f"f{j}.py" for j in range(surfaces_count)]}},
+            "2026-09-01T00:00:00+00:00",
+        )  # fmt: skip
+        p = store.conn.dialect.placeholder
+        cols = "call_id, run_id, seq, phase_id, task_id, role, model_alias, tier, cost_usd, turns, ok, ts"
+        marks = ", ".join(p for _ in range(12))
+        store.conn.execute(
+            f"INSERT INTO node_calls ({cols}) VALUES ({marks})",
+            (f"c{i}", "past-run", i, "p1", f"t{i}", "build", "sonnet", "mid", cost, 1, 1, "2026-09-01T00:00:00Z"),
+        )
+    ctx = _budget_ctx(repo, cart, store, date="2026-09-28")
+    inv = _lifecycle_invocation(ctx, {"id": "t1-probe", "surfaces": ["a.py"]}, body="", fix_attempts=None)
+    expected, _ = estimate_budget(history, str(repo), 1)
+    assert inv.args["build_budget_usd"] == expected
+    assert inv.args["build_budget_source"] == "estimate"
+
+
 def test_a_repo_without_the_file_gets_only_the_cartridges_checks(repo, cart) -> None:
     from harness.epic import _Ctx
 

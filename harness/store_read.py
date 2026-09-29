@@ -35,6 +35,7 @@ from harness.store_migrate import check_version
 __all__ = [
     "StoreVersionError",
     "attempts",
+    "build_task_history",
     "calls",
     "connect_readonly",
     "cost_by_model",
@@ -283,6 +284,46 @@ def task_records(conn: Connection, run_id: str) -> dict[tuple[str, str], Row]:
     sql = f"{_select(_TASK_RECORD_COLS, 'task_records')} WHERE run_id = {p} ORDER BY phase_id, task_id"
     rows = (_dict(_TASK_RECORD_COLS, r) for r in conn.query_all(sql, (run_id,)))
     return {(r["phase_id"], r["task_id"]): r["record_json"] for r in rows}
+
+
+def build_task_history(conn: Connection, repo: str, since: str) -> list[tuple[str, int, float]]:
+    """Landed build-task cost history for `repo`, at or after `since` (an ISO timestamp), oldest first.
+
+    Every row of `task_records` is a landed lifecycle result: `harness/epic.py`
+    mirrors one there for each build task a phase runs, so no further filter
+    for "a build task" is needed beyond the table itself. The schema has no
+    `repo` column anywhere — `runs`, `task_records` and `work_items` all lack
+    one — so `repo` is not filtered on here; it only labels every row
+    returned, correct for a store that is not shared across more than one
+    target repository, the only way any existing write path uses one.
+
+    `surfaces_count` is the number of files the landed patch actually touched
+    (`change_facts.files_touched`, already computed and stored by the
+    `lifecycle` graph), the nearest thing the store already records to the
+    surfaces a ticket declares up front. `build_cost_usd` is the sum of that
+    task's `build`-role `node_calls.cost_usd`, found by a correlated
+    subquery rather than a join so no `GROUP BY` is needed over the JSON
+    `record_json` column. A row with no `change_facts.files_touched` list —
+    an older record, or one whose build never reached that point — is not
+    history yet and is skipped rather than raised on.
+    """
+    p = conn.dialect.placeholder
+    sql = (
+        f"SELECT t.record_json,"
+        f" (SELECT COALESCE(SUM(c.cost_usd), 0) FROM node_calls c"
+        f"  WHERE c.run_id = t.run_id AND c.phase_id = t.phase_id AND c.task_id = t.task_id AND c.role = {p})"
+        f" FROM task_records t"
+        f" WHERE t.updated_at >= {p}"
+        f" ORDER BY t.updated_at"
+    )
+    history: list[tuple[str, int, float]] = []
+    for record_json, cost in conn.query_all(sql, ("build", since)):
+        record = json_load(record_json) or {}
+        files = (record.get("change_facts") or {}).get("files_touched")
+        if not isinstance(files, list):
+            continue
+        history.append((repo, len(files), float(cost)))
+    return history
 
 
 def work_items(conn: Connection, initiative: str) -> list[Row]:
