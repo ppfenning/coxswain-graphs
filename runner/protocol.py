@@ -20,7 +20,7 @@ The runner is the only object in the system that gets to know either mapping.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
@@ -160,6 +160,7 @@ class NodeRunner(Protocol):
         budget_usd: float | None = None,
         task: str | None = None,
         router_decision: RouterDecision | None = None,
+        wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
         """Execute one node.
 
@@ -186,5 +187,9 @@ class NodeRunner(Protocol):
 
         `router_decision` is the caller's shadow decision. A runner may ignore
         it. It is not a command.
+
+        `wait_if_paused` is called with no arguments immediately before the
+        runner starts or retries a call on a threaded role; the runner has no
+        opinion on what it does or how long it takes.
         """
         ...
