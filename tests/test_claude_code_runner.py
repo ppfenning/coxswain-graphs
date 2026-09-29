@@ -2313,6 +2313,33 @@ def test_a_transient_failure_on_a_thread_retries_the_same_session_id(sequenced_c
         "the counter only advanced once a call actually succeeded"
 
 
+def test_a_wait_if_paused_hook_runs_once_before_each_threaded_dispatch_including_retries(
+    sequenced_claude, tmp_path
+) -> None:
+    """The hook fires before the first attempt and again before its retry, never more."""
+    script, set_sequence, _ = sequenced_claude
+    set_sequence(SAFEGUARD, OK)
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path)
+    calls: list[int] = []
+
+    def wait_if_paused() -> None:
+        calls.append(1)
+        if len(calls) > 2:
+            raise AssertionError("wait_if_paused called more than once per dispatch")
+
+    result = runner.run(role="build", schema=SCHEMA, prompt="build it", thread="T", wait_if_paused=wait_if_paused)
+    assert dict(result) == {"ok": True}
+    assert len(calls) == 2, "the first attempt and its transient retry, one hook call each"
+
+
+def test_a_threaded_run_with_wait_if_paused_none_is_unchanged(fake_claude, tmp_path, repo) -> None:
+    runner = runner_for(fake_claude, tmp_path, repo_dir=repo)
+    result = runner.run(role="plan", schema=SCHEMA, prompt="plan it", thread="T-1", wait_if_paused=None)
+    assert dict(result) == {"ok": True}
+    argv = recorded(fake_claude)["argv"]
+    assert "--session-id" in argv, "an explicit wait_if_paused=None calls no hook and changes nothing"
+
+
 def test_a_retry_resends_the_same_budget_override(sequenced_claude, tmp_path) -> None:
     script, set_sequence, _ = sequenced_claude
     argv_log = tmp_path / "argvs.jsonl"
