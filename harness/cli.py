@@ -36,6 +36,8 @@ from core.cartridge import CartridgeError
 from core.manifest import append_ledger, build_manifest
 
 from graphs._contract import ContractViolation
+from graphs.delivery.initiative_decompose import GRAPH_NAME as _DECOMPOSE_GRAPH_NAME
+from graphs.delivery.initiative_decompose import unexecuted_item_create_reason
 from harness import CORE_SCHEMA, run_lease, store_traces
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, repo_checks, run_checks
@@ -1392,6 +1394,16 @@ def _run_graph(
         provider_profile=provider_profile,
         ledger_path=args.ledger,
     )
+
+    # A decompose run's whole point is the task item_create it proposes. An
+    # approved item_create that never actually landed (the arm refused, or
+    # nothing executed it) means the intake was never decomposed, so the run
+    # ends failed here rather than reporting the gate's approval as success.
+    if graph_name == _DECOMPOSE_GRAPH_NAME:
+        reason = unexecuted_item_create_reason(diffs)
+        if reason is not None:
+            print(f"decompose failed: no task item_create was executed: {reason}", file=sys.stderr)
+            return 1
 
     print(f"\nrecorded {run_id}: {len(auto_applied)} auto-applied, {len(diffs)} gated decision(s), {len(proposals)} proposal(s)")
     print(f"  manifest: recorded in the run store under {run_id}")
