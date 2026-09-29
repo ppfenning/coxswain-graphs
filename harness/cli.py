@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import faulthandler
 import hashlib
 import json
 import os
@@ -1009,6 +1010,22 @@ def _run_rescue(
     return 0, status
 
 
+def register_stack_dump(stream: TextIO) -> None:
+    """Dump every thread's stack to `stream` on SIGUSR1, without pausing or killing the process.
+
+    Leaves `faulthandler.is_enabled()` (the fault handler's own enabled state, for
+    SIGSEGV/SIGABRT/etc.) untouched — this registers a handler for a user signal only.
+    `faulthandler.register` needs a real file descriptor; a stream that has none (a
+    captured stdout under a test runner, say) means there is nowhere to dump to, so
+    registration is skipped rather than taking the run down over it.
+    """
+    try:
+        stream.fileno()
+    except (OSError, AttributeError):
+        return
+    faulthandler.register(signal.SIGUSR1, file=stream, all_threads=True)
+
+
 def _run_graph(
     *,
     specs: dict[str, GraphSpec],
@@ -1044,6 +1061,11 @@ def _run_graph(
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+
+        # Wired to stdout because that's the stream this branch's own status
+        # lines (the "epic {run_id}: ..." summary below) already write to —
+        # the run's log, for whatever is capturing this process's output.
+        register_stack_dump(sys.stdout)
 
         result = run_epic(
             initiative=initiative,

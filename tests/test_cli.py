@@ -9,6 +9,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1255,3 +1256,39 @@ def test_without_pyarrow_compaction_warns_once_and_leaves_the_files(monkeypatch,
 
     assert len(list((tmp_path / "runS-trace").iterdir())) == 3
     assert capsys.readouterr().err.count("traces: not compacted") == 1
+
+
+def test_register_stack_dump_writes_all_thread_stacks_on_sigusr1(tmp_path) -> None:
+    log_path = tmp_path / "run.log"
+    script = f"""
+import faulthandler
+import os
+import signal
+
+import harness.cli as cli
+
+before = faulthandler.is_enabled()
+with open({str(log_path)!r}, "w") as stream:
+    cli.register_stack_dump(stream)
+    after = faulthandler.is_enabled()
+
+    def test_target_marker():
+        os.kill(os.getpid(), signal.SIGUSR1)
+
+    test_target_marker()
+    stream.flush()
+
+assert before == after, (before, after)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+    dumped = log_path.read_text()
+    assert "test_target_marker" in dumped
+    assert "Current thread" in dumped or "Thread" in dumped
