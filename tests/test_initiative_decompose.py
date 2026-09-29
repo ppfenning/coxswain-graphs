@@ -210,6 +210,72 @@ def test_ids_and_needs_the_model_already_prefixed_stay_single_prefixed(cart) -> 
     assert next(t for t in result["tasks"] if t["id"] == "regatta-t3")["needs"] == ["regatta-t1", "regatta-t2"]
 
 
+# ── ordinal task_ids mode ───────────────────────────────────────────────────
+
+
+def test_ordinal_task_ids_map_through_prefixed_in_listed_order(cart) -> None:
+    result = initiative_decompose.run(
+        {
+            "run_id": "r",
+            "date": "d",
+            "cartridge": cart,
+            "idea": "x",
+            "initiative_id": "I412",
+            "task_ids": "ordinal",
+        },
+        ScriptedRunner({"decompose": DECOMPOSITION}),
+    )
+    assert [t["id"] for t in result["tasks"]] == ["I412-t1", "I412-t2", "I412-t3"]
+    assert next(t for t in result["tasks"] if t["id"] == "I412-t2")["needs"] == ["I412-t1"]
+
+
+def test_an_ordinal_needs_key_naming_no_listed_task_fails_as_invalid_output(cart) -> None:
+    bad = dict(
+        DECOMPOSITION,
+        tasks=[
+            dict(DECOMPOSITION["tasks"][0]),
+            dict(DECOMPOSITION["tasks"][1], needs=["t9"]),
+            dict(DECOMPOSITION["tasks"][2]),
+        ],
+    )
+    with pytest.raises(ContractViolation):
+        initiative_decompose.run(
+            {
+                "run_id": "r",
+                "date": "d",
+                "cartridge": cart,
+                "idea": "x",
+                "initiative_id": "I412",
+                "task_ids": "ordinal",
+            },
+            ScriptedRunner({"decompose": bad}),
+        )
+
+
+def test_default_slug_mode_applies_no_ordinal_validation_and_prefixes_unchanged(cart) -> None:
+    """A `needs` key naming no listed task would fail ordinal mode; slug mode passes it through unchanged."""
+    dangling = {
+        "phases": [{"id": "p1", "goal": "foundations"}],
+        "tasks": [
+            {
+                "id": "schema-probe",
+                "phase": "p1",
+                "title": "schema probe",
+                "body": "b",
+                "needs": ["phantom"],
+                "surfaces": [],
+            },
+        ],
+        "rationale": "slug",
+    }
+    args = {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "initiative_id": "I412"}
+    for task_ids_arg in ({}, {"task_ids": "slug"}):
+        result = initiative_decompose.run(dict(args, **task_ids_arg), ScriptedRunner({"decompose": dangling}))
+        task = result["tasks"][0]
+        assert task["id"] == "I412-schema-probe"
+        assert task["needs"] == ["I412-phantom"]
+
+
 # ── the adversary on the DAG ───────────────────────────────────────────────
 
 

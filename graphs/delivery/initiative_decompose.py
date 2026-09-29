@@ -302,6 +302,22 @@ def _apply_challenge(tasks: list[dict[str, Any]], challenge: Mapping[str, Any]) 
     return list(by_id.values())
 
 
+def _ordinal_needs_problems(tasks: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One line per `needs` entry that names no id among the tasks the model listed.
+
+    Ordinal mode asks the model for `t1`, `t2`, ... keys instead of full slugs;
+    this is the check that a `needs` entry actually lands on one of them before
+    anything downstream mints an id or writes a proposal from it.
+    """
+    ids = {str(t.get("id")) for t in tasks}
+    return [
+        f"{task.get('id')}: needs unknown key {need!r}"
+        for task in tasks
+        for need in task.get("needs") or []
+        if need not in ids
+    ]
+
+
 def _local_cycle(tasks: list[dict[str, Any]]) -> list[str]:
     """Cheap cycle check before anything is proposed. The store checks again."""
     by_id = {t["id"]: t for t in tasks}
@@ -340,7 +356,22 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     source = args.get("decision_source") or NoDecisionSource()
     context = list(cartridge.get("context") or [])
 
+    task_ids = str(args.get("task_ids") or "slug")
+
     decompose_hints = Hints(judgment="high")
+    decompose_prompt = (
+        f"Break this idea into phases and tasks.\n\nIdea: {idea}\nDate: {date}\n\n"
+        "Phases are ordered; tasks within a phase are not necessarily. Draw a "
+        "dependency edge ONLY where order genuinely matters — an edge that exists "
+        "because the work feels sequential blocks work that could have run in "
+        "parallel. Name the surfaces each task touches."
+    )
+    if task_ids == "ordinal":
+        decompose_prompt += (
+            " Key each task t1, t2, t3, ... in the order you list them, rather than "
+            "writing a full id yourself, and write every `needs` entry using those "
+            "same t-keys instead of a full slug."
+        )
     decomposition = dict(
         runner.run(
             role="decompose",
@@ -348,13 +379,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             **_decision(source, "decompose", decompose_hints),
             schema=DECOMPOSE_SCHEMA,
             context=context,
-            prompt=(
-                f"Break this idea into phases and tasks.\n\nIdea: {idea}\nDate: {date}\n\n"
-                "Phases are ordered; tasks within a phase are not necessarily. Draw a "
-                "dependency edge ONLY where order genuinely matters — an edge that exists "
-                "because the work feels sequential blocks work that could have run in "
-                "parallel. Name the surfaces each task touches."
-            ),
+            prompt=decompose_prompt,
         )
     )
 
@@ -363,6 +388,14 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     tasks = [dict(t, needs=list(t.get("needs") or []), surfaces=list(t.get("surfaces") or [])) for t in decomposition.get("tasks") or []]
     if not tasks:
         raise ContractViolation("decompose returned no tasks; there is nothing to propose")
+
+    if task_ids == "ordinal":
+        ordinal_problems = _ordinal_needs_problems(tasks)
+        if ordinal_problems:
+            raise ContractViolation(
+                "the decomposed graph used a needs key that names no listed task: "
+                + "; ".join(ordinal_problems)
+            )
 
     if initiative_id:
         tasks = [
