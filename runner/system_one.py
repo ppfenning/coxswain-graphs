@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
+from runner.decision_log import RouterDecision
 from runner.protocol import NodeResult, NodeRunner
 from runner.tier_resolution import Hints
 
@@ -275,6 +276,8 @@ class FastPathRunner:
         thread: str | None = None,
         budget_usd: float | None = None,
         task: str | None = None,
+        router_decision: RouterDecision | None = None,
+        wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
         kwargs: dict[str, Any] = {
             "role": role,
@@ -287,22 +290,25 @@ class FastPathRunner:
             "budget_usd": budget_usd,
             "task": task,
         }
+        # The inner runner gets these only when given, so an inner runner that predates them still runs.
+        extras = {"router_decision": router_decision, "wait_if_paused": wait_if_paused}
+        passed = {**kwargs, **{k: v for k, v in extras.items() if v is not None}}
         setting, spec = self._settings.get(role), self._specs.get(role)
         if setting is None or spec is None or setting.mode not in ("shadow", "on"):
-            return self._inner.run(**kwargs)
+            return self._inner.run(**passed)
         consulted = self._consulted.pop(role, None)
         answer = consulted if consulted is not None else self._ask(spec, MappingProxyType(kwargs))
         if answer is None:
-            return self._inner.run(**kwargs)
+            return self._inner.run(**passed)
         if setting.mode == "on" and answer.confidence >= setting.threshold:
             fast = self._rendered(spec, answer)
             if fast is not None:
                 return fast
         if setting.mode == "on":
-            return self._inner.run(**kwargs)
+            return self._inner.run(**passed)
         if hasattr(self._inner, "tag_decision"):
-            return self._run_tagging(kwargs, spec, setting, answer)
-        result = self._inner.run(**kwargs)
+            return self._run_tagging(passed, spec, setting, answer)
+        result = self._inner.run(**passed)
         tagged = self._tagged(result, spec, setting, answer)
         if tagged is None:
             return result

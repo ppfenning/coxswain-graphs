@@ -22,7 +22,7 @@ import json
 import os
 import uuid
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -269,6 +269,7 @@ class AnthropicRunner:
         effort: str | None = None,
         # unknown: protocol.py does not declare this either. The caller's shadow decision is recorded, never computed here.
         router_decision: RouterDecision | None = None,
+        wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
         # `thread` is accepted for the protocol and ignored: each call here is
         # one stateless Messages request. Carrying history would be this
@@ -305,6 +306,9 @@ class AnthropicRunner:
         packs = [body, *context] if body else list(context)
         system = "\n\n".join(part for part in (self._read_context(packs), self.extra_system) if part)
 
+        # A paused run waits here, before the request, as it does before a Claude Code call.
+        if wait_if_paused is not None:
+            wait_if_paused()
         response = self._client.messages.create(
             model=model_id,
             max_tokens=self.max_tokens,

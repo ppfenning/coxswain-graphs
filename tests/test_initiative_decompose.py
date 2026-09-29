@@ -210,6 +210,74 @@ def test_ids_and_needs_the_model_already_prefixed_stay_single_prefixed(cart) -> 
     assert next(t for t in result["tasks"] if t["id"] == "regatta-t3")["needs"] == ["regatta-t1", "regatta-t2"]
 
 
+# ── ordinal task_ids mode ───────────────────────────────────────────────────
+
+
+def test_ordinal_task_ids_map_through_prefixed_in_listed_order(cart) -> None:
+    result = initiative_decompose.run(
+        {
+            "run_id": "r",
+            "date": "d",
+            "cartridge": cart,
+            "idea": "x",
+            "initiative_id": "I412",
+            "task_ids": "ordinal",
+        },
+        ScriptedRunner({"decompose": DECOMPOSITION}),
+    )
+    assert [t["id"] for t in result["tasks"]] == ["I412-t1", "I412-t2", "I412-t3"]
+    assert next(t for t in result["tasks"] if t["id"] == "I412-t2")["needs"] == ["I412-t1"]
+
+
+def test_an_ordinal_needs_key_naming_no_listed_task_fails_as_invalid_output(cart) -> None:
+    bad = dict(
+        DECOMPOSITION,
+        tasks=[
+            dict(DECOMPOSITION["tasks"][0]),
+            dict(DECOMPOSITION["tasks"][1], needs=["t9"]),
+            dict(DECOMPOSITION["tasks"][2]),
+        ],
+    )
+    with pytest.raises(ContractViolation):
+        initiative_decompose.run(
+            {
+                "run_id": "r",
+                "date": "d",
+                "cartridge": cart,
+                "idea": "x",
+                "initiative_id": "I412",
+                "task_ids": "ordinal",
+            },
+            ScriptedRunner({"decompose": bad}),
+        )
+
+
+def test_default_slug_mode_applies_no_ordinal_validation_but_still_drops_a_foreign_need(cart) -> None:
+    """Ordinal mode would fail a `needs` key naming no listed task; slug mode does not — but the
+    plan-level needs validation still drops it once no task in the finished plan carries that id."""
+    dangling = {
+        "phases": [{"id": "p1", "goal": "foundations"}],
+        "tasks": [
+            {
+                "id": "schema-probe",
+                "phase": "p1",
+                "title": "schema probe",
+                "body": "b",
+                "needs": ["phantom"],
+                "surfaces": [],
+            },
+        ],
+        "rationale": "slug",
+    }
+    args = {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "initiative_id": "I412"}
+    for task_ids_arg in ({}, {"task_ids": "slug"}):
+        result = initiative_decompose.run(dict(args, **task_ids_arg), ScriptedRunner({"decompose": dangling}))
+        task = result["tasks"][0]
+        assert task["id"] == "I412-schema-probe"
+        assert task["needs"] == []
+        assert task["needs_dropped"] == ["I412-phantom"]
+
+
 # ── the adversary on the DAG ───────────────────────────────────────────────
 
 
@@ -249,6 +317,82 @@ def test_the_adversary_cannot_invent_a_task(cart) -> None:
     }
     result = decompose(cart, challenge=challenge)
     assert next(t for t in result["tasks"] if t["id"] == "t1")["needs"] == []
+
+
+# ── phase validation and unexecuted item_create ─────────────────────────────
+
+
+def test_a_near_miss_phase_is_corrected_and_the_evidence_names_it(cart) -> None:
+    near_miss = {
+        "phases": [{"id": "faulthandler-signal", "goal": "signal handling"}],
+        "tasks": [
+            {
+                "id": "t1",
+                "phase": "faulthandler-signl",
+                "title": "dump stacks",
+                "body": "b",
+                "needs": [],
+                "surfaces": [],
+            },
+        ],
+        "rationale": "single task",
+    }
+    result = decompose(cart, decomposition=near_miss)
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert task["phase"] == "faulthandler-signal"
+    t1_proposal = next(p for p in result["proposals"] if p["target"] == "t1")
+    assert {"check": "phase correction", "output": 'phase "faulthandler-signl" corrected to "faulthandler-signal"'} in (
+        t1_proposal["evidence"]
+    )
+
+
+def test_a_phase_too_far_from_its_declared_phase_fails_the_node(cart) -> None:
+    too_far = {
+        "phases": [{"id": "faulthandler-signal", "goal": "signal handling"}],
+        "tasks": [
+            {
+                "id": "t1",
+                "phase": "faulthandring-signal",
+                "title": "dump stacks",
+                "body": "b",
+                "needs": [],
+                "surfaces": [],
+            },
+        ],
+        "rationale": "single task",
+    }
+    with pytest.raises(ContractViolation) as excinfo:
+        decompose(cart, decomposition=too_far)
+    assert "t1" in str(excinfo.value)
+    assert "faulthandring-signal" in str(excinfo.value)
+
+
+def test_a_phase_equidistant_from_two_declared_phases_fails_the_node(cart) -> None:
+    ambiguous = {
+        "phases": [{"id": "pax", "goal": "a"}, {"id": "pbx", "goal": "b"}],
+        "tasks": [
+            {"id": "t1", "phase": "p1x", "title": "x", "body": "b", "needs": [], "surfaces": []},
+        ],
+        "rationale": "ambiguous phase",
+    }
+    with pytest.raises(ContractViolation) as excinfo:
+        decompose(cart, decomposition=ambiguous)
+    assert "t1" in str(excinfo.value)
+    assert "p1x" in str(excinfo.value)
+
+
+def test_an_approved_unapplied_item_create_diff_returns_its_refusal_reason() -> None:
+    diffs = [
+        {"kind": "item_create", "target": "t1", "decision": "approved", "risk": "low", "outcome": "skipped", "applied": False, "edited": False},
+    ]
+    assert initiative_decompose.unexecuted_item_create_reason(diffs) == "skipped"
+
+
+def test_an_applied_item_create_diff_leaves_the_run_unflagged() -> None:
+    diffs = [
+        {"kind": "item_create", "target": "t1", "decision": "approved", "risk": "low", "outcome": "clean", "applied": True, "edited": False},
+    ]
+    assert initiative_decompose.unexecuted_item_create_reason(diffs) is None
 
 
 def test_the_adversary_cannot_stall_a_task_on_itself(cart) -> None:
@@ -419,6 +563,65 @@ def test_a_second_unresolved_set_after_the_adversarys_attempt_quarantines_the_ru
             {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": [{"repo": "g", "path": "g/other.py"}]},
             runner,
         )
+
+
+def test_a_misplaced_test_surface_is_corrected_to_the_real_tests_path(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [
+            {
+                "id": "t1",
+                "phase": "p1",
+                "title": "a",
+                "body": "b",
+                "needs": [],
+                "surfaces": ["agent_tools/tests/test_route.py"],
+            }
+        ],
+    }
+    runner = ScriptedRunner({"decompose": decomposition})
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": [{"repo": "g", "path": "tests/test_route.py"}]},
+        runner,
+    )
+    task = result["tasks"][0]
+    assert task["surfaces"] == ["tests/test_route.py"]
+    proposal = next(p for p in result["proposals"] if p["target"] == "t1")
+    assert {
+        "check": "surface corrected",
+        "output": "agent_tools/tests/test_route.py -> tests/test_route.py",
+    } in proposal["evidence"]
+
+
+def test_a_missing_non_test_surface_fails_the_node_as_invalid_output(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["graphs/nope.py"]}],
+    }
+    runner = ScriptedRunner({"decompose": decomposition})
+    with pytest.raises(ContractViolation, match="graphs/nope.py"):
+        initiative_decompose.run(
+            {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": [{"repo": "g", "path": "g/other.py"}]},
+            runner,
+        )
+
+
+def test_a_needs_entry_naming_a_task_absent_from_the_plan_is_dropped(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [
+            {"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": []},
+            {"id": "t2", "phase": "p1", "title": "b", "body": "b", "needs": ["t1", "ghost"], "surfaces": []},
+        ],
+    }
+    result = decompose(cart, decomposition)
+    t2 = next(t for t in result["tasks"] if t["id"] == "t2")
+    assert t2["needs"] == ["t1"]
+    proposal = next(p for p in result["proposals"] if p["target"] == "t2")
+    assert {
+        "check": "needs dropped",
+        "output": "t2: dropped 'ghost', not a task id in this plan",
+    } in proposal["evidence"]
 
 
 def test_a_task_whose_surfaces_span_two_repos_is_split_one_per_repo(cart) -> None:
