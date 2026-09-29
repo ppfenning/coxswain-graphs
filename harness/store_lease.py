@@ -19,6 +19,10 @@ __all__ = ["LeaseResult", "acquire", "assert_epoch", "lease_state", "release", "
 _PAST = "1970-01-01T00:00:00Z"
 _COLUMNS = ("name", "holder", "epoch", "heartbeat_at", "expires_at")
 
+# Sentinel default for `renew`'s `status` argument: "leave the column as it is."
+# An explicit `None` is a real value (it clears the column); only the sentinel skips the write.
+_KEEP = object()
+
 # `?` is the placeholder token; `_sql` swaps in the engine's own.
 _TAKE = (
     "UPDATE leases SET holder = ?, epoch = epoch + 1, heartbeat_at = ?, expires_at = ?, status = NULL "
@@ -32,11 +36,15 @@ _RENEW = (
     "UPDATE leases SET heartbeat_at = ?, expires_at = ?, status = ? "
     "WHERE name = ? AND holder = ? AND epoch = ? AND expires_at > ?"
 )
+_RENEW_KEEP = (
+    "UPDATE leases SET heartbeat_at = ?, expires_at = ? "
+    "WHERE name = ? AND holder = ? AND epoch = ? AND expires_at > ?"
+)
 _RELEASE = "UPDATE leases SET expires_at = ? WHERE name = ? AND holder = ? AND epoch = ?"
 _READ = "SELECT name, holder, epoch, heartbeat_at, expires_at FROM leases WHERE name = ?"
 _FENCE = "SELECT 1 FROM leases WHERE name = ? AND epoch = ? AND expires_at > ?"
 
-SQL = (_TAKE, _STEAL, _RENEW, _RELEASE, _READ, _FENCE)
+SQL = (_TAKE, _STEAL, _RENEW, _RENEW_KEEP, _RELEASE, _READ, _FENCE)
 
 
 @dataclass(frozen=True)
@@ -99,12 +107,18 @@ def acquire(conn: Connection, name: str, holder: str, now: str, ttl: int, steal:
         return LeaseResult(False, None if row is None else int(row[2]), None if row is None else row[1])
 
 
-def renew(conn: Connection, name: str, holder: str, epoch: int, now: str, ttl: int, status: str | None = None) -> bool:
+def renew(
+    conn: Connection, name: str, holder: str, epoch: int, now: str, ttl: int, status: str | None = _KEEP
+) -> bool:
     """Extend a live lease. An expired or released lease is not revived: the holder must acquire again.
 
-    `status` is written verbatim, including None to clear a prior heartbeat status.
+    `status` defaults to the `_KEEP` sentinel, which leaves the stored status column untouched.
+    An explicit value, including None, is written verbatim, so a caller clears a prior status
+    by passing `status=None` on purpose.
     """
     at = _stamp(now)
+    if status is _KEEP:
+        return conn.execute(_sql(conn.dialect, _RENEW_KEEP), (at, _expiry(now, ttl), name, holder, epoch, at)) == 1
     return conn.execute(_sql(conn.dialect, _RENEW), (at, _expiry(now, ttl), status, name, holder, epoch, at)) == 1
 
 
