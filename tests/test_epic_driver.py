@@ -43,6 +43,7 @@ from harness.epic import (
 from harness.resume import load_result, save_result
 from harness.store_lease import acquire, release
 from harness.store_migrate import open_store
+from harness.store_pause import clear_paused, set_paused
 from harness.store_write import Store, ledger_row
 from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import BudgetStop, LimitStop, RunnerError
@@ -214,7 +215,10 @@ class Runner:
     def _subject(self, prompt: str, candidates) -> str | None:
         return next((c for c in candidates if c in prompt), None)
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         with self.lock:
             self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
 
@@ -256,7 +260,10 @@ class CommandsRunner(Runner):
         super().__init__(patches)
         self.commands_run = commands_run or {}
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         result = super().run(
             role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd
         )
@@ -278,7 +285,10 @@ class BudgetStopArm(Runner):
         super().__init__(patches)
         self.stops = stops
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "work_state_arm" and self.stops in prompt:
             raise BudgetStop(role="work_state_arm", thread=None, session=None, spent_usd=0.0, detail="budget")
         return super().run(
@@ -294,7 +304,10 @@ class LimitStopArm(Runner):
         self.stops = stops
         self.detail = detail
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "work_state_arm" and self.stops in prompt:
             raise LimitStop(detail=self.detail)
         return super().run(
@@ -771,7 +784,10 @@ class RetriedCommandsRunner(CommandsRunner):
         super().__init__(patches, commands_run={"t1-probe": [{"command": "first", "output": "1", "source": "trace"}]})
         self._revised = False
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "review_charter" and "t1-probe" in prompt and not self._revised:
             self._revised = True
             with self.lock:
@@ -902,7 +918,10 @@ class Repairing(Runner):
         self.repaired = repaired
         self.style_edit = style_edit
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "build" and "failed its configured checks" in prompt:
             task = self._subject(prompt, TASK_IDS)
             with self.lock:
@@ -1321,7 +1340,10 @@ def test_a_frontmatter_change_forces_the_amendment_gated() -> None:
 class TriageAttemptRunner(Runner):
     """Like `Runner`, but scripts `role="triage"` with a `ticket_defect` classification."""
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "triage":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
@@ -1887,7 +1909,10 @@ def test_a_stale_branch_whose_diff_adds_a_line_still_blocks(repo, cart, tmp_path
 class Revising(Runner):
     """Reviews everything as `revise`, so the fix loop is the only thing running."""
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "review_charter":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -2065,7 +2090,10 @@ class RefusedRunner(Runner):
         super().__init__(patches, **kw)
         self.refused = refused
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "review_charter" and self.refused in prompt:
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -2101,7 +2129,10 @@ class ArbitrateFailsRunner(Runner):
     shape the ticket names: build complete, charter review ran, then
     arbitrate failed with a provider-side error."""
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "review_adversary":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -2144,7 +2175,10 @@ class ArbitrateBudgetStopRunner(Runner):
     pre-existing `no_work` path exactly like any other `RunnerError` from a
     non-build node did before this ticket."""
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "review_adversary":
             with self.lock:
                 self.calls.append({"role": role, "tier": tier, "prompt": prompt})
@@ -2180,7 +2214,10 @@ class AdversaryFailsRunner(Runner):
         super().__init__(patches, **kw)
         self.fails_for = fails_for
 
-    def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
         if role == "review_adversary":
             if self.fails_for in prompt:
                 raise RunnerError("provider-side safeguard error")
@@ -2351,7 +2388,10 @@ def test_a_task_at_the_attempt_cap_is_refused_and_its_sibling_still_lands(repo, 
     # proposal is itself refused — triage runs, but cannot turn this into a write,
     # and the task still ends up quarantined, plainly, for a person to decide.
     class TriageRejectRunner(Runner):
-        def run(self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None):
+        def run(
+            self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None,
+            task=None, wait_if_paused=None,
+        ):
             if role == "triage":
                 with self.lock:
                     self.calls.append({"role": role, "tier": tier, "prompt": prompt, "budget_usd": budget_usd})
@@ -2576,6 +2616,132 @@ def _taken_over_during(monkeypatch, store: Store, name: str, epoch: int) -> None
         return original(*args, **kwargs)
 
     monkeypatch.setattr(epic_module, name, wrapper)
+
+
+class _FakeTime:
+    """Stands in for the `time` module `_wait_if_paused` reaches through: `sleep` never blocks for real."""
+
+    def __init__(self, on_sleep) -> None:
+        self._on_sleep = on_sleep
+        self.calls = 0
+
+    def sleep(self, seconds: float) -> None:
+        self.calls += 1
+        self._on_sleep()
+
+
+def test_the_next_node_waits_while_the_store_pause_flag_is_set(repo, cart, tmp_path, store, monkeypatch) -> None:
+    """A pause set before the run starts holds the first node call until `clear_paused` runs."""
+    run_id = "epic-pause"
+    store.conn.execute(f"INSERT INTO runs (run_id, status) VALUES ('{run_id}', 'queued')")
+    lease = acquire(store.conn, LEASE, run_id, _now(), 3600)
+    set_paused(store.conn, run_id, _now())
+    order: list[str] = []
+
+    def on_sleep() -> None:
+        order.append("sleep")
+        clear_paused(store.conn, run_id)
+
+    monkeypatch.setattr(epic_module, "time", _FakeTime(on_sleep))
+    runner = Runner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+    original_run = runner.run
+
+    def tracking_run(**kwargs):
+        order.append(f"call:{kwargs.get('role')}")
+        return original_run(**kwargs)
+
+    monkeypatch.setattr(runner, "run", tracking_run)
+
+    drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), runner=runner, store=store,
+        epoch=lease.epoch, lease_name=LEASE, run_id=run_id,
+    )
+
+    assert "sleep" in order
+    first_call = next(i for i, entry in enumerate(order) if entry.startswith("call:"))
+    assert order.index("sleep") < first_call
+
+
+def test_an_unpaused_run_never_sleeps(repo, cart, tmp_path, store, monkeypatch) -> None:
+    """A run whose pause flag is never set never touches `sleep`, and its build still runs."""
+    run_id = "epic-nopause"
+    store.conn.execute(f"INSERT INTO runs (run_id, status) VALUES ('{run_id}', 'queued')")
+    lease = acquire(store.conn, LEASE, run_id, _now(), 3600)
+    fake_time = _FakeTime(lambda: None)
+    monkeypatch.setattr(epic_module, "time", fake_time)
+
+    result, runner = drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), store=store,
+        epoch=lease.epoch, lease_name=LEASE, run_id=run_id,
+    )
+
+    assert fake_time.calls == 0
+    assert any(c["role"] == "build" for c in runner.calls)
+
+
+def test_a_pause_set_just_before_the_apply_arm_holds_its_own_runner_call(repo, cart, tmp_path, store, monkeypatch) -> None:
+    """The apply arm's own `runner.run` (`auto_apply`, dispatched from `_execute`) waits too.
+
+    The lifecycle batch's pre-dispatch wait (proven above) is not the only boundary: `_execute`
+    runs once per batch item, gated proposal or auto-cleared, and its own apply-arm call must
+    honor a pause set right at that boundary, not only one set before the batch started.
+    """
+    run_id = "epic-pause-arm"
+    store.conn.execute(f"INSERT INTO runs (run_id, status) VALUES ('{run_id}', 'queued')")
+    lease = acquire(store.conn, LEASE, run_id, _now(), 3600)
+    order: list[str] = []
+
+    def on_sleep() -> None:
+        order.append("sleep")
+        clear_paused(store.conn, run_id)
+
+    monkeypatch.setattr(epic_module, "time", _FakeTime(on_sleep))
+
+    # The pause is set the first time `_execute` runs, i.e. at the batch's own node
+    # boundary — well after the lifecycle build/review graphs have already finished —
+    # so only `_execute`'s own wait, not the earlier pre-batch one, can be what holds it.
+    original_execute = epic_module._execute
+    armed: list[bool] = []
+
+    def armed_execute(*args, **kwargs):
+        if not armed:
+            armed.append(True)
+            set_paused(store.conn, run_id, _now())
+        return original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(epic_module, "_execute", armed_execute)
+
+    runner = Runner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+    original_run = runner.run
+
+    def tracking_run(**kwargs):
+        order.append(f"call:{kwargs.get('role')}")
+        return original_run(**kwargs)
+
+    monkeypatch.setattr(runner, "run", tracking_run)
+
+    drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), runner=runner, store=store,
+        epoch=lease.epoch, lease_name=LEASE, run_id=run_id,
+    )
+
+    assert "sleep" in order
+    arm_calls = [i for i, entry in enumerate(order) if entry == "call:work_state_arm"]
+    assert arm_calls, "the apply arm's own runner.run must have been reached for this to prove anything"
+    assert order.index("sleep") < arm_calls[0]
+
+
+def test_the_pause_wait_ttl_matches_the_cli_s_own_lease_ttl() -> None:
+    """`_PAUSE_LEASE_TTL`'s comment claims it matches `cli._LEASE_TTL`; this is what proves it.
+
+    A paused run's own renew heartbeat must not ask for a shorter lease than the one the CLI
+    acquired, or a long pause would let the lease expire out from under a still-live run. If a
+    future edit changes either constant without the other, this fails instead of the drift going
+    unnoticed until a pause outlives its lease.
+    """
+    from harness.cli import _LEASE_TTL
+
+    assert epic_module._PAUSE_LEASE_TTL == _LEASE_TTL
 
 
 def _store_rows(store: Store) -> list[int]:

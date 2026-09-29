@@ -43,7 +43,8 @@ import json
 import logging
 import subprocess
 import sys
-from collections.abc import Collection, Mapping, Sequence
+import time
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -83,7 +84,8 @@ from harness.escalate import escalate_self_modification, touched_paths
 from harness.gate import apply_arm_for, auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
-from harness.store_lease import assert_epoch
+from harness.store_lease import assert_epoch, renew
+from harness.store_pause import is_paused
 from harness.store_write import Store, upsert_work_item
 from harness.worktree import (
     apply_patch,
@@ -664,6 +666,7 @@ def _style_fix(ctx: _Ctx, *, phase: str, task: str, result: Mapping[str, Any], b
         tier="standard",
         schema=_STYLE_PASS_SCHEMA,
         task=task,
+        wait_if_paused=lambda: _wait_if_paused(ctx),
         context=list(ctx.cartridge.get("context") or []),
         prompt=(
             f"{_CHECK_FIX_PROMPT}\n\nTicket: {task}\n\nFailing checks:\n{check_feedback(build['checks'])}"
@@ -1384,6 +1387,35 @@ def _fenced(ctx: _Ctx) -> str | None:
     return f"stale epoch: this driver holds epoch {ctx.epoch}, lease '{name}' is at epoch {held} or has expired"
 
 
+_PAUSE_LEASE_TTL = 120  # seconds; matches the CLI's own `_LEASE_TTL` (harness/cli.py) heartbeat renew.
+
+
+def _wait_while_paused(
+    conn: Any,
+    run_id: str,
+    lease_name: str,
+    epoch: int,
+    now: Callable[[], str],
+    ttl: int,
+    sleep: Callable[[float], None] = time.sleep,
+    poll_seconds: float = 10,
+) -> None:
+    """Block between nodes while the store says this run is paused; a call already in flight is untouched."""
+    while is_paused(conn, run_id):
+        renew(conn, lease_name, run_id, epoch, now(), ttl, status="paused")  # heartbeat says why: paused, not stuck
+        sleep(poll_seconds)
+    renew(conn, lease_name, run_id, epoch, now(), ttl, status=None)  # always: clears a prior "paused" on resume too
+
+
+def _wait_if_paused(ctx: _Ctx) -> None:
+    """`_wait_while_paused` bound to this run's own lease; a no-op without a fenced store."""
+    if ctx.epoch is None or ctx.store is None:
+        return
+    _wait_while_paused(
+        ctx.store.conn, ctx.run_id, ctx.lease_name or LEASE_NAME, ctx.epoch, _now, _PAUSE_LEASE_TTL, sleep=time.sleep,
+    )
+
+
 def _task_record_mirror(
     store: Store | None, result: Mapping[str, Any], run_id: str, phase: str, task: str, ts: str
 ) -> tuple[str, str, str, dict[str, Any], str] | None:
@@ -1660,6 +1692,7 @@ def _run_phase(
     capped_ids = sorted(task_id for task_id, attempts in counted_by_id.items() if len(attempts) >= ATTEMPT_CAP)
     if capped_ids:
         all_ready_by_id = {str(item["id"]): item for item in all_ready}
+        _wait_if_paused(ctx)
         triaged, _, triage_failures = invoke_graphs(
             [
                 Invocation(
@@ -1774,6 +1807,7 @@ def _run_phase(
     }
 
     if runnable:
+        _wait_if_paused(ctx)
         results, _, failures = invoke_graphs(
             [
                 _lifecycle_invocation(
@@ -2278,6 +2312,7 @@ def _trim_phase(ctx: _Ctx, phase: str) -> str | None:
         role="style_pass",
         tier="standard",
         schema=_STYLE_PASS_SCHEMA,
+        wait_if_paused=lambda: _wait_if_paused(ctx),
         prompt=f"{_STYLE_PASS_PROMPT}\n\nPhase: {phase}\n\nPhase diff:\n{diff}",
         context=list(ctx.cartridge.get("context") or []),
     )
@@ -2584,6 +2619,7 @@ def _execute(
     if stale is not None:
         _refuse_stale(state, phase=phase, subject=subject, slot=slot, reason=stale)
         return False, stale
+    _wait_if_paused(ctx)
 
     kind = item.get("kind")
 
@@ -2642,7 +2678,9 @@ def _execute(
         state.moved[subject] = True
         return True, "store moved to approved; file state line written"
     try:
-        applied, detail = auto_apply(dict(item), cartridge=ctx.cartridge, runner=ctx.runner)
+        applied, detail = auto_apply(
+            dict(item), cartridge=ctx.cartridge, runner=ctx.runner, wait_if_paused=lambda: _wait_if_paused(ctx)
+        )
     except LimitStop:
         raise  # the account's own limit, not this task's; never through `_quarantine_task`
     except RunnerError as exc:
