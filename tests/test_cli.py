@@ -18,6 +18,7 @@ from typing import ClassVar
 import pytest
 
 import harness.cli as cli
+from graphs.delivery.initiative_decompose import GRAPH_NAME as DECOMPOSE_GRAPH_NAME
 from harness.invoke import Invocation, invoke_graphs
 from runner.scripted import ScriptedRunner
 
@@ -889,6 +890,89 @@ def test_without_a_store_a_single_graph_run_still_appends_the_ledger_and_exits_z
 
     assert (tmp_path / "ledger.jsonl").is_file()
     assert not (tmp_path / "runs" / "r1.json").exists()
+
+
+# --- decompose: an approved item_create that never landed fails the run, not just the gate -------------------------
+
+_DECOMPOSE_ITEM = {
+    "id": "t9-new",
+    "phase": "p1-foundations",
+    "state": "ready",
+    "needs": [],
+    "surfaces": ["schema"],
+    "title": "A brand new task",
+    "body": "Write the thing.",
+}
+
+
+def _decompose_run(tmp_path: Path, *, target: Path) -> int:
+    """One `item_create` proposal, approved at the gate, applied through the code `workstore` arm.
+
+    `target` already existing makes the arm refuse (`applied=False`); a `target`
+    that does not exist yet makes it land (`applied=True`) — the two cases the
+    ticket asks for, produced without scripting a model call at all.
+    """
+    profile = tmp_path / "profile.yaml"
+    profile.write_text("provider: test\n", encoding="utf-8")
+    spec = SimpleNamespace(
+        name="decompose",
+        graph_name=DECOMPOSE_GRAPH_NAME,
+        needs=(),
+        run=lambda graph_args, runner: {
+            "proposals": [
+                {
+                    "kind": "item_create",
+                    "risk": "low",
+                    "target": str(target),
+                    "evidence": [{"check": "c", "output": "o"}],
+                    "rationale": "because",
+                    "suggested_action": "create",
+                    "apply": {"path": str(target), "item": dict(_DECOMPOSE_ITEM)},
+                }
+            ]
+        },
+    )
+    args = SimpleNamespace(
+        graph="decompose",
+        date="2026-09-29",
+        runs_dir=tmp_path / "runs",
+        ledger=tmp_path / "ledger.jsonl",
+        provider_profile=str(profile),
+        repo=None,
+        assume="a",
+        result_out=None,
+    )
+    return cli._run_graph(
+        specs={"decompose": spec},
+        parser=_FakeParser(args),
+        args=args,
+        cartridge={
+            **_CARTRIDGE,
+            "write_kinds": {"item_create": {"risk": "low", "ramp": "gated", "apply_arm": "workstore"}},
+        },
+        runner=ScriptedRunner({}),
+        run_id="r1",
+    )
+
+
+def test_a_decompose_run_with_an_approved_but_unapplied_item_create_returns_1_and_prints_the_reason(
+    tmp_path, capsys
+) -> None:
+    existing = tmp_path / "t9-new.md"
+    existing.write_text("already here", encoding="utf-8")
+
+    assert _decompose_run(tmp_path, target=existing) == 1
+
+    assert "decompose failed: no task item_create was executed: skipped" in capsys.readouterr().err
+
+
+def test_a_decompose_run_with_an_applied_item_create_returns_0(tmp_path, capsys) -> None:
+    new_task = tmp_path / "t9-new.md"
+
+    assert _decompose_run(tmp_path, target=new_task) == 0
+
+    assert new_task.exists()
+    assert "decompose failed" not in capsys.readouterr().err
 
 
 def test_the_parser_takes_result_out_and_defaults_it_to_none() -> None:
