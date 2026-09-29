@@ -319,6 +319,82 @@ def test_the_adversary_cannot_invent_a_task(cart) -> None:
     assert next(t for t in result["tasks"] if t["id"] == "t1")["needs"] == []
 
 
+# ── phase validation and unexecuted item_create ─────────────────────────────
+
+
+def test_a_near_miss_phase_is_corrected_and_the_evidence_names_it(cart) -> None:
+    near_miss = {
+        "phases": [{"id": "faulthandler-signal", "goal": "signal handling"}],
+        "tasks": [
+            {
+                "id": "t1",
+                "phase": "faulthandler-signl",
+                "title": "dump stacks",
+                "body": "b",
+                "needs": [],
+                "surfaces": [],
+            },
+        ],
+        "rationale": "single task",
+    }
+    result = decompose(cart, decomposition=near_miss)
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert task["phase"] == "faulthandler-signal"
+    t1_proposal = next(p for p in result["proposals"] if p["target"] == "t1")
+    assert {"check": "phase correction", "output": 'phase "faulthandler-signl" corrected to "faulthandler-signal"'} in (
+        t1_proposal["evidence"]
+    )
+
+
+def test_a_phase_too_far_from_its_declared_phase_fails_the_node(cart) -> None:
+    too_far = {
+        "phases": [{"id": "faulthandler-signal", "goal": "signal handling"}],
+        "tasks": [
+            {
+                "id": "t1",
+                "phase": "faulthandring-signal",
+                "title": "dump stacks",
+                "body": "b",
+                "needs": [],
+                "surfaces": [],
+            },
+        ],
+        "rationale": "single task",
+    }
+    with pytest.raises(ContractViolation) as excinfo:
+        decompose(cart, decomposition=too_far)
+    assert "t1" in str(excinfo.value)
+    assert "faulthandring-signal" in str(excinfo.value)
+
+
+def test_a_phase_equidistant_from_two_declared_phases_fails_the_node(cart) -> None:
+    ambiguous = {
+        "phases": [{"id": "pax", "goal": "a"}, {"id": "pbx", "goal": "b"}],
+        "tasks": [
+            {"id": "t1", "phase": "p1x", "title": "x", "body": "b", "needs": [], "surfaces": []},
+        ],
+        "rationale": "ambiguous phase",
+    }
+    with pytest.raises(ContractViolation) as excinfo:
+        decompose(cart, decomposition=ambiguous)
+    assert "t1" in str(excinfo.value)
+    assert "p1x" in str(excinfo.value)
+
+
+def test_an_approved_unapplied_item_create_diff_returns_its_refusal_reason() -> None:
+    diffs = [
+        {"kind": "item_create", "target": "t1", "decision": "approved", "risk": "low", "outcome": "skipped", "applied": False, "edited": False},
+    ]
+    assert initiative_decompose.unexecuted_item_create_reason(diffs) == "skipped"
+
+
+def test_an_applied_item_create_diff_leaves_the_run_unflagged() -> None:
+    diffs = [
+        {"kind": "item_create", "target": "t1", "decision": "approved", "risk": "low", "outcome": "clean", "applied": True, "edited": False},
+    ]
+    assert initiative_decompose.unexecuted_item_create_reason(diffs) is None
+
+
 def test_the_adversary_cannot_stall_a_task_on_itself(cart) -> None:
     challenge = {
         "spurious_edges": [],
