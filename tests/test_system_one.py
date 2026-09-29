@@ -235,3 +235,10 @@ def test_untagged_rows_are_ignored_by_the_shadow_report():
     tagged = {**untagged, "system_one_mode": "shadow", "system_one_agreed": True, "system_one_confidence": 0.9}
     summary = report([untagged, untagged, tagged], None, {"r": 0.8})["r"]
     assert (summary.shadow_calls, summary.skipped) == (1, 0)
+
+
+def test_the_inner_runner_gets_the_pause_hook():
+    inner = Inner()
+    hook = lambda: None  # noqa: E731
+    runner("off", Decider(), inner).run(**CALL, wait_if_paused=hook)
+    assert inner.calls[0]["wait_if_paused"] is hook
