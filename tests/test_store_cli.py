@@ -9,6 +9,7 @@ import harness.store_cli as store_cli
 from harness.cli import REPO_ROOT
 from harness.store_cli import main, resolve_store_url
 from harness.store_migrate import open_store
+from harness.store_pause import is_paused
 from harness.store_read import task_record
 from harness.store_write import Store
 
@@ -70,6 +71,15 @@ def with_conn(url, action):
 
 def seed(url, record=None):
     with_conn(url, lambda c: Store(c).record_task_record("r1", "p1", "t1", {"n": "x"} if record is None else record, T0))
+
+
+def _insert_run(conn, run_id):
+    p = conn.dialect.placeholder
+    conn.execute(f"INSERT INTO runs (run_id, status) VALUES ({p}, {p})", (run_id, "queued"))
+
+
+def seed_run(url, run_id="r1"):
+    with_conn(url, lambda c: _insert_run(c, run_id))
 
 
 def one_object(out):
@@ -137,6 +147,38 @@ def test_record_action_target_falls_back_to_initiative_then_the_first_intake_id_
         "recorded chair action launch_decompose a\n",
         "recorded chair action standby \n",
     ]
+
+
+def test_pause_prints_ok_and_sets_paused_at(url, run, at):
+    seed_run(url)
+    at(T0)
+    code, out, err = run(url, "pause", "r1", "--reason", "manual")
+    expected = {"ok": True, "run": "r1", "paused": T0, "reason": "manual"}
+    assert (code, one_object(out), err) == (0, expected, "")
+    assert with_conn(url, lambda c: is_paused(c, "r1")) is True
+
+
+def test_resume_clears_the_paused_flag(url, run, at):
+    seed_run(url)
+    at(T0)
+    run(url, "pause", "r1")
+    code, out, err = run(url, "resume", "r1")
+    assert (code, one_object(out), err) == (0, {"ok": True, "run": "r1", "paused": None}, "")
+    assert with_conn(url, lambda c: is_paused(c, "r1")) is False
+
+
+def test_pause_and_resume_on_an_unknown_run_exit_3_and_leave_other_runs_alone(url, run, at):
+    seed_run(url)
+    at(T0)
+    run(url, "pause", "r1")
+    rows = "SELECT run_id, paused_at FROM runs ORDER BY run_id"
+    expected = {"ok": False, "run": "no-such-run", "paused": None, "reason": None}
+    for argv in (("pause", "no-such-run"), ("resume", "no-such-run")):
+        at(T40)
+        code, out, err = run(url, *argv)
+        assert (code, one_object(out)) == (3, expected)
+        assert err == "error: no run no-such-run\n"
+        assert with_conn(url, lambda c: c.query_all(rows)) == [("r1", T0)]
 
 
 def test_exit_two_on_an_action_line_without_kind_and_nothing_is_written(url, run):

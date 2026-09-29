@@ -28,8 +28,8 @@ def test_a_database_at_version_eight_gains_queue_and_claim_columns_and_old_rows_
             "INSERT INTO work_items (initiative, task_id, phase, state, needs_json, updated_at, updated_by)"
             f" VALUES ('i1', 't1', 'p1', 'ready', '[]', '{NOW1}', 'chair')"
         )
-        assert migrate(c, NOW2, default_modules()) == 10
-        assert check_version(c) == (10, 10)
+        assert migrate(c, NOW2, default_modules()) == 11
+        assert check_version(c) == (11, 11)
         found = shape(c)
         assert [found[n][1:] for n in TEXT_NEW] == [(True, None)] * len(TEXT_NEW)
         assert found["epoch"][1] is True
@@ -49,7 +49,7 @@ def test_applying_again_changes_nothing(store_conn):
     )
     versions = store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")
     columns = shape(store_conn)
-    assert migrate(store_conn, NOW2, default_modules()) == 10
+    assert migrate(store_conn, NOW2, default_modules()) == 11
     assert store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version") == versions
     assert shape(store_conn) == columns
     assert store_conn.query_all("SELECT kind, holder, epoch FROM work_items") == [("task", "me", 3)]

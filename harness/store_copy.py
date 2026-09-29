@@ -28,6 +28,7 @@ import harness.store_ddl_0007 as ddl7
 import harness.store_ddl_0008 as ddl8
 import harness.store_ddl_0009 as ddl9
 import harness.store_ddl_0010 as ddl10
+import harness.store_ddl_0011 as ddl11
 from harness.store_dialect import Connection, insert_ignore, upsert
 from harness.store_migrate import open_store
 
@@ -50,10 +51,13 @@ _ORDER = (
     "leases",
     "chair_actions",
     "hosts",
+    "id_sequence",
 )
 
 # Tables whose rows change after they are first written. Every other table in _ORDER is append-only.
-_REFRESH = frozenset({"runs", "phases", "tasks", "task_records", "work_items", "leases", "hosts"})
+_REFRESH = frozenset(
+    {"runs", "phases", "tasks", "task_records", "work_items", "leases", "hosts", "id_sequence"}
+)
 
 
 class CopyCheckFailed(Exception):
@@ -68,11 +72,19 @@ class CopyCheckFailed(Exception):
 def tables() -> tuple[Table, ...]:
     """(name, column names, key) for every table the DDL modules create, migration ALTER columns included."""
     # The list must follow every migration's ALTERs: a column left out is dropped silently and the copy holds NULL.
-    alters = (*ddl2._ADDED, *ddl3._ADDED, *ddl5._ADDED, *ddl9._ADDED, *ddl10._ADDED)
+    alters = (*ddl2._ADDED, *ddl3._ADDED, *ddl5._ADDED, *ddl9._ADDED, *ddl10._ADDED, *ddl11._ADDED)
     added = {t: tuple(c for u, c in alters if u == t) for t, _ in alters}
     return tuple(
         (name, (*(c for c, _ in columns), *added.get(name, ())), key)
-        for name, columns, key in (*ddl1._TABLES, *ddl2._TABLES, *ddl4._TABLES, *ddl6._TABLES, *ddl7._TABLES, *ddl8._TABLES)
+        for name, columns, key in (
+            *ddl1._TABLES,
+            *ddl2._TABLES,
+            *ddl4._TABLES,
+            *ddl6._TABLES,
+            *ddl7._TABLES,
+            *ddl8._TABLES,
+            *ddl11._TABLES,
+        )
     )
 
 
