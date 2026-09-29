@@ -625,6 +625,10 @@ class ClaudeCodeRunner:
         # ceiling above stays the size of each slice, so the harness gets a go/no-go checkpoint at every guide's worth
         # of spend, well before the failsafe; the weekly cap bounds everything else.
         self.role_ceiling_usd = {str(k): float(v) for k, v in (self.profile.get("role_ceiling_usd") or {}).items()}
+        # A per-thread ceiling (Pat, 2026-09-28): thread name -> (ceiling, label), set by the harness after
+        # construction, like `node_cap_usd` below. `_hard_ceiling` prefers this over the role's runaway ceiling
+        # when it is tighter, so a single task's own budget can bind before the role-wide failsafe does.
+        self.thread_ceiling_usd: dict[str, tuple[float, str]] = {}
         # The operator's per-node spend cap (docs/design/cost-bounds.md §1), set
         # by the harness after construction, like `runs_dir`/`run_id`. Unset
         # means the shape ceiling above is the only limit, exactly as before.
@@ -1042,7 +1046,15 @@ class ClaudeCodeRunner:
         lines.append("</workspace>")
         return "\n".join(lines)
 
-    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None, spent_usd: float = 0.0, effort: str | None = None, checkpoint_fractions: tuple[float, ...] | None = None, checkpoint_index: int = 0) -> list[str]:
+    def _hard_ceiling(self, role: str | None, thread: str | None) -> tuple[float | None, str]:
+        """The thread's (ceiling, label) when set and below the role's; else the role's ceiling labelled runaway."""
+        role_ceiling = self.role_ceiling_usd.get(role) if role is not None else None
+        thread_entry = self.thread_ceiling_usd.get(thread) if thread is not None else None
+        if thread_entry is not None and (role_ceiling is None or thread_entry[0] < role_ceiling):
+            return thread_entry
+        return role_ceiling, "runaway"
+
+    def _argv(self, *, model: str, tier: str, tools: Sequence[str], schema: Mapping[str, Any], system: str, scratch: Path | None = None, role: str | None = None, session: Sequence[str] = (), budget_usd: float | None = None, spent_usd: float = 0.0, effort: str | None = None, checkpoint_fractions: tuple[float, ...] | None = None, checkpoint_index: int = 0, thread: str | None = None) -> list[str]:
         argv = [
             self.claude_bin,
             "-p",
@@ -1072,10 +1084,13 @@ class ClaudeCodeRunner:
         # operator's node cap still bounds a checkpoint, as it bounds a slice.
         target = _checkpoint_target(checkpoint_fractions, checkpoint_index, ceiling)
         if target is not None:
-            limit, _ = _effective_limit(target, self.node_cap_usd)
+            # --max-budget-usd bounds this one call, not the session, so a
+            # checkpoint target already stated as a session total is sent as
+            # what is left of it, not the target itself.
+            limit, _ = _effective_limit(max(target - spent_usd, 0.0), self.node_cap_usd)
         else:
             limit = None if effective is None else spent_usd + effective
-        hard = self.role_ceiling_usd.get(role) if role is not None else None
+        hard, _ = self._hard_ceiling(role, thread)
         if hard is not None:
             # --max-budget-usd bounds one invocation, not the session, so the runaway ceiling sends what is left of
             # it: on 2026-09-28 a resumed build spent $16.39 over four calls that were each sent $6.
@@ -1151,7 +1166,7 @@ class ClaudeCodeRunner:
         self, *, role: str, tier: str, model: str, tools: Sequence[str], schema: Mapping[str, Any], prompt: str,
         packs: Sequence[str], scratch: Path | None, patches: bool, session: Sequence[str], budget_usd: float | None = None,
         spent_usd: float = 0.0, effort: str | None = None,
-        checkpoint_fractions: tuple[float, ...] | None = None, checkpoint_index: int = 0,
+        checkpoint_fractions: tuple[float, ...] | None = None, checkpoint_index: int = 0, thread: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         system = "\n\n".join(
             part for part in (self._read_context(packs), self._workspace(scratch, patches=patches, role=role), self.extra_system)
@@ -1164,7 +1179,7 @@ class ClaudeCodeRunner:
         argv = self._argv(
             model=model, tier=tier, tools=tools, schema=schema, system=system, scratch=scratch, role=role,
             session=session, budget_usd=budget_usd, spent_usd=spent_usd, effort=effort,
-            checkpoint_fractions=checkpoint_fractions, checkpoint_index=checkpoint_index,
+            checkpoint_fractions=checkpoint_fractions, checkpoint_index=checkpoint_index, thread=thread,
         )
         try:
             return subprocess.run(
@@ -1240,26 +1255,49 @@ class ClaudeCodeRunner:
             if thread:
                 state = self._thread(thread, role)
                 session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
-                hard = self.role_ceiling_usd.get(role) if role is not None else None
+                hard, label = self._hard_ceiling(role, thread)
                 spent_so_far = state.get("spent_usd", 0.0)
                 if hard is not None and spent_so_far >= hard:
-                    # The session already spent the runaway ceiling: no call is made, and the stop reads like one
+                    # The session already spent the binding ceiling: no call is made, and the stop reads like one
                     # the CLI raised at the ceiling, so the lifecycle quarantines it with its split advice.
+                    reached = (
+                        f"runaway ceiling ${hard:.2f} reached" if label == "runaway"
+                        else f"{label} budget reached (${hard:.2f} = 1.5 x budget): split the task"
+                    )
                     raise BudgetStop(
                         role=role,
                         thread=thread,
                         session=state["session"],
                         spent_usd=spent_so_far,
                         detail=f"node '{role}' not started: the session has spent ${spent_so_far:.2f} "
-                        f"(runaway ceiling ${hard:.2f} reached)",
+                        f"({reached})",
                         partial_patch=_capture_diff(state["scratch"]) if state.get("scratch") else "",
                         checkpoint_index=None,
+                    )
+                reached_index = state.get("checkpoint_index", 0)
+                target = _checkpoint_target(
+                    resolved_fractions, reached_index, self._shape_ceiling(role, tier, used_model, budget_usd)[0]
+                )
+                if target is not None and spent_so_far >= target:
+                    # The CLI overshoots what it is sent, so a target already passed is a stop here, not a
+                    # $0.00 call: the stop crosses this checkpoint exactly as one the CLI raised would.
+                    state["checkpoint_index"] = reached_index + 1
+                    raise BudgetStop(
+                        role=role,
+                        thread=thread,
+                        session=state["session"],
+                        spent_usd=spent_so_far,
+                        detail=f"node '{role}' not started: the session has spent ${spent_so_far:.2f} "
+                        f"(checkpoint ${target:.2f} reached)",
+                        partial_patch=_capture_diff(state["scratch"]) if state.get("scratch") else "",
+                        checkpoint_index=reached_index,
                     )
                 proc = self._invoke(
                     role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
                     scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
                     spent_usd=state.get("spent_usd", 0.0), effort=effort,
                     checkpoint_fractions=resolved_fractions, checkpoint_index=state.get("checkpoint_index", 0),
+                    thread=thread,
                 )
                 if role in _PATCH_ROLES and state.get("scratch"):
                     has_scratch = True
@@ -1325,13 +1363,16 @@ class ClaudeCodeRunner:
             if cap_stop:
                 detail["subtype"] = "error_spend_cap"
             message = f"node '{role}' failed in claude: {json.dumps(detail)[:800]}"
-            hard = self.role_ceiling_usd.get(role) if role is not None else None
+            hard, label = self._hard_ceiling(role, thread)
             session_total = reported_now if thread else float(payload.get("total_cost_usd") or 0.0)
             runaway_stop = (
                 not cap_stop and hard is not None and detail.get("subtype") == "error_max_budget_usd" and session_total >= hard
             )
             if runaway_stop:
-                message += f" (runaway ceiling ${hard:.2f} reached)"
+                message += (
+                    f" (runaway ceiling ${hard:.2f} reached)" if label == "runaway"
+                    else f" ({label} budget reached (${hard:.2f} = 1.5 x budget): split the task)"
+                )
             if cap_stop:
                 ceiling_txt = f"${shape_ceiling:.4f}" if shape_ceiling is not None else "none"
                 message += f" (cap ${self.node_cap_usd:.4f} < shape ceiling {ceiling_txt})"
