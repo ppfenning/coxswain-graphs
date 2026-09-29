@@ -289,3 +289,10 @@ def test_a_yaml_profile_with_an_unquoted_mode_loads(tmp_path, line, mode):
 def test_an_unknown_router_mode_is_refused_at_construction():
     with pytest.raises(RunnerError, match="router"):
         AnthropicRunner({**PROFILE, "router": "bogus"}, client=_Stub())
+
+
+def test_a_paused_run_waits_before_the_request():
+    stub = _Stub()
+    seen: list[int] = []
+    _run(stub, wait_if_paused=lambda: seen.append(len(stub.calls)))
+    assert seen == [0]

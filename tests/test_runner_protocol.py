@@ -2,8 +2,13 @@ import inspect
 
 import pytest
 
+from runner.anthropic_runner import AnthropicRunner
+from runner.claude_code_runner import ClaudeCodeRunner
 from runner.decision_log import CallDecision
+from runner.openai_compatible_runner import OpenAICompatibleRunner
 from runner.protocol import Capability, NodeResult, NodeRunner, ProviderProfile, RunnerError, resolve_profile
+from runner.scripted import ScriptedRunner
+from runner.system_one import FastPathRunner
 from runner.tier_resolution import Hints
 
 CHEAP = ProviderProfile(
@@ -142,3 +147,11 @@ def test_a_decision_rides_on_the_result_without_becoming_a_key():
     result.decision = decision
     assert result == {"a": 1}
     assert result.decision is decision
+
+
+@pytest.mark.parametrize("runner", [AnthropicRunner, ClaudeCodeRunner, FastPathRunner, OpenAICompatibleRunner, ScriptedRunner])
+def test_every_runner_accepts_every_keyword_of_the_protocol(runner):
+    params = inspect.signature(runner.run).parameters
+    takes_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    missing = [name for name in inspect.signature(NodeRunner.run).parameters if name not in params and not takes_any]
+    assert missing == []
