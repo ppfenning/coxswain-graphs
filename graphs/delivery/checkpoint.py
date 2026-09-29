@@ -39,6 +39,7 @@ class CheckpointSignals:
     diff_grew: bool
     checks_pass: bool
     files_outside_surfaces: tuple[str, ...]
+    scratch_ignored: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,7 @@ def checkpoint_ledger_line(*, ts: str, task: str, role: str, signals: Checkpoint
         "diff_grew": signals.diff_grew,
         "checks_pass": signals.checks_pass,
         "files_outside_surfaces": list(signals.files_outside_surfaces),
+        "scratch_ignored": list(signals.scratch_ignored),
         "decision": "resume" if isinstance(decision, Resume) else "revise",
     }
     return line if isinstance(decision, Resume) else {**line, "reason": decision.reason}

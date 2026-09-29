@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from unittest.mock import ANY
 
 import pytest
@@ -1193,3 +1195,70 @@ def test_under_a_runaway_ceiling_a_build_resumes_past_the_continuation_count_unt
     go, _ = lifecycle_propose._continue_ok(under, surfaces=["x.py"], continuations=5, hard_ceiling=6.0)
     stop, why = lifecycle_propose._continue_ok(over, surfaces=["x.py"], continuations=5, hard_ceiling=6.0)
     assert (go, stop, why.startswith("the $6.00 runaway ceiling was reached")) == (True, False, True)
+
+
+def _git_repo_with_tracked_debug_py(tmp_path):
+    """A real worktree holding one tracked file, `debug.py` — the scratch-exemption tests' pre-existing repo."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "a@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "a"], cwd=repo, check=True)
+    (repo / "debug.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "debug.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    return repo
+
+
+def _checkpoint_ctx(tmp_path, repo, run_id: str) -> lifecycle_propose._CheckpointContext:
+    return lifecycle_propose._CheckpointContext(
+        checks=(), repo_dir=str(repo), role_budget_usd={}, tier_budget_usd={},
+        runs_dir=tmp_path, run_id=run_id, task="TICKET-1",
+    )
+
+
+def _checkpoint_stop(patch: str) -> lifecycle_propose.BudgetStop:
+    return lifecycle_propose.BudgetStop(
+        role="build", thread="t", session="s1", spent_usd=0.5, detail="checkpoint",
+        partial_patch=patch, checkpoint_index=0, num_turns=3,
+    )
+
+
+def _last_ledger_line(tmp_path, run_id: str) -> dict:
+    lines = (tmp_path / f"{run_id}.checkpoints.jsonl").read_text().splitlines()
+    return json.loads(lines[-1])
+
+
+def test_an_untracked_scratch_probe_outside_surfaces_is_dropped_not_flagged(tmp_path) -> None:
+    """build-s-scratch-files-probes-diffs-outputs: a probe the build itself
+    wrote and never committed is scratch, not a surface violation."""
+    repo = _git_repo_with_tracked_debug_py(tmp_path)
+    patch = "--- a/README.md\n+++ b/README.md\n+x\n--- a/_debug_probe.py\n+++ b/_debug_probe.py\n+y\n"
+    lifecycle_propose._checkpoint_call(
+        _checkpoint_stop(patch), surfaces=["README.md"], ctx=_checkpoint_ctx(tmp_path, repo, "run-1"),
+        guide_usd=1.0, previous_patch=None,
+    )
+    line = _last_ledger_line(tmp_path, "run-1")
+    assert (line["files_outside_surfaces"], line["scratch_ignored"]) == ([], ["_debug_probe.py"])
+
+
+def test_an_untracked_non_scratch_file_outside_surfaces_still_flags(tmp_path) -> None:
+    repo = _git_repo_with_tracked_debug_py(tmp_path)
+    patch = "--- a/README.md\n+++ b/README.md\n+x\n--- a/docs/new.md\n+++ b/docs/new.md\n+y\n"
+    lifecycle_propose._checkpoint_call(
+        _checkpoint_stop(patch), surfaces=["README.md"], ctx=_checkpoint_ctx(tmp_path, repo, "run-2"),
+        guide_usd=1.0, previous_patch=None,
+    )
+    line = _last_ledger_line(tmp_path, "run-2")
+    assert (line["files_outside_surfaces"], line["scratch_ignored"]) == (["docs/new.md"], [])
+
+
+def test_a_tracked_file_named_like_scratch_still_flags_because_it_is_tracked(tmp_path) -> None:
+    repo = _git_repo_with_tracked_debug_py(tmp_path)
+    patch = "--- a/README.md\n+++ b/README.md\n+x\n--- a/debug.py\n+++ b/debug.py\n+y\n"
+    lifecycle_propose._checkpoint_call(
+        _checkpoint_stop(patch), surfaces=["README.md"], ctx=_checkpoint_ctx(tmp_path, repo, "run-3"),
+        guide_usd=1.0, previous_patch=None,
+    )
+    line = _last_ledger_line(tmp_path, "run-3")
+    assert (line["files_outside_surfaces"], line["scratch_ignored"]) == (["debug.py"], [])
