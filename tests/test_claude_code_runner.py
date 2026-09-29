@@ -901,6 +901,58 @@ def test_an_operator_cap_below_the_runaway_ceiling_still_binds(fake_claude, tmp_
     assert argv[argv.index("--max-budget-usd") + 1] == "2.0000"
 
 
+def test_a_thread_ceiling_tighter_than_the_role_ceiling_sends_what_is_left_of_it(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path)
+    runner.thread_ceiling_usd = {"T-1": (2.40, "task")}
+    argv = runner._argv(
+        model="sonnet", tier="standard", tools=[], schema=SCHEMA, system="", role="build", spent_usd=0.9, thread="T-1"
+    )
+    assert argv[argv.index("--max-budget-usd") + 1] == "1.5000"
+
+
+def test_a_thread_already_at_its_ceiling_stops_without_calling_the_cli_and_names_the_task_budget(fake_claude, tmp_path) -> None:
+    script, record, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path)
+    runner.thread_ceiling_usd = {"T-1": (2.40, "task")}
+    state = runner._thread("T-1", "build")
+    state["calls"], state["spent_usd"] = 1, 2.40
+    with pytest.raises(BudgetStop, match=r"task budget reached \(\$2\.40 = 1\.5 x budget\): split the task"):
+        runner.run(role="build", schema=SCHEMA, prompt="again", thread="T-1", task="t1")
+    assert not record.exists()
+
+
+def test_a_thread_with_no_ceiling_entry_still_stops_at_the_role_s_runaway_ceiling(fake_claude, tmp_path) -> None:
+    script, record, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "role_ceiling_usd": {"build": 6.0}}, claude_bin=str(script), cwd=tmp_path)
+    state = runner._thread("T-2", "build")
+    state["calls"], state["spent_usd"] = 3, 6.1
+    with pytest.raises(BudgetStop, match=r"runaway ceiling \$6.00 reached"):
+        runner.run(role="build", schema=SCHEMA, prompt="again", thread="T-2", task="t1")
+    assert not record.exists()
+
+
+def test_a_checkpoint_target_is_sent_as_what_is_left_of_it(fake_claude, tmp_path) -> None:
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 1.6}}, claude_bin=str(script), cwd=tmp_path)
+    argv = runner._argv(
+        model="sonnet", tier="standard", tools=[], schema=SCHEMA, system="", role="build", spent_usd=0.6,
+        checkpoint_fractions=(1.0,), checkpoint_index=0,
+    )
+    assert argv[argv.index("--max-budget-usd") + 1] == "1.0000"
+
+
+def test_a_thread_already_past_its_checkpoint_stops_there_without_calling_the_cli(fake_claude, tmp_path) -> None:
+    script, record, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, "budget_usd": {"standard": 0.5}}, claude_bin=str(script), cwd=tmp_path)
+    state = runner._thread("T-1", "build")
+    state["calls"], state["spent_usd"] = 1, 0.6
+    with pytest.raises(BudgetStop, match=r"checkpoint \$0\.50 reached") as stop:
+        runner.run(role="build", schema=SCHEMA, prompt="again", thread="T-1", checkpoint_fractions=(1.0, 2.0))
+    assert not record.exists()
+    assert (stop.value.checkpoint_index, state["checkpoint_index"]) == (0, 1)
+
+
 def _bounds_file(tmp_path: Path, rows: list[dict]) -> Path:
     path = tmp_path / "bounds.json"
     path.write_text(json.dumps({"generated": "2026-09-16", "db": "stats.db", "rows": rows}), encoding="utf-8")
@@ -1811,7 +1863,7 @@ def test_checkpoint_fractions_stop_the_session_in_order(sequenced_claude, tmp_pa
     assert second.value.num_turns == 20
     calls_argv = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
     assert calls_argv[0][calls_argv[0].index("--max-budget-usd") + 1] == "0.5000", "1.0x the 0.5 guide"
-    assert calls_argv[1][calls_argv[1].index("--max-budget-usd") + 1] == "1.0000", "2.0x the 0.5 guide"
+    assert calls_argv[1][calls_argv[1].index("--max-budget-usd") + 1] == "0.5000", "2.0x the 0.5 guide, less the 0.5 already spent"
 
 
 def test_a_node_cap_below_the_checkpoint_bounds_it_and_is_named_as_the_cause(sequenced_claude, tmp_path) -> None:
@@ -1872,10 +1924,10 @@ _GUIDE_ROW = {"role": "build", "model": "sonnet", "strict": 0.5, "moderate": 0.5
 
 
 @pytest.mark.parametrize(("rows", "second_limit"), [
-    ([{**_GUIDE_ROW, "n": 25, "checkpoint_fractions": [1.0, 3.0]}], "1.5000"),
-    ([{**_GUIDE_ROW, "n": 10, "checkpoint_fractions": [1.0, 3.0]}], "1.0000"),
-    ([{**_GUIDE_ROW, "n": 25}], "1.0000"),
-    (None, "1.0000"),
+    ([{**_GUIDE_ROW, "n": 25, "checkpoint_fractions": [1.0, 3.0]}], "1.0000"),
+    ([{**_GUIDE_ROW, "n": 10, "checkpoint_fractions": [1.0, 3.0]}], "0.5000"),
+    ([{**_GUIDE_ROW, "n": 25}], "0.5000"),
+    (None, "0.5000"),
 ])
 def test_the_resolved_fractions_set_each_checkpoint_on_the_session(sequenced_claude, tmp_path, rows, second_limit) -> None:
     script, set_sequence, _ = sequenced_claude
@@ -1890,7 +1942,7 @@ def test_the_resolved_fractions_set_each_checkpoint_on_the_session(sequenced_cla
         runner.run(role="build", schema=SCHEMA, prompt="build more", thread="T")
 
     limits = [a[a.index("--max-budget-usd") + 1] for a in map(json.loads, argv_log.read_text(encoding="utf-8").splitlines())]
-    assert limits == ["0.5000", second_limit], "1.0x the 0.5 guide, then the second fraction of it"
+    assert limits == ["0.5000", second_limit], "1.0x the 0.5 guide, then what is left of the second fraction of it"
     assert (first.value.checkpoint_index, second.value.checkpoint_index) == (0, 1)
 
 
