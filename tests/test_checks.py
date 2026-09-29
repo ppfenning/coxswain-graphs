@@ -102,6 +102,41 @@ def test_run_checks_failing_cmd_reports_both_counts_and_failure(tmp_path) -> Non
     assert result["outcome"] == "failed"
 
 
+def test_run_checks_pytest_exit_5_with_no_python_tests_is_skipped(tmp_path) -> None:
+    """pytest's own "no tests ran" exit is a skip, not a failure, when the tree has none."""
+    checks = [{"name": "tests", "cmd": "pytest -q"}]
+    [result] = run_checks(tmp_path, checks)
+    assert result["exit_code"] == 5
+    assert result["outcome"] == "skipped"
+    assert result["passed"] is True
+    [row] = checks_evidence([result])
+    assert row["output"] == "skipped: no Python tests"
+
+
+def test_run_checks_pytest_exit_5_with_a_test_file_present_is_a_failure(tmp_path) -> None:
+    """A Python repo that loses all its tests still fails: exit 5 with a test_*.py on disk."""
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_something.py").write_text("", encoding="utf-8")
+    checks = [{"name": "tests", "cmd": "pytest -q"}]
+    [result] = run_checks(tmp_path, checks)
+    assert result["exit_code"] == 5
+    assert result["outcome"] == "failed"
+    assert result["passed"] is False
+
+
+def test_run_checks_pytest_exit_1_is_a_failure_regardless_of_test_files(tmp_path) -> None:
+    """A real test failure (exit 1) is never rewritten to a skip."""
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_something.py").write_text("def test_x():\n    assert False\n", encoding="utf-8")
+    checks = [{"name": "tests", "cmd": "pytest -q"}]
+    [result] = run_checks(tmp_path, checks)
+    assert result["exit_code"] == 1
+    assert result["outcome"] == "failed"
+    assert result["passed"] is False
+
+
 def test_run_checks_unrunnable_cmd_is_a_harness_fault_not_a_failure(tmp_path) -> None:
     missing = tmp_path / "no-such-worktree"
     checks = [{"name": "ghost", "cmd": "true"}]
