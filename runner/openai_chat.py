@@ -7,6 +7,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+from runner.protocol import LimitStop, RunnerError
+
 
 class ChatTransportError(Exception):
     """The request never produced a usable JSON body: refused, timed out, non-2xx, or not JSON."""
@@ -58,20 +60,32 @@ def parse_response(body: dict) -> Reply | ChatError:
     )
 
 
-def post_chat(base_url: str, payload: dict, *, timeout: float) -> dict:
+def post_chat(
+    base_url: str,
+    payload: dict,
+    *,
+    timeout: float,
+    role: str | None = None,
+    bearer_token: str | None = None,
+) -> dict:
     """POST to `{base_url}/v1/chat/completions`. The base is the server root, not a path ending in /v1."""
+    headers = {"Content-Type": "application/json"}
+    if bearer_token is not None:
+        headers["Authorization"] = f"Bearer {bearer_token}"
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise ChatTransportError(f"HTTP {exc.code} from {request.full_url}") from exc
+        if exc.code in (429, 529):
+            raise LimitStop(detail=f"HTTP {exc.code} from {request.full_url}") from exc
+        raise RunnerError(f"node '{role}': HTTP {exc.code} from {request.full_url}") from exc
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-        raise ChatTransportError(f"transport failure: {exc}") from exc
+        raise RunnerError(f"node '{role}': transport failure: {exc}") from exc
     except ValueError as exc:
         raise ChatTransportError(f"response body is not JSON: {exc}") from exc

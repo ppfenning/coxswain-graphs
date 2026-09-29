@@ -9,13 +9,13 @@ from fake_openai_server import FakeOpenAIServer
 
 from runner.openai_chat import (
     ChatError,
-    ChatTransportError,
     Reply,
     build_request,
     parse_response,
     post_chat,
     wire_model,
 )
+from runner.protocol import LimitStop, RunnerError
 
 
 def test_wire_model_strips_the_vendor_prefix():
@@ -67,14 +67,33 @@ def test_post_chat_returns_the_body_and_hits_the_completions_path():
     assert server.requests == [{"path": "/v1/chat/completions", "body": {"model": "m"}}]
 
 
-def test_post_chat_raises_naming_a_500_status():
-    with FakeOpenAIServer([(500, {"error": "boom"})]) as server, pytest.raises(ChatTransportError, match="500"):
-        post_chat(server.base_url, {"model": "m"}, timeout=5)
+def test_post_chat_on_a_500_raises_runner_error_naming_the_role():
+    with (
+        FakeOpenAIServer([(500, {"error": "boom"})]) as server,
+        pytest.raises(RunnerError, match="worker"),
+    ):
+        post_chat(server.base_url, {"model": "m"}, timeout=5, role="worker")
 
 
 def test_post_chat_raises_on_a_closed_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    with pytest.raises(ChatTransportError):
+    with pytest.raises(RunnerError):
         post_chat(f"http://127.0.0.1:{port}", {"model": "m"}, timeout=2)
+
+
+def test_post_chat_with_a_bearer_token_sends_the_authorization_header():
+    with FakeOpenAIServer(["hello"]) as server:
+        post_chat(server.base_url, {"model": "m"}, timeout=5, bearer_token="tok")
+    assert server.headers[0]["Authorization"] == "Bearer tok"
+
+
+def test_post_chat_on_a_429_raises_limit_stop():
+    with FakeOpenAIServer([(429, {"error": "rate limited"})]) as server, pytest.raises(LimitStop):
+        post_chat(server.base_url, {"model": "m"}, timeout=5)
+
+
+def test_post_chat_on_a_529_raises_limit_stop():
+    with FakeOpenAIServer([(529, {"error": "overloaded"})]) as server, pytest.raises(LimitStop):
+        post_chat(server.base_url, {"model": "m"}, timeout=5)
