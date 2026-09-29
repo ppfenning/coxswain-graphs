@@ -676,16 +676,31 @@ def _touched_paths(patch: str) -> list[str]:
     ]
 
 
+def _is_test_path(path: str) -> bool:
+    """Whether `path` is a test, a test fixture or a test snapshot: under a `tests/` or `test/` directory, named
+    `test_*.py` or `*_test.py`, or an insta `.snap` file."""
+    parts = path.split("/")
+    name = parts[-1]
+    return (
+        any(part in ("tests", "test") for part in parts[:-1])
+        or (name.startswith("test_") and name.endswith(".py"))
+        or name.endswith(("_test.py", ".snap"))
+    )
+
+
 def _files_outside_surfaces(touched: Sequence[str], surfaces: Sequence[str]) -> list[str]:
     """`touched` paths not named in `surfaces`; empty whenever `surfaces` is empty.
 
     A surface written `path (new)` names the path; the marker is the
-    decompose's note that the file does not exist yet, not part of it.
+    decompose's note that the file does not exist yet, not part of it. A
+    surface ending in `/` covers everything under it. Tests go with any
+    change, so a test path is never outside; review still judges it.
     """
     if not surfaces:
         return []
     declared = {re.sub(r"\s*\([^)]*\)\s*$", "", str(s_)) for s_ in surfaces}
-    return [path for path in touched if path not in declared]
+    dirs = tuple(d for d in declared if d.endswith("/"))
+    return [path for path in touched if path not in declared and not path.startswith(dirs) and not _is_test_path(path)]
 
 
 _SCRATCH_SUFFIXES = (".diff", ".patch", ".out", ".log", ".orig", ".rej")
