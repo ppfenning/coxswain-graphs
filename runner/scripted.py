@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from runner.decision_log import RouterDecision
 from runner.protocol import NodeResult, RunnerError
 from runner.tier_resolution import Hints
 
@@ -46,6 +47,7 @@ class ScriptedRunner:
         thread: str | None = None,
         budget_usd: float | None = None,
         task: str | None = None,
+        router_decision: RouterDecision | None = None,
         wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
         # `task` is not recorded on `.calls` — this double replays graphs whose

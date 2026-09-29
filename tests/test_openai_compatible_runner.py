@@ -242,3 +242,20 @@ def test_an_unknown_prefix_raises_without_building_the_delegate() -> None:
     with FakeOpenAIServer([]) as server, pytest.raises(RunnerError, match="deep"):
         _hybrid(server, factory).run(role="r", tier="deep", schema=SCHEMA, prompt="go")
     assert factory.built == []
+
+
+def test_a_paused_run_waits_before_the_request_and_before_the_retry() -> None:
+    seen: list[int] = []
+    with FakeOpenAIServer(['{"ok": "yes"}', '{"ok": true}']) as server:
+        _runner(server).run(
+            role="r", tier="cheap", schema=SCHEMA, prompt="go", wait_if_paused=lambda: seen.append(len(server.requests))
+        )
+    assert seen == [0, 1]
+
+
+def test_the_delegate_gets_the_pause_hook() -> None:
+    factory = _Factory()
+    hook = lambda: None  # noqa: E731
+    with FakeOpenAIServer([]) as server:
+        _hybrid(server, factory).run(role="r", tier="standard", schema=SCHEMA, prompt="go", wait_if_paused=hook)
+    assert factory.delegate.runs[0]["wait_if_paused"] is hook

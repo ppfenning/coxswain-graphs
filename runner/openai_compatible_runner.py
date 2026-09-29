@@ -227,6 +227,7 @@ class OpenAICompatibleRunner:
         budget_usd: float | None = None,
         task: str | None = None,
         router_decision: RouterDecision | None = None,
+        wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
         # `thread` is accepted for the protocol and ignored: each call is one stateless request.
         # `budget_usd` is recorded on the decision as given and never spent against: a local call is free.
@@ -266,6 +267,7 @@ class OpenAICompatibleRunner:
                 budget_usd=budget_usd,
                 task=task,
                 router_decision=router_decision,
+                wait_if_paused=wait_if_paused,
                 model=model_id.removeprefix(ANTHROPIC_PREFIX),
             )
         if not model_id.startswith(LOCAL_PREFIX):
@@ -292,6 +294,9 @@ class OpenAICompatibleRunner:
             ),
             effort=None,
         )
+        # A paused run waits before the request and before its one retry, as it does before a Claude Code call.
+        wait = wait_if_paused or (lambda: None)
+        wait()
         if not schema:
             record, reply = self._post(ask, prompt)
             self._record_to_store(record, decision)
@@ -303,6 +308,7 @@ class OpenAICompatibleRunner:
         if not errors:
             return self._answer(first_record, data, decision)
         self._record_to_store(first_record, None)
+        wait()
         second_record, _, data, errors = self._shaped(ask, retry_prompt(asked, first.text, errors), schema)
         if errors:
             self._record_to_store(second_record, None)
