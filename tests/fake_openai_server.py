@@ -20,11 +20,13 @@ class FakeOpenAIServer:
     """Serves `replies` in order. A str is a 200 chat reply; a `(status, body)` pair is sent as given.
 
     `requests` records `{"path": ..., "body": ...}` for every request received.
+    `headers` records the request headers, as a plain dict, in the same order.
     """
 
     def __init__(self, replies: list[Scripted]) -> None:
         self._replies = list(replies)
         self.requests: list[dict] = []
+        self.headers: list[dict] = []
         lock = threading.Lock()
         outer = self
 
@@ -33,6 +35,7 @@ class FakeOpenAIServer:
                 raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 with lock:
                     outer.requests.append({"path": self.path, "body": json.loads(raw)})
+                    outer.headers.append(dict(self.headers))
                     reply = outer._replies.pop(0) if outer._replies else (500, {"error": "no scripted reply left"})
                 status, body = (200, _chat_body(reply)) if isinstance(reply, str) else reply
                 data = json.dumps(body).encode("utf-8")

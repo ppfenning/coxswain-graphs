@@ -193,10 +193,13 @@ class OpenAICompatibleRunner:
         }
         payload = build_request(wire_model(ask.model_id), ask.system, prompt, self.max_tokens, TEMPERATURE)
         try:
-            reply = parse_response(post_chat(self.base_url, payload, timeout=self.timeout))
-        except ChatTransportError as exc:
+            reply = parse_response(post_chat(self.base_url, payload, timeout=self.timeout, role=ask.role))
+        except (ChatTransportError, RunnerError) as exc:
             self.calls.append(record)
             self._record_to_store(record, None)
+            # LimitStop subclasses RunnerError. Re-raise it unwrapped, or a rate limit reads as a node failure.
+            if isinstance(exc, RunnerError):
+                raise
             raise RunnerError(f"node '{ask.role}' could not reach the endpoint: {exc}") from exc
         if isinstance(reply, ChatError):
             self.calls.append(record)

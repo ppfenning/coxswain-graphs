@@ -11,7 +11,7 @@ from harness.store_migrate import open_store
 from harness.store_write import Store
 from runner.anthropic_runner import AnthropicRunner
 from runner.openai_compatible_runner import TEXT_SCHEMA, OpenAICompatibleRunner
-from runner.protocol import NodeResult, RunnerError
+from runner.protocol import LimitStop, NodeResult, RunnerError
 from tests.fake_openai_server import FakeOpenAIServer
 
 ENV_VAR = "LOCAL_LLM_URL"
@@ -129,6 +129,13 @@ def test_a_tier_that_resolves_to_a_non_local_model_raises_naming_the_tier() -> N
     with FakeOpenAIServer([]) as server, pytest.raises(RunnerError, match="deep"):
         _runner(server).run(role="r", tier="deep", schema=None, prompt="go")
     assert server.requests == []
+
+
+def test_a_429_raises_limit_stop_and_records_one_failed_call() -> None:
+    with FakeOpenAIServer([(429, {"error": "rate limited"})]) as server, pytest.raises(LimitStop):
+        runner = _runner(server)
+        runner.run(role="r", tier="cheap", schema=None, prompt="go")
+    assert [c["ok"] for c in runner.calls] == [False]
 
 
 def test_capabilities_come_from_the_profile_and_close_is_a_no_op() -> None:
