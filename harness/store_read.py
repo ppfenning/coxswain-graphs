@@ -303,15 +303,20 @@ def build_task_history(conn: Connection, repo: str, since: str) -> list[tuple[st
     surfaces a ticket declares up front. `build_cost_usd` is the sum of that
     task's `build`-role `node_calls.cost_usd`, found by a correlated
     subquery rather than a join so no `GROUP BY` is needed over the JSON
-    `record_json` column. A row with no `change_facts.files_touched` list —
-    an older record, or one whose build never reached that point — is not
-    history yet and is skipped rather than raised on.
+    `record_json` column. The subquery matches on `run_id` and `task_id`
+    only — build `node_calls` rows carry an empty `phase_id`, not the
+    task's real one, so a `phase_id` condition would never match. A row
+    with no `change_facts.files_touched` list — an older record, or one
+    whose build never reached that point — is not history yet and is
+    skipped rather than raised on, and so is a row whose computed build
+    cost is 0: a task record with no recorded build call is not a $0
+    data point.
     """
     p = conn.dialect.placeholder
     sql = (
         f"SELECT t.record_json,"
         f" (SELECT COALESCE(SUM(c.cost_usd), 0) FROM node_calls c"
-        f"  WHERE c.run_id = t.run_id AND c.phase_id = t.phase_id AND c.task_id = t.task_id AND c.role = {p})"
+        f"  WHERE c.run_id = t.run_id AND c.task_id = t.task_id AND c.role = {p})"
         f" FROM task_records t"
         f" WHERE t.updated_at >= {p}"
         f" ORDER BY t.updated_at"
@@ -321,6 +326,8 @@ def build_task_history(conn: Connection, repo: str, since: str) -> list[tuple[st
         record = json_load(record_json) or {}
         files = (record.get("change_facts") or {}).get("files_touched")
         if not isinstance(files, list):
+            continue
+        if not cost:
             continue
         history.append((repo, len(files), float(cost)))
     return history
