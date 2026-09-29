@@ -252,8 +252,9 @@ def test_an_ordinal_needs_key_naming_no_listed_task_fails_as_invalid_output(cart
         )
 
 
-def test_default_slug_mode_applies_no_ordinal_validation_and_prefixes_unchanged(cart) -> None:
-    """A `needs` key naming no listed task would fail ordinal mode; slug mode passes it through unchanged."""
+def test_default_slug_mode_applies_no_ordinal_validation_but_still_drops_a_foreign_need(cart) -> None:
+    """Ordinal mode would fail a `needs` key naming no listed task; slug mode does not — but the
+    plan-level needs validation still drops it once no task in the finished plan carries that id."""
     dangling = {
         "phases": [{"id": "p1", "goal": "foundations"}],
         "tasks": [
@@ -273,7 +274,8 @@ def test_default_slug_mode_applies_no_ordinal_validation_and_prefixes_unchanged(
         result = initiative_decompose.run(dict(args, **task_ids_arg), ScriptedRunner({"decompose": dangling}))
         task = result["tasks"][0]
         assert task["id"] == "I412-schema-probe"
-        assert task["needs"] == ["I412-phantom"]
+        assert task["needs"] == []
+        assert task["needs_dropped"] == ["I412-phantom"]
 
 
 # ── the adversary on the DAG ───────────────────────────────────────────────
@@ -485,6 +487,65 @@ def test_a_second_unresolved_set_after_the_adversarys_attempt_quarantines_the_ru
             {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": [{"repo": "g", "path": "g/other.py"}]},
             runner,
         )
+
+
+def test_a_misplaced_test_surface_is_corrected_to_the_real_tests_path(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [
+            {
+                "id": "t1",
+                "phase": "p1",
+                "title": "a",
+                "body": "b",
+                "needs": [],
+                "surfaces": ["agent_tools/tests/test_route.py"],
+            }
+        ],
+    }
+    runner = ScriptedRunner({"decompose": decomposition})
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": [{"repo": "g", "path": "tests/test_route.py"}]},
+        runner,
+    )
+    task = result["tasks"][0]
+    assert task["surfaces"] == ["tests/test_route.py"]
+    proposal = next(p for p in result["proposals"] if p["target"] == "t1")
+    assert {
+        "check": "surface corrected",
+        "output": "agent_tools/tests/test_route.py -> tests/test_route.py",
+    } in proposal["evidence"]
+
+
+def test_a_missing_non_test_surface_fails_the_node_as_invalid_output(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["graphs/nope.py"]}],
+    }
+    runner = ScriptedRunner({"decompose": decomposition})
+    with pytest.raises(ContractViolation, match="graphs/nope.py"):
+        initiative_decompose.run(
+            {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": [{"repo": "g", "path": "g/other.py"}]},
+            runner,
+        )
+
+
+def test_a_needs_entry_naming_a_task_absent_from_the_plan_is_dropped(cart) -> None:
+    decomposition = {
+        **DECOMPOSITION,
+        "tasks": [
+            {"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": []},
+            {"id": "t2", "phase": "p1", "title": "b", "body": "b", "needs": ["t1", "ghost"], "surfaces": []},
+        ],
+    }
+    result = decompose(cart, decomposition)
+    t2 = next(t for t in result["tasks"] if t["id"] == "t2")
+    assert t2["needs"] == ["t1"]
+    proposal = next(p for p in result["proposals"] if p["target"] == "t2")
+    assert {
+        "check": "needs dropped",
+        "output": "t2: dropped 'ghost', not a task id in this plan",
+    } in proposal["evidence"]
 
 
 def test_a_task_whose_surfaces_span_two_repos_is_split_one_per_repo(cart) -> None:

@@ -227,6 +227,77 @@ def _unresolved_pairs(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping
     ]
 
 
+def _tests_replacement(surface: str, tree: Sequence[Mapping[str, Any]]) -> str | None:
+    """The `tests/`-rooted tree path whose file name matches `surface`'s, else None."""
+    name = surface.rsplit("/", 1)[-1]
+    return next(
+        (
+            str(row.get("path"))
+            for row in tree
+            if str(row.get("path")).startswith("tests/") and str(row.get("path")).rsplit("/", 1)[-1] == name
+        ),
+        None,
+    )
+
+
+def _validate_plan_surfaces(
+    tasks: list[dict[str, Any]], tree: Sequence[Mapping[str, Any]]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """New task dicts with a real `tests/` path swapped in for a misplaced one; `(task, surface)` hard failures.
+
+    Runs ahead of the prose-oriented resolution below: a surface that is
+    `(new)`, is not path-shaped, or already resolves against `tree` is left
+    for that code to handle exactly as it does today. What is left is a
+    well-formed path that simply names the wrong location — a build defect,
+    not prose for the adversary to interpret, so a `tests/` rename is
+    corrected here and anything else fails the node outright.
+    """
+    new_tasks: list[dict[str, Any]] = []
+    failures: list[str] = []
+    for task in tasks:
+        surfaces = task.get("surfaces") or []
+        resolved, unresolved = resolve_surfaces(surfaces, tree)
+        still_prose = set(unresolved)
+        fixes: list[str] = []
+        new_surfaces: list[str] = []
+        for surface in surfaces:
+            candidate = surface
+            eligible = (
+                candidate in still_prose
+                and not candidate.endswith(" (new)")
+                and _looks_like_a_surface(candidate)
+            )
+            if not eligible:
+                new_surfaces.append(surface)
+                continue
+            replacement = _tests_replacement(candidate, tree)
+            if replacement is None:
+                failures.append(f"{task['id']}: {surface}")
+                new_surfaces.append(surface)
+                continue
+            fixes.append(f"{surface} -> {replacement}")
+            new_surfaces.append(replacement)
+        new_tasks.append(dict(task, surfaces=new_surfaces, surface_fixes=fixes))
+    return new_tasks, failures
+
+
+def _drop_foreign_needs(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """New task dicts; a `needs` entry naming no id in this plan is removed and recorded.
+
+    A foreign id names real work, just not work this plan orders by an edge —
+    it lands on its own schedule, so dropping the edge is correct, not a
+    workaround for a decompose mistake.
+    """
+    ids = {str(t["id"]) for t in tasks}
+    new_tasks: list[dict[str, Any]] = []
+    for task in tasks:
+        needs = task.get("needs") or []
+        kept = [n for n in needs if n in ids]
+        dropped = [n for n in needs if n not in ids]
+        new_tasks.append(dict(task, needs=kept, needs_dropped=dropped))
+    return new_tasks
+
+
 def _apply_corrections(tasks: list[dict[str, Any]], corrections: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """New task dicts; a corrected surface replaces the prose the adversary named, nothing else."""
     by_task: dict[str, dict[str, str]] = {}
@@ -433,6 +504,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 
     tree = list(args.get("tree") or [])
     if tree:
+        tasks, surface_failures = _validate_plan_surfaces(tasks, tree)
+        if surface_failures:
+            raise ContractViolation(
+                "plan surface not found in the checkout: " + "; ".join(surface_failures)
+            )
         problems = _unresolved_pairs(tasks, tree)
         if problems:
             # An unresolved surface is a decompose defect, never a task to
@@ -524,6 +600,10 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         for t in tasks
     ]
 
+    # This plan's own task ids are the only valid `needs` targets — a foreign
+    # id names real work, just ordered by landing rather than by an edge.
+    tasks = _drop_foreign_needs(tasks)
+
     shape = epic_shape(
         cartridge,
         phases=len({t["phase"] for t in tasks}),
@@ -557,6 +637,14 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     [{"check": "lint", "output": "; ".join(task.get("lint") or [])}]
                     if task.get("lint")
                     else []
+                ),
+                *(
+                    {"check": "surface corrected", "output": fix}
+                    for fix in task.get("surface_fixes") or []
+                ),
+                *(
+                    {"check": "needs dropped", "output": f"{task['id']}: dropped {dropped!r}, not a task id in this plan"}
+                    for dropped in task.get("needs_dropped") or []
                 ),
             ],
             rationale=_strip_trailing_tag(str(task.get("body") or decomposition.get("rationale", ""))),
