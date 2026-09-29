@@ -14,9 +14,11 @@ Offline throughout: real `git` and `sys.executable`, no network.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -102,9 +104,15 @@ def test_run_checks_failing_cmd_reports_both_counts_and_failure(tmp_path) -> Non
     assert result["outcome"] == "failed"
 
 
+# This interpreter's own pytest by absolute path: a land runs the suite as `.venv/bin/python -m pytest`
+# without the venv on PATH, where a bare `pytest` exits 127. The name still ends in `pytest`, which is
+# what `_is_pytest_cmd` keys on.
+_PYTEST_Q = f"{shlex.quote(str(Path(sys.executable).with_name('pytest')))} -q"
+
+
 def test_run_checks_pytest_exit_5_with_no_python_tests_is_skipped(tmp_path) -> None:
     """pytest's own "no tests ran" exit is a skip, not a failure, when the tree has none."""
-    checks = [{"name": "tests", "cmd": "pytest -q"}]
+    checks = [{"name": "tests", "cmd": _PYTEST_Q}]
     [result] = run_checks(tmp_path, checks)
     assert result["exit_code"] == 5
     assert result["outcome"] == "skipped"
@@ -118,7 +126,7 @@ def test_run_checks_pytest_exit_5_with_a_test_file_present_is_a_failure(tmp_path
     tests_dir = tmp_path / "tests"
     tests_dir.mkdir()
     (tests_dir / "test_something.py").write_text("", encoding="utf-8")
-    checks = [{"name": "tests", "cmd": "pytest -q"}]
+    checks = [{"name": "tests", "cmd": _PYTEST_Q}]
     [result] = run_checks(tmp_path, checks)
     assert result["exit_code"] == 5
     assert result["outcome"] == "failed"
@@ -130,7 +138,7 @@ def test_run_checks_pytest_exit_1_is_a_failure_regardless_of_test_files(tmp_path
     tests_dir = tmp_path / "tests"
     tests_dir.mkdir()
     (tests_dir / "test_something.py").write_text("def test_x():\n    assert False\n", encoding="utf-8")
-    checks = [{"name": "tests", "cmd": "pytest -q"}]
+    checks = [{"name": "tests", "cmd": _PYTEST_Q}]
     [result] = run_checks(tmp_path, checks)
     assert result["exit_code"] == 1
     assert result["outcome"] == "failed"
