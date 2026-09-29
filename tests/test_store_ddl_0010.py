@@ -28,8 +28,8 @@ def test_a_database_at_version_nine_gains_paused_at_and_status_and_old_rows_read
             "INSERT INTO leases (name, holder, epoch, heartbeat_at, expires_at)"
             " VALUES ('l1', 'h1', 1, 'T0', 'T1')"
         )
-        assert migrate(c, NOW2, default_modules()) == 10
-        assert check_version(c) == (10, 10)
+        assert migrate(c, NOW2, default_modules()) == 11
+        assert check_version(c) == (11, 11)
         assert _shape(c, "runs")["paused_at"] == ("TEXT", True, None)
         assert _shape(c, "leases")["status"] == ("TEXT", True, None)
         assert c.query_all("SELECT run_id, paused_at FROM runs") == [("r1", None)]
@@ -48,7 +48,7 @@ def test_applying_again_changes_nothing(store_conn):
     versions = store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")
     runs_shape = _shape(store_conn, "runs")
     leases_shape = _shape(store_conn, "leases")
-    assert migrate(store_conn, NOW2, default_modules()) == 10
+    assert migrate(store_conn, NOW2, default_modules()) == 11
     assert store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version") == versions
     assert _shape(store_conn, "runs") == runs_shape
     assert _shape(store_conn, "leases") == leases_shape

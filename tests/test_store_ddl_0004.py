@@ -43,7 +43,7 @@ def test_task_records_has_the_listed_columns_and_composite_key():
 
 
 def test_a_fresh_store_reaches_the_newest_version(store_conn):
-    assert check_version(store_conn) == (10, 10)
+    assert check_version(store_conn) == (11, 11)
     assert store_conn.query_all("SELECT run_id FROM task_records") == []
 
 
@@ -73,9 +73,9 @@ def test_applying_again_is_a_no_op():
     c = open_store("sqlite:///:memory:", NOW1)
     try:
         insert(c, "t1", {"n": 1})
-        assert migrate(c, NOW2, default_modules()) == 10
+        assert migrate(c, NOW2, default_modules()) == 11
         assert c.query_all("SELECT version FROM schema_version ORDER BY version") == [
-            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,),
+            (1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,),
         ]
         assert c.query_all("SELECT COUNT(*) FROM task_records") == [(1,)]
     finally:
