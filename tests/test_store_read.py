@@ -431,7 +431,8 @@ def _third_party_roots_with_the_harness_package_stubbed():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
     # Interpreter and virtualenv machinery (__main__, _virtualenv, editable finders, cython_runtime) is not an import.
-    return {n for n in ast.literal_eval(out) if not n.startswith("_") and n != "cython_runtime"}
+    # site.py imports sitecustomize at interpreter startup, before store_read runs, so store_read does not pull it in.
+    return {n for n in ast.literal_eval(out) if not n.startswith("_") and n not in ("cython_runtime", "sitecustomize")}
 
 
 def test_store_read_and_what_it_imports_pull_no_module_outside_harness_and_runner():

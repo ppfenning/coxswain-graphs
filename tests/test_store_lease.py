@@ -30,6 +30,11 @@ def _epoch(conn):
     return None if row is None else row[0]
 
 
+def _status(conn):
+    row = conn.query_one(f"SELECT status FROM leases WHERE name = {conn.dialect.placeholder}", (NAME,))
+    return None if row is None else row[0]
+
+
 def test_expiry_adds_ttl_seconds_in_fixed_form():
     assert _expiry(T0, 30) == "2026-09-24T00:00:30Z"
 
@@ -94,6 +99,19 @@ def test_renew_fails_on_wrong_holder_wrong_epoch_and_after_release(conn):
     assert renew(conn, NAME, "a", 2, T10, 30) is False
     release(conn, NAME, "a", 1)
     assert renew(conn, NAME, "a", 1, T10, 30) is False
+
+
+def test_renew_with_status_sets_it_and_a_later_renew_with_none_clears_it(conn):
+    acquire(conn, NAME, "a", T0, 30)
+    assert renew(conn, NAME, "a", 1, T10, 30, status="paused") is True
+    assert _status(conn) == "paused"
+    assert renew(conn, NAME, "a", 1, T10, 30, status=None) is True
+    assert _status(conn) is None
+
+
+def test_acquire_on_a_fresh_lease_leaves_status_none(conn):
+    acquire(conn, NAME, "a", T0, 30)
+    assert _status(conn) is None
 
 
 def test_release_with_a_stale_epoch_or_holder_changes_nothing(conn):

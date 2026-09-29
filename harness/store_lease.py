@@ -21,14 +21,16 @@ _COLUMNS = ("name", "holder", "epoch", "heartbeat_at", "expires_at")
 
 # `?` is the placeholder token; `_sql` swaps in the engine's own.
 _TAKE = (
-    "UPDATE leases SET holder = ?, epoch = epoch + 1, heartbeat_at = ?, expires_at = ? "
+    "UPDATE leases SET holder = ?, epoch = epoch + 1, heartbeat_at = ?, expires_at = ?, status = NULL "
     "WHERE name = ? AND (expires_at <= ? OR holder = ?)"
 )
 _STEAL = (
-    "UPDATE leases SET holder = ?, epoch = epoch + 1, heartbeat_at = ?, expires_at = ? WHERE name = ? AND epoch = ?"
+    "UPDATE leases SET holder = ?, epoch = epoch + 1, heartbeat_at = ?, expires_at = ?, status = NULL "
+    "WHERE name = ? AND epoch = ?"
 )
 _RENEW = (
-    "UPDATE leases SET heartbeat_at = ?, expires_at = ? WHERE name = ? AND holder = ? AND epoch = ? AND expires_at > ?"
+    "UPDATE leases SET heartbeat_at = ?, expires_at = ?, status = ? "
+    "WHERE name = ? AND holder = ? AND epoch = ? AND expires_at > ?"
 )
 _RELEASE = "UPDATE leases SET expires_at = ? WHERE name = ? AND holder = ? AND epoch = ?"
 _READ = "SELECT name, holder, epoch, heartbeat_at, expires_at FROM leases WHERE name = ?"
@@ -97,10 +99,13 @@ def acquire(conn: Connection, name: str, holder: str, now: str, ttl: int, steal:
         return LeaseResult(False, None if row is None else int(row[2]), None if row is None else row[1])
 
 
-def renew(conn: Connection, name: str, holder: str, epoch: int, now: str, ttl: int) -> bool:
-    """Extend a live lease. An expired or released lease is not revived: the holder must acquire again."""
+def renew(conn: Connection, name: str, holder: str, epoch: int, now: str, ttl: int, status: str | None = None) -> bool:
+    """Extend a live lease. An expired or released lease is not revived: the holder must acquire again.
+
+    `status` is written verbatim, including None to clear a prior heartbeat status.
+    """
     at = _stamp(now)
-    return conn.execute(_sql(conn.dialect, _RENEW), (at, _expiry(now, ttl), name, holder, epoch, at)) == 1
+    return conn.execute(_sql(conn.dialect, _RENEW), (at, _expiry(now, ttl), status, name, holder, epoch, at)) == 1
 
 
 def release(conn: Connection, name: str, holder: str, epoch: int) -> bool:
