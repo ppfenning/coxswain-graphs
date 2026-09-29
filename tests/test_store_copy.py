@@ -23,6 +23,7 @@ EXPECTED_ORDER = (
     "leases",
     "chair_actions",
     "hosts",
+    "id_sequence",
 )
 
 SEED = {
@@ -55,6 +56,7 @@ SEED = {
         {"initiative": "i1", "task_id": "t1", "phase": "p1", "state": "ready", "needs_json": "[]",
          "updated_at": "2026-09-25T00:00:00Z", "updated_by": "chair"},
     ],
+    "id_sequence": [{"scope": "initiative", "next": 1}],
 }
 
 
@@ -192,6 +194,18 @@ def test_a_changed_host_state_is_refreshed_in_the_destination(src_url, dst_url):
     dst = open_store(dst_url, T0)
     try:
         assert dst.query_one("SELECT state FROM hosts WHERE name = 'jarvis'") == ("draining",)
+    finally:
+        dst.close()
+
+
+def test_a_bumped_id_sequence_counter_is_refreshed_in_the_destination(src_url, dst_url):
+    sc.copy(src_url, dst_url, T0)
+    _update_source(src_url, "UPDATE id_sequence SET next = 7 WHERE scope = 'initiative'")
+    again = sc.copy(src_url, dst_url, T0)
+    assert (again["id_sequence"]["copied"], again["id_sequence"]["refreshed"]) == (0, 1)
+    dst = open_store(dst_url, T0)
+    try:
+        assert dst.query_one("SELECT next FROM id_sequence WHERE scope = 'initiative'") == (7,)
     finally:
         dst.close()
 

@@ -191,7 +191,7 @@ def test_a_store_migrated_from_version_two_reads_an_existing_run_with_host_null(
     real = default_modules()
     assert migrate(conn, NOW, real[:2]) == 2
     conn.execute("INSERT INTO runs (run_id, status) VALUES ('r1', 'done')")
-    assert migrate(conn, NOW, real) == 10
+    assert migrate(conn, NOW, real) == 11
     assert conn.query_all("SELECT run_id, status, host FROM runs") == [("r1", "done", None)]
 
 
@@ -202,13 +202,13 @@ def test_a_store_migrated_from_version_nine_reads_an_existing_run_and_lease_with
     conn.execute(
         "INSERT INTO leases (name, holder, epoch, heartbeat_at, expires_at) VALUES ('l1', 'h1', 1, 'T0', 'T1')"
     )
-    assert migrate(conn, NOW, real) == 10
+    assert migrate(conn, NOW, real) == 11
     assert conn.query_all("SELECT run_id, paused_at FROM runs") == [("r1", None)]
     assert conn.query_all("SELECT name, status FROM leases") == [("l1", None)]
 
 
 def test_a_fresh_store_is_at_the_newest_version_and_runs_has_a_host_column(store_conn):
-    assert check_version(store_conn) == (10, 10)
+    assert check_version(store_conn) == (11, 11)
     assert store_conn.query_all("SELECT host FROM runs") == []
     assert store_conn.query_all("SELECT paused_at FROM runs") == []
     assert store_conn.query_all("SELECT status FROM leases") == []
