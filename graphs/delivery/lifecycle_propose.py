@@ -753,15 +753,23 @@ class _CheckpointContext(NamedTuple):
     runs_dir: Path | None
     run_id: str
     task: str
+    checkpoint_fractions: tuple[float, ...]
+    checkpoint_source: str
 
 
-def _checkpoint_context(cartridge: Mapping[str, Any], raw_runner: Any, run_id: str, ticket: Any) -> _CheckpointContext:
+def _checkpoint_context(
+    cartridge: Mapping[str, Any], raw_runner: Any, run_id: str, ticket: Any, task_budget_usd: float | None = None
+) -> _CheckpointContext:
     """The ticket's named checks and the runner facts a checkpoint reads.
 
     Read off the raw runner, not the `_Elevated` wrapper, which forwards no
     attributes: a `getattr` through it finds nothing. `runs_dir` is the same
     attribute `ClaudeCodeRunner` kept for the old per-call `calls.jsonl`
     ledger; nothing reads that ledger any more, so this is its only reader now.
+
+    `task_budget_usd`, given only for a build with a ticket- or
+    estimate-sourced budget, replaces `CHECKPOINT_FRACTIONS` with `(0.5,
+    1.0)` — half and full of that budget, not the bounds-derived table.
     """
     repo_dir = getattr(raw_runner, "repo_dir", None)
     runs_dir = getattr(raw_runner, "runs_dir", None)
@@ -773,6 +781,8 @@ def _checkpoint_context(cartridge: Mapping[str, Any], raw_runner: Any, run_id: s
         runs_dir=Path(runs_dir) if runs_dir else None,
         run_id=run_id,
         task=str(ticket),
+        checkpoint_fractions=(0.5, 1.0) if task_budget_usd is not None else CHECKPOINT_FRACTIONS,
+        checkpoint_source="task" if task_budget_usd is not None else "default",
     )
 
 
@@ -869,7 +879,7 @@ def _checkpoint_call(
         checks_pass=_checkpoint_checks_pass(stop.partial_patch or "", ctx.checks, ctx.repo_dir),
         files_outside_surfaces=tuple(_files_outside_surfaces(touched, surfaces)),
     )
-    decision = checkpoint_decision(signals, CHECKPOINT_FRACTIONS)
+    decision = checkpoint_decision(signals, ctx.checkpoint_fractions)
     _append_checkpoint_ledger(ctx, signals, decision)
     return decision
 
@@ -1860,6 +1870,14 @@ def _run(
     raw_build_budget_usd = args.get("build_budget_usd")
     build_budget_usd = None if raw_build_budget_usd is None else float(raw_build_budget_usd)
 
+    # A budget this graph was handed for THIS task, from the ticket or an
+    # estimate — as opposed to one that merely overrides the profile's
+    # default for the call. Only a task-sourced budget reshapes the
+    # checkpoints and sets a per-thread runaway ceiling; an ordinary
+    # override keeps today's bounds-derived behavior.
+    build_budget_source = args.get("build_budget_source")
+    task_budget = build_budget_usd is not None and build_budget_source in ("ticket", "estimate")
+
     is_work_item = bool(args.get("work_item"))
 
     context = list(cartridge.get("context") or [])
@@ -1969,9 +1987,28 @@ def _run(
     # builder's reasoning is the failure the seat exists to prevent.
     continuations = 0
     continuation_refused: str | None = None
-    checkpoint = _checkpoint_context(cartridge, raw_runner, run_id, ticket)
+    checkpoint = _checkpoint_context(
+        cartridge, raw_runner, run_id, ticket, task_budget_usd=build_budget_usd if task_budget else None
+    )
     previous_checkpoint_patch: str | None = None
     checkpoint_reason: str | None = None
+
+    # Before the first call on the thread: a task-sourced budget also sets a
+    # runaway ceiling of one and a half times itself, capped by the role's
+    # own ceiling when the runner has one. Read and written on `raw_runner`,
+    # not `runner` — `runner` may be `_Elevated` (no `__getattr__`, so a read
+    # through it finds nothing) or `_Asking` (forwards reads but a write
+    # would land on the wrapper, never on the inner runner `_shape_ceiling`
+    # actually consults), same reasoning as `_checkpoint_context` above. A
+    # raw runner with no `thread_ceiling_usd` at all (the scripted test
+    # double, an older runner) is left exactly alone.
+    if task_budget:
+        existing_thread_ceiling = getattr(raw_runner, "thread_ceiling_usd", None)
+        if existing_thread_ceiling is not None:
+            role_ceiling = (getattr(raw_runner, "role_ceiling_usd", None) or {}).get("build")
+            cap = min(1.5 * build_budget_usd, role_ceiling) if role_ceiling is not None else 1.5 * build_budget_usd
+            raw_runner.thread_ceiling_usd = {**existing_thread_ceiling, str(ticket): (cap, "task")}
+
     try:
         build = runner.run(
             role="build",
@@ -2383,6 +2420,14 @@ def _run(
                     *(
                         [{"check": "build budget", "output": f"override ${build_budget_usd} per build call"}]
                         if build_budget_usd is not None
+                        else []
+                    ),
+                    # A task-sourced budget is not merely an override: it also
+                    # shaped this build's checkpoints and its thread's runaway
+                    # ceiling, and the record names which source set it.
+                    *(
+                        [{"check": "build ceiling", "output": f"ceiling_usd=${build_budget_usd} source=task-{build_budget_source}"}]
+                        if task_budget
                         else []
                     ),
                     # Normalised into the evidence shape rather than spread raw:
