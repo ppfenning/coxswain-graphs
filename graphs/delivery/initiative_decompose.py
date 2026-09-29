@@ -32,7 +32,14 @@ from runner.decision_source import DecisionSource, NoDecisionSource, ask
 from runner.protocol import NodeRunner
 from runner.tier_resolution import Hints
 
-__all__ = ["GRAPH_NAME", "initiative_text", "resolve_surfaces", "run", "surface_problem"]
+__all__ = [
+    "GRAPH_NAME",
+    "initiative_text",
+    "resolve_surfaces",
+    "run",
+    "surface_problem",
+    "unexecuted_item_create_reason",
+]
 
 # A `/` or a file suffix, no spaces, optional trailing `(new)` marker — the
 # same shape lifecycle_propose._PATH_TOKEN checks. An all-caps bare token
@@ -45,6 +52,49 @@ def _looks_like_a_surface(entry: str) -> bool:
     if not _PATH_TOKEN.match(body):
         return False
     return "/" in body or bool(re.search(r"\.[A-Za-z0-9]{1,5}$", body)) or body.isupper()
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance: insert, delete, and substitute each cost 1."""
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        current = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+        previous = current
+    return previous[-1]
+
+
+# The declared phase in a task is the seat's own transcription of a plan id it
+# was just given — a one- or two-character slip, not a different word. Wider
+# than that and a "correction" is a guess dressed as a fix, which is exactly
+# what turned 'faulthandring-signal' into a silently accepted 'faulthandler-
+# signal' would have been: that pair sits at distance 4, outside this budget,
+# and the node fails instead of guessing.
+_PHASE_EDIT_DISTANCE_BUDGET = 2
+
+
+def _resolve_phase(phase: str, declared: Sequence[str]) -> tuple[str, str | None] | None:
+    """Resolve `phase` against the plan's declared phases.
+
+    `(phase, None)` on an exact match. `(matched, note)` when exactly one
+    declared phase is within `_PHASE_EDIT_DISTANCE_BUDGET` — `note` names the
+    correction. `None` when no declared phase is close enough, or more than
+    one ties: an ambiguous near-miss is a defect for the caller to refuse,
+    never a guess.
+    """
+    if phase in declared:
+        return phase, None
+    near = [d for d in declared if _edit_distance(phase, d) <= _PHASE_EDIT_DISTANCE_BUDGET]
+    if len(near) == 1:
+        return near[0], f'phase "{phase}" corrected to "{near[0]}"'
+    return None
+
 
 GRAPH_NAME = "initiative-decompose"
 
@@ -412,6 +462,27 @@ def _local_cycle(tasks: list[dict[str, Any]]) -> list[str]:
     return problems
 
 
+def unexecuted_item_create_reason(diffs: Sequence[Mapping[str, Any]]) -> str | None:
+    """The arm's own refusal, when every `item_create` diff was approved but none applied.
+
+    `None` when there are no `item_create` diffs, or at least one landed —
+    the run summary already counts that case correctly. `apply_decisions`
+    (harness/gate.py) never passes the arm's free-text detail into
+    `gate_diff` (core.manifest) — only `item`, `decision`, `applied`, and
+    `edited` cross that boundary — so the refusal named here is the diff's
+    own `outcome` field, the word `apply_decisions`'s docstring already
+    promises for this case: `"skipped"`.
+    """
+    item_creates = [d for d in diffs if d.get("kind") == "item_create"]
+    if not item_creates:
+        return None
+    if any(d.get("applied") for d in item_creates):
+        return None
+    if not all(d.get("decision") == "approved" for d in item_creates):
+        return None
+    return str(item_creates[0].get("outcome"))
+
+
 def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     """Run the graph. The idea arrives as an argument; nothing is read from disk."""
     cartridge = require_cartridge(args)
@@ -604,6 +675,26 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # id names real work, just ordered by landing rather than by an edge.
     tasks = _drop_foreign_needs(tasks)
 
+    # Validated before anything is proposed: a typo written the same way in
+    # both the task and the plan reaches the work-item arm looking
+    # consistent, and the arm rightly refuses to fix it silently. A
+    # near-miss that matches more than one declared phase is not corrected
+    # either — that is a guess, not a fix — so the node fails here and its
+    # existing retry runs.
+    phase_order = [str(p.get("id")) for p in decomposition.get("phases") or []]
+    resolved_tasks = []
+    for task in tasks:
+        match = _resolve_phase(str(task.get("phase")), phase_order)
+        if match is None:
+            raise ContractViolation(
+                f"task {task['id']} names phase {task.get('phase')!r}, which is not within "
+                f"edit distance {_PHASE_EDIT_DISTANCE_BUDGET} of exactly one declared phase "
+                f"({', '.join(phase_order) or 'none declared'})"
+            )
+        resolved_phase, note = match
+        resolved_tasks.append(dict(task, phase=resolved_phase, phase_correction=note) if note else task)
+    tasks = resolved_tasks
+
     shape = epic_shape(
         cartridge,
         phases=len({t["phase"] for t in tasks}),
@@ -612,7 +703,6 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     )
     landing = landing_for(cartridge, "planned")
 
-    phase_order = [str(p.get("id")) for p in decomposition.get("phases") or []]
     goals = {str(p.get("id")): str(p.get("goal") or "") for p in decomposition.get("phases") or []}
     idea_doc = {"id": initiative_id or run_id, "title": str(idea), "budget_usd": args.get("budget_usd"), "why": str(idea)}
     intake_path = args.get("intake_path")
@@ -626,6 +716,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             target=str(task["id"]),
             evidence=[
                 {"check": "phase", "output": str(task.get("phase"))},
+                *(
+                    [{"check": "phase correction", "output": task["phase_correction"]}]
+                    if task.get("phase_correction")
+                    else []
+                ),
                 {"check": "depends on", "output": ", ".join(task["needs"]) or "nothing — can start immediately"},
                 {"check": "surfaces", "output": ", ".join(task.get("surfaces") or []) or "none declared"},
                 *(
