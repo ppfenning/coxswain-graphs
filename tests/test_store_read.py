@@ -11,9 +11,10 @@ import pytest
 import harness.store_ddl_0001 as ddl1
 import harness.store_read as read
 from harness.store_dialect import POSTGRES, Connection, _sqlite_target, connect, forbidden_constructs, json_text
-from harness.store_migrate import migrate, open_store
+from harness.store_migrate import default_modules, migrate, open_store
 
 NOW = "2026-09-24T00:00:00Z"
+LATEST = len(default_modules())
 
 
 def put(conn, table, **row):
@@ -198,7 +199,7 @@ def test_connect_readonly_refuses_an_older_database_in_one_line(tmp_path):
     c.close()
     with pytest.raises(read.StoreVersionError) as err:
         read.connect_readonly(url)
-    assert str(err.value) == "store is at schema version 1, older than the 11 this code expects"
+    assert str(err.value) == f"store is at schema version 1, older than the {LATEST} this code expects"
 
 
 def test_connect_readonly_refuses_an_empty_database(tmp_path):
@@ -323,7 +324,7 @@ class FakeCursor:
         self.raw.sent.append((sql, tuple(params)))
         replies = (
             ("information_schema", [(1,)]),
-            ("MAX(version)", [(11,)]),
+            ("MAX(version)", [(LATEST,)]),
             ("FROM graphs", [("g1", "review", "1", "g1", "t", "{}")]),
             ("LEFT JOIN", [(1, 0.5, 1, 10, 5, 3)]),
         )
@@ -354,11 +355,11 @@ def test_connect_readonly_closes_a_postgres_connection_that_is_at_the_wrong_vers
 def test_connect_readonly_refuses_a_newer_database(tmp_path):
     url = f"sqlite:///{tmp_path / 'cox.db'}"
     c = open_store(url, NOW)
-    put(c, "schema_version", version=12, applied_at=NOW, description="future")
+    put(c, "schema_version", version=LATEST + 1, applied_at=NOW, description="future")
     c.close()
     with pytest.raises(read.StoreVersionError) as err:
         read.connect_readonly(url)
-    assert str(err.value) == "store is at schema version 12, newer than the 11 this code expects"
+    assert str(err.value) == f"store is at schema version {LATEST + 1}, newer than the {LATEST} this code expects"
 
 
 READERS = (
