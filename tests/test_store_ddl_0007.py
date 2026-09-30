@@ -3,6 +3,7 @@ from harness.store_migrate import default_modules, migrate, open_store
 
 NOW1 = "2026-09-24T00:00:00Z"
 NOW2 = "2026-09-25T00:00:00Z"
+LATEST = len(default_modules())
 
 COLUMNS = ["ts", "epoch", "holder", "kind", "target", "status", "reason", "action_json"]
 
@@ -38,7 +39,7 @@ def test_a_database_at_version_six_gains_chair_actions_and_keeps_work_items():
         )
         before = c.query_all("PRAGMA table_info(work_items)")
         assert c.query_all("SELECT name FROM sqlite_master WHERE name = 'chair_actions'") == []
-        assert migrate(c, NOW2, default_modules()) == 11
+        assert migrate(c, NOW2, default_modules()) == LATEST
         assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[6:7] == [(7, NOW2)]
         assert [r[1] for r in c.query_all("PRAGMA table_info(chair_actions)")] == COLUMNS
         assert c.query_all("SELECT COUNT(*) FROM chair_actions") == [(0,)]

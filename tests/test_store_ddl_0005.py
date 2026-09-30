@@ -6,6 +6,7 @@ from harness.store_migrate import check_version, default_modules, migrate
 
 NOW1 = "2026-09-24T00:00:00Z"
 NOW2 = "2026-09-25T00:00:00Z"
+LATEST = len(default_modules())
 NEW = ("cause", "cause_why")
 
 
@@ -25,8 +26,8 @@ def test_a_database_at_version_four_gains_two_nullable_columns_and_old_rows_read
     try:
         assert migrate(c, NOW1, default_modules()[:4]) == 4
         c.execute("INSERT INTO attempts (run_id, task_id, seq) VALUES ('r1', 't1', 1)")
-        assert migrate(c, NOW2, default_modules()) == 11
-        assert check_version(c) == (11, 11)
+        assert migrate(c, NOW2, default_modules()) == LATEST
+        assert check_version(c) == (LATEST, LATEST)
         found = shape(c)
         assert [found[n] for n in NEW] == [("TEXT", True, None)] * 2
         assert c.query_all("SELECT run_id, cause, cause_why FROM attempts") == [("r1", None, None)]
@@ -39,7 +40,7 @@ def test_applying_again_changes_nothing(store_conn):
     store_conn.execute("INSERT INTO attempts (run_id, task_id, seq, cause) VALUES ('r1', 't1', 1, 'x')")
     versions = store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")
     columns = shape(store_conn)
-    assert migrate(store_conn, NOW2, default_modules()) == 11
+    assert migrate(store_conn, NOW2, default_modules()) == LATEST
     assert store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version") == versions
     assert shape(store_conn) == columns
     assert store_conn.query_all("SELECT cause, cause_why FROM attempts") == [("x", None)]
