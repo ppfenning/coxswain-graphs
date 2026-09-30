@@ -6,6 +6,7 @@ from harness.store_migrate import check_version, default_modules, migrate
 
 NOW1 = "2026-09-24T00:00:00Z"
 NOW2 = "2026-09-25T00:00:00Z"
+LATEST = len(default_modules())
 TEXT_NEW = ("kind", "title", "surfaces_json", "body", "extra_json", "holder", "expires_at")
 
 
@@ -28,8 +29,8 @@ def test_a_database_at_version_eight_gains_queue_and_claim_columns_and_old_rows_
             "INSERT INTO work_items (initiative, task_id, phase, state, needs_json, updated_at, updated_by)"
             f" VALUES ('i1', 't1', 'p1', 'ready', '[]', '{NOW1}', 'chair')"
         )
-        assert migrate(c, NOW2, default_modules()) == 11
-        assert check_version(c) == (11, 11)
+        assert migrate(c, NOW2, default_modules()) == LATEST
+        assert check_version(c) == (LATEST, LATEST)
         found = shape(c)
         assert [found[n][1:] for n in TEXT_NEW] == [(True, None)] * len(TEXT_NEW)
         assert found["epoch"][1] is True
@@ -49,7 +50,7 @@ def test_applying_again_changes_nothing(store_conn):
     )
     versions = store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")
     columns = shape(store_conn)
-    assert migrate(store_conn, NOW2, default_modules()) == 11
+    assert migrate(store_conn, NOW2, default_modules()) == LATEST
     assert store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version") == versions
     assert shape(store_conn) == columns
     assert store_conn.query_all("SELECT kind, holder, epoch FROM work_items") == [("task", "me", 3)]
