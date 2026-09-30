@@ -5,6 +5,7 @@ from types import ModuleType
 
 import pytest
 
+import harness.store_migrate as store_migrate
 from harness.store_dialect import POSTGRES, SQLITE, Connection, connect
 from harness.store_migrate import (
     MigrationError,
@@ -13,6 +14,7 @@ from harness.store_migrate import (
     discover_migrations,
     migrate,
     open_store,
+    pending,
 )
 
 NOW = "2026-09-24T00:00:00Z"
@@ -191,7 +193,7 @@ def test_a_store_migrated_from_version_two_reads_an_existing_run_with_host_null(
     real = default_modules()
     assert migrate(conn, NOW, real[:2]) == 2
     conn.execute("INSERT INTO runs (run_id, status) VALUES ('r1', 'done')")
-    assert migrate(conn, NOW, real) == 11
+    assert migrate(conn, NOW, real) == len(real)
     assert conn.query_all("SELECT run_id, status, host FROM runs") == [("r1", "done", None)]
 
 
@@ -202,13 +204,14 @@ def test_a_store_migrated_from_version_nine_reads_an_existing_run_and_lease_with
     conn.execute(
         "INSERT INTO leases (name, holder, epoch, heartbeat_at, expires_at) VALUES ('l1', 'h1', 1, 'T0', 'T1')"
     )
-    assert migrate(conn, NOW, real) == 11
+    assert migrate(conn, NOW, real) == len(real)
     assert conn.query_all("SELECT run_id, paused_at FROM runs") == [("r1", None)]
     assert conn.query_all("SELECT name, status FROM leases") == [("l1", None)]
 
 
 def test_a_fresh_store_is_at_the_newest_version_and_runs_has_a_host_column(store_conn):
-    assert check_version(store_conn) == (11, 11)
+    newest = len(default_modules())
+    assert check_version(store_conn) == (newest, newest)
     assert store_conn.query_all("SELECT host FROM runs") == []
     assert store_conn.query_all("SELECT paused_at FROM runs") == []
     assert store_conn.query_all("SELECT status FROM leases") == []
@@ -222,3 +225,77 @@ def test_open_store_on_a_file_leaves_the_store_at_the_newest_real_migration(tmp_
         assert check_version(c) == (newest, newest)
     finally:
         c.close()
+
+
+class FakePG(Connection):
+    """A postgres-shaped connection that answers `_current_version` (as version 0) but refuses any write."""
+
+    def __init__(self):
+        super().__init__(raw=None, dialect=POSTGRES, begin="BEGIN")
+
+    def query_all(self, sql, params=()):
+        return []
+
+    def execute(self, sql, params=()):
+        raise AssertionError("must not write when the backup step failed")
+
+    def transaction(self):
+        raise AssertionError("must not write when the backup step failed")
+
+    def close(self):
+        pass
+
+
+def test_open_store_backs_up_the_sqlite_file_before_the_new_table_exists(tmp_path, monkeypatch):
+    monkeypatch.setenv("COX_STORE_BACKUP_DIR", str(tmp_path / "backups"))
+    monkeypatch.setattr(store_migrate, "default_modules", lambda: (fake(1, ONE),))
+    url = f"sqlite:///{tmp_path / 'x.db'}"
+    open_store(url, NOW).close()
+    backups = list((tmp_path / "backups").glob("*.sqlite"))
+    assert len(backups) == 1
+    backup = sqlite3.connect(str(backups[0]))
+    try:
+        assert backup.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall() == []
+    finally:
+        backup.close()
+
+
+def test_open_store_with_nothing_pending_writes_no_backup_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("COX_STORE_BACKUP_DIR", str(tmp_path / "backups"))
+    monkeypatch.setattr(store_migrate, "default_modules", lambda: (fake(1, ONE),))
+    url = f"sqlite:///{tmp_path / 'x.db'}"
+    open_store(url, NOW).close()
+    after_first_open = list((tmp_path / "backups").glob("*"))
+    assert len(after_first_open) == 1
+    open_store(url, NOW).close()
+    assert list((tmp_path / "backups").glob("*")) == after_first_open
+
+
+def test_a_missing_pg_dump_raises_and_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))  # an empty directory: pg_dump is not on it
+    monkeypatch.setattr(store_migrate, "connect", lambda url: FakePG())
+    with pytest.raises(MigrationError, match="pg_dump"):
+        open_store("postgresql://user:secret@host/db", NOW)
+
+
+def test_the_without_backup_override_skips_the_backup_and_prints_one_warning_line(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("COX_STORE_MIGRATE_WITHOUT_BACKUP", "1")
+    monkeypatch.setenv("COX_STORE_BACKUP_DIR", str(tmp_path / "backups"))
+    url = f"sqlite:///{tmp_path / 'x.db'}"
+    open_store(url, NOW).close()
+    assert not (tmp_path / "backups").exists()
+    assert capsys.readouterr().err.count("\n") == 1
+
+
+def test_pending_lists_exactly_the_migrations_newer_than_current(conn):
+    migrate(conn, NOW, [fake(1, ONE)])
+    assert pending(conn, [fake(1, ONE), fake(2, TWO), fake(3, ("SELECT 1",))]) == [(2, "fake 2"), (3, "fake 3")]
+
+
+def test_a_password_in_the_url_never_appears_in_a_raised_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))  # an empty directory: pg_dump is not on it
+    monkeypatch.setattr(store_migrate, "connect", lambda url: FakePG())
+    url = "postgresql://user:s3cret-pw@host/db"
+    with pytest.raises(MigrationError) as err:
+        open_store(url, NOW)
+    assert "s3cret-pw" not in str(err.value)
