@@ -9,11 +9,19 @@ finds them with pkgutil. Only `open_store` applies migrations. Read paths call
 
 from __future__ import annotations
 
+import argparse
 import importlib
+import os
 import pkgutil
 import re
+import shutil
+import sqlite3
+import subprocess
+import sys
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from types import ModuleType
+from urllib.parse import urlsplit
 
 import harness
 from harness.store_dialect import Connection, Dialect, connect
@@ -25,7 +33,11 @@ __all__ = [
     "discover_migrations",
     "migrate",
     "open_store",
+    "pending",
 ]
+
+_WITHOUT_BACKUP = "COX_STORE_MIGRATE_WITHOUT_BACKUP"
+_BACKUP_DIR_ENV = "COX_STORE_BACKUP_DIR"
 
 _NAME = re.compile(r"(?:^|\.)store_ddl_(\d{4})$")
 _CREATE = "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT, description TEXT)"
@@ -107,6 +119,76 @@ def check_version(conn: Connection, modules: Sequence[ModuleType | str] | None =
     return _current_version(conn), len(_ordered(default_modules() if modules is None else modules))
 
 
+def pending(conn: Connection, modules: Sequence[ModuleType | str] | None = None) -> list[tuple[int, str]]:
+    """(version, description) for every migration newer than the database. Reads only; applies nothing."""
+    current = _current_version(conn)
+    ordered = _ordered(default_modules() if modules is None else modules)
+    return [(m.VERSION, m.DESCRIPTION) for m in ordered if current < m.VERSION]
+
+
+def _safe_url(url: str) -> str:
+    """Scheme and path only: userinfo, host, port and query never reach output. Mirrors store_copy._safe_url."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return f"{url.partition(':')[0]}://"
+    return f"{parts.scheme}://{parts.path}"
+
+
+def _backup_dir() -> Path:
+    """`$COX_STORE_BACKUP_DIR` if set, else a fixed path under the user's home, computed here, never hardcoded."""
+    override = os.environ.get(_BACKUP_DIR_ENV)
+    return Path(override) if override else Path.home() / ".local" / "state" / "coxswain" / "backups"
+
+
+def _backup_name(dialect: Dialect, current: int, newest: int, now: str) -> str:
+    """store-v<current>-to-v<newest>-<UTC yyyymmddThhmmssZ>.<ext>. The timestamp is `now`, not a fresh clock read."""
+    ts = now.replace("-", "").replace(":", "")
+    ext = "sqlite" if dialect.name == "sqlite" else "dump"
+    return f"store-v{current}-to-v{newest}-{ts}.{ext}"
+
+
+def _sqlite_backup(conn: Connection, dest: Path) -> None:
+    """Back up the live connection, not a fresh reconnect: a `sqlite:///:memory:` store has no file to reopen."""
+    target = sqlite3.connect(str(dest))
+    try:
+        conn.raw.backup(target)
+    finally:
+        target.close()
+
+
+def _pg_dump(url: str, dest: Path, safe_url: str) -> None:
+    """`pg_dump -Fc` the store at `url` into `dest`. Never puts `url` or the process's own output in a message."""
+    if shutil.which("pg_dump") is None:
+        raise MigrationError(
+            f"pg_dump is not on PATH; cannot back up {safe_url} before migrating. "
+            f"Install pg_dump, or set {_WITHOUT_BACKUP}=1 to migrate without a backup."
+        )
+    result = subprocess.run(
+        ["pg_dump", "-Fc", f"--dbname={url}", "-f", str(dest)], capture_output=True, check=False
+    )
+    if result.returncode != 0:
+        raise MigrationError(
+            f"pg_dump exited {result.returncode} backing up {safe_url}. "
+            f"Set {_WITHOUT_BACKUP}=1 to migrate without a backup."
+        )
+
+
+def _backup_before_migrate(conn: Connection, url: str, current: int, newest: int, now: str) -> None:
+    """Write a backup of `url` unless the override skips it. Never calls `migrate`; the caller does that next."""
+    if os.environ.get(_WITHOUT_BACKUP) == "1":
+        print(f"WARNING: {_WITHOUT_BACKUP}=1 is set; migrating without a backup.", file=sys.stderr)
+        return
+    safe_url = _safe_url(url)
+    directory = _backup_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    dest = directory / _backup_name(conn.dialect, current, newest, now)
+    if conn.dialect.name == "sqlite":
+        _sqlite_backup(conn, dest)
+    else:
+        _pg_dump(url, dest, safe_url)
+
+
 def migrate(conn: Connection, applied_at: str, modules: Sequence[ModuleType | str] | None = None) -> int:
     """Apply each migration newer than the database, one transaction apiece. Returns the version read back.
 
@@ -134,11 +216,44 @@ def migrate(conn: Connection, applied_at: str, modules: Sequence[ModuleType | st
 
 
 def open_store(url: str, now: str) -> Connection:
-    """Connect, bring the schema up to date, and return the connection. `now` is the applied-at text."""
+    """Connect, back up first when a migration is pending, bring the schema up to date, and return the connection.
+
+    `now` is the applied-at text. When the database is already at the newest known migration,
+    neither a backup file nor a subprocess is written or spawned.
+    """
     conn = connect(url)
     try:
+        current = _current_version(conn)
+        newest = len(_ordered(default_modules()))
+        if current < newest:
+            _backup_before_migrate(conn, url, current, newest, now)
         migrate(conn, now)
     except BaseException:
         conn.close()
         raise
     return conn
+
+
+def main(argv: Sequence[str]) -> int:
+    ap = argparse.ArgumentParser(prog="python -m harness.store_migrate", description=__doc__.split("\n")[0])
+    ap.add_argument("--pending", metavar="URL", required=True, help="list migrations newer than this store's version")
+    args = ap.parse_args(argv)
+    conn = connect(args.pending)
+    try:
+        current, newest = check_version(conn)
+        if current > newest:
+            print(f"database is at schema version {current}, newest known migration is {newest}", file=sys.stderr)
+            return 2
+        items = pending(conn)
+        if not items:
+            print(f"up to date (v{current})")
+            return 0
+        for version, description in items:
+            print(f"{version:04d} {description}")
+        return 0
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

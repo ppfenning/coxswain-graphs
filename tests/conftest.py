@@ -115,3 +115,17 @@ def store_conn(store_url):
         yield c
     finally:
         c.close()
+
+
+@pytest.fixture(autouse=True)
+def _store_backups_stay_out_of_home(tmp_path_factory, monkeypatch):
+    """Every test that opens a fresh store through `store_conn`/`open_store` now backs it up first.
+
+    Route that backup at a tmp directory of its own instead of the real $HOME the code defaults
+    to, so the other ~30 test files that never meant to test backup behaviour do not write there.
+    A directory from `tmp_path_factory`, not the test's own `tmp_path`: several tests inventory
+    every file under their own `tmp_path` and a stray backup directory there would be extra.
+    Tests in test_store_migrate.py that examine `COX_STORE_BACKUP_DIR` set their own value, which
+    simply overrides this default.
+    """
+    monkeypatch.setenv("COX_STORE_BACKUP_DIR", str(tmp_path_factory.mktemp("store-backups")))
