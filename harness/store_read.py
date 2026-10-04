@@ -55,7 +55,7 @@ __all__ = [
 
 Row = dict[str, Any]
 
-_RUN_COLS = ("run_id", "principal", "status", "started_at", "ended_at", "graph_id")
+_RUN_COLS = ("run_id", "principal", "status", "started_at", "ended_at", "graph_id", "short_id")
 _CALL_COLS = (
     "call_id", "run_id", "seq", "phase_id", "task_id", "node_id", "role", "tier", "model_alias", "model_id",
     "claude_code_version", "cost_usd", "ceiling_usd", "ceiling_source", "turns", "duration_ms", "input_tokens",
