@@ -319,6 +319,15 @@ def test_a_build_budget_override_reaches_both_the_first_build_and_a_retry(cart, 
     assert {"check": "build budget", "output": "override $2.5 per build call"} in evidence
 
 
+def test_an_estimated_build_budget_is_attributed_to_the_estimate_not_an_override(
+    cart, plan_response, build_response
+) -> None:
+    result, _ = run(cart, plan_response, build_response, build_budget_usd=2.5, build_budget_source="estimate")
+    row = next(r for r in result["proposals"][0]["evidence"] if r["check"] == "build budget")
+    assert "from estimate" in row["output"]
+    assert "override" not in row["output"]
+
+
 def test_a_cli_style_budget_string_is_coerced_to_a_float(cart, plan_response, build_response) -> None:
     """The harness has no float `Need` kind; a flag value arrives as a raw string."""
     _, scripted = run(cart, plan_response, build_response, build_budget_usd="2.5")
