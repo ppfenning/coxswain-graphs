@@ -146,6 +146,16 @@ def test_build_task_history_keeps_only_rows_whose_scope_repos_names_the_repo(con
     assert read.build_task_history(conn, "/work/checkouts/repo-b", since) == [("/work/checkouts/repo-b", 2, 3.5)]
 
 
+def test_build_task_history_skips_a_record_whose_scope_is_a_string(conn):
+    put(
+        conn, "task_records", run_id="r1", phase_id="p1", task_id="hstr",
+        record_json=json_text({"scope": "ticket", "change_facts": {"files_touched": ["a.py"]}}),
+        updated_at="2026-09-10T00:00:00Z",
+    )  # fmt: skip
+    call(conn, "hc7", "r1", 14, "build", "sonnet", "mid", 2.0, 100, 0, 50, phase_id="p1", task_id="hstr")
+    assert read.build_task_history(conn, "repo-a", "2026-09-01T00:00:00Z") == []
+
+
 def test_postgres_decimal_sums_come_back_as_int_and_float():
     s = read.summary_row("r", (2, Decimal("1.5"), Decimal(3), Decimal(400), Decimal(100), Decimal(9)))
     assert s == {
