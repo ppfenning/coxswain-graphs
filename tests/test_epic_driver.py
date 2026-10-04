@@ -20,6 +20,7 @@ import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from core import ledger, workstore
@@ -198,11 +199,15 @@ def initiative(*, two_phases: bool = True, done: tuple[str, ...] = ()) -> dict:
 class Runner:
     """Scripted by role, and by task where a role runs once per task.
 
+    Declares tool use, as an API runner that can edit files does; the gate refuses an undeclared one.
+
     Keyed off the prompt rather than a call counter: the fan-out is concurrent,
     so a positional script would be answering whichever task happened to get
     there first. A role with nothing scripted for the task in front of it raises
     — which is exactly how a task gets quarantined without the test faking one.
     """
+
+    capabilities: ClassVar[dict[str, bool]] = {"tool_use": True}
 
     def __init__(self, patches: dict[str, str], *, chunk=None, verdicts=None, style=None, review=None) -> None:
         self.patches = patches

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -37,6 +38,8 @@ class NoRunner:
 
 
 class RecordingRunner:
+    capabilities: ClassVar[dict[str, bool]] = {"tool_use": True}
+
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
@@ -131,3 +134,28 @@ def test_a_missing_apply_falls_back_to_the_work_state_arm_once() -> None:
 )
 def test_the_route_is_chosen_from_kind_and_apply_alone(kind: str, apply: object, route: str) -> None:
     assert workstore_route(kind, apply)[0] == route
+
+
+def test_model_arm_refuses_when_no_tier_has_tool_use() -> None:
+    from runner.claude_code_runner import ClaudeCodeRunner
+
+    class ToolUseRunner(ClaudeCodeRunner):
+        run = RecordingRunner.run
+
+    class AnthropicShaped(RecordingRunner):
+        capabilities = None  # AnthropicRunner has no such attribute; its profile dict declares none either
+
+    message = "work_state_arm needs tool_use; 'deep' lacks it too"
+    refused = RecordingRunner()
+    refused.capabilities = {"structured_output": True}
+    assert auto_apply(proposal("state_move"), cartridge=cartridge("state_move"), runner=refused) == (False, message)
+    assert refused.calls == []
+    undeclared = AnthropicShaped()
+    undeclared.profile = {"tiers": {"standard": "sonnet"}}
+    assert auto_apply(proposal("state_move"), cartridge=cartridge("state_move"), runner=undeclared) == (False, message)
+    assert undeclared.calls == []
+    # A real ClaudeCodeRunner: no `capabilities` in its profile dict, tool use on its attribute.
+    tooled = ToolUseRunner({"tiers": {"standard": "sonnet"}})
+    tooled.calls = []
+    assert auto_apply(proposal("state_move"), cartridge=cartridge("state_move"), runner=tooled) == (True, "by the model")
+    assert tooled.calls[0]["tier"] == "standard"

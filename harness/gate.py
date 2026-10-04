@@ -11,6 +11,8 @@ from typing import Any
 from core import workstore
 from core.manifest import gate_diff
 
+from runner.protocol import Capability, ProviderProfile, RunnerError, resolve_profile
+
 __all__ = ["APPLY_SCHEMA", "apply_arm_for", "apply_decisions", "auto_apply", "gate", "workstore_route"]
 
 # What an apply arm must report back. Small on purpose: the arm says whether it
@@ -75,6 +77,22 @@ def _apply_workstore(route: str, fields: dict[str, Any]) -> tuple[bool, str]:
         return False, str(error)
 
 
+def _apply_tier(runner: Any, role: str, tier: str) -> tuple[str, str | None]:
+    """Capabilities come from `runner.capabilities`, else `profile["capabilities"]`; with neither, tool use is undeclared and refused."""
+    found = getattr(runner, "profile", None)
+    raw = found if isinstance(found, Mapping) else {}
+    declared = getattr(runner, "capabilities", None)
+    capabilities = declared if isinstance(declared, Mapping) else raw.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        capabilities = {}
+    profile = ProviderProfile(capabilities=capabilities, tiers=raw.get("tiers") or {})
+    try:
+        _, fallback = resolve_profile(profile, role=role, tier=tier, required=(Capability.TOOL_USE,))
+    except RunnerError as error:
+        return tier, str(error)
+    return (fallback["resolved_tier"] if fallback else tier), None
+
+
 def auto_apply(
     item: dict[str, Any],
     *,
@@ -107,9 +125,12 @@ def auto_apply(
         arm = _FALLBACK_ROLE.get(item["kind"])
         if arm is None:
             return False, f"the workstore arm does not apply to '{item['kind']}'"
+    tier, refusal = _apply_tier(runner, arm, "standard")
+    if refusal is not None:
+        return False, refusal
     result = runner.run(
         role=arm,
-        tier="standard",
+        tier=tier,
         schema=APPLY_SCHEMA,
         wait_if_paused=wait_if_paused,
         context=list(cartridge.get("context") or []),

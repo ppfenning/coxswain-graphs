@@ -9,6 +9,7 @@ a caller that never calls it, so these drive the seam itself.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from core import ledger
@@ -152,6 +153,8 @@ def test_caps_bound_a_graduated_kind_within_one_run(cart, tmp_path) -> None:
 
 def test_auto_apply_goes_through_the_arm_the_cartridge_names(cart) -> None:
     class Arm:
+        capabilities: ClassVar[dict[str, bool]] = {"tool_use": True}
+
         def __init__(self):
             self.calls = []
 

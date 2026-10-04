@@ -13,6 +13,7 @@ import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -128,6 +129,8 @@ def initiative(*, done: bool = False) -> dict:
 
 
 class Runner:
+    capabilities: ClassVar[dict[str, bool]] = {"tool_use": True}
+
     def __init__(self, patch: str) -> None:
         self.patch = patch
         self.calls: list[dict] = []
