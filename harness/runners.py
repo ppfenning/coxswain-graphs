@@ -155,6 +155,15 @@ def _claude_code(
     )
 
 
+def _with_workdir(runner: Any, workdir: str | Path | None, repo: str | Path | None) -> Any:
+    """The API runners take `cwd` and `repo_dir` by attribute after build, not by constructor kwarg."""
+    if workdir is not None:
+        runner.cwd = workdir
+    if repo is not None:
+        runner.repo_dir = repo
+    return runner
+
+
 def _anthropic(
     profile: Mapping[str, Any],
     *,
@@ -164,7 +173,7 @@ def _anthropic(
 ) -> Any:
     from runner.anthropic_runner import AnthropicRunner
 
-    return AnthropicRunner(profile, role_skills=role_skills or {})
+    return _with_workdir(AnthropicRunner(profile, role_skills=role_skills or {}), workdir, repo)
 
 
 def _openai_compatible(
@@ -176,7 +185,7 @@ def _openai_compatible(
 ) -> Any:
     from runner.openai_compatible_runner import OpenAICompatibleRunner
 
-    return OpenAICompatibleRunner(profile, role_skills=role_skills or {})
+    return _with_workdir(OpenAICompatibleRunner(profile, role_skills=role_skills or {}), workdir, repo)
 
 
 _RUNNERS: dict[str, _RunnerFactory] = {
