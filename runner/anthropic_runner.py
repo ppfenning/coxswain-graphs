@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from runner.decision_log import CallDecision, RouterDecision, joined_reasons, to_row
-from runner.protocol import NodeResult, RunnerError
+from runner.pricing import max_output_tokens_for_budget, price_call
+from runner.protocol import BudgetStop, LimitStop, NodeResult, RunnerError
 from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class
 
 if TYPE_CHECKING:
@@ -111,6 +112,21 @@ def _class_model(classes: Mapping[str, Sequence[Any]], chosen_class: str | None)
     return str(models[0]) if models else None
 
 
+def _limit_exception_types() -> tuple[type[BaseException], ...]:
+    """The SDK's rate-limit exception class; empty when the optional `anthropic` extra is absent.
+
+    Imported here and nowhere else, so this module still imports, and a stub client still runs, without the SDK.
+    `InternalServerError` is left out on purpose: it covers every 5xx, and a 500 is a failure, not a limit. An overloaded
+    response is HTTP 529, which `run` maps by status code whichever class carries it. Unchecked: `anthropic` is not
+    installed in the build sandbox, so which class the SDK raises for 529 was not confirmed by importing it.
+    """
+    try:
+        import anthropic
+    except ImportError:  # pragma: no cover - depends on install extras
+        return ()
+    return (anthropic.RateLimitError,)
+
+
 def _decision(
     *,
     role: str,
@@ -126,7 +142,7 @@ def _decision(
 
     A supplied `router_decision` is copied onto the `router_*` fields as given; it never changes what was chosen.
 
-    `budget_usd` is the ceiling the caller granted. It is recorded, not enforced: the Messages API has no per-call spend ceiling.
+    `budget_usd` is the ceiling the caller granted, recorded as given. `run` enforces it, by capping `max_tokens` and raising `BudgetStop`.
     """
     return CallDecision(
         role=role,
@@ -168,6 +184,8 @@ class AnthropicRunner:
         self.store = store
         self.run_id = run_id
         self._store_seq = itertools.count(1)
+        # Cumulative cost_usd per thread, in process memory only: what "the thread's spend so far" means for the budget.
+        self._thread_spend: dict[str, float] = {}
         # role -> path of the skill body the cartridge bound to it, resolved by
         # the harness. Prepended to the node's system below — the moment a
         # binding stops being a validated name and becomes what the node knows.
@@ -225,7 +243,18 @@ class AnthropicRunner:
                 raise RunnerError(f"cannot read context pack {path}: {exc}") from exc
         return "\n\n".join(chunks)
 
-    def _record_to_store(self, role: str, task: str | None, tier: str, model: str, decision: CallDecision | None) -> None:
+    def _record_to_store(
+        self,
+        role: str,
+        task: str | None,
+        tier: str,
+        model: str,
+        decision: CallDecision | None,
+        *,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost_usd: float | None = None,
+    ) -> None:
         """Write one finished call to the store; no decision means the call failed. A store error is warned about, never raised."""
         if self.store is None or not self.run_id:
             return
@@ -240,6 +269,9 @@ class AnthropicRunner:
             "model": model,
             "ts": datetime.now(UTC).isoformat(),
             "ok": decision is not None,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": cost_usd,
         }
         try:
             self.store.record_call(
@@ -271,13 +303,12 @@ class AnthropicRunner:
         router_decision: RouterDecision | None = None,
         wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
-        # `thread` is accepted for the protocol and ignored: each call here is
-        # one stateless Messages request. Carrying history would be this
-        # runner's own feature, and nothing in it is needed for correctness.
-        # `budget_usd` is recorded on the decision and otherwise ignored: the
-        # Messages API has no per-call spend ceiling to hand it to. `model`,
-        # `effort` and `budget_usd` arrive finished from above the runner and
-        # are used as given, never clipped here.
+        # `thread` carries no history here: each call is one stateless Messages
+        # request. It is the key `_thread_spend` accumulates cost under, so
+        # `budget_usd` holds across a caller's calls on one thread. Before the
+        # call `budget_usd` caps `max_tokens`; after it, a thread over budget
+        # raises BudgetStop, once the call's own row is written. `model` and
+        # `effort` arrive finished from above the runner and are used as given.
         # `task` is accepted for the protocol and ignored: this runner keeps
         # no call ledger for `_trace_evidence` to read, so there is nothing to
         # stamp it onto.
@@ -309,51 +340,104 @@ class AnthropicRunner:
         # A paused run waits here, before the request, as it does before a Claude Code call.
         if wait_if_paused is not None:
             wait_if_paused()
-        response = self._client.messages.create(
-            model=model_id,
-            max_tokens=self.max_tokens,
-            system=system or None,
-            messages=[{"role": "user", "content": prompt}],
-            thinking={"type": "adaptive"},
-            output_config={
-                "effort": effort_used,
-                "format": {"type": "json_schema", "schema": dict(schema)},
-            },
-        )
+        profile_prices = self.profile.get("prices") or {}
+        spent_before = self._thread_spend.get(thread, 0.0) if thread is not None else 0.0
+        request_max_tokens = self.max_tokens
+        if budget_usd is not None and thread is not None and spent_before >= budget_usd:
+            # Nothing is left to spend: stop before sending a call that could only overspend. No call, so no row.
+            raise BudgetStop(
+                role=role,
+                thread=thread,
+                session=None,
+                spent_usd=spent_before,
+                detail=f"node '{role}' has spent ${spent_before:.4f} of its ${budget_usd:.4f} budget",
+            )
+        if budget_usd is not None:
+            affordable = max_output_tokens_for_budget(profile_prices, model_id, budget_usd - spent_before)
+            if affordable is not None:
+                # The API refuses max_tokens below 1, so an exhausted budget still sends the smallest request.
+                request_max_tokens = max(1, min(request_max_tokens, affordable))
+        try:
+            response = self._client.messages.create(
+                model=model_id,
+                max_tokens=request_max_tokens,
+                system=system or None,
+                messages=[{"role": "user", "content": prompt}],
+                thinking={"type": "adaptive"},
+                output_config={
+                    "effort": effort_used,
+                    "format": {"type": "json_schema", "schema": dict(schema)},
+                },
+            )
+        except Exception as exc:
+            # Rate limit (429) and overloaded (529) are limits, not failures; anything else is a call that did not complete.
+            if isinstance(exc, _limit_exception_types()) or getattr(exc, "status_code", None) in (429, 529):
+                raise LimitStop(detail=str(exc)) from exc
+            raise RunnerError(f"node '{role}': {exc}") from exc
+
+        # The vendor has billed the call once `create` returns, whatever the content turns out to be:
+        # price it, charge the thread and carry the usage onto every row below, failures included.
+        billed_model = getattr(response, "model", None) or model_id
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        cost_usd = price_call(profile_prices, billed_model, input_tokens, output_tokens)
+        if cost_usd is None:
+            cost_usd = price_call(profile_prices, model_id, input_tokens, output_tokens)
+        spent_usd = spent_before + (cost_usd or 0.0)
+        if thread is not None:
+            self._thread_spend[thread] = spent_usd
+        paid = {"input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd}
 
         # A refusal is an HTTP 200 with no usable content. Checking stop_reason
         # before reading content is the difference between a clear error and a
         # confusing one three frames further up.
         if getattr(response, "stop_reason", None) == "refusal":
             details = getattr(response, "stop_details", None)
-            self._record_to_store(role, task, recorded.tier, model_id, None)
+            self._record_to_store(role, task, recorded.tier, billed_model, None, **paid)
             raise RunnerError(f"node '{role}' was refused by the model (category: {getattr(details, 'category', None)})")
 
         try:
             text = next(block.text for block in response.content if block.type == "text")
         except StopIteration as exc:
-            self._record_to_store(role, task, recorded.tier, model_id, None)
+            self._record_to_store(role, task, recorded.tier, billed_model, None, **paid)
             raise RunnerError(f"node '{role}' returned no text block") from exc
 
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
-            self._record_to_store(role, task, recorded.tier, model_id, None)
+            self._record_to_store(role, task, recorded.tier, billed_model, None, **paid)
             raise RunnerError(f"node '{role}' returned text that is not valid JSON: {exc}") from exc
 
         if not isinstance(data, dict):
-            self._record_to_store(role, task, recorded.tier, model_id, None)
+            self._record_to_store(role, task, recorded.tier, billed_model, None, **paid)
             raise RunnerError(f"node '{role}' returned {type(data).__name__}, expected an object")
         result = NodeResult(data)
         result.decision = _decision(
             role=role,
             requested_tier=requested_tier,
             resolution=recorded,
-            model_id=getattr(response, "model", None) or model_id,
+            model_id=billed_model,
             effort=effort_used,
             budget_usd=budget_usd,
             task=task,
             router_decision=shadow,
         )
-        self._record_to_store(role, task, recorded.tier, result.decision.model_id, result.decision)
+        # The row is written before any stop: a call the thread paid for always leaves its row.
+        self._record_to_store(
+            role,
+            task,
+            recorded.tier,
+            result.decision.model_id,
+            result.decision,
+            **paid,
+        )
+        if budget_usd is not None and spent_usd > budget_usd:
+            raise BudgetStop(
+                role=role,
+                thread=thread,
+                session=None,
+                spent_usd=spent_usd,
+                detail=f"node '{role}' spent ${spent_usd:.4f} past its ${budget_usd:.4f} budget",
+            )
         return result
