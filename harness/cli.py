@@ -19,11 +19,12 @@ import json
 import os
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from datetime import date as date_type
 from pathlib import Path
@@ -618,8 +619,27 @@ def _lifecycle_worktree(args: argparse.Namespace, cartridge: Mapping[str, Any], 
     return Path(str(root)).expanduser() / run_id
 
 
-def _child_pids(tasks: Path = Path("/proc/self/task")) -> list[int]:
-    """This process's direct children, from every thread's Linux `children` file; empty where /proc has none."""
+def pgrep_pids(text: str) -> list[int]:
+    """The pids in `pgrep` output, one per line; blank and non-numeric lines are skipped."""
+    return [int(line) for line in map(str.strip, text.splitlines()) if line.isdigit()]
+
+
+def _pgrep_children(pid: int) -> str | None:
+    """`pgrep -P <pid>` output; "" when exit 1 says no children, None when pgrep is missing or fails."""
+    try:
+        done = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    return {0: done.stdout, 1: ""}.get(done.returncode)
+
+
+def _child_pids(
+    tasks: Path = Path("/proc/self/task"), pgrep: Callable[[int], str | None] | None = None
+) -> list[int]:
+    """This process's direct children, from every thread's Linux `children` file.
+
+    Where `tasks` does not exist (macOS has no /proc) and `pgrep` is given, its output for this pid is parsed instead.
+    """
 
     def read(path: Path) -> str:
         try:
@@ -627,11 +647,13 @@ def _child_pids(tasks: Path = Path("/proc/self/task")) -> list[int]:
         except OSError:
             return ""
 
+    if pgrep is not None and not tasks.exists():
+        return pgrep_pids(pgrep(os.getpid()) or "")
     return sorted({int(pid) for path in tasks.glob("*/children") for pid in read(path).split()})
 
 
 def _terminate_children() -> None:
-    for pid in _child_pids():
+    for pid in _child_pids(pgrep=_pgrep_children):
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
 

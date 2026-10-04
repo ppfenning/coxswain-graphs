@@ -1009,6 +1009,27 @@ def test_child_pids_reads_every_threads_children_file(tmp_path) -> None:
     assert cli._child_pids(tmp_path / "absent") == []
 
 
+def test_pgrep_pids_reads_one_pid_per_line_and_skips_blank_lines() -> None:
+    assert cli.pgrep_pids("12\n13\n\n") == [12, 13]
+
+
+def test_pgrep_pids_of_empty_output_is_empty() -> None:
+    assert cli.pgrep_pids("") == []
+
+
+def test_pgrep_pids_skips_non_numeric_lines() -> None:
+    assert cli.pgrep_pids("7\nnot-a-pid\n8\n") == [7, 8]
+
+
+def test_child_pids_falls_back_to_pgrep_when_the_proc_directory_is_absent(tmp_path) -> None:
+    assert cli._child_pids(tmp_path / "absent", pgrep=lambda pid: "41\n") == [41]
+
+
+def test_child_pids_is_empty_when_pgrep_finds_no_children_or_fails(tmp_path) -> None:
+    assert cli._child_pids(tmp_path / "absent", pgrep=lambda pid: "") == []
+    assert cli._child_pids(tmp_path / "absent", pgrep=lambda pid: None) == []
+
+
 def test_a_real_sigterm_during_a_fan_out_stamps_the_end_stops_the_node_and_drops_the_queue(
     monkeypatch, tmp_path
 ) -> None:
