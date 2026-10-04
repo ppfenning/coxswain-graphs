@@ -1943,6 +1943,9 @@ def _run(
     # that passes it to the runner.
     raw_build_budget_usd = args.get("build_budget_usd")
     build_budget_usd = None if raw_build_budget_usd is None else float(raw_build_budget_usd)
+    # "ticket" or "estimate" from the epic driver; None on the CLI path, where
+    # a supplied budget really is the caller's override.
+    build_budget_source = args.get("build_budget_source")
 
     is_work_item = bool(args.get("work_item"))
 
@@ -2460,12 +2463,21 @@ def _run(
                     ),
                     *([{"check": "tier escalation", "output": escalation}] if escalation else []),
                     {"check": "changed lines", "output": str(facts["changed_lines"])},
-                    # Only when the caller overrode the build budget: a row
-                    # that always reads the default budget is a row nobody
-                    # reads, and present whether or not an override was given
-                    # would claim an override that never happened.
+                    # Only when a budget was set, and attributed to where it
+                    # came from: an estimated budget read as an override would
+                    # claim an override that never happened. No source means
+                    # the CLI flag, which is an override.
                     *(
-                        [{"check": "build budget", "output": f"override ${build_budget_usd} per build call"}]
+                        [
+                            {
+                                "check": "build budget",
+                                "output": (
+                                    f"budget ${build_budget_usd} from {build_budget_source}"
+                                    if build_budget_source
+                                    else f"override ${build_budget_usd} per build call"
+                                ),
+                            }
+                        ]
                         if build_budget_usd is not None
                         else []
                     ),
