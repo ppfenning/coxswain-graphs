@@ -41,6 +41,7 @@ import contextlib
 import difflib
 import json
 import logging
+import sqlite3
 import subprocess
 import sys
 import time
@@ -85,7 +86,7 @@ from harness.gate import apply_arm_for, auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
 from harness.store_lease import assert_epoch, renew
-from harness.store_pause import is_paused
+from harness.store_pause import clear_paused, is_paused
 from harness.store_write import Store, upsert_work_item
 from harness.worktree import (
     apply_patch,
@@ -1085,8 +1086,9 @@ def run_epic(
         }
     finally:
         # Every exit — the return above, a raise from anywhere in this try, or
-        # a signal delivered as KeyboardInterrupt — lands here. Nothing before
-        # `ctx` exists can have made a worktree, so there is nothing to do yet.
+        # a signal delivered as KeyboardInterrupt or SystemExit — lands here.
+        _clear_pause_if_held(store, run_id, lease_name or LEASE_NAME, epoch)
+        # Nothing before `ctx` exists can have made a worktree, so there is nothing to do yet.
         if ctx is not None:
             run_dir = ctx.worktree_root / ctx.run_id
             if keep_worktrees:
@@ -1387,6 +1389,15 @@ def _fenced(ctx: _Ctx) -> str | None:
     return f"stale epoch: this driver holds epoch {ctx.epoch}, lease '{name}' is at epoch {held} or has expired"
 
 
+# Only a store error is retried in the pause wait; a bug there still raises with its traceback.
+_STORE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
+try:  # the postgres driver is an optional extra
+    import psycopg
+
+    _STORE_ERRORS = (*_STORE_ERRORS, psycopg.Error)
+except ImportError:  # pragma: no cover - depends on what is installed
+    pass
+
 _PAUSE_LEASE_TTL = 120  # seconds; matches the CLI's own `_LEASE_TTL` (harness/cli.py) heartbeat renew.
 
 
@@ -1399,12 +1410,42 @@ def _wait_while_paused(
     ttl: int,
     sleep: Callable[[float], None] = time.sleep,
     poll_seconds: float = 10,
+    attempts: int = 3,
+    retry_wait: float = 2.0,
 ) -> None:
-    """Block between nodes while the store says this run is paused; a call already in flight is untouched."""
-    while is_paused(conn, run_id):
-        renew(conn, lease_name, run_id, epoch, now(), ttl, status="paused")  # heartbeat says why: paused, not stuck
+    """Block while paused; a lost lease or a store down for `attempts` tries ends the run as SIGTERM does (143)."""
+
+    def retried(call: Callable[[], Any]) -> Any:
+        error: Exception | None = None
+        for attempt in range(max(1, attempts)):
+            if attempt:
+                sleep(retry_wait)
+            try:
+                return call()
+            except _STORE_ERRORS as exc:
+                error = exc
+        _log.warning("pause wait: store error after %d attempts: %s: %s", attempts, type(error).__name__, error)
+        raise SystemExit(143) from error
+
+    while retried(lambda: is_paused(conn, run_id)):
+        # heartbeat says why: paused, not stuck
+        if not retried(lambda: renew(conn, lease_name, run_id, epoch, now(), ttl, status="paused")):
+            _log.warning("pause wait: lease '%s' epoch %s lost; ending the run", lease_name, epoch)
+            raise SystemExit(143)
         sleep(poll_seconds)
-    renew(conn, lease_name, run_id, epoch, now(), ttl, status=None)  # always: clears a prior "paused" on resume too
+    # always: clears a prior "paused" on resume too. A False return is left to the caller's fence re-check.
+    retried(lambda: renew(conn, lease_name, run_id, epoch, now(), ttl, status=None))
+
+
+def _clear_pause_if_held(store: Store, run_id: str, lease_name: str, epoch: int | None) -> None:
+    """Clear the run's pause flag so a rerun does not stop at once; skipped when another holder owns the run."""
+    try:
+        if epoch is None or assert_epoch(store.conn, lease_name, epoch, _now()):
+            clear_paused(store.conn, run_id)
+        else:
+            _log.warning("pause flag kept for %s: lease '%s' epoch %s is no longer held", run_id, lease_name, epoch)
+    except _STORE_ERRORS as exc:  # a store failure must not mask the run's real exit
+        _log.warning("pause flag clear failed for %s: %s: %s", run_id, type(exc).__name__, exc)
 
 
 def _wait_if_paused(ctx: _Ctx) -> None:
@@ -2620,6 +2661,10 @@ def _execute(
         _refuse_stale(state, phase=phase, subject=subject, slot=slot, reason=stale)
         return False, stale
     _wait_if_paused(ctx)
+    stale = _fenced(ctx)  # the wait can outlast this driver's lease
+    if stale is not None:
+        _refuse_stale(state, phase=phase, subject=subject, slot=slot, reason=stale)
+        return False, stale
 
     kind = item.get("kind")
 
