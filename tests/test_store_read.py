@@ -188,6 +188,17 @@ def test_list_runs_is_newest_first_since_and_limited(conn):
     assert [r["run_id"] for r in read.list_runs(conn, "2026-09-24T01:30:00Z", 10)] == ["r2"]
 
 
+def test_a_run_with_a_short_id_set_reads_back_with_that_value(conn):
+    put(conn, "runs", run_id="r3", principal="pat", status="done", started_at="2026-09-24T03:00:00Z", short_id="r3s")
+    rows = {r["run_id"]: r for r in read.list_runs(conn, "2026-09-24T00:00:00Z", 10)}
+    assert rows["r3"]["short_id"] == "r3s"
+
+
+def test_a_run_with_no_short_id_set_reads_back_null(conn):
+    rows = {r["run_id"]: r for r in read.list_runs(conn, "2026-09-24T00:00:00Z", 10)}
+    assert rows["r1"]["short_id"] is None
+
+
 def test_attempts_ledger_gate_and_lease(conn):
     assert [a["kind"] for a in read.attempts(conn, "t1")] == ["first", "retry"]
     assert [r["row_json"] for r in read.ledger_rows(conn, "r1")] == [{"n": 1}, {"n": 2}]
