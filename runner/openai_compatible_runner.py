@@ -1,8 +1,11 @@
 """A runner for models served by an OpenAI-compatible endpoint, such as a local server.
 
 The profile names the env var holding the endpoint's base URL. It never carries the URL.
-A `local/` model is served here. A local call is free: it records a cost of 0.0, never
-draws on `budget_usd`, and cannot stop a budget. An `anthropic/` model is handed to an
+A `local/` model is served here, and so is any other prefix the profile marks
+`pass_through: true`, sent to the endpoint with no rewriting. Cost comes from the
+profile's `prices` map; a model absent from that map records `cost_usd: None`, never
+`0.0`. A profile `budget_usd` caps `max_tokens` before the call and raises `BudgetStop`
+once cumulative spend on a thread passes it. An `anthropic/` model is handed to an
 AnthropicRunner built on first use, which owns that call's records and store writes.
 """
 
@@ -38,7 +41,8 @@ from runner.openai_chat import (
     post_chat,
     wire_model,
 )
-from runner.protocol import NodeResult, RunnerError
+from runner.pricing import max_output_tokens_for_budget, price_call
+from runner.protocol import BudgetStop, NodeResult, RunnerError
 from runner.schema_answer import retry_prompt, schema_instruction, shape_answer
 from runner.tier_resolution import CLASSES, TIERS, Hints, resolve, to_class
 
@@ -79,6 +83,8 @@ class _Ask:
     tier: str
     model_id: str
     system: str | None
+    thread: str | None
+    wire_model_id: str
 
 
 class OpenAICompatibleRunner:
@@ -124,6 +130,15 @@ class OpenAICompatibleRunner:
                 f"provider profile 'floor' must be one of {', '.join(TIERS)} or {', '.join(CLASSES)}, not '{self.floor}'"
             )
         self.router_mode = _router_mode(self.profile)
+        self.prices = dict(self.profile.get("prices") or {})
+        # A flat ceiling, unlike the Claude Code runner's per-tier `budget_usd` dict
+        # (runner/claude_code_runner.py:622): this runner has no shape/session model,
+        # so one float per thread is enough.
+        self.budget_usd = self.profile.get("budget_usd")
+        self.pass_through = bool(self.profile.get("pass_through"))
+        auth_env = self.profile.get("auth_env")
+        self.auth_token = None if not auth_env else (os.environ if env is None else env).get(str(auth_env))
+        self._spent: dict[str | None, float] = {}
         self.calls: list[dict[str, Any]] = []
         self._store_seq = itertools.count(1)
         self._delegate_factory = delegate_factory
@@ -178,7 +193,11 @@ class OpenAICompatibleRunner:
             warnings.warn(f"store write failed for call {call['id']}: {exc}", RuntimeWarning, stacklevel=2)
 
     def _post(self, ask: _Ask, prompt: str) -> tuple[dict[str, Any], Reply]:
-        """One HTTP call and its record. A transport or chat failure is recorded, stored as failed, and raised."""
+        """One HTTP call and its record. A transport or chat failure is recorded, stored as failed, and raised.
+
+        A success that pushes cumulative spend on `ask.thread` past `self.budget_usd` is still recorded — the
+        call already happened and was billed — then raises `BudgetStop` so the caller stops, not `_post`.
+        """
         record = {
             "id": str(uuid.uuid4()),
             "role": ask.role,
@@ -191,9 +210,17 @@ class OpenAICompatibleRunner:
             "input_tokens": 0,
             "output_tokens": 0,
         }
-        payload = build_request(wire_model(ask.model_id), ask.system, prompt, self.max_tokens, TEMPERATURE)
+        max_tokens = self.max_tokens
+        if self.budget_usd is not None:
+            budget_left = self.budget_usd - self._spent.get(ask.thread, 0.0)
+            cap = max_output_tokens_for_budget(self.prices, ask.wire_model_id, budget_left)
+            if cap is not None:
+                max_tokens = min(max_tokens, cap)
+        payload = build_request(ask.wire_model_id, ask.system, prompt, max_tokens, TEMPERATURE)
         try:
-            reply = parse_response(post_chat(self.base_url, payload, timeout=self.timeout, role=ask.role))
+            reply = parse_response(
+                post_chat(self.base_url, payload, timeout=self.timeout, role=ask.role, bearer_token=self.auth_token)
+            )
         except (ChatTransportError, RunnerError) as exc:
             self.calls.append(record)
             self._record_to_store(record, None)
@@ -205,8 +232,27 @@ class OpenAICompatibleRunner:
             self.calls.append(record)
             self._record_to_store(record, None)
             raise RunnerError(f"node '{ask.role}' got an unusable reply: {reply.reason}")
-        counted = {**record, "ok": True, "input_tokens": reply.prompt_tokens, "output_tokens": reply.completion_tokens}
+        cost = price_call(self.prices, ask.wire_model_id, reply.prompt_tokens, reply.completion_tokens)
+        counted = {
+            **record,
+            "ok": True,
+            "cost_usd": cost,
+            "input_tokens": reply.prompt_tokens,
+            "output_tokens": reply.completion_tokens,
+        }
         self.calls.append(counted)
+        if self.budget_usd is not None and cost is not None:
+            spent = self._spent.get(ask.thread, 0.0) + cost
+            self._spent[ask.thread] = spent
+            if spent > self.budget_usd:
+                self._record_to_store(counted, None)
+                raise BudgetStop(
+                    role=ask.role,
+                    thread=ask.thread,
+                    session=None,
+                    spent_usd=spent,
+                    detail=f"node '{ask.role}' spent ${spent:.4f}, over budget ${self.budget_usd:.4f}",
+                )
         return counted, reply
 
     def _shaped(
@@ -232,8 +278,10 @@ class OpenAICompatibleRunner:
         router_decision: RouterDecision | None = None,
         wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
-        # `thread` is accepted for the protocol and ignored: each call is one stateless request.
-        # `budget_usd` is recorded on the decision as given and never spent against: a local call is free.
+        # `thread` names the bucket `self._spent` accumulates against for a profile `budget_usd`; the call
+        # itself is still stateless, with no session or scratch to resume.
+        # `budget_usd` here is the per-call ceiling recorded on the decision below, distinct from the
+        # profile's own `self.budget_usd`, which `_post` enforces against cumulative spend.
         requested_tier = tier or DEFAULT_TIER
         if to_class(requested_tier) is None:
             raise RunnerError(
@@ -273,7 +321,7 @@ class OpenAICompatibleRunner:
                 wait_if_paused=wait_if_paused,
                 model=model_id.removeprefix(ANTHROPIC_PREFIX),
             )
-        if not model_id.startswith(LOCAL_PREFIX):
+        if not model_id.startswith(LOCAL_PREFIX) and not self.pass_through:
             raise RunnerError(
                 f"node '{role}' resolved tier '{recorded.tier}' to model '{model_id}'; "
                 f"this runner serves only '{LOCAL_PREFIX}' and '{ANTHROPIC_PREFIX}' models"
@@ -283,7 +331,12 @@ class OpenAICompatibleRunner:
         shadow = router_decision if self.router_mode in ("shadow", "on") else None
         body = self.role_skills.get(role)
         packs = [body, *context] if body else list(context)
-        ask = _Ask(role, task, recorded.tier, model_id, AnthropicRunner._read_context(packs) or None)
+        # A `local/` model still has its vendor prefix stripped for the wire; a `pass_through`
+        # model reaches the endpoint exactly as the profile names it, with no rewriting.
+        wire_model_id = wire_model(model_id) if model_id.startswith(LOCAL_PREFIX) else model_id
+        ask = _Ask(
+            role, task, recorded.tier, model_id, AnthropicRunner._read_context(packs) or None, thread, wire_model_id
+        )
         decision = replace(
             _decision(
                 role=role,

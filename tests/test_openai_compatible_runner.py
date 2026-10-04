@@ -11,7 +11,7 @@ from harness.store_migrate import open_store
 from harness.store_write import Store
 from runner.anthropic_runner import AnthropicRunner
 from runner.openai_compatible_runner import TEXT_SCHEMA, OpenAICompatibleRunner
-from runner.protocol import LimitStop, NodeResult, RunnerError
+from runner.protocol import BudgetStop, LimitStop, NodeResult, RunnerError
 from tests.fake_openai_server import FakeOpenAIServer
 
 ENV_VAR = "LOCAL_LLM_URL"
@@ -81,14 +81,14 @@ def _runner(server: FakeOpenAIServer, **kwargs) -> OpenAICompatibleRunner:
     return OpenAICompatibleRunner(PROFILE, role_skills={}, env={ENV_VAR: server.base_url}, **kwargs)
 
 
-def test_a_plain_text_call_returns_the_text_at_zero_cost_with_the_reported_tokens() -> None:
+def test_a_plain_text_call_returns_the_text_at_unpriced_cost_with_the_reported_tokens() -> None:
     with FakeOpenAIServer(["hello"]) as server:
         runner = _runner(server)
         out = runner.run(role="r", tier="cheap", schema=None, prompt="hi", budget_usd=0.0001)
     assert out["text"] == "hello"
     assert out.decision.budget_usd == 0.0001
     (call,) = runner.calls
-    assert (call["cost_usd"], call["input_tokens"], call["output_tokens"]) == (0.0, 3, 2)
+    assert (call["cost_usd"], call["input_tokens"], call["output_tokens"]) == (None, 3, 2)
     assert server.requests[0]["path"] == "/v1/chat/completions"
     assert server.requests[0]["body"]["model"] == "qwen-small"
 
@@ -156,7 +156,7 @@ def test_the_store_write_for_a_local_call_has_the_shape_the_anthropic_runner_wri
     assert rows[0][:4] == ("run-1", "p3-write", "r", 0)
     assert rows[1][:4] == ("run-1", "p3-write", "r", 1)
     assert (rows[1][4], rows[1][5]) == (out.decision.model_id, out.decision.chosen_tier)
-    assert rows[1][6:] == (0.0, 3, 2)
+    assert rows[1][6:] == (None, 3, 2)
 
 
 def test_a_standard_tier_goes_to_the_delegate_and_never_touches_the_server() -> None:
@@ -266,3 +266,49 @@ def test_the_delegate_gets_the_pause_hook() -> None:
     with FakeOpenAIServer([]) as server:
         _hybrid(server, factory).run(role="r", tier="standard", schema=SCHEMA, prompt="go", wait_if_paused=hook)
     assert factory.delegate.runs[0]["wait_if_paused"] is hook
+
+
+def test_a_priced_model_records_the_expected_cost_usd() -> None:
+    priced = {**PROFILE, "prices": {"qwen-small": {"input": 1_000_000, "output": 1_000_000}}}
+    with FakeOpenAIServer(["hello"]) as server:
+        runner = OpenAICompatibleRunner(priced, role_skills={}, env={ENV_VAR: server.base_url})
+        runner.run(role="r", tier="cheap", schema=None, prompt="hi")
+    (call,) = runner.calls
+    assert call["cost_usd"] == 5.0
+
+
+def test_a_call_that_pushes_cumulative_spend_past_budget_usd_raises_budget_stop() -> None:
+    budgeted = {
+        **PROFILE,
+        "prices": {"qwen-small": {"input": 1_000_000, "output": 1_000_000}},
+        "budget_usd": 1.0,
+    }
+    with FakeOpenAIServer(["hello"]) as server, pytest.raises(BudgetStop) as excinfo:
+        runner = OpenAICompatibleRunner(budgeted, role_skills={}, env={ENV_VAR: server.base_url})
+        runner.run(role="r", tier="cheap", schema=None, prompt="hi", thread="t1")
+    assert (excinfo.value.role, excinfo.value.thread, excinfo.value.spent_usd) == ("r", "t1", 5.0)
+
+
+def test_setting_auth_env_sends_the_resolved_token_as_a_bearer_token() -> None:
+    authed = {**PROFILE, "auth_env": "FAKE_OPENAI_TOKEN"}
+    with FakeOpenAIServer(["hello"]) as server:
+        runner = OpenAICompatibleRunner(
+            authed, role_skills={}, env={ENV_VAR: server.base_url, "FAKE_OPENAI_TOKEN": "secret-tok"}
+        )
+        runner.run(role="r", tier="cheap", schema=None, prompt="hi")
+    assert server.headers[0]["Authorization"] == "Bearer secret-tok"
+
+
+def test_a_pass_through_profile_sends_an_unrecognized_prefix_model_id_unchanged() -> None:
+    passed = {**PROFILE, "pass_through": True}
+    with FakeOpenAIServer(["hello"]) as server:
+        runner = OpenAICompatibleRunner(passed, role_skills={}, env={ENV_VAR: server.base_url})
+        out = runner.run(role="r", tier="deep", schema=None, prompt="hi")
+    assert out["text"] == "hello"
+    assert server.requests[0]["body"]["model"] == "remote/opus"
+
+
+def test_a_profile_without_pass_through_still_rejects_an_unrecognized_prefix() -> None:
+    with FakeOpenAIServer([]) as server, pytest.raises(RunnerError, match="deep"):
+        _runner(server).run(role="r", tier="deep", schema=None, prompt="go")
+    assert server.requests == []
