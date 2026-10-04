@@ -109,6 +109,14 @@ def test_renew_with_status_sets_it_and_a_later_renew_with_none_clears_it(conn):
     assert _status(conn) is None
 
 
+def test_renew_with_no_status_argument_leaves_a_paused_status_untouched(conn):
+    acquire(conn, NAME, "a", T0, 30)
+    assert renew(conn, NAME, "a", 1, T10, 30, status="paused") is True
+    assert _status(conn) == "paused"
+    assert renew(conn, NAME, "a", 1, T10, 30) is True
+    assert _status(conn) == "paused"
+
+
 def test_acquire_on_a_fresh_lease_leaves_status_none(conn):
     acquire(conn, NAME, "a", T0, 30)
     assert _status(conn) is None
