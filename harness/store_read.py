@@ -287,8 +287,12 @@ def task_records(conn: Connection, run_id: str) -> dict[tuple[str, str], Row]:
 
 
 def _scoped_to(record: dict[str, Any], repo: str) -> bool:
-    """True when the record's saved `scope.repos` names `repo`, exactly or by its last path component."""
-    repos = (record.get("scope") or {}).get("repos")
+    """True when the record's saved `scope.repos` names `repo`, exactly or by its last path component.
+
+    `scope` is not always a mapping: a record can carry the scope seat's verdict as a plain string, which names no
+    repos, so such a record is not attributed to any repository (skipped, as a record with no `scope.repos` is)."""
+    scope = record.get("scope")
+    repos = scope.get("repos") if isinstance(scope, dict) else None
     return isinstance(repos, list) and (repo in repos or Path(repo).name in repos)
 
 
