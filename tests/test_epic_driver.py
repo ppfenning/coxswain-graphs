@@ -14,6 +14,7 @@ carry the work onto the phase branch actually happened.
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -43,7 +44,7 @@ from harness.epic import (
 from harness.resume import load_result, save_result
 from harness.store_lease import acquire, release
 from harness.store_migrate import open_store
-from harness.store_pause import clear_paused, set_paused
+from harness.store_pause import clear_paused, is_paused, set_paused
 from harness.store_write import Store, ledger_row
 from runner.claude_code_runner import files_touched_from_patch
 from runner.protocol import BudgetStop, LimitStop, RunnerError
@@ -1513,7 +1514,10 @@ def test_an_unbudgeted_item_gets_a_history_backed_estimate(repo, cart) -> None:
     for i, (_repo_name, surfaces_count, cost) in enumerate(history):
         store.record_task_record(
             "past-run", "p1", f"t{i}",
-            {"change_facts": {"files_touched": [f"f{j}.py" for j in range(surfaces_count)]}},
+            {
+                "scope": {"repos": [str(repo)]},
+                "change_facts": {"files_touched": [f"f{j}.py" for j in range(surfaces_count)]},
+            },
             "2026-09-01T00:00:00+00:00",
         )  # fmt: skip
         p = store.conn.dialect.placeholder
@@ -2729,6 +2733,156 @@ def test_a_pause_set_just_before_the_apply_arm_holds_its_own_runner_call(repo, c
     arm_calls = [i for i, entry in enumerate(order) if entry == "call:work_state_arm"]
     assert arm_calls, "the apply arm's own runner.run must have been reached for this to prove anything"
     assert order.index("sleep") < arm_calls[0]
+
+
+def test_a_lost_lease_ends_the_pause_wait_instead_of_looping(monkeypatch) -> None:
+    """A paused renew that returns False raises the SIGTERM exit on the first pass, with no sleep."""
+    monkeypatch.setattr(epic_module, "is_paused", lambda conn, run_id: True)
+    monkeypatch.setattr(epic_module, "renew", lambda *args, **kwargs: False)
+    sleeps: list[float] = []
+
+    with pytest.raises(SystemExit) as exit_info:
+        epic_module._wait_while_paused(object(), "r", LEASE, 1, _now, 120, sleep=sleeps.append)
+
+    assert exit_info.value.code == 143
+    assert sleeps == []
+
+
+def test_a_store_error_in_the_pause_wait_is_retried_not_fatal(monkeypatch) -> None:
+    """`is_paused` raising a store error once is retried after `retry_wait`, then the wait ends normally."""
+    answers = iter([sqlite3.OperationalError("database is locked"), False])
+
+    def flaky(conn, run_id):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(epic_module, "is_paused", flaky)
+    monkeypatch.setattr(epic_module, "renew", lambda *args, **kwargs: True)
+    sleeps: list[float] = []
+
+    epic_module._wait_while_paused(object(), "r", LEASE, 1, _now, 120, sleep=sleeps.append, retry_wait=0.5)
+
+    assert sleeps == [0.5]
+
+
+def test_a_store_down_for_every_attempt_ends_the_pause_wait_with_the_sigterm_exit(monkeypatch) -> None:
+    """Three store errors in a row exhaust the retries and end the run with 143, chained from the last error."""
+
+    def down(conn, run_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(epic_module, "is_paused", down)
+    sleeps: list[float] = []
+
+    with pytest.raises(SystemExit) as exit_info:
+        epic_module._wait_while_paused(object(), "r", LEASE, 1, _now, 120, sleep=sleeps.append, retry_wait=0.5)
+
+    assert exit_info.value.code == 143
+    assert isinstance(exit_info.value.__cause__, sqlite3.OperationalError)
+    assert sleeps == [0.5, 0.5]
+
+
+def test_a_bug_in_the_pause_wait_is_not_retried_or_turned_into_a_stop(monkeypatch) -> None:
+    """A non-store exception propagates on the first call with its own type."""
+
+    def broken(conn, run_id):
+        raise TypeError("bug")
+
+    monkeypatch.setattr(epic_module, "is_paused", broken)
+    sleeps: list[float] = []
+
+    with pytest.raises(TypeError):
+        epic_module._wait_while_paused(object(), "r", LEASE, 1, _now, 120, sleep=sleeps.append)
+
+    assert sleeps == []
+
+
+def test_the_fence_is_re_checked_after_the_pause_wait_and_a_lost_lease_blocks_the_apply(
+    repo, cart, tmp_path, store, monkeypatch
+) -> None:
+    """A lease released during the first `_execute`'s wait refuses that very apply: no draft branch is created.
+
+    The pre-wait fence passed for that call, so only the post-wait re-check can stop its draft. Every later
+    `_execute` call already fails the pre-wait fence, so the draft branch list is what discriminates.
+    """
+    run_id = "epic-pause-fence"
+    store.conn.execute(f"INSERT INTO runs (run_id, status) VALUES ('{run_id}', 'queued')")
+    lease = acquire(store.conn, LEASE, run_id, _now(), 3600)
+    order: list[str] = []
+
+    def on_sleep() -> None:
+        order.append("sleep")
+        clear_paused(store.conn, run_id)
+        assert release(store.conn, LEASE, run_id, lease.epoch)
+
+    monkeypatch.setattr(epic_module, "time", _FakeTime(on_sleep))
+    original_execute = epic_module._execute
+    armed: list[bool] = []
+
+    def armed_execute(*args, **kwargs):
+        if not armed:
+            armed.append(True)
+            set_paused(store.conn, run_id, _now())
+        return original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(epic_module, "_execute", armed_execute)
+    runner = Runner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+    original_run = runner.run
+
+    def tracking_run(**kwargs):
+        order.append(f"call:{kwargs.get('role')}")
+        return original_run(**kwargs)
+
+    monkeypatch.setattr(runner, "run", tracking_run)
+
+    drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), runner=runner, store=store,
+        epoch=lease.epoch, lease_name=LEASE, run_id=run_id,
+    )
+
+    assert armed and order.count("sleep") == 1
+    drafts = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "epic/*--*"], capture_output=True, text=True, check=True
+    ).stdout
+    assert drafts.strip() == ""
+    assert "call:work_state_arm" not in order
+
+
+def _drive_to_a_signal_exit(repo, cart, tmp_path, store, monkeypatch, run_id: str, *, steal: bool):
+    """Drive a paused run whose first wait exits as a SIGTERM; with `steal`, another holder took the lease first."""
+    store.conn.execute(f"INSERT INTO runs (run_id, status) VALUES ('{run_id}', 'queued')")
+    lease = acquire(store.conn, LEASE, run_id, _now(), 3600)
+    set_paused(store.conn, run_id, _now())
+
+    def signalled(ctx) -> None:
+        if steal:
+            assert acquire(store.conn, LEASE, "other", _now(), 3600, steal=True).ok
+        raise SystemExit(143)
+
+    monkeypatch.setattr(epic_module, "_wait_if_paused", signalled)
+    with pytest.raises(SystemExit):
+        drive(
+            repo, cart, tmp_path, work=initiative(two_phases=False), store=store,
+            epoch=lease.epoch, lease_name=LEASE, run_id=run_id,
+        )
+
+
+def test_a_signal_exit_still_holding_the_lease_clears_the_pause_flag(repo, cart, tmp_path, store, monkeypatch) -> None:
+    """A rerun of the same run id must not stop at its first boundary again."""
+    _drive_to_a_signal_exit(repo, cart, tmp_path, store, monkeypatch, "epic-pause-clear", steal=False)
+
+    assert not is_paused(store.conn, "epic-pause-clear")
+
+
+def test_an_exit_after_losing_the_lease_leaves_the_new_holder_s_pause_flag(
+    repo, cart, tmp_path, store, monkeypatch
+) -> None:
+    """The run id now belongs to another holder, so its pause flag is not this driver's to clear."""
+    _drive_to_a_signal_exit(repo, cart, tmp_path, store, monkeypatch, "epic-pause-kept", steal=True)
+
+    assert is_paused(store.conn, "epic-pause-kept")
 
 
 def test_the_pause_wait_ttl_matches_the_cli_s_own_lease_ttl() -> None:
