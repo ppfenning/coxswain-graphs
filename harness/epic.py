@@ -1864,23 +1864,26 @@ def _run_phase(
         if task.get("attempts")
     }
 
+    budget_sources: dict[str, Any] = {}
     if runnable:
         _wait_if_paused(ctx)
+        invocations = [
+            _lifecycle_invocation(
+                ctx,
+                task,
+                body=_carry_forward(
+                    task.get("body") or "",
+                    list(task.get("attempts") or []),
+                    patches_for_attempt.get(str(task["id"])),
+                    limit=PATCH_FOR_VALIDATION_CHARS,
+                ),
+                fix_attempts=ctx.fix_attempts,
+            )
+            for task in runnable
+        ]
+        budget_sources = {inv.id: inv.args["build_budget_source"] for inv in invocations}
         results, _, failures = invoke_graphs(
-            [
-                _lifecycle_invocation(
-                    ctx,
-                    task,
-                    body=_carry_forward(
-                        task.get("body") or "",
-                        list(task.get("attempts") or []),
-                        patches_for_attempt.get(str(task["id"])),
-                        limit=PATCH_FOR_VALIDATION_CHARS,
-                    ),
-                    fix_attempts=ctx.fix_attempts,
-                )
-                for task in runnable
-            ],
+            invocations,
             specs=ctx.specs,
             runner=ctx.runner,
             run_id=f"{ctx.run_id}:{phase}",
@@ -2027,6 +2030,7 @@ def _run_phase(
                 "status": "quarantined" if build.get("quarantine") else "built",
                 "lint_fixed": build.get("lint_fixed", False),
                 "lint_fix_checks": build.get("lint_fix_checks", []),
+                "build_budget_source": budget_sources.get(task),
                 **({"refix": build["refix"]} if build.get("refix") else {}),
             }
         )
