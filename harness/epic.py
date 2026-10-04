@@ -861,6 +861,7 @@ def task_outcome(
 # ── the driver ──────────────────────────────────────────────────────────────
 
 WORK_STATES = ("files", "store")
+POSTGRES_URL_PREFIXES = ("postgresql://", "postgresql+psycopg://", "postgres://")
 
 
 def checked_work_state(value: Any) -> str:
@@ -871,8 +872,12 @@ def checked_work_state(value: Any) -> str:
 
 
 def work_state_of(profile: Mapping[str, Any]) -> str:
-    """The profile's `work_state`: which side owns a task's state. An absent key means files."""
-    return checked_work_state(profile.get("work_state", "files"))
+    """The profile's `work_state`: which side owns a task's state. An absent key means store when `storage_url` is Postgres, else files."""
+    if "work_state" in profile:
+        return checked_work_state(profile["work_state"])
+    if str(profile.get("storage_url") or "").startswith(POSTGRES_URL_PREFIXES):
+        return "store"
+    return "files"
 
 
 def run_epic(

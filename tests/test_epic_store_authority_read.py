@@ -59,6 +59,22 @@ def test_the_key_defaults_to_files_and_refuses_any_other_value():
         epic.work_state_of({"work_state": "db"})
 
 
+def test_an_absent_key_with_a_postgres_url_is_store():
+    assert epic.work_state_of({"storage_url": "postgresql://h/db"}) == "store"
+
+
+def test_an_absent_key_with_a_sqlite_url_is_files():
+    assert epic.work_state_of({"storage_url": "sqlite:///x.db"}) == "files"
+
+
+def test_an_absent_key_and_no_url_is_files():
+    assert epic.work_state_of({}) == "files"
+
+
+def test_an_explicit_files_wins_over_a_postgres_url():
+    assert epic.work_state_of({"work_state": "files", "storage_url": "postgresql://h/db"}) == "files"
+
+
 def test_the_driver_refuses_an_invalid_value_before_any_work(store_conn, tmp_path):
     with pytest.raises(ValueError, match="work_state"):
         epic.run_epic(
