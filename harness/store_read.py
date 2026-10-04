@@ -286,16 +286,26 @@ def task_records(conn: Connection, run_id: str) -> dict[tuple[str, str], Row]:
     return {(r["phase_id"], r["task_id"]): r["record_json"] for r in rows}
 
 
+def _scoped_to(record: dict[str, Any], repo: str) -> bool:
+    """True when the record's saved `scope.repos` names `repo`, exactly or by its last path component."""
+    repos = (record.get("scope") or {}).get("repos")
+    return isinstance(repos, list) and (repo in repos or Path(repo).name in repos)
+
+
 def build_task_history(conn: Connection, repo: str, since: str) -> list[tuple[str, int, float]]:
     """Landed build-task cost history for `repo`, at or after `since` (an ISO timestamp), oldest first.
 
     Every row of `task_records` is a landed lifecycle result: `harness/epic.py`
     mirrors one there for each build task a phase runs, so no further filter
-    for "a build task" is needed beyond the table itself. The schema has no
-    `repo` column anywhere — `runs`, `task_records` and `work_items` all lack
-    one — so `repo` is not filtered on here; it only labels every row
-    returned, correct for a store that is not shared across more than one
-    target repository, the only way any existing write path uses one.
+    for "a build task" is needed beyond the table itself. The store is shared
+    across repositories, so the query filters by `repo`: a row is kept only
+    when the `scope.repos` list the `lifecycle` graph saved in its
+    `record_json` names the repository. `repo` matches an entry exactly or by
+    its last path component, because `harness/epic.py` passes a checkout path
+    and the scope role lists repository names. A record with no `scope.repos`
+    list, such as one from a team that has not bound `scope_epic`, cannot be
+    attributed to a repository and is skipped, so such a store yields no
+    history and the estimate falls back to its default.
 
     `surfaces_count` is the number of files the landed patch actually touched
     (`change_facts.files_touched`, already computed and stored by the
@@ -328,6 +338,8 @@ def build_task_history(conn: Connection, repo: str, since: str) -> list[tuple[st
         if not isinstance(files, list):
             continue
         if not cost:
+            continue
+        if not _scoped_to(record, repo):
             continue
         history.append((repo, len(files), float(cost)))
     return history

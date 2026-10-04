@@ -85,12 +85,12 @@ def test_an_unknown_run_has_no_summary_and_a_run_with_no_calls_sums_to_zero(conn
 def test_build_task_history_sums_build_cost_counts_files_touched_and_keeps_the_window(conn):
     put(
         conn, "task_records", run_id="r1", phase_id="p1", task_id="hin",
-        record_json=json_text({"change_facts": {"files_touched": ["a.py", "b.py"]}}),
+        record_json=json_text({"scope": {"repos": ["demo-repo"]}, "change_facts": {"files_touched": ["a.py", "b.py"]}}),
         updated_at="2026-09-10T00:00:00Z",
     )  # fmt: skip
     put(
         conn, "task_records", run_id="r2", phase_id="p1", task_id="hout",
-        record_json=json_text({"change_facts": {"files_touched": ["c.py"]}}),
+        record_json=json_text({"scope": {"repos": ["demo-repo"]}, "change_facts": {"files_touched": ["c.py"]}}),
         updated_at="2026-08-01T00:00:00Z",
     )  # fmt: skip
     call(conn, "hc1", "r1", 10, "build", "sonnet", "mid", 1.25, 100, 0, 50, phase_id="p1", task_id="hin")
@@ -111,7 +111,7 @@ def test_build_task_history_skips_a_row_with_no_files_touched(conn):
 def test_build_task_history_matches_a_build_call_with_an_empty_phase_id(conn):
     put(
         conn, "task_records", run_id="r1", phase_id="p1", task_id="hnoph",
-        record_json=json_text({"change_facts": {"files_touched": ["a.py"]}}),
+        record_json=json_text({"scope": {"repos": ["demo-repo"]}, "change_facts": {"files_touched": ["a.py"]}}),
         updated_at="2026-09-10T00:00:00Z",
     )  # fmt: skip
     call(conn, "hc4", "r1", 13, "build", "sonnet", "mid", 4.5, 100, 0, 50, phase_id="", task_id="hnoph")
@@ -126,6 +126,24 @@ def test_build_task_history_omits_a_task_record_with_no_matching_build_call(conn
         updated_at="2026-09-10T00:00:00Z",
     )  # fmt: skip
     assert read.build_task_history(conn, "demo-repo", "2026-09-01T00:00:00Z") == []
+
+
+def test_build_task_history_keeps_only_rows_whose_scope_repos_names_the_repo(conn):
+    put(
+        conn, "task_records", run_id="r1", phase_id="p1", task_id="hrepo-a",
+        record_json=json_text({"scope": {"repos": ["repo-a"]}, "change_facts": {"files_touched": ["a.py"]}}),
+        updated_at="2026-09-10T00:00:00Z",
+    )  # fmt: skip
+    put(
+        conn, "task_records", run_id="r2", phase_id="p1", task_id="hrepo-b",
+        record_json=json_text({"scope": {"repos": ["repo-b"]}, "change_facts": {"files_touched": ["b.py", "c.py"]}}),
+        updated_at="2026-09-11T00:00:00Z",
+    )  # fmt: skip
+    call(conn, "hc5", "r1", 14, "build", "sonnet", "mid", 2.0, 100, 0, 50, phase_id="p1", task_id="hrepo-a")
+    call(conn, "hc6", "r2", 15, "build", "sonnet", "mid", 3.5, 100, 0, 50, phase_id="p1", task_id="hrepo-b")
+    since = "2026-09-01T00:00:00Z"
+    assert read.build_task_history(conn, "repo-a", since) == [("repo-a", 1, 2.0)]
+    assert read.build_task_history(conn, "/work/checkouts/repo-b", since) == [("/work/checkouts/repo-b", 2, 3.5)]
 
 
 def test_postgres_decimal_sums_come_back_as_int_and_float():
