@@ -193,6 +193,23 @@ def _git(*args: str, cwd: Path | None = None) -> tuple[bool, str]:
     return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
 
 
+def _push_review_branch(ctx: _Ctx, task: str) -> tuple[bool, str]:
+    """Push the task's scratch branch to origin as `review/<initiative>/<task>`."""
+    return _git(
+        "-C", str(ctx.repo), "push", "origin",
+        f"{ctx.scratch_branch(task)}:refs/heads/review/{ctx.initiative_id}/{task}",
+    )
+
+
+def _open_review_pr(ctx: _Ctx, *, title: str, body: str, head: str, base: str) -> tuple[bool, str]:
+    """Open a PR for `head` against `base`; the detail is its URL on success."""
+    proc = subprocess.run(
+        ["gh", "pr", "create", "--title", title, "--body", body, "--head", head, "--base", base],
+        cwd=ctx.repo, capture_output=True, text=True,
+    )
+    return proc.returncode == 0, (proc.stdout if proc.returncode == 0 else proc.stderr or proc.stdout).strip()
+
+
 def default_branch(origin_head: str | None, local: set[str], head: str) -> str:
     """Origin's default if it is local, else main, else master, else `head`."""
     origin_name = (origin_head or "").removeprefix("origin/")
@@ -1983,6 +2000,15 @@ def _run_phase(
             escalated.add(task)
             build["governance_hits"] = hits
 
+        # `_execute` sees only the batch item, so the verdicts ride on it.
+        arbitration = final.get("arbitration")
+        for item in build["proposals"]:
+            if item.get("escalated_from") == "draft_pr_create":
+                item["review_verdict"] = str((final.get("review") or {}).get("verdict") or "")
+                item["arbitration_verdict"] = str(
+                    arbitration.get("verdict") if isinstance(arbitration, Mapping) else arbitration or ""
+                )
+
         record["task_records"].append(
             {
                 "id": task,
@@ -2199,6 +2225,8 @@ def _run_phase(
             # `self_modification`, or any other reason `merge_stack` did not
             # run — so the task is not `done` yet, only `approved`.
             task_record["status"] = "approved"
+        if task in state.review_pr:
+            task_record["review_pr"] = state.review_pr[task]
         verdicts = (built.get(task) or {}).get("result") or {}
         task_record["outcome"] = task_outcome(
             str((verdicts.get("review") or {}).get("verdict") or "") or None,
@@ -2640,6 +2668,7 @@ class _Execution:
     merged: dict[str, bool]
     moved: dict[str, bool]
     quarantined: list[dict[str, Any]]
+    review_pr: dict[str, str] = field(default_factory=dict)
 
 
 def _execute(
@@ -2709,6 +2738,34 @@ def _execute(
                 {"id": phase, "phase": phase, "grain": "phase", "reason": f"rebase conflict: {detail}"}
             )
         return ok, detail
+
+    if kind == "self_modification" and slot == "draft" and item.get("escalated_from") == "draft_pr_create":
+        # A review PR a human reads, never a merge: no merge call runs here.
+        ok, detail = _push_review_branch(ctx, subject)
+        if not ok:
+            return False, f"review branch push failed: {detail}"
+        paths = next(
+            (str(row.get("output") or "") for row in item.get("evidence") or [] if row.get("check") == "governance_paths"),
+            "",
+        )
+        body = "\n".join(
+            (
+                f"Review verdict: {item.get('review_verdict') or 'none'}",
+                f"Arbiter verdict: {item.get('arbitration_verdict') or 'none'}",
+                f"Governance paths: {paths or 'none'}",
+            )
+        )
+        ok, detail = _open_review_pr(
+            ctx,
+            title=f"[review] {ctx.initiative_id}: {by_id[subject]['title']}",
+            body=body,
+            head=f"review/{ctx.initiative_id}/{subject}",
+            base=ctx.default_ref,
+        )
+        if not ok:
+            return False, f"review PR failed: {detail}"
+        state.review_pr[subject] = detail
+        return True, detail
 
     # Everything else goes to the arm the cartridge names — the same call
     # `gate.apply_decisions` makes, because an apply arm is a role and the same
