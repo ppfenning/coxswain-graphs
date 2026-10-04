@@ -25,6 +25,7 @@ import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import reduce
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -33,13 +34,18 @@ import yaml
 from runner.decision_log import CallDecision, RouterDecision, joined_reasons, to_row
 from runner.pricing import max_output_tokens_for_budget, price_call
 from runner.protocol import BudgetStop, LimitStop, NodeResult, RunnerError
+from runner.schema_answer import schema_instruction, shape_answer
 from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class
+from runner.tool_loop import AdapterStep, FinalAnswer, ToolCall, run_tool_loop
 
 if TYPE_CHECKING:
     # Type only: importing harness at module load is circular, since harness imports the runners.
     from harness.store_write import Store
 
-__all__ = ["AnthropicRunner", "load_provider_profile"]
+__all__ = ["AnthropicRunner", "AnthropicToolLoopAdapter", "load_provider_profile"]
+
+# unknown: the right turn cap for a build; this is a guess, not a measurement.
+_BUILD_TURN_CAP = 40
 
 # Roles doing verification, adversarial review, or arbitration are worth more
 # capability than roles doing bulk enumeration. The profile decides which model
@@ -165,6 +171,98 @@ def _decision(
     )
 
 
+def _wire_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    """One tool_loop message as one Messages API message; a tool result is a user turn of `tool_result` blocks."""
+    if message["role"] == "assistant":
+        calls = message["tool_calls"]
+        return {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": c["id"], "name": c["name"], "input": c["arguments"]} for c in calls],
+        }
+    if message["role"] == "tool":
+        block = {
+            "type": "tool_result",
+            "tool_use_id": message["tool_call_id"],
+            "content": message["content"],
+            "is_error": message["is_error"],
+        }
+        return {"role": "user", "content": [block]}
+    return {"role": "user", "content": message["content"]}
+
+
+def _merge_results(acc: list[dict[str, Any]], message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Fold consecutive block-list user turns into one: the API wants every result for a turn's calls in one message."""
+    prev = acc[-1] if acc else None
+    if prev and prev["role"] == message["role"] == "user" and isinstance(prev["content"], list) and isinstance(message["content"], list):
+        return [*acc[:-1], {"role": "user", "content": [*prev["content"], *message["content"]]}]
+    return [*acc, message]
+
+
+def _to_anthropic(messages: Sequence[Mapping[str, Any]], tools: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The `system`, `messages` and `tools` request fields for a tool_loop message list and tool set."""
+    head = messages[0]
+    schema = head.get("schema")
+    system = "\n\n".join(part for part in (head["content"], schema_instruction(dict(schema)) if schema else "") if part)
+    return {
+        "system": system or None,
+        "messages": reduce(_merge_results, map(_wire_message, messages[1:]), []),
+        "tools": [
+            {"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in tools
+        ],
+    }
+
+
+class AnthropicToolLoopAdapter:
+    """`ToolLoopAdapter` over the Messages API; `answer` and `billed` outlive the loop, which returns neither."""
+
+    def __init__(self, client: Any, *, model: str, max_tokens: int, effort: str, prices: Mapping[str, Any]) -> None:
+        self._client = client
+        self._model = model
+        self._max_tokens = max_tokens
+        self._effort = effort
+        self._prices = prices
+        self.answer: dict[str, Any] | None = None
+        # Every billed turn, including one whose reply then raises, so a failed loop can still be charged.
+        self.billed: dict[str, float] = {}
+
+    def send(self, messages: list[dict], tools: list[dict]) -> AdapterStep:
+        schema = dict(messages[0].get("schema") or {})
+        try:
+            # No `thinking`: a thinking block must be echoed back unchanged, and the neutral message list cannot hold one.
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                output_config={"effort": self._effort},
+                **_to_anthropic(messages, tools),
+            )
+        except Exception as exc:
+            if isinstance(exc, _limit_exception_types()) or getattr(exc, "status_code", None) in (429, 529):
+                raise LimitStop(detail=str(exc)) from exc
+            raise RunnerError(f"tool loop: {exc}") from exc
+        billed = getattr(response, "model", None) or self._model
+        raw = getattr(response, "usage", None)
+        input_tokens = getattr(raw, "input_tokens", 0) or 0
+        output_tokens = getattr(raw, "output_tokens", 0) or 0
+        cost = price_call(self._prices, billed, input_tokens, output_tokens)
+        if cost is None:
+            cost = price_call(self._prices, self._model, input_tokens, output_tokens)
+        usage = {"input_tokens": input_tokens, "output_tokens": output_tokens, **({} if cost is None else {"cost_usd": cost})}
+        self.billed = {k: self.billed.get(k, 0) + usage.get(k, 0) for k in {*self.billed, *usage}}
+        if getattr(response, "stop_reason", None) == "refusal":
+            raise RunnerError("tool loop: the model refused the request")
+        calls = [ToolCall(b.id, b.name, dict(b.input)) for b in response.content if b.type == "tool_use"]
+        if calls:
+            return AdapterStep(calls, None, usage)
+        text = next((b.text for b in response.content if b.type == "text"), None)
+        if text is None:
+            raise RunnerError("tool loop: the reply had no tool call and no text block")
+        data, errors = shape_answer(text, schema)
+        if not isinstance(data, dict):
+            raise RunnerError(f"tool loop: the final reply does not match the schema: {'; '.join(errors) or 'not an object'}")
+        self.answer = data
+        return AdapterStep([], FinalAnswer(data), usage)
+
+
 class AnthropicRunner:
     """Runs nodes against the Messages API with structured outputs."""
 
@@ -178,7 +276,9 @@ class AnthropicRunner:
         role_skills: Mapping[str, str] | None = None,
         store: Store | None = None,
         run_id: str | None = None,
+        cwd: Path | None = None,
     ) -> None:
+        self.cwd = cwd
         # Also record every finished call in the run-record store. This runner receives no run id today,
         # so a new optional `run_id` (`run:phase`) is the smallest way to give the store its context.
         self.store = store
@@ -284,6 +384,17 @@ class AnthropicRunner:
         except Exception as exc:
             warnings.warn(f"store write failed for call {call['id']}: {exc}", RuntimeWarning, stacklevel=2)
 
+    def _charge_loop(self, thread: str | None, spent_before: float, billed: Mapping[str, float]) -> dict[str, Any]:
+        """Charge a tool loop's billed turns to `thread`; returns the store row's usage fields."""
+        cost_usd = billed.get("cost_usd")
+        if thread is not None:
+            self._thread_spend[thread] = spent_before + (cost_usd or 0.0)
+        return {
+            "input_tokens": int(billed.get("input_tokens", 0)),
+            "output_tokens": int(billed.get("output_tokens", 0)),
+            "cost_usd": cost_usd,
+        }
+
     def run(
         self,
         *,
@@ -302,6 +413,8 @@ class AnthropicRunner:
         # unknown: protocol.py does not declare this either. The caller's shadow decision is recorded, never computed here.
         router_decision: RouterDecision | None = None,
         wait_if_paused: Callable[[], None] | None = None,
+        # The commands `run_check` may run in the build's worktree. The stateless path has no use for them.
+        checks: Sequence[str] = (),
     ) -> NodeResult:
         # `thread` carries no history here: each call is one stateless Messages
         # request. It is the key `_thread_spend` accumulates cost under, so
@@ -357,6 +470,72 @@ class AnthropicRunner:
             if affordable is not None:
                 # The API refuses max_tokens below 1, so an exhausted budget still sends the smallest request.
                 request_max_tokens = max(1, min(request_max_tokens, affordable))
+        if role == "build" and self.cwd is not None:
+            if budget_usd is not None and model_id not in profile_prices:
+                # The loop stops on summed `cost_usd`; an unpriced model never reports one, so the budget could never trip.
+                raise RunnerError(
+                    f"node '{role}' has a ${budget_usd:.4f} budget but model '{model_id}' has no price in the provider "
+                    "profile, so the tool loop could not enforce it"
+                )
+            adapter = AnthropicToolLoopAdapter(
+                self._client, model=model_id, max_tokens=request_max_tokens, effort=effort_used, prices=profile_prices
+            )
+            try:
+                loop = run_tool_loop(
+                    adapter,
+                    worktree=self.cwd,
+                    system_prompt=system,
+                    user_prompt=prompt,
+                    schema=dict(schema),
+                    checks=checks,
+                    turn_cap=_BUILD_TURN_CAP,
+                    budget_usd=None if budget_usd is None else budget_usd - spent_before,
+                    wait_if_paused=wait_if_paused,
+                )
+            except RunnerError as exc:
+                # BudgetStop and LimitStop are RunnerErrors: every turn billed before the raise is charged and recorded.
+                paid = self._charge_loop(thread, spent_before, adapter.billed)
+                self._record_to_store(role, task, recorded.tier, model_id, None, **paid)
+                if isinstance(exc, BudgetStop):
+                    raise BudgetStop(
+                        role=role,
+                        thread=thread,
+                        session=None,
+                        spent_usd=spent_before + (paid["cost_usd"] or 0.0),
+                        detail=exc.detail,
+                        partial_patch=exc.partial_patch,
+                        num_turns=exc.num_turns,
+                    ) from exc
+                raise
+            paid = self._charge_loop(thread, spent_before, adapter.billed)
+            if loop.stop_reason != "final":
+                self._record_to_store(role, task, recorded.tier, model_id, None, **paid)
+                raise RunnerError(
+                    f"node '{role}' used all {_BUILD_TURN_CAP} tool-loop turns without a final answer; "
+                    f"the worktree {self.cwd} holds its unfinished change ({len(loop.patch)} characters of diff)"
+                )
+            result = NodeResult(
+                {**(adapter.answer or {}), "patch": loop.patch, **({"patch_error": loop.patch_error} if loop.patch_error else {})}
+            )
+            result.decision = _decision(
+                role=role,
+                requested_tier=requested_tier,
+                resolution=recorded,
+                model_id=model_id,
+                effort=effort_used,
+                budget_usd=budget_usd,
+                task=task,
+                router_decision=shadow,
+            )
+            self._record_to_store(
+                role,
+                task,
+                recorded.tier,
+                model_id,
+                result.decision,
+                **paid,
+            )
+            return result
         try:
             response = self._client.messages.create(
                 model=model_id,
