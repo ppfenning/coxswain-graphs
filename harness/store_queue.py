@@ -6,7 +6,8 @@ Connection, placeholder and json helpers, never a hand-rolled dialect branch. Ti
 always an argument: claim's NOW and TTL_S come from argv, nothing here reads the clock.
 
 This module owns the queue and claim columns migration 0009 added to work_items: kind,
-title, surfaces_json, body, extra_json, holder, epoch, expires_at. The seven columns
+title, surfaces_json, body, extra_json, holder, epoch, expires_at. Migration 0012's integer
+priority is read and written here too, by this module's own statements. The seven columns
 store_read.work_items and store_work_state already read and write (initiative, task_id,
 phase, state, needs_json, updated_at, updated_by) keep their meaning; this module writes
 them the same way those helpers do, through the same table, and never adds a duplicate
@@ -38,12 +39,12 @@ Row = dict[str, Any]
 # never through this tuple.
 _QUEUE_COLS = (
     "initiative", "task_id", "kind", "phase", "state", "needs_json", "title",
-    "surfaces_json", "body", "extra_json", "updated_at", "updated_by",
+    "surfaces_json", "body", "extra_json", "priority", "updated_at", "updated_by",
     "holder", "epoch", "expires_at",
 )  # fmt: skip
 _RENAME = {"needs_json": "needs", "surfaces_json": "surfaces", "extra_json": "extra"}
 # The fields upsert compares to decide whether a repeat changes anything.
-_CONTENT = ("kind", "phase", "state", "needs", "title", "surfaces", "body", "extra")
+_CONTENT = ("kind", "phase", "state", "needs", "title", "surfaces", "body", "extra", "priority")
 _KEY_COLS = ("initiative", "task_id")
 
 
@@ -74,6 +75,7 @@ def _insert_row(row: Row) -> Row:
         "surfaces_json": row.get("surfaces"),
         "body": row.get("body"),
         "extra_json": row.get("extra"),
+        "priority": row["priority"],
         # Every work_items column is NOT NULL (migration 0006); a caller that sends no stamp, as tools' `route import`
         # rows do, gets the write time and this module's name rather than a refused row.
         "updated_at": row.get("updated_at") or datetime.now(UTC).isoformat(),
@@ -94,16 +96,31 @@ def _unchanged(current: Row | None, row: Row) -> bool:
     return current is not None and all(current[k] == row.get(k) for k in _CONTENT)
 
 
+def _priority_problem(row: Row) -> str | None:
+    """A refusal message when `row` carries a priority that is not an integer; a bool is not one."""
+    value = row.get("priority", 0)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return None
+    return f"priority must be an integer, got {value!r}"
+
+
 def upsert(conn: Connection, row: Row) -> bool:
     """Insert a new (initiative, task_id) row, or update its queue columns; False when the content was already stored.
 
     holder, epoch and expires_at are not in the column list, so the SET never touches a claim.
+    A row with no priority key inserts 0 and keeps the stored priority on an update. A bad priority raises ValueError.
     """
-    values = _insert_row(row)
+    problem = _priority_problem(row)
+    if problem is not None:
+        raise ValueError(problem)
     with conn.transaction():
+        current = _current(conn, row["initiative"], row["task_id"])
+        stored = 0 if current is None else current["priority"]
+        resolved = {**row, "priority": row.get("priority", stored)}
+        values = _insert_row(resolved)
         # store_dialect.upsert overwrites every listed column, updated_at included: this guard keeps
         # updated_at stable when a repeat carries the same content.
-        if _unchanged(_current(conn, row["initiative"], row["task_id"]), row):
+        if _unchanged(current, resolved):
             return False
         conn.execute(upsert_sql(conn.dialect, "work_items", list(values), _KEY_COLS), _params(values))
     return True
@@ -209,7 +226,10 @@ def dispatch(conn: Connection, args: argparse.Namespace) -> int:
             print(json.dumps(row, sort_keys=True))
         return EXIT_OK
     if args.command == "upsert":
-        upsert(conn, args.row_json)
+        try:
+            upsert(conn, args.row_json)
+        except ValueError as exc:
+            return _fail(str(exc))
         print(json.dumps(args.row_json, sort_keys=True))
         return EXIT_OK
     if args.command == "claim":
