@@ -14,6 +14,7 @@ def item_row(initiative: str, item: Mapping[str, Any], updated_at: str | None, u
     return {
         "initiative": initiative,
         "task_id": item["id"],
+        "kind": "task",
         "phase": item["phase"],
         "state": item["state"],
         "needs": list(item["needs"]),

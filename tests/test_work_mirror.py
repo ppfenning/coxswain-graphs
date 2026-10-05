@@ -4,6 +4,7 @@ ITEM = {"id": "t1", "phase": "p1", "state": "done", "needs": ["t0", "tz"]}
 STORED = {
     "initiative": "init",
     "task_id": "t1",
+    "kind": "task",
     "phase": "p1",
     "state": "done",
     "needs": ["t0", "tz"],
@@ -15,7 +16,7 @@ TIMES = {"t1": "2026-09-25T09:00:00Z"}
 
 def test_item_row_has_the_assumed_keys_and_plans_nothing_against_itself():
     row = item_row("init", ITEM, "2026-09-25T09:00:00Z", "driver")
-    assert list(row) == ["initiative", "task_id", "phase", "state", "needs", "updated_at", "updated_by"]
+    assert list(row) == ["initiative", "task_id", "kind", "phase", "state", "needs", "updated_at", "updated_by"]
     assert plan_mirror("init", [ITEM], [row], TIMES, "driver") == ([], [])
 
 
@@ -25,6 +26,7 @@ def test_a_missing_row_is_upserted():
         {
             "initiative": "init",
             "task_id": "t1",
+            "kind": "task",
             "phase": "p1",
             "state": "done",
             "needs": ["t0", "tz"],
