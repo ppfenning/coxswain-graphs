@@ -26,6 +26,7 @@ from typing import Any
 import yaml
 
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
+from graphs.delivery.phase_split import split_same_phase_needs
 from graphs.delivery.ticket_lint import Problem, lint_tickets
 from runner.decision_log import RouterDecision
 from runner.decision_source import DecisionSource, NoDecisionSource, ask
@@ -514,7 +515,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "writing a full id yourself, and write every `needs` entry using those "
             "same t-keys instead of a full slug."
         )
-    decomposition = dict(
+    raw = dict(
         runner.run(
             role="decompose",
             hints=decompose_hints,
@@ -524,8 +525,21 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             prompt=decompose_prompt,
         )
     )
+    # A deterministic rewrite, not a model call. It runs before the adversary,
+    # so the adversary sees the split phases.
+    decomposition, moves = split_same_phase_needs(
+        {**raw, "phases": list(raw.get("phases") or []), "tasks": list(raw.get("tasks") or [])}
+    )
 
     initiative_id = args.get("initiative_id")
+    reported_moves = (
+        [
+            dict(m, task=_prefixed(initiative_id, m["task"]), needs=[_prefixed(initiative_id, n) for n in m["needs"]])
+            for m in moves
+        ]
+        if initiative_id
+        else moves
+    )
 
     tasks = [dict(t, needs=list(t.get("needs") or []), surfaces=list(t.get("surfaces") or [])) for t in decomposition.get("tasks") or []]
     if not tasks:
@@ -787,6 +801,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "shape": shape,
         "phases": decomposition.get("phases") or [],
         "tasks": sorted(tasks, key=lambda t: str(t["id"])),
+        "moves": reported_moves,
         "challenge": challenge,
         "proposals": proposals,
         "totals": {
