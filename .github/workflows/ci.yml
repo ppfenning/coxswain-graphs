@@ -78,6 +78,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.15"
+          allow-prereleases: true
           cache: pip
       - name: Check out the substrate (optional)
         if: env.SUBSTRATE_TOKEN != ''
