@@ -137,6 +137,24 @@ def test_an_upsert_that_omits_priority_on_a_row_with_priority_5_still_reads_back
     assert (stored["priority"], stored["state"]) == (5, "done")
 
 
+def test_a_state_only_upsert_keeps_the_stored_kind_title_surfaces_body_and_extra(store_conn):
+    upsert(store_conn, ROW)
+    partial = {"initiative": "i1", "task_id": "t1", "phase": "p1", "state": "done", "needs": ["t0"],
+               "updated_at": T30, "updated_by": "epic-driver:r1"}
+    assert upsert(store_conn, partial) is True
+    (stored,) = read(store_conn)
+    assert {k: stored[k] for k in ("kind", "title", "surfaces", "body", "extra", "state")} == {
+        "kind": "task", "title": "do the thing", "surfaces": {"files": ["a.py", "b.py"]},
+        "body": "some body text", "extra": {"note": "extra data", "n": 2}, "state": "done"}
+
+
+def test_an_explicit_none_still_clears_a_stored_column(store_conn):
+    upsert(store_conn, ROW)
+    upsert(store_conn, {**ROW, "extra": None, "updated_at": T30})
+    (stored,) = read(store_conn)
+    assert stored["extra"] is None
+
+
 @pytest.mark.parametrize("bad", ["5", True, 1.5])
 def test_a_non_integer_priority_is_refused_and_writes_nothing(store_conn, bad):
     with pytest.raises(ValueError, match="priority must be an integer"):

@@ -109,6 +109,8 @@ def upsert(conn: Connection, row: Row) -> bool:
 
     holder, epoch and expires_at are not in the column list, so the SET never touches a claim.
     A row with no priority key inserts 0 and keeps the stored priority on an update. A bad priority raises ValueError.
+    Any other content key the row leaves out keeps its stored value on an update, so a state-only mirror write
+    never blanks the kind, title, surfaces or body; a key sent as None still clears its column.
     """
     problem = _priority_problem(row)
     if problem is not None:
@@ -116,7 +118,8 @@ def upsert(conn: Connection, row: Row) -> bool:
     with conn.transaction():
         current = _current(conn, row["initiative"], row["task_id"])
         stored = 0 if current is None else current["priority"]
-        resolved = {**row, "priority": row.get("priority", stored)}
+        kept = {} if current is None else {k: current[k] for k in _CONTENT if k not in row}
+        resolved = {**kept, **row, "priority": row.get("priority", stored)}
         values = _insert_row(resolved)
         # store_dialect.upsert overwrites every listed column, updated_at included: this guard keeps
         # updated_at stable when a repeat carries the same content.
