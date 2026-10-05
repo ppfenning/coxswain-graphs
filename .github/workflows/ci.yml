@@ -105,14 +105,14 @@ jobs:
     # unlike `test`, this job cannot degrade: no token means a red run.
     env:
       SUBSTRATE_TOKEN: ${{ secrets.SUBSTRATE_REPO_TOKEN }}
-      COXSWAIN_TEST_PG_URL: postgresql://postgres:postgres@localhost:5432/postgres
     services:
       postgres:
         image: postgres:16
         env:
           POSTGRES_PASSWORD: postgres
+        # a random host port, so two of these jobs can share a self-hosted runner's host
         ports:
-          - 5432:5432
+          - 5432
         options: >-
           --health-cmd pg_isready
           --health-interval 5s
@@ -120,6 +120,9 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v5
+
+      - name: Point the store tests at the service's host port
+        run: echo "COXSWAIN_TEST_PG_URL=postgresql://postgres:postgres@localhost:${{ job.services.postgres.ports['5432'] }}/postgres" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v6
         with:
