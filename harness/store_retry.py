@@ -2,9 +2,6 @@
 
 from collections.abc import Callable
 from itertools import count
-from typing import TypeVar
-
-T = TypeVar("T")
 
 # Lower-cased fragments of the libpq and psycopg messages for a connection that dropped or cannot be made yet.
 # An OperationalError without one, such as a failed password or a missing database, is a fault, not an outage.
@@ -39,7 +36,7 @@ def is_connection_error(exc: BaseException) -> bool:
     return _is_psycopg_operational(exc) and any(fragment in message for fragment in _CONNECTION_LOST)
 
 
-def retry_store_write(
+def retry_store_write[T](
     write: Callable[[], T],
     *,
     reconnect: Callable[[], None],

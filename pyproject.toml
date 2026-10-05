@@ -7,7 +7,7 @@ name = "agent-graphs"
 version = "0.28.0"
 description = "Portable agent graphs for the agent-cartridges substrate"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = ["pyyaml>=6", "zstandard>=0.23"]
 
 [project.optional-dependencies]
