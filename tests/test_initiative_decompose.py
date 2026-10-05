@@ -49,6 +49,36 @@ def decompose(cart, decomposition=DECOMPOSITION, challenge=None):
     )
 
 
+def test_a_same_phase_edge_is_split_and_the_move_is_recorded(cart) -> None:
+    stub = {
+        "phases": [{"id": "p1", "goal": "g1"}, {"id": "p2", "goal": "g2"}],
+        "tasks": [
+            {"id": "a", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": []},
+            {"id": "b", "phase": "p1", "title": "b", "body": "b", "needs": ["a"], "surfaces": []},
+        ],
+        "rationale": "r",
+    }
+    result = decompose(cart, stub)
+    phase_of = {t["id"]: t["phase"] for t in result["tasks"]}
+    assert all(phase_of[n] != t["phase"] for t in result["tasks"] for n in t["needs"])
+    assert result["moves"] == [{"task": "b", "from": "p1", "to": "p1-b", "needs": ["a"]}]
+    assert [p["id"] for p in result["phases"]] == ["p1", "p1-b", "p2"]
+
+
+def test_a_decomposition_with_no_same_phase_edge_records_no_moves(cart) -> None:
+    stub = {
+        "phases": [{"id": "p1", "goal": "g1"}, {"id": "p2", "goal": "g2"}],
+        "tasks": [
+            {"id": "a", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": []},
+            {"id": "b", "phase": "p2", "title": "b", "body": "b", "needs": ["a"], "surfaces": []},
+        ],
+        "rationale": "r",
+    }
+    result = decompose(cart, stub)
+    assert result["moves"] == []
+    assert {t["id"]: t["phase"] for t in result["tasks"]} == {"a": "p1", "b": "p2"}
+
+
 def test_emits_one_proposal_per_task(cart) -> None:
     result = decompose(cart)
     assert [p["target"] for p in result["proposals"]] == ["t1", "t2", "t3", "initiative"]
@@ -58,7 +88,7 @@ def test_emits_one_proposal_per_task(cart) -> None:
 def test_totals_report_the_shape_of_the_graph(cart) -> None:
     totals = decompose(cart)["totals"]
     assert totals["tasks"] == 3
-    assert totals["phases"] == 2
+    assert totals["phases"] == 3
     assert totals["edges"] == 3
     assert totals["immediately_startable"] == 1
 
@@ -184,6 +214,7 @@ def test_task_ids_and_files_are_prefixed_with_the_initiative_id(cart) -> None:
         ScriptedRunner({"decompose": DECOMPOSITION}),
     )
     assert [t["id"] for t in result["tasks"]] == ["regatta-t1", "regatta-t2", "regatta-t3"]
+    assert result["moves"] == [{"task": "regatta-t2", "from": "p1", "to": "p1-b", "needs": ["regatta-t1"]}]
 
 
 def test_prefixed_adds_the_initiative_id_to_a_bare_id() -> None:
