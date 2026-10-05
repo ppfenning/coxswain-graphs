@@ -51,6 +51,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Literal
+from urllib.parse import urlencode
 
 from core import ledger, workstore
 from core.manifest import append_ledger, build_manifest, gate_diff
@@ -85,8 +86,10 @@ from harness.escalate import escalate_self_modification, touched_paths
 from harness.gate import apply_arm_for, auto_apply, gate
 from harness.invoke import Invocation, invoke_graphs
 from harness.resume import load_result, reusable, save_result
+from harness.store_dialect import Connection, connect
 from harness.store_lease import assert_epoch, renew
 from harness.store_pause import clear_paused, is_paused
+from harness.store_retry import retry_store_write
 from harness.store_write import Store, upsert_work_item
 from harness.worktree import (
     apply_patch,
@@ -222,6 +225,59 @@ def default_branch(origin_head: str | None, local: set[str], head: str) -> str:
     return head
 
 
+# A mid-run mirror or a pause clear waits this long for a lost connection; the run's exit record gets the full five minutes.
+_END_WRITE_WINDOW_S = 60.0
+_EXIT_WINDOW_S = 300.0
+
+
+def _reopen_url(conn: Connection) -> str | None:
+    """A URL `connect` accepts for the database `conn` is on, or None when it cannot be reopened (an in-memory sqlite)."""
+    raw = conn.raw
+    if isinstance(raw, sqlite3.Connection):
+        file = next((row[2] for row in raw.execute("PRAGMA database_list") if row[1] == "main"), "")
+        return f"sqlite:///{file}" if file else None
+    # psycopg's `info.get_parameters()` never returns the password; the libpq `pgconn.info` does.
+    params = {item.keyword.decode(): item.val.decode() for item in raw.pgconn.info if item.val}
+    return "postgresql:///?" + urlencode(params)
+
+
+def reopen_connection(conn: Connection) -> None:
+    """Replace the driver connection under `conn` with a fresh one to the same database.
+
+    Every holder of `conn` (the heartbeat, the runner) sees the new connection. The old one is closed only
+    after the new one is open, so a server still down leaves `conn` as it was and raises for the retry to repeat.
+    """
+    url = _reopen_url(conn)
+    if url is None:
+        return
+    fresh = connect(url)
+    old, conn.raw = conn.raw, fresh.raw
+    with contextlib.suppress(Exception):  # the old connection is already dead
+        old.close()
+
+
+@dataclass(frozen=True)
+class _StoreRetry:
+    """How a store write is retried across a lost connection. The default reconnects nothing: see `for_store`."""
+
+    reconnect: Callable[[], None] = lambda: None
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+
+    @classmethod
+    def for_store(
+        cls, store: Store, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep
+    ) -> _StoreRetry:
+        """Retries that reconnect `store`'s own connection."""
+        return cls(reconnect=lambda: reopen_connection(store.conn), clock=clock, sleep=sleep)
+
+    def write(self, call: Callable[[], Any], window_s: float) -> Any:
+        """Run `call`, reconnecting and retrying a lost connection for `window_s`; any other error, or the window's end, raises."""
+        return retry_store_write(
+            call, reconnect=self.reconnect, clock=self.clock, sleep=self.sleep, window_s=window_s
+        )
+
+
 @dataclass(frozen=True)
 class _Ctx:
     """Everything the per-phase work needs, fixed for the whole run.
@@ -252,6 +308,7 @@ class _Ctx:
     epoch: int | None = None
     lease_name: str | None = None
     work_state: str = "files"
+    retry: _StoreRetry = field(default_factory=_StoreRetry)
 
     # ── names, in one place, so the topology is readable ─────────────────────
     def phase_branch(self, phase: str) -> str:
@@ -902,6 +959,7 @@ def run_epic(
     epoch: int | None = None,
     lease_name: str | None = None,
     work_state: str = "files",
+    retry: _StoreRetry | None = None,
 ) -> dict[str, Any]:
     """Drive a whole initiative: every phase, in dependency order, landing nothing.
 
@@ -925,12 +983,16 @@ def run_epic(
     decisions and ledger rows, and no per-phase manifest file is written. With an
     `epoch`, every leader-only write first asserts that epoch against the lease
     `lease_name` and is refused when it is stale.
+
+    The writes at the end of a run (task mirrors, the pause clear, the exit record) are retried through
+    `retry` across a lost store connection. The exit record is attempted last and always, with its own window.
     """
     if store is None:
         raise ValueError(
             "the epic driver needs a store: phases, tasks, attempts, gate decisions and ledger rows are recorded there"
         )
     work_state = checked_work_state(work_state)
+    retry = retry or _StoreRetry.for_store(store)
     repo = Path(repo)
     ctx: _Ctx | None = None
     try:
@@ -965,6 +1027,7 @@ def run_epic(
             epoch=epoch,
             lease_name=lease_name,
             work_state=work_state,
+            retry=retry,
             initiative_id=str(initiative.get("id")),
             # An unparented phase branches from the repository's default branch, read
             # once here so every phase in a run stacks on the same ground, whatever
@@ -1109,7 +1172,12 @@ def run_epic(
     finally:
         # Every exit — the return above, a raise from anywhere in this try, or
         # a signal delivered as KeyboardInterrupt or SystemExit — lands here.
-        _clear_pause_if_held(store, run_id, lease_name or LEASE_NAME, epoch)
+        # A failed pause clear, even a bug in it, must not skip the exit record, the last write given up on.
+        try:
+            _clear_pause_if_held(store, run_id, lease_name or LEASE_NAME, epoch, retry)
+        finally:
+            # A return leaves no exception in flight here; a raise, a signal or an exit leaves one.
+            _record_run_exit(store, run_id, "ok" if sys.exc_info()[0] is None else "error", retry)
         # Nothing before `ctx` exists can have made a worktree, so there is nothing to do yet.
         if ctx is not None:
             run_dir = ctx.worktree_root / ctx.run_id
@@ -1459,15 +1527,30 @@ def _wait_while_paused(
     retried(lambda: renew(conn, lease_name, run_id, epoch, now(), ttl, status=None))
 
 
-def _clear_pause_if_held(store: Store, run_id: str, lease_name: str, epoch: int | None) -> None:
+def _clear_pause_if_held(
+    store: Store, run_id: str, lease_name: str, epoch: int | None, retry: _StoreRetry | None = None
+) -> None:
     """Clear the run's pause flag so a rerun does not stop at once; skipped when another holder owns the run."""
-    try:
+
+    def clear() -> None:
         if epoch is None or assert_epoch(store.conn, lease_name, epoch, _now()):
             clear_paused(store.conn, run_id)
         else:
             _log.warning("pause flag kept for %s: lease '%s' epoch %s is no longer held", run_id, lease_name, epoch)
+
+    try:
+        (retry or _StoreRetry()).write(clear, _END_WRITE_WINDOW_S)
     except _STORE_ERRORS as exc:  # a store failure must not mask the run's real exit
         _log.warning("pause flag clear failed for %s: %s: %s", run_id, type(exc).__name__, exc)
+
+
+def _record_run_exit(store: Store, run_id: str, status: str, retry: _StoreRetry) -> None:
+    """Stamp the run's end, retried for the full exit window. A failure is logged and never changes the run's exit."""
+    ended_at = _now()
+    try:
+        retry.write(lambda: store.finish_run(run_id, ended_at, status), _EXIT_WINDOW_S)
+    except Exception as exc:
+        _log.warning("run exit for %s not recorded in the store: %s: %s", run_id, type(exc).__name__, exc)
 
 
 def _wait_if_paused(ctx: _Ctx) -> None:
@@ -1499,8 +1582,14 @@ def _save_result(ctx: _Ctx, result: Mapping[str, Any], *, phase: str, task: str)
     save_result(result, runs_dir=ctx.runs_dir, run_id=ctx.run_id, phase=phase, task=task)
     try:
         args = _task_record_mirror(ctx.store, result, ctx.run_id, phase, task, _now())
-        if args is not None and ctx.store is not None and _fenced(ctx) is None:
-            ctx.store.record_task_record(*args)
+        store = ctx.store
+
+        def mirror() -> None:
+            if _fenced(ctx) is None:
+                store.record_task_record(*args)
+
+        if args is not None and store is not None:
+            ctx.retry.write(mirror, _END_WRITE_WINDOW_S)
     except Exception as exc:
         _log.warning("task record for %s/%s/%s not mirrored into the store: %r", ctx.run_id, phase, task, exc)
 

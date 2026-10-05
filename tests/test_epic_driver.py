@@ -14,6 +14,7 @@ carry the work onto the phase branch actually happened.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -3076,3 +3077,189 @@ def test_a_quarantined_task_still_gets_its_attempt_in_its_frontmatter_with_no_ma
     item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
     assert len(item["attempts"]) == 1
     assert list((tmp_path / "runs").glob("*.json")) == []
+
+
+# ── the end-of-run store writes, across a lost connection ────────────────────
+
+# Shaped like psycopg's class so `is_connection_error` retries it; a real subclass when the extra is installed,
+# so `_STORE_ERRORS` also catches it.
+try:
+    from psycopg import OperationalError as _PsycopgError
+except ImportError:  # pragma: no cover - depends on what is installed
+    _PsycopgError = Exception
+_ConnectionLost = type("OperationalError", (_PsycopgError,), {"__module__": "psycopg"})
+
+
+class _FakeClock:
+    """A clock that only `sleep` moves, so a five-minute window costs no real time."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _lost() -> Exception:
+    return _ConnectionLost("server closed the connection unexpectedly")
+
+
+def _flaky_store_writes(monkeypatch, *, exit_fails=0, mirror_fails=0, pause_fails=0):
+    """Make the three end-of-run writes fail with a lost connection that many times (-1: always).
+
+    Returns the ordered list of (write, failed) attempts.
+    """
+    events: list[tuple[str, bool]] = []
+    remaining = {"exit": exit_fails, "mirror": mirror_fails, "pause": pause_fails}
+    real = {"exit": Store.finish_run, "mirror": Store.record_task_record, "pause": clear_paused}
+
+    def attempt(name: str, *args, **kwargs):
+        failing = remaining[name] != 0
+        events.append((name, failing))
+        if failing:
+            remaining[name] -= remaining[name] > 0
+            raise _lost()
+        return real[name](*args, **kwargs)
+
+    monkeypatch.setattr(Store, "finish_run", lambda self, *a: attempt("exit", self, *a))
+    monkeypatch.setattr(Store, "record_task_record", lambda self, *a: attempt("mirror", self, *a))
+    monkeypatch.setattr(epic_module, "clear_paused", lambda *a: attempt("pause", *a))
+    return events
+
+
+def _exit_row(store: Store, run_id: str):
+    return store.conn.query_one(
+        f"SELECT ended_at, status FROM runs WHERE run_id = {store.conn.dialect.placeholder}", (run_id,)
+    )
+
+
+def test_a_connection_dropped_at_exit_that_recovers_inside_the_window_records_ended_at(
+    repo, cart, tmp_path, store, monkeypatch
+) -> None:
+    store.record_run({"run_id": "epic-exit"}, {})
+    events = _flaky_store_writes(monkeypatch, exit_fails=2)
+    clock, reconnects = _FakeClock(), []
+    retry = epic_module._StoreRetry(reconnect=lambda: reconnects.append(1), clock=clock, sleep=clock.sleep)
+
+    result, _ = drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), store=store, run_id="epic-exit", retry=retry
+    )
+
+    assert result["phases"][0]["status"] == "complete"
+    assert [e for e in events if e[0] == "exit"] == [("exit", True), ("exit", True), ("exit", False)]
+    assert (len(reconnects), clock.sleeps) == (2, [1.0, 2.0])
+    ended_at, status = _exit_row(store, "epic-exit")
+    assert ended_at is not None and status == "ok"
+
+
+def test_a_connection_that_never_recovers_gives_up_after_the_window_with_the_exit_record_last(
+    repo, cart, tmp_path, store, monkeypatch, caplog
+) -> None:
+    events = _flaky_store_writes(monkeypatch, exit_fails=-1)
+    clock = _FakeClock()
+    retry = epic_module._StoreRetry(clock=clock, sleep=clock.sleep)
+
+    with caplog.at_level(logging.WARNING, logger=epic_module.__name__):
+        result, _ = drive(
+            repo, cart, tmp_path, work=initiative(two_phases=False), store=store, run_id="epic-gone", retry=retry
+        )
+
+    assert result["phases"][0]["status"] == "complete"
+    exits = [e for e in events if e[0] == "exit"]
+    assert len(exits) > 1 and all(failed for _, failed in exits)
+    assert events[-1] == ("exit", True)
+    assert sum(clock.sleeps) == epic_module._EXIT_WINDOW_S
+    assert any("run exit for epic-gone not recorded" in r.getMessage() for r in caplog.records)
+
+
+def test_a_task_mirror_that_exhausts_its_window_still_leads_to_an_exit_record_attempt(
+    repo, cart, tmp_path, store, monkeypatch, caplog
+) -> None:
+    store.record_run({"run_id": "epic-mirror"}, {})
+    events = _flaky_store_writes(monkeypatch, mirror_fails=-1)
+    clock = _FakeClock()
+    retry = epic_module._StoreRetry(clock=clock, sleep=clock.sleep)
+
+    with caplog.at_level(logging.WARNING, logger=epic_module.__name__):
+        result, _ = drive(
+            repo, cart, tmp_path, work=initiative(two_phases=False), store=store, run_id="epic-mirror", retry=retry
+        )
+
+    assert result["phases"][0]["status"] == "complete"
+    assert any("not mirrored into the store" in r.getMessage() for r in caplog.records)
+    assert events[-1] == ("exit", False)
+    assert ("mirror", True) in events
+    assert max(i for i, e in enumerate(events) if e[0] == "mirror") < events.index(("exit", False))
+    assert _exit_row(store, "epic-mirror")[0] is not None
+
+
+def test_a_pause_clear_that_exhausts_its_window_does_not_skip_the_exit_record(
+    repo, cart, tmp_path, store, monkeypatch
+) -> None:
+    pytest.importorskip("psycopg")  # `_clear_pause_if_held` only swallows the driver's own error classes
+    store.record_run({"run_id": "epic-pause"}, {})
+    events = _flaky_store_writes(monkeypatch, pause_fails=-1)
+    clock = _FakeClock()
+    retry = epic_module._StoreRetry(clock=clock, sleep=clock.sleep)
+
+    drive(repo, cart, tmp_path, work=initiative(two_phases=False), store=store, run_id="epic-pause", retry=retry)
+
+    names = [name for name, _ in events]
+    assert names.index("pause") < names.index("exit") and events[-1] == ("exit", False)
+    assert _exit_row(store, "epic-pause")[0] is not None
+
+
+def test_reopening_a_sqlite_connection_swaps_the_driver_connection_and_keeps_the_data(tmp_path) -> None:
+    conn = open_store(f"sqlite:///{tmp_path / 'cox.db'}", _now())
+    store = Store(conn)
+    store.record_run({"run_id": "r1"}, {})
+    old = conn.raw
+
+    epic_module.reopen_connection(conn)
+
+    assert conn.raw is not old
+    with pytest.raises(sqlite3.ProgrammingError):
+        old.execute("SELECT 1")
+    assert conn.query_one("SELECT run_id FROM runs") == ("r1",)
+    conn.close()
+
+
+def test_reopening_a_postgres_connection_connects_with_the_password_and_swaps_only_once_connected(
+    monkeypatch,
+) -> None:
+    item = lambda k, v: type("Info", (), {"keyword": k.encode(), "val": v.encode() if v else None})()  # noqa: E731
+    closed: list[str] = []
+    old = type("Raw", (), {"close": lambda self: closed.append("old")})()
+    old.pgconn = type("PG", (), {"info": [item("host", "db"), item("password", "s3 cret"), item("sslmode", None)]})()
+    conn = type("Conn", (), {"raw": old})()
+    urls: list[str] = []
+
+    def down(url: str):
+        urls.append(url)
+        raise _lost()
+
+    monkeypatch.setattr(epic_module, "connect", down)
+    with pytest.raises(Exception, match="server closed"):
+        epic_module.reopen_connection(conn)
+    assert (conn.raw is old, closed) == (True, [])
+
+    fresh = object()
+    monkeypatch.setattr(epic_module, "connect", lambda url: (urls.append(url), type("C", (), {"raw": fresh})())[1])
+    epic_module.reopen_connection(conn)
+
+    assert urls[-1] == "postgresql:///?host=db&password=s3+cret"
+    assert (conn.raw is fresh, closed) == (True, ["old"])
+
+
+def test_a_store_retry_for_a_store_reconnects_that_stores_own_connection(monkeypatch, store) -> None:
+    reopened: list[object] = []
+    monkeypatch.setattr(epic_module, "reopen_connection", reopened.append)
+
+    epic_module._StoreRetry.for_store(store).reconnect()
+
+    assert reopened == [store.conn]
