@@ -1,7 +1,7 @@
 """lint_tickets — the static checks from docs/design/work-shape.md §3, plus `cross_repo`.
 
 Pure: plain data in, plain data out, no file I/O, no network, no clock.
-`reach` and `coupling` are refusals; `grant`, `size` and `cross_repo` are advisory
+`reach`, `coupling` and `contract` are refusals; `grant`, `size` and `cross_repo` are advisory
 (`Problem.severity`) — the caller in `initiative_decompose.py` routes on that.
 `tree` rows may carry an optional `"imports"` list (paths that file imports),
 computed once at the edge, so the coupling rule's import disjunct stays pure.
@@ -16,7 +16,7 @@ from typing import Any
 
 __all__ = ["Problem", "lint_tickets"]
 
-_REFUSAL_RULES = frozenset({"reach", "coupling"})
+_REFUSAL_RULES = frozenset({"reach", "coupling", "contract"})
 _ROOTED_PREFIXES = ("~/", "/")
 _RISKY_SINGLE = frozenset({"cox", "uv", "gh", "ruff"})
 _RISKY_TWO_WORD = frozenset({"git push"})
@@ -35,6 +35,10 @@ _OTHER_REPO_ROOTS: Mapping[str, tuple[str, ...]] = {
 }
 _PATH_PUNCTUATION = "`,.()\"':;"
 _CROSS_REPO_CORRECTION = "paste the code the build needs into the ticket: a build reads only its own repository"
+_CONTRACT_CORRECTION = (
+    "add a contract task in the producer repository that commits a JSON fixture of the interface, "
+    "and add its id to this task's needs"
+)
 
 
 @dataclass(frozen=True)
@@ -46,7 +50,7 @@ class Problem:
 
     @property
     def severity(self) -> str:
-        """`"refusal"` for reach/coupling, `"advisory"` for grant/size/cross_repo."""
+        """`"refusal"` for reach/coupling/contract, `"advisory"` for grant/size/cross_repo."""
         return "refusal" if self.rule in _REFUSAL_RULES else "advisory"
 
 
@@ -281,6 +285,57 @@ def _size_problems(tasks: Sequence[Mapping[str, Any]]) -> list[Problem]:
     return problems
 
 
+def _contract_flaws(contract: Mapping[str, Any], producer_repos: set[Any]) -> list[str]:
+    has_json = any(str(s).endswith(".json") for s in contract.get("surfaces") or [])
+    wrong_repo = bool(producer_repos) and contract.get("repo") not in producer_repos
+    return [
+        *(["has no .json surface"] if not has_json else []),
+        *(["is not in the producer repository"] if wrong_repo else []),
+    ]
+
+
+def _interface_problems(name: str, group: Sequence[Mapping[str, Any]]) -> list[Problem]:
+    if len({t.get("repo") for t in group if t.get("repo")}) < 2:
+        return []
+    contracts = [t for t in group if t.get("side") == "contract"]
+    producers = [t for t in group if t.get("side") == "producer"]
+    consumers = [t for t in group if t.get("side") == "consumer"]
+    if not contracts:
+        detail = f"interface {name} has no contract task: the consumer has no contract to parse"
+        return [Problem(str(t["id"]), "contract", detail, _CONTRACT_CORRECTION) for t in consumers]
+    contract_id = str(contracts[0]["id"])
+    unlinked = [
+        Problem(
+            str(t["id"]),
+            "contract",
+            f"interface {name}: needs does not list contract task {contract_id}",
+            f"add {contract_id} to this task's needs",
+        )
+        for t in [*producers, *consumers]
+        if contract_id not in (t.get("needs") or [])
+    ]
+    producer_repos = {t.get("repo") for t in producers}
+    flawed = [(c, _contract_flaws(c, producer_repos)) for c in contracts]
+    malformed = [
+        Problem(
+            str(c["id"]),
+            "contract",
+            f"interface {name}: contract task " + " and ".join(flaws),
+            "give the contract task a `.json` fixture surface in the producer repository",
+        )
+        for c, flaws in flawed
+        if flaws
+    ]
+    return [*unlinked, *malformed]
+
+
+def _contract_problems(tasks: Sequence[Mapping[str, Any]]) -> list[Problem]:
+    names = dict.fromkeys(i for t in tasks if (i := t.get("interface")))
+    return [
+        p for name in names for p in _interface_problems(str(name), [t for t in tasks if t.get("interface") == name])
+    ]
+
+
 def lint_tickets(
     tasks: Sequence[Mapping[str, Any]],
     tree: Sequence[Mapping[str, Any]],
@@ -294,4 +349,5 @@ def lint_tickets(
         *_grant_problems(fixed_tasks, grants),
         *_size_problems(fixed_tasks),
         *_cross_repo_problems(fixed_tasks, tree, repo),
+        *_contract_problems(fixed_tasks),
     ]

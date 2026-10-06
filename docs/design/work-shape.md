@@ -73,6 +73,8 @@ that changes a ticket body. `Problem(task, rule, detail, fix)`. Rules:
   or order with needs`.
 - **size:** a body over ~700 words → `fix: point at a spec file in the repository` (the measured `plan`
   death band).
+- **contract:** a cross-repo consumer with no contract fixture task (a `.json` surface in the producer repository
+  that producer and consumer both list in `needs`) is refused → `fix: add the contract task and its id to needs`.
 
 Decompose REFUSES a DAG with a `reach` or `coupling` problem and returns the corrections to the
 `work_item_arm` (the graph already has `_apply_corrections`); `grant` and `size` are recorded as warnings on
