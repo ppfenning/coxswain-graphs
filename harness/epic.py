@@ -1278,6 +1278,7 @@ def _quarantine_task(
             ctx.run_id, task, seq, phase, kind, detail or reason, ts, epoch=ctx.epoch, cause=cause, cause_why=cause_why
         )
         _record_task_cause(ctx, phase, task, cause, cause_why)
+    _quarantine_row(ctx, phase, task)
     return entry
 
 
@@ -1454,6 +1455,29 @@ def _store_first(ctx: _Ctx, item: dict[str, Any], state: str) -> str | None:
     if written.current is not None:
         item["state"] = written.current
     return reason
+
+
+def row_should_quarantine(work_state: str, current_state: str | None) -> bool:
+    """True when a quarantine moves the store row: store work state, a row that exists, and not finished or already quarantined."""
+    return work_state == "store" and current_state is not None and current_state not in ("approved", "done", "quarantined")
+
+
+def _quarantine_row(ctx: _Ctx, phase: str, task: str) -> None:
+    """Under work_state store, move the task's row to quarantined, so the chair stops relaunching it. Errors are logged, never raised.
+
+    The files work state writes nothing here. Same store write as the move to approved: `_store_first`.
+    """
+    if not _store_authoritative(ctx):
+        return
+    try:
+        from harness import store_read  # not module level: see `_mirror_read`
+
+        row = next((r for r in store_read.work_items(ctx.store.conn, ctx.initiative_id) if r["task_id"] == task), None)
+        current = None if row is None else str(row["state"])
+        if row_should_quarantine(ctx.work_state, current):
+            _store_first(ctx, {"id": task, "phase": phase, "state": current}, "quarantined")
+    except Exception as exc:
+        _log.warning("quarantined state not written to the store row: task=%s: %s: %s", task, type(exc).__name__, exc)
 
 
 def _mirror_write(ctx: _Ctx, item: Mapping[str, Any] | None, state: str) -> None:
