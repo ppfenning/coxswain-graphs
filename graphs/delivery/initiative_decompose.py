@@ -35,6 +35,8 @@ from runner.tier_resolution import Hints
 
 __all__ = [
     "GRAPH_NAME",
+    "LintRefusal",
+    "first_problem_line",
     "initiative_text",
     "resolve_surfaces",
     "run",
@@ -246,6 +248,15 @@ def surface_problem(unresolved: Sequence[str]) -> str | None:
     if not unresolved:
         return None
     return "\n".join(f"unbuildable: surfaces are prose — {item}" for item in unresolved)
+
+
+class LintRefusal(ContractViolation):
+    """Ticket lint refused the decomposition for reach or coupling; the message is one problem per line."""
+
+
+def first_problem_line(lines: Sequence[str]) -> str | None:
+    """The first line with text, stripped of surrounding whitespace; None when every line is blank."""
+    return next((s for s in (line.strip() for line in lines) if s), None)
 
 
 def _lint_refusal_text(problems: Sequence[Problem]) -> str | None:
@@ -635,7 +646,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         # quarantines on the second lint exactly as it would with no adversary
         # bound at all.
         if "review_adversary" not in bound:
-            raise ContractViolation(_lint_refusal_text(refusals))
+            raise LintRefusal(_lint_refusal_text(refusals))
         correction = dict(
             runner.run(
                 role="review_adversary",
@@ -653,7 +664,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         lint_problems = lint_tickets(tasks, tree, grants, repo_name)
         refusals = [p for p in lint_problems if p.severity == "refusal"]
         if refusals:
-            raise ContractViolation(_lint_refusal_text(refusals))
+            raise LintRefusal(_lint_refusal_text(refusals))
 
     advisories = [p for p in lint_problems if p.severity == "advisory"]
     if advisories:
