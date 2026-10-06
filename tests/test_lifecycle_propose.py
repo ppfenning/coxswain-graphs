@@ -1271,3 +1271,20 @@ def test_a_tracked_file_named_like_scratch_still_flags_because_it_is_tracked(tmp
     )
     line = _last_ledger_line(tmp_path, "run-3")
     assert (line["files_outside_surfaces"], line["scratch_ignored"]) == (["debug.py"], [])
+
+
+def test_touched_paths_names_a_deleted_file_by_its_old_path_not_dev_null():
+    """A deletion's `+++` side is /dev/null; the file it removed is on the `---` side (2026-10-05: delete-curses was
+    sent back to re-scope for touching /dev/null)."""
+    patch = (
+        "diff --git a/agent_tools/home_screen.py b/agent_tools/home_screen.py\n"
+        "deleted file mode 100644\n"
+        "--- a/agent_tools/home_screen.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n-x = 1\n-y = 2\n"
+        "diff --git a/agent_tools/cli.py b/agent_tools/cli.py\n"
+        "--- a/agent_tools/cli.py\n"
+        "+++ b/agent_tools/cli.py\n"
+        "@@ -1 +1 @@\n-a\n+b\n"
+    )
+    assert lifecycle_propose._touched_paths(patch) == ["agent_tools/home_screen.py", "agent_tools/cli.py"]
