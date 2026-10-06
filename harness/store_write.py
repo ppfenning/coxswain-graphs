@@ -8,11 +8,14 @@ Booleans are 0/1, and anything a record does not carry is None.
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from harness.store_dialect import Connection, insert_ignore, json_text, upsert
+from harness.store_dialect import Connection, insert_ignore, json_load, json_text, upsert
+
+log = logging.getLogger(__name__)
 
 Row = dict[str, Any]
 
@@ -91,6 +94,11 @@ def _rest(src: Mapping[str, Any], known: Sequence[str]) -> Row | None:
 def _params(row: Row) -> list[Any]:
     """Row values in column order, with each non-None *_json value encoded as text."""
     return [json_text(v) if c.endswith("_json") and v is not None else v for c, v in row.items()]
+
+
+def merge_outcome(record: Mapping[str, Any] | None, outcome: Mapping[str, Any]) -> dict[str, Any]:
+    """A new record with `outcome` under the key 'outcome'; a null or empty record starts from {}."""
+    return {**(record or {}), "outcome": dict(outcome)}
 
 
 def split_phase_id(run_id: str) -> tuple[str, str]:
@@ -292,6 +300,23 @@ class Store:
         mark = self.conn.dialect.placeholder
         sql = f"UPDATE runs SET ended_at = {mark}, status = {mark} WHERE run_id = {mark}"
         return self.conn.execute(sql, (ended_at, status, run_id))
+
+    def record_outcome(self, run_id: str, outcome: Mapping[str, Any]) -> bool:
+        """Merge `outcome` into the run's record_json. False, logged, on any failure or a missing run; never raises."""
+        mark = self.conn.dialect.placeholder
+        try:
+            with self.conn.transaction():
+                row = self.conn.query_one(f"SELECT record_json FROM runs WHERE run_id = {mark}", (run_id,))
+                if row is None:
+                    log.error("record_outcome: no run %r to record an outcome on", run_id)
+                    return False
+                merged = merge_outcome(json_load(row[0]), outcome)
+                sql = f"UPDATE runs SET record_json = {mark} WHERE run_id = {mark}"
+                self.conn.execute(sql, (json_text(merged), run_id))
+            return True
+        except Exception:
+            log.exception("record_outcome: could not write the outcome for run %r", run_id)
+            return False
 
     def record_phase(self, record: Mapping[str, Any], epoch: int | None = None) -> int:
         return self._insert("phases", phase_row(record))
