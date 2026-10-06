@@ -1288,3 +1288,20 @@ def test_touched_paths_names_a_deleted_file_by_its_old_path_not_dev_null():
         "@@ -1 +1 @@\n-a\n+b\n"
     )
     assert lifecycle_propose._touched_paths(patch) == ["agent_tools/home_screen.py", "agent_tools/cli.py"]
+
+
+def test_patch_sections_keys_a_deleted_file_by_its_old_path():
+    """2026-10-05: a pure-deletion build (curses-screens delete-curses, run 13) was refused as build_output_invalid
+    because the patch's files read as /dev/null while files_touched named the deleted files."""
+    patch = (
+        "diff --git c/agent_tools/x.py i/agent_tools/x.py\n"
+        "deleted file mode 100644\n"
+        "--- c/agent_tools/x.py\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n-a\n"
+        "diff --git c/tests/test_y.py i/tests/test_y.py\n"
+        "--- c/tests/test_y.py\n"
+        "+++ i/tests/test_y.py\n"
+        "@@ -1 +1 @@\n-b\n+c\n"
+    )
+    assert list(lifecycle_propose._patch_sections(patch)) == ["agent_tools/x.py", "tests/test_y.py"]
