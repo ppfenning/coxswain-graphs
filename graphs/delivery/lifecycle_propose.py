@@ -613,8 +613,16 @@ def _patch_sections(patch: str) -> dict[str, str]:
     """Each touched file's own diff text, sliced between its `+++ b/<path>` headers."""
     # Builders emit `a/`+`b/` or, under diff.mnemonicPrefix, `c/`+`i/`/`w/`;
     # any one-letter prefix is stripped so the key is the repository path.
+    # A deletion's `+++` side is /dev/null; the file it removes is named on the `---` line just above.
     marks = list(re.finditer(r"^\+\+\+ (?:[a-z]/)?(\S+)", patch, re.MULTILINE))
-    return {m.group(1): patch[m.end() : n.start() if n else len(patch)] for m, n in zip(marks, marks[1:] + [None])}
+
+    def path_of(mark: re.Match[str]) -> str:
+        if mark.group(1) != "/dev/null":
+            return mark.group(1)
+        old = re.match(r"--- (?:[a-z]/)?(\S+)", patch[: mark.start()].rstrip("\n").rsplit("\n", 1)[-1])
+        return old.group(1) if old else mark.group(1)
+
+    return {path_of(m): patch[m.end() : n.start() if n else len(patch)] for m, n in zip(marks, marks[1:] + [None])}
 
 
 # A ticket's own contract commands, always backtick-fenced in its prose.
