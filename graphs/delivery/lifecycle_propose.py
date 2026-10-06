@@ -668,10 +668,13 @@ def _is_budget_stop(exc: Exception) -> bool:
 
 
 def _touched_paths(patch: str) -> list[str]:
-    """Every path a unified diff's `+++` lines name."""
+    """Every path a unified diff's `+++` lines name; a deletion, whose `+++` side is /dev/null, by its `---` path."""
+    lines = (patch or "").splitlines()
     return [
-        _diff_path(line[len("+++ ") :].strip())
-        for line in (patch or "").splitlines()
+        _diff_path(lines[n - 1][len("--- ") :].strip())
+        if line.strip() == "+++ /dev/null" and n > 0 and lines[n - 1].startswith("--- ")
+        else _diff_path(line[len("+++ ") :].strip())
+        for n, line in enumerate(lines)
         if line.startswith("+++ ")
     ]
 
