@@ -243,3 +243,35 @@ def test_a_trailing_colon_or_quote_is_stripped_from_the_named_path():
 def test_a_cross_repo_root_the_tree_lists_is_the_repositorys_own():
     tree = [{"path": "graphs/delivery/ticket_lint.py", "repo": "graphs"}]
     assert lint_tickets([_task(body="edit graphs/delivery/ticket_lint.py")], tree, [], "graphs") == []
+
+
+def _contract_problems(tasks):
+    return [p for p in lint_tickets(tasks, [], [], "") if p.rule == "contract"]
+
+
+_PRODUCER = _task(id="p", repo="tools", interface="verb", side="producer", needs=["c"])
+_CONSUMER = _task(id="k", repo="dash", interface="verb", side="consumer", needs=["c"])
+_CONTRACT = _task(id="c", repo="tools", interface="verb", side="contract", surfaces=["tests/fixtures/verb.json"])
+
+
+def test_a_cross_repo_consumer_with_no_contract_task_is_a_contract_refusal():
+    problems = _contract_problems([{**_PRODUCER, "needs": []}, {**_CONSUMER, "needs": []}])
+    assert [(p.task, p.rule, p.severity) for p in problems] == [("k", "contract", "refusal")]
+
+
+def test_a_json_contract_task_in_the_producer_repo_that_both_sides_need_is_clean():
+    assert _contract_problems([_PRODUCER, _CONSUMER, _CONTRACT]) == []
+
+
+def test_a_consumer_missing_the_contract_id_in_needs_gets_one_problem_naming_it():
+    problems = _contract_problems([_PRODUCER, {**_CONSUMER, "needs": []}, _CONTRACT])
+    assert [(p.task, p.detail) for p in problems] == [("k", "interface verb: needs does not list contract task c")]
+
+
+def test_a_contract_task_with_only_a_py_surface_gets_one_problem():
+    contract = {**_CONTRACT, "surfaces": ["agent_tools/verb.py"]}
+    assert [p.task for p in _contract_problems([_PRODUCER, _CONSUMER, contract])] == ["c"]
+
+
+def test_two_tasks_with_one_interface_in_one_repo_give_no_contract_problem():
+    assert _contract_problems([_PRODUCER, {**_CONSUMER, "repo": "tools", "needs": []}]) == []
