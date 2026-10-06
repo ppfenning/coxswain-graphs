@@ -995,6 +995,7 @@ def run_epic(
     retry = retry or _StoreRetry.for_store(store)
     repo = Path(repo)
     ctx: _Ctx | None = None
+    result: dict[str, Any] | None = None
     try:
         head_ok, head_out = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
         origin_ok, origin_out = _git("-C", str(repo), "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
@@ -1146,7 +1147,7 @@ def run_epic(
         ]
         for t, command in unlanded:
             send_to_courier(f"coxswain://task/{t['id']}", "chair", command)
-        return {
+        result = {
             "run_id": run_id,
             "date": date,
             "initiative": ctx.initiative_id,
@@ -1169,6 +1170,7 @@ def run_epic(
                 "stacks_rebased": stacks_rebased,
             },
         }
+        return result
     finally:
         # Every exit — the return above, a raise from anywhere in this try, or
         # a signal delivered as KeyboardInterrupt or SystemExit — lands here.
@@ -1177,7 +1179,7 @@ def run_epic(
             _clear_pause_if_held(store, run_id, lease_name or LEASE_NAME, epoch, retry)
         finally:
             # A return leaves no exception in flight here; a raise, a signal or an exit leaves one.
-            _record_run_exit(store, run_id, "ok" if sys.exc_info()[0] is None else "error", retry)
+            _record_run_exit(store, run_id, "ok" if sys.exc_info()[0] is None else "error", retry, result)
         # Nothing before `ctx` exists can have made a worktree, so there is nothing to do yet.
         if ctx is not None:
             run_dir = ctx.worktree_root / ctx.run_id
@@ -1544,13 +1546,40 @@ def _clear_pause_if_held(
         _log.warning("pause flag clear failed for %s: %s: %s", run_id, type(exc).__name__, exc)
 
 
-def _record_run_exit(store: Store, run_id: str, status: str, retry: _StoreRetry) -> None:
-    """Stamp the run's end, retried for the full exit window. A failure is logged and never changes the run's exit."""
+def build_outcome(result: Mapping[str, Any]) -> dict[str, Any]:
+    """The run's outcome from its epic result: totals, phase-grain quarantines, phases waiting on a parent.
+
+    A waiting phase is a blocked record with exactly one `parents` entry: the parent did not complete, so it built nothing.
+    """
+    blocked = [
+        {"phase": q["phase"], "reason": q["reason"]}
+        for q in result.get("quarantined") or []
+        if q.get("grain") == "phase"
+    ]
+    blocked_ids = {b["phase"] for b in blocked}
+    waiting = [
+        p["phase"]
+        for p in result.get("phases") or []
+        if p.get("status") == "blocked" and len(p.get("parents") or []) == 1 and p["phase"] not in blocked_ids
+    ]
+    return {"totals": dict(result.get("totals") or {}), "blocked": blocked, "waiting": waiting}
+
+
+def _record_run_exit(
+    store: Store, run_id: str, status: str, retry: _StoreRetry, result: Mapping[str, Any] | None = None
+) -> None:
+    """Stamp the run's end, then store its outcome, each retried for the full exit window. A failure is logged and never changes the run's exit."""
     ended_at = _now()
     try:
         retry.write(lambda: store.finish_run(run_id, ended_at, status), _EXIT_WINDOW_S)
     except Exception as exc:
         _log.warning("run exit for %s not recorded in the store: %s: %s", run_id, type(exc).__name__, exc)
+    if result is None:
+        return
+    try:
+        retry.write(lambda: store.record_outcome(run_id, build_outcome(result)), _EXIT_WINDOW_S)
+    except Exception as exc:
+        _log.warning("run outcome for %s not recorded in the store: %s: %s", run_id, type(exc).__name__, exc)
 
 
 def _wait_if_paused(ctx: _Ctx) -> None:

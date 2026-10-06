@@ -38,7 +38,7 @@ from core.manifest import append_ledger, build_manifest
 
 from graphs._contract import ContractViolation
 from graphs.delivery.initiative_decompose import GRAPH_NAME as _DECOMPOSE_GRAPH_NAME
-from graphs.delivery.initiative_decompose import unexecuted_item_create_reason
+from graphs.delivery.initiative_decompose import LintRefusal, first_problem_line, unexecuted_item_create_reason
 from harness import CORE_SCHEMA, run_lease, store_traces
 from harness.autonomy import split_by_policy
 from harness.checks import all_passed, checks_evidence, repo_checks, run_checks
@@ -417,6 +417,17 @@ def _finish_store_run(store: Store, run_id: str, ended_at: str, status: str) -> 
         store.finish_run(run_id, ended_at, status)
     except Exception as exc:
         print(f"store: could not record the end of {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
+
+
+def _record_refusal(store: Store | None, run_id: str, refusal: LintRefusal) -> None:
+    """Store the first lint problem line as the run's outcome. A failed write warns; it never changes the exit."""
+    first = first_problem_line(str(refusal).splitlines())
+    if store is None or first is None:
+        return
+    try:
+        store.record_outcome(run_id, {"refused": first})
+    except Exception as exc:
+        print(f"store: could not record the outcome of {run_id}: {' '.join(str(exc).split())}", file=sys.stderr)
 
 
 def _trace_path(detail: Any) -> Path | None:
@@ -1276,6 +1287,11 @@ def _run_graph(
         graph_args.update(_materialise(spec, args, parser))
         try:
             result = spec.run(graph_args, runner)
+        except LintRefusal as exc:
+            # Recorded before the exit, so the run says why it refused; the exit itself is the same as below.
+            _record_refusal(store, run_id, exc)
+            print(f"{graph_name} failed: {exc}", file=sys.stderr)
+            return 1
         except (ContractViolation, RunnerError) as exc:
             # A contract violation or a dead runner is a bad invocation, and it
             # is reported as one. Anything else is a bug in this code and is
