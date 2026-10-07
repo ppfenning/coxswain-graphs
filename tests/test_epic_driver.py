@@ -1555,6 +1555,46 @@ def test_a_build_budget_over_the_cap_is_quarantined_and_the_sibling_still_lands(
     assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
 
 
+def test_surface_passes_checks_a_plain_path_itself_and_a_new_path_by_its_parent() -> None:
+    from harness.epic import _surface_passes
+
+    present = {Path("/r/a.py"), Path("/r/src")}
+    root = Path("/r")
+    assert _surface_passes(present.__contains__, root, "a.py")
+    assert not _surface_passes(present.__contains__, root, "b.py")
+    assert _surface_passes(present.__contains__, root, "src/b.py (new)")
+    assert not _surface_passes(present.__contains__, root, "lib/b.py (new)")
+    assert not _surface_passes(present.__contains__, root, "src/b.py")
+
+
+def test_a_task_whose_only_surface_is_a_new_path_with_no_parent_is_refused_before_any_model_call(
+    repo, cart, tmp_path
+) -> None:
+    import harness.store_read as read
+    from harness.store_write import task_cause
+
+    work = initiative(two_phases=False)
+    next(i for i in work["items"] if i["id"] == "t1-probe")["surfaces"] = ["nowhere/new_file.py (new)"]
+    store = Store(open_store("sqlite:///:memory:", datetime.now(UTC).isoformat()))
+    result, runner = drive(repo, cart, tmp_path, work=work, store=store)
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["reason"] == f"surfaces not in {repo}: nowhere/new_file.py (new); wrong repository?"
+    assert entry["kind"] == "no_work"
+    assert task_cause(read.task_record(store.conn, "epic-1", "p1-foundations", "t1-probe"))[0] == "ticket"
+    assert store.conn.query_all("SELECT 1 FROM attempts WHERE task_id = 't1-probe'", ()) == []
+    assert not any(c["role"] in ("plan", "build", "review_charter") and "t1-probe" in c["prompt"] for c in runner.calls)
+    assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t2-bench", "epic/demo-initiative/p1-foundations")
+
+
+def test_a_new_file_under_an_existing_directory_proceeds_to_the_model(repo, cart, tmp_path) -> None:
+    (repo / "docs").mkdir()
+    work = initiative(two_phases=False)
+    next(i for i in work["items"] if i["id"] == "t1-probe")["surfaces"] = ["docs/notes.md (new)"]
+    result, runner = drive(repo, cart, tmp_path, work=work)
+    assert any(c["role"] == "build" and "t1-probe" in c["prompt"] for c in runner.calls)
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+
+
 def _budget_ctx(repo, cart, store=None, *, date="2026-09-28"):
     from harness.epic import _Ctx
 
@@ -2202,13 +2242,13 @@ def test_a_finding_citing_a_file_the_other_task_owns_emits_one_consolidate_propo
             {
                 "charter_principle": "cross-ticket reach",
                 "detail": "Landing this cleanly also needs an edit here, and that belongs to the bench ticket.",
-                "file": "t2-bench.txt",
+                "file": "README.md",
             }
         ],
         "rationale": "the patch is fine on its own terms",
     }
     runner = Runner(patches, review={"t1-probe": blocked})
-    work = _two_task_initiative(t2_surfaces=["t2-bench.txt"])
+    work = _two_task_initiative(t2_surfaces=["README.md"])
     result, _ = drive(repo, cart, tmp_path, work=work, runner=runner)
 
     consolidate = [p for p in result["proposals"] if p["kind"] == "consolidate"]
@@ -2220,7 +2260,7 @@ def test_a_finding_citing_a_file_the_other_task_owns_emits_one_consolidate_propo
 def test_a_run_with_no_such_finding_emits_no_consolidate_proposal(repo, cart, tmp_path) -> None:
     # t2-bench owns t2-bench.txt, same as the positive case, but nothing t1-probe's
     # review says ever names it: ownership alone never fires the proposal.
-    work = _two_task_initiative(t2_surfaces=["t2-bench.txt"])
+    work = _two_task_initiative(t2_surfaces=["README.md"])
     result, _ = drive(repo, cart, tmp_path, work=work)
     assert [p for p in result["proposals"] if p["kind"] == "consolidate"] == []
 
@@ -2304,9 +2344,9 @@ class ArbitrateFailsRunner(Runner):
 def test_a_non_build_node_failure_quarantines_as_infra_with_the_patch_kept(repo, cart, tmp_path) -> None:
     cart = dict(cart)
     cart["skills"] = {**cart["skills"], "review_adversary": "acme-skills:review-adversary", "arbitrate": "acme-skills:arbitrate"}
-    cart["policy"] = {**cart["policy"], "review_tier": {"tier2_surfaces": ["dangerous"]}}
+    cart["policy"] = {**cart["policy"], "review_tier": {"tier2_surfaces": ["README.md"]}}
     work = initiative(two_phases=False)
-    work["items"][0]["surfaces"] = ["dangerous"]
+    work["items"][0]["surfaces"] = ["README.md"]
     runner = ArbitrateFailsRunner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
     result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-infra")
 
@@ -2349,9 +2389,9 @@ class ArbitrateBudgetStopRunner(Runner):
 def test_a_budget_stop_from_a_non_build_node_is_not_converted_to_infra(repo, cart, tmp_path) -> None:
     cart = dict(cart)
     cart["skills"] = {**cart["skills"], "review_adversary": "acme-skills:review-adversary", "arbitrate": "acme-skills:arbitrate"}
-    cart["policy"] = {**cart["policy"], "review_tier": {"tier2_surfaces": ["dangerous"]}}
+    cart["policy"] = {**cart["policy"], "review_tier": {"tier2_surfaces": ["README.md"]}}
     work = initiative(two_phases=False)
-    work["items"][0]["surfaces"] = ["dangerous"]
+    work["items"][0]["surfaces"] = ["README.md"]
     runner = ArbitrateBudgetStopRunner({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
     result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-budget-arb")
 
