@@ -31,12 +31,15 @@ from graphs.delivery import lifecycle_propose, phase_validate
 from graphs.ops import triage_quarantine
 from harness import epic as epic_module
 from harness.epic import (
+    EXIT_AWAITING_LAND,
     EXIT_PAUSED,
     _lifecycle_invocation,
     _ticket_amend_ramp,
     _trace_evidence,
     _unapproved,
     branch_action,
+    build_outcome,
+    classify_unlanded,
     default_branch,
     phase_order,
     phase_parents,
@@ -1848,6 +1851,85 @@ def test_a_stale_reused_branch_with_its_own_commits_blocks_rather_than_building(
     third, _ = drive(repo, cart, tmp_path, work=work, run_id="epic-3")
     assert third["phases"][0]["status"] == "blocked"
     assert "rebase it through the gate" in third["phases"][0]["reason"]
+
+
+def test_classify_unlanded_reads_the_task_states_of_the_plus_commits() -> None:
+    t1, t2 = "+ a1 epic r-1: t1", "+ b2 epic r-1: t2"
+    assert classify_unlanded([], {}) == "landed"
+    assert classify_unlanded(["- a1 epic r-1: t1", "+ c3 epic r-1: merge t1 into p1"], {}) == "landed"
+    assert classify_unlanded([t1, t2], {"t1": "done", "t2": "done"}) == "landed"
+    assert classify_unlanded([t1, t2], {"t1": "approved", "t2": "approved"}) == "awaiting_land"
+    assert classify_unlanded([t1, t2], {"t1": "done", "t2": "approved"}) == "rebase"
+    assert classify_unlanded([t1, t2], {"t1": "done", "t2": "ready"}) == "block"
+    assert classify_unlanded([t1], {}) == "block"
+    assert classify_unlanded(["+ a1 fix the thing"], {"t1": "approved"}) == "block"
+
+
+BRANCH = "epic/demo-initiative/p1-foundations"
+
+
+def _stale_branch_with_two_task_commits(repo, cart, tmp_path, *, main_adds=("moved.md",)) -> str:
+    """Run epic-1 so the phase branch carries both tasks' commits, then move main underneath it."""
+    first, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False), run_id="epic-1")
+    assert first["phases"][0]["status"] == "complete"
+    for name in main_adds:
+        (repo / name).write_text("different\n" if name.endswith(".txt") else "moved\n", encoding="utf-8")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "advance main", cwd=repo)
+    return git("rev-parse", BRANCH, cwd=repo)
+
+
+def _with_states(**states: str) -> dict:
+    work = initiative(two_phases=False)
+    for item in work["items"]:
+        item["state"] = states[item["id"].replace("-", "_").split("_")[0]]
+    return work
+
+
+def test_a_phase_whose_unlanded_commits_are_all_approved_awaits_their_land(repo, cart, tmp_path) -> None:
+    before = _stale_branch_with_two_task_commits(repo, cart, tmp_path)
+    result, runner = drive(repo, cart, tmp_path, work=_with_states(t1="approved", t2="approved"), run_id="epic-2")
+    assert result["phases"][0]["status"] == "awaiting_land"
+    assert result["exit_code"] == EXIT_AWAITING_LAND == 4
+    assert result["quarantined"] == []
+    assert build_outcome(result)["blocked_kind"] == "awaiting_land"
+    assert not any(c["role"] == "build" for c in runner.calls)
+    assert git("rev-parse", BRANCH, cwd=repo) == before
+
+
+def test_a_phase_whose_unlanded_commits_are_all_done_is_recreated_not_rebased(repo, cart, tmp_path, monkeypatch) -> None:
+    _stale_branch_with_two_task_commits(repo, cart, tmp_path)
+    rebases: list[str] = []
+    monkeypatch.setattr(epic_module, "_rebase", lambda *a: rebases.append("called") or (True, ""))
+    result, _ = drive(repo, cart, tmp_path, work=_with_states(t1="done", t2="done"), run_id="epic-2")
+    assert "recreated" in result["phases"][0]
+    assert rebases == [] and "exit_code" not in result
+    assert is_ancestor(repo, "main", BRANCH)
+
+
+def test_a_phase_of_done_and_approved_commits_is_rebased_and_proceeds(repo, cart, tmp_path, monkeypatch) -> None:
+    _stale_branch_with_two_task_commits(repo, cart, tmp_path)
+    rebases: list[str] = []
+    real = epic_module._rebase
+    monkeypatch.setattr(epic_module, "_rebase", lambda *a: rebases.append("called") or real(*a))
+    result, _ = drive(repo, cart, tmp_path, work=_with_states(t1="done", t2="approved"), run_id="epic-2")
+    assert rebases == ["called"]
+    assert result["phases"][0]["rebased"] is True
+    assert result["phases"][0]["status"] != "blocked"
+    assert [q for q in result["quarantined"] if q["grain"] == "phase"] == []
+    assert "exit_code" not in result
+    assert is_ancestor(repo, "main", BRANCH)
+
+
+def test_a_rebase_conflict_aborts_and_quarantines_the_phase(repo, cart, tmp_path) -> None:
+    before = _stale_branch_with_two_task_commits(repo, cart, tmp_path, main_adds=("moved.md", "t1-probe.txt"))
+    result, runner = drive(repo, cart, tmp_path, work=_with_states(t1="done", t2="approved"), run_id="epic-2")
+    assert result["phases"][0]["status"] == "blocked"
+    [entry] = [q for q in result["quarantined"] if q["grain"] == "phase"]
+    assert entry["reason"].startswith("rebase conflict")
+    assert not any(c["role"] == "build" for c in runner.calls)
+    assert git("rev-parse", BRANCH, cwd=repo) == before
+    assert git("status", "--porcelain", cwd=repo) == ""
 
 
 def test_a_stale_branch_whose_commits_cancel_out_still_blocks(repo, cart, tmp_path) -> None:
