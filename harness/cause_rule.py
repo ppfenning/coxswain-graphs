@@ -33,6 +33,10 @@ _AUTH_MARKERS: tuple[str, ...] = (
 )
 
 
+# Must equal `harness.checks.HARNESS_FAULT_PREFIX`; this module imports nothing from the harness.
+_HARNESS_FAULT_PREFIX = "harness fault:"
+
+
 def is_auth_failure(reason: str) -> bool:
     """True when the reason carries an authentication marker; `classify_cause` asks the same."""
     return any(marker in reason.lower() for marker in _AUTH_MARKERS)
@@ -47,6 +51,8 @@ def classify_cause(kind: str, reason: str) -> Cause | None:
     if kind == "infra" or "patch did not apply" in reason:
         return "harness"
     if "worktree" in reason and "could not be" in reason:
+        return "harness"
+    if reason.startswith(_HARNESS_FAULT_PREFIX):
         return "harness"
     if "configured check failed" in reason or "configured checks failed" in reason:
         return "code"

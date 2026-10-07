@@ -30,6 +30,7 @@ from runner.claude_code_runner import (
     _init_facts,
     _parse_version,
     _run_verify,
+    _trace_cost,
     _version_violations,
     apply_reported_patch,
     call_cost,
@@ -2158,6 +2159,58 @@ def test_a_transient_retry_with_tracing_ledgers_the_renamed_trace_not_the_reused
     assert rows[0]["trace"] != rows[1]["trace"], "one path must not be claimed by two rows"
     assert rows[0]["trace"].endswith("arbitrate-1.error.jsonl")
     assert rows[1]["trace"].endswith("arbitrate-1.jsonl")
+
+
+def _timing_out(monkeypatch, script) -> None:
+    """Make the claude subprocess outlive its timeout; every other subprocess runs for real."""
+    real = subprocess.run
+
+    def fake(argv, *args, **kwargs):
+        if argv and argv[0] == str(script):
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake)
+
+
+def test_a_node_timeout_ledgers_one_failed_row_with_null_cost_and_still_raises(
+    fake_claude, tmp_path, conn, monkeypatch
+) -> None:
+    _timing_out(monkeypatch, fake_claude[0])
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn), timeout=7)
+    errors: list[str | None] = []
+    append = runner._append_call_ledger
+    monkeypatch.setattr(
+        runner, "_append_call_ledger", lambda call, *, ok, error=None: (errors.append(error), append(call, ok=ok, error=error))
+    )
+
+    with pytest.raises(RunnerError, match="node 'plan' did not finish within 7s"):
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    (row,) = _ledger_lines(conn, "r1")
+    assert row["ok"] is False and row["cost_usd"] is None and "trace" not in row
+    assert errors == ["node timeout after 7s"]
+
+
+def test_a_node_timeout_with_a_trace_on_disk_ledgers_its_cost(fake_claude, tmp_path, conn, monkeypatch) -> None:
+    _timing_out(monkeypatch, fake_claude[0])
+    trace = tmp_path / "trace" / "plan-1.jsonl"
+    trace.parent.mkdir()
+    trace.write_text(json.dumps({"type": "result", "total_cost_usd": 0.42}) + "\n", encoding="utf-8")
+    runner = runner_for(fake_claude, tmp_path, runs_dir=tmp_path, run_id="r1", store=Store(conn), trace_dir=tmp_path / "trace")
+
+    with pytest.raises(RunnerError, match="did not finish within 1800s"):
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    (row,) = _ledger_lines(conn, "r1")
+    assert row["ok"] is False and row["cost_usd"] == 0.42 and row["trace"] == str(trace)
+
+
+def test_trace_cost_reads_the_last_result_event_and_is_none_without_one(tmp_path) -> None:
+    trace = tmp_path / "t.jsonl"
+    trace.write_text('{"type": "system"}\nnot json\n{"type": "result", "total_cost_usd": 0.5}\n', encoding="utf-8")
+    assert _trace_cost(trace) == 0.5
+    assert _trace_cost(tmp_path / "missing.jsonl") is None
+    trace.write_text('{"type": "system"}\n', encoding="utf-8")
+    assert _trace_cost(trace) is None
 
 
 def test_a_budget_stop_still_ledgers_the_attempt_it_spent(sequenced_claude, tmp_path, conn) -> None:

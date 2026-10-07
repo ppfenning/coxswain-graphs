@@ -22,10 +22,12 @@ from pathlib import Path
 
 import pytest
 
+from harness.cause_rule import classify_cause
 from harness.checks import (
     all_passed,
     check_feedback,
     check_outcome,
+    check_timeout,
     checks_evidence,
     collected_ids,
     coverage_floor_holds,
@@ -206,6 +208,34 @@ def test_run_checks_timeout_is_a_failure_not_an_absence(tmp_path) -> None:
     assert result["passed"] is False
     assert result["exit_code"] is None
     assert "timed out" in result["output_tail"]
+
+
+def test_a_timed_out_check_keeps_its_bytes_output_and_is_a_harness_fault(tmp_path, monkeypatch) -> None:
+    def fake(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"], output=b"3 passed\nhalf \xff", stderr=b"warn: slow")
+
+    monkeypatch.setattr("harness.checks.subprocess.run", fake)
+    results = run_checks(tmp_path, [{"name": "slow", "cmd": "x"}], timeout=9)
+    [result] = results
+    assert result["outcome"] == "timed_out"
+    assert result["passed"] is False
+    assert result["exit_code"] is None
+    assert result["counts"] == {"passed": 3}
+    assert result["output_tail"].startswith("3 passed\nhalf \N{REPLACEMENT CHARACTER}warn: slow")
+    assert result["output_tail"].endswith("[timed out after 9s]")
+    assert result["error"].startswith("harness fault:")
+    reason = quarantine_reason(results)
+    assert is_harness_fault(reason)
+    assert classify_cause("unverified", reason) == "harness"
+    assert classify_cause("unverified", "configured check failed: tests") == "code"
+
+
+def test_check_timeout_is_the_checks_own_positive_int_else_the_default() -> None:
+    assert check_timeout({"name": "a"}, 600) == 600
+    assert check_timeout({"name": "a", "timeout": 7}, 600) == 7
+    for bad in (0, -1, True, "30"):
+        with pytest.raises(ValueError, match=rf"'a'.*{bad!r}"):
+            check_timeout({"name": "a", "timeout": bad}, 600)
 
 
 def test_run_checks_output_tail_is_bounded(tmp_path) -> None:

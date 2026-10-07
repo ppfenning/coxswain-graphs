@@ -42,6 +42,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -426,6 +427,31 @@ def self_reported_commands(data: Mapping[str, Any]) -> list[dict[str, str]]:
     if not isinstance(reported, list):
         return []
     return [{"command": str(item), "source": "self_report"} for item in reported if item]
+
+
+class _NodeTimeout(RunnerError):
+    """A node's subprocess outlived its timeout. A RunnerError, so every existing handler still matches."""
+
+
+def _trace_cost(path: Path) -> float | None:
+    """`total_cost_usd` of the last result event in a trace file; None when there is no such file or event.
+
+    Wrong belief: a timed-out node leaves a trace. `_payload` writes the file only after the CLI
+    returns, so on a real timeout there is usually none and the row's cost stays null.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    costs: list[float] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result" and event.get("total_cost_usd") is not None:
+            costs.append(float(event["total_cost_usd"]))
+    return costs[-1] if costs else None
 
 
 def _call_fields(
@@ -1196,7 +1222,33 @@ class ClaudeCodeRunner:
         except FileNotFoundError as exc:
             raise RunnerError(f"'{self.claude_bin}' not found; is Claude Code installed and on PATH?") from exc
         except subprocess.TimeoutExpired as exc:
-            raise RunnerError(f"node '{role}' did not finish within {self.timeout}s") from exc
+            raise _NodeTimeout(f"node '{role}' did not finish within {self.timeout}s") from exc
+
+    def _ledger_timeout(
+        self, *, call_id: str, role: str, tier: str, model: str, tools: Sequence[str], task: str | None,
+        budget_usd: float | None, checkpoint_fractions: tuple[float, ...] | None, checkpoint_source: str,
+        retry_extra: Mapping[str, Any],
+    ) -> None:
+        """Ledger a timed-out node as a failed call, in the one row shape every other failure path uses."""
+        trace = self.trace_dir / f"{role}-{sum(1 for c in self.calls if c['role'] == role) + 1}.jsonl" if self.trace_dir else None
+        cost = _trace_cost(trace) if trace is not None else None
+        payload = {
+            **({"total_cost_usd": cost} if cost is not None else {}),
+            **({"trace": str(trace)} if cost is not None and trace is not None else {}),
+        }
+        ceiling_usd, ceiling_source = self._shape_ceiling(role, tier, model, budget_usd)
+        self._append_call_ledger(
+            {
+                **_call_fields(
+                    role, tier, model, tools, payload, task,
+                    ceiling_usd=ceiling_usd, ceiling_source=ceiling_source,
+                    hard_ceiling_usd=self.role_ceiling_usd.get(role),
+                    checkpoint_fractions=checkpoint_fractions, checkpoint_source=checkpoint_source,
+                ),
+                "id": call_id, **retry_extra,
+            },
+            ok=False, error=f"node timeout after {self.timeout}s",
+        )
 
     def _verify_rows(self, scratch: Path, task: str | None, patch: str, stdout: str | None) -> list[dict[str, str]]:
         """Verify a build that will reach reconciliation, then restore the scratch: a thread's scratch outlives this call.
@@ -1253,6 +1305,14 @@ class ClaudeCodeRunner:
             call_id = first_call_id if attempt == 1 else str(uuid.uuid4())
             used_model = attempt_model
             resolved_fractions, checkpoint_source = self._shape_checkpoint(role, used_model, checkpoint_fractions)
+
+            ledger_timeout = partial(
+                self._ledger_timeout,
+                call_id=call_id, role=role, tier=tier, model=used_model, tools=tools, task=task,
+                budget_usd=budget_usd, checkpoint_fractions=resolved_fractions,
+                checkpoint_source=checkpoint_source, retry_extra=retry_extra,
+            )
+
             if thread:
                 state = self._thread(thread, role)
                 session = ["--session-id", state["session"]] if state["calls"] == 0 else ["--resume", state["session"]]
@@ -1295,13 +1355,17 @@ class ClaudeCodeRunner:
                     )
                 if wait_if_paused is not None:
                     wait_if_paused()
-                proc = self._invoke(
-                    role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
-                    scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
-                    spent_usd=state.get("spent_usd", 0.0), effort=effort,
-                    checkpoint_fractions=resolved_fractions, checkpoint_index=state.get("checkpoint_index", 0),
-                    thread=thread,
-                )
+                try:
+                    proc = self._invoke(
+                        role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
+                        scratch=state["scratch"], patches=role in _PATCH_ROLES, session=session, budget_usd=budget_usd,
+                        spent_usd=state.get("spent_usd", 0.0), effort=effort,
+                        checkpoint_fractions=resolved_fractions, checkpoint_index=state.get("checkpoint_index", 0),
+                        thread=thread,
+                    )
+                except _NodeTimeout:
+                    ledger_timeout()
+                    raise
                 if role in _PATCH_ROLES and state.get("scratch"):
                     has_scratch = True
                     computed_patch, patch_source = recover_diff(
@@ -1309,11 +1373,15 @@ class ClaudeCodeRunner:
                     )
             else:
                 with self._scratch(role) as scratch:
-                    proc = self._invoke(
-                        role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt, packs=packs,
-                        scratch=scratch, patches=True, session=(), budget_usd=budget_usd, effort=effort,
-                        checkpoint_fractions=resolved_fractions,
-                    )
+                    try:
+                        proc = self._invoke(
+                            role=role, tier=tier, model=used_model, tools=tools, schema=schema, prompt=prompt,
+                            packs=packs, scratch=scratch, patches=True, session=(), budget_usd=budget_usd,
+                            effort=effort, checkpoint_fractions=resolved_fractions,
+                        )
+                    except _NodeTimeout:
+                        ledger_timeout()
+                        raise
                     if role in _PATCH_ROLES and scratch:
                         has_scratch = True
                         computed_patch, patch_source = recover_diff(

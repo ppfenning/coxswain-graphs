@@ -25,6 +25,7 @@ __all__ = [
     "all_passed",
     "check_feedback",
     "check_outcome",
+    "check_timeout",
     "checks_evidence",
     "collected_ids",
     "coverage_floor_holds",
@@ -154,14 +155,21 @@ def fixable_checks(checks: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def _check_timeout(check: Mapping[str, Any], default: int) -> int:
-    """The check's own `timeout` in seconds, else `default`; a bad value is refused."""
+def check_timeout(check: Mapping[str, Any], default: int) -> int:
+    """The check's own `timeout` in seconds, else `default`; a bool, non-int or non-positive value is refused."""
     if "timeout" not in check:
         return default
     value = check["timeout"]
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"check entry {check.get('name')!r} has a bad 'timeout' (need a positive int): {value!r}")
     return value
+
+
+def _text(value: str | bytes | None) -> str:
+    """A partial stream as text: `TimeoutExpired` hands back bytes even when the run asked for text."""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value or ""
 
 
 def run_checks(
@@ -184,7 +192,7 @@ def run_checks(
         cmd = check.get("cmd")
         if not name or not cmd:
             raise ValueError(f"check entry missing 'name' or 'cmd': {dict(check)!r}")
-        limit = _check_timeout(check, timeout)
+        limit = check_timeout(check, timeout)
 
         try:
             proc = subprocess.run(
@@ -196,16 +204,14 @@ def run_checks(
                 timeout=limit,
             )
         except subprocess.TimeoutExpired as exc:
-            partial = ((exc.stdout or "") if isinstance(exc.stdout, str) else "") + (
-                (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-            )
+            partial = _text(exc.stdout) + _text(exc.stderr)
             results.append(
                 {
                     "name": name,
                     "cmd": cmd,
                     "passed": False,
-                    "outcome": "failed",
-                    "error": None,
+                    "outcome": "timed_out",
+                    "error": f"{HARNESS_FAULT_PREFIX} check {name!r} timed out after {limit}s",
                     "exit_code": None,
                     "counts": _parse_counts(partial),
                     "output_tail": (partial + f"\n[timed out after {limit}s]")[-_TAIL_CHARS:],
@@ -332,10 +338,13 @@ def refix_route(
 def quarantine_reason(results: Sequence[Mapping[str, Any]]) -> str | None:
     if all_passed(results):
         return None
-    real_failures = [r for r in results if not r.get("passed") and r.get("outcome") != "unrunnable"]
+    faults = ("unrunnable", "timed_out")
+    real_failures = [r for r in results if not r.get("passed") and r.get("outcome") not in faults]
     if not real_failures:
-        unrunnable = next(r for r in results if r.get("outcome") == "unrunnable")
-        return f"{HARNESS_FAULT_PREFIX} check '{unrunnable['name']}' could not run: {unrunnable.get('error')}"
+        fault = next(r for r in results if r.get("outcome") in faults)
+        if fault.get("outcome") == "timed_out":
+            return str(fault.get("error"))
+        return f"{HARNESS_FAULT_PREFIX} check '{fault['name']}' could not run: {fault.get('error')}"
     failing = [r for r in results if not r.get("passed")]
     names = ", ".join(r["name"] for r in failing)
     first_line = next((ln for ln in str(failing[0].get("output_tail") or "").splitlines() if ln.strip()), "")
