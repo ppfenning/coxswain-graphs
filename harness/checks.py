@@ -140,13 +140,28 @@ def repo_checks(text: str) -> list[dict]:
     return [{"name": line.split(None, 1)[0], "cmd": line} for line in unique]
 
 
-def fixable_checks(checks: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+def fixable_checks(checks: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Checks carrying a `fix` command, reshaped to `{name, cmd}` for `run_checks`.
 
     A check without `fix` is not a candidate. The `fix` string runs verbatim —
-    `--unsafe-fixes` or any other flag is never added on its behalf.
+    `--unsafe-fixes` or any other flag is never added on its behalf. A check's
+    `timeout` is carried into its fix entry; no key is added when it has none.
     """
-    return [{"name": c["name"], "cmd": c["fix"]} for c in checks if c.get("fix")]
+    return [
+        {"name": c["name"], "cmd": c["fix"], **({"timeout": c["timeout"]} if "timeout" in c else {})}
+        for c in checks
+        if c.get("fix")
+    ]
+
+
+def _check_timeout(check: Mapping[str, Any], default: int) -> int:
+    """The check's own `timeout` in seconds, else `default`; a bad value is refused."""
+    if "timeout" not in check:
+        return default
+    value = check["timeout"]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"check entry {check.get('name')!r} has a bad 'timeout' (need a positive int): {value!r}")
+    return value
 
 
 def run_checks(
@@ -169,6 +184,7 @@ def run_checks(
         cmd = check.get("cmd")
         if not name or not cmd:
             raise ValueError(f"check entry missing 'name' or 'cmd': {dict(check)!r}")
+        limit = _check_timeout(check, timeout)
 
         try:
             proc = subprocess.run(
@@ -177,7 +193,7 @@ def run_checks(
                 cwd=worktree,
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=limit,
             )
         except subprocess.TimeoutExpired as exc:
             partial = ((exc.stdout or "") if isinstance(exc.stdout, str) else "") + (
@@ -192,7 +208,7 @@ def run_checks(
                     "error": None,
                     "exit_code": None,
                     "counts": _parse_counts(partial),
-                    "output_tail": (partial + f"\n[timed out after {timeout}s]")[-_TAIL_CHARS:],
+                    "output_tail": (partial + f"\n[timed out after {limit}s]")[-_TAIL_CHARS:],
                 }
             )
             continue
