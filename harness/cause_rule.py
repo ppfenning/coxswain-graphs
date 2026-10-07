@@ -37,13 +37,19 @@ _AUTH_MARKERS: tuple[str, ...] = (
 _HARNESS_FAULT_PREFIX = "harness fault:"
 
 
+# A failure in a test outside the ticket's surfaces is the ticket's fault, not the code's: matched as a prefix only,
+# since the phrase appearing mid-reason says nothing about where the failing test lives.
+_OUTSIDE_SURFACES_PREFIX = "configured check failed outside surfaces:"
+OUTSIDE_SURFACES_WHY = "tests outside surfaces"
+
+
 def is_auth_failure(reason: str) -> bool:
     """True when the reason carries an authentication marker; `classify_cause` asks the same."""
     return any(marker in reason.lower() for marker in _AUTH_MARKERS)
 
 
 def classify_cause(kind: str, reason: str) -> Cause | None:
-    """An authentication failure first, then a budget, turn or session limit stop, then harness, code, ticket; None when no rule matches."""
+    """An authentication failure first, then a budget, turn or session limit stop, then harness, an outside-surfaces check failure (ticket), code, ticket; None when no rule matches."""
     if is_auth_failure(reason):
         return "harness"
     if any(marker in reason.lower() for marker in _LIMIT_MARKERS):
@@ -54,6 +60,8 @@ def classify_cause(kind: str, reason: str) -> Cause | None:
         return "harness"
     if reason.startswith(_HARNESS_FAULT_PREFIX):
         return "harness"
+    if reason.startswith(_OUTSIDE_SURFACES_PREFIX):
+        return "ticket"
     if "configured check failed" in reason or "configured checks failed" in reason:
         return "code"
     if kind == "no_work":
