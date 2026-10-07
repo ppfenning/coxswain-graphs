@@ -1496,6 +1496,22 @@ def row_should_quarantine(work_state: str, current_state: str | None, *, approve
     return work_state == "store" and current_state is not None and current_state not in finished
 
 
+def _exists(path: Path) -> bool:
+    """The filesystem lookup `_surface_passes` is handed; the one place the check touches disk."""
+    return path.exists()
+
+
+def _surface_passes(exists: Callable[[Path], bool], root: Path, surface: str) -> bool:
+    """A plain path passes when it exists under `root`; a `(new)` path, when its parent directory does."""
+    text = surface.strip()
+    is_new = text.endswith("(new)")
+    path = text.removesuffix("(new)").strip()
+    if not path:
+        return False
+    target = root / path
+    return exists(target.parent) if is_new else exists(target)
+
+
 def _quarantine_row(ctx: _Ctx, phase: str, task: str, *, approved_is_open: bool = False) -> None:
     """Under work_state store, move the task's row to quarantined, so the chair stops relaunching it. Errors are logged, never raised.
 
@@ -2054,7 +2070,25 @@ def _run_phase(
         _quarantine_row(ctx, phase, task_id)
         print(f"  build budget: {task_id} refused (budget_usd {task['budget_usd']} > cap {cap})")
     over_budget_ids = {str(task["id"]) for task in over_budget}
-    runnable = [task for task in to_run if str(task["id"]) not in over_budget_ids]
+    within_budget = [task for task in to_run if str(task["id"]) not in over_budget_ids]
+
+    # A task whose every surface is missing from this repository is aimed at
+    # the wrong one. Refused plainly, like the budget refusal above: not an
+    # attempt, so never through `_quarantine_task`, and no model call is made.
+    wrong_repo = [
+        task for task in within_budget
+        if task.get("surfaces") and not any(_surface_passes(_exists, ctx.repo, str(s)) for s in task["surfaces"])
+    ]
+    for task in wrong_repo:
+        task_id = str(task["id"])
+        failed = ", ".join(str(s) for s in task["surfaces"])
+        reason = f"surfaces not in {ctx.repo}: {failed}; wrong repository?"
+        quarantined.append({"id": task_id, "phase": phase, "grain": "task", "kind": "no_work", "reason": reason})
+        _record_task_cause(ctx, phase, task_id, "ticket", "rule: surfaces not in the repository")
+        _quarantine_row(ctx, phase, task_id)
+        print(f"  surfaces: {task_id} refused ({failed} not in {ctx.repo})")
+    wrong_repo_ids = {str(task["id"]) for task in wrong_repo}
+    runnable = [task for task in within_budget if str(task["id"]) not in wrong_repo_ids]
 
     # A task the driver quarantined before carries its reasons — and, when one
     # was saved, its last patch — into the ticket body, so the planner and the
