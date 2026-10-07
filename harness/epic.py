@@ -138,6 +138,9 @@ ATTEMPT_CAP = 2
 # Distinct from a clean run's implicit 0, for a caller to act on the pause.
 EXIT_PAUSED = 3
 
+# A phase whose unlanded commits are all approved tasks with a land in flight: not a failure, not a pause.
+EXIT_AWAITING_LAND = 4
+
 # docs/design/landing-model.md §5: the existing style_pass brief, plus the one
 # sentence that scopes it to a whole phase rather than one task's diff.
 _STYLE_PASS_PROMPT = (
@@ -497,6 +500,22 @@ def unlanded(cherry_lines: Sequence[str], done_tasks: set[str]) -> list[str]:
     return [s for s in subjects if (t := _task_of(s)) is None or not (t in done_tasks or t.startswith("merge "))]
 
 
+def classify_unlanded(cherry_lines: Sequence[str], task_states: Mapping[str, str]) -> str:
+    """What the phase branch's `+` commits mean, by their tasks' work-store states.
+
+    `landed`: none left, or every one is a done task's (already squashed onto main).
+    `awaiting_land`: every one is an approved task whose land is still in flight.
+    `rebase`: a mix of done and approved. `block`: any other commit or task state.
+    """
+    tasks = [_task_of(s) for s in unlanded(cherry_lines, set())]
+    states = {task_states.get(t, "") if t is not None else "" for t in tasks}
+    if not states or states == {"done"}:
+        return "landed"
+    if states == {"approved"}:
+        return "awaiting_land"
+    return "rebase" if states == {"approved", "done"} else "block"
+
+
 def open_in_phase(items: Sequence[Mapping[str, Any]], phase: str, in_run: Collection[str]) -> list[str]:
     """Ids of `phase` items neither `done` nor `dropped` and outside this run, in item order."""
     return [
@@ -508,10 +527,10 @@ def open_in_phase(items: Sequence[Mapping[str, Any]], phase: str, in_run: Collec
     ]
 
 
-def _phase_branch_has_unlanded_commits(ctx: _Ctx, phase: str, done_tasks: set[str]) -> bool:
-    """Patch-id semantics, less commits of tasks the work store already calls done."""
+def _phase_branch_cherry(ctx: _Ctx, phase: str) -> list[str]:
+    """`git cherry -v` of the phase branch against main, patch-id semantics; empty if git fails."""
     ok, out = _git("-C", str(ctx.repo), "cherry", "-v", ctx.default_ref, ctx.phase_branch(phase))
-    return ok and bool(unlanded(out.splitlines(), done_tasks))
+    return out.splitlines() if ok else []
 
 
 def _rebase(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str]:
@@ -1162,6 +1181,11 @@ def run_epic(
             "quarantined": quarantined,
             "proposals": proposals,
             **({"paused_until": paused_until, "exit_code": EXIT_PAUSED} if paused_until else {}),
+            **(
+                {"exit_code": EXIT_AWAITING_LAND}
+                if not paused_until and any(p.get("status") == "awaiting_land" for p in phases)
+                else {}
+            ),
             "exit_summary": (
                 [f"paused: account session limit, resets {paused_until}"] if paused_until else []
             ) + [
@@ -1600,7 +1624,13 @@ def build_outcome(result: Mapping[str, Any]) -> dict[str, Any]:
         for p in result.get("phases") or []
         if p.get("status") == "blocked" and len(p.get("parents") or []) == 1 and p["phase"] not in blocked_ids
     ]
-    return {"totals": dict(result.get("totals") or {}), "blocked": blocked, "waiting": waiting}
+    awaiting_land = any(p.get("status") == "awaiting_land" for p in result.get("phases") or [])
+    return {
+        "totals": dict(result.get("totals") or {}),
+        "blocked": blocked,
+        "waiting": waiting,
+        **({"blocked_kind": "awaiting_land"} if awaiting_land else {}),
+    }
 
 
 def _record_run_exit(
@@ -1788,11 +1818,32 @@ def _run_phase(
     # Decided before a single task builds: a reused branch behind its base is
     # either recreated (nothing of its own to lose) or blocked (something is).
     head_moved = reused and _parent_head_moved(ctx, phase, base_ref)
-    done_tasks = {str(i["id"]) for i in items if i.get("state") == "done"}
-    has_own_commits = head_moved and _phase_branch_has_unlanded_commits(ctx, phase, done_tasks)
-    action = branch_action(reused, head_moved, has_own_commits)
+    task_states = {str(i["id"]): str(i.get("state")) for i in items}
+    cherry = _phase_branch_cherry(ctx, phase) if head_moved else []
+    unlanded_kind = classify_unlanded(cherry, task_states)
+    action = branch_action(reused, head_moved, unlanded_kind != "landed")
 
-    if action == "block":
+    if action == "block" and unlanded_kind == "awaiting_land":
+        # Their lands are in flight: nothing to quarantine and nothing to rebase. Wait.
+        record["status"] = "awaiting_land"
+        record["reason"] = (
+            f"phase branch {branch} is behind {base_ref}; its unlanded commits belong to approved "
+            "tasks whose lands are still in flight"
+        )
+        _git("-C", str(ctx.phase_worktree(phase)), "checkout", "--detach", "-q")
+        return record
+
+    if action == "block" and unlanded_kind == "rebase":
+        # Some commits already landed (done), the rest are approved: replay the branch onto the new base.
+        rebased_ok, rebase_detail = _rebase(ctx, phase, base_ref)
+        if not rebased_ok:
+            record["status"] = "blocked"
+            record["reason"] = f"rebase conflict: {rebase_detail}"
+            quarantined.append({"id": phase, "phase": phase, "grain": "phase", "reason": record["reason"]})
+            _git("-C", str(ctx.phase_worktree(phase)), "checkout", "--detach", "-q")
+            return record
+        record["rebased"] = True
+    elif action == "block":
         # The proposal the quiet path below would have built for the same
         # staleness — filed here, unchanged, so the gate has it to decide on.
         record["batch"].append(
@@ -1849,25 +1900,6 @@ def _run_phase(
         ctx.runner.repo_digest = build_digest(ctx.phase_worktree(phase)) or None
     if hasattr(ctx.runner, "check_commands"):
         ctx.runner.check_commands = [str(c.get("cmd")) for c in ctx.checks if c.get("cmd")]
-
-    # A rebase is a WRITE, so it is a proposal like any other and joins this
-    # phase's gate batch rather than happening quietly on the way past.
-    rebase: dict[str, Any] | None = None
-    if reused and _parent_head_moved(ctx, phase, base_ref):
-        rebase = proposal(
-            ctx.cartridge,
-            kind="stack_rebase",
-            target=branch,
-            evidence=[
-                {"check": "merge-base --is-ancestor", "output": f"{base_ref} is NOT an ancestor of {branch}"},
-                {"check": "stacked on", "output": f"{branch} was branched from {base_ref}, whose head has moved"},
-            ],
-            rationale=(
-                f"'{base_ref}' moved since '{branch}' was created, so this phase — and "
-                "everything stacked above it — is sitting on ground that is no longer there"
-            ),
-            suggested_action=f"rebase {branch} onto {base_ref}",
-        )
 
     # A dropped task is terminal like a done one: it never gets rebuilt or
     # re-reviewed, and never blocks the phase behind it.
@@ -2334,7 +2366,7 @@ def _run_phase(
         built=built,
         escalated=escalated,
         chunk_by_task=chunk_by_task,
-        rebase=rebase,
+        rebase=None,
         by_id=by_id,
     )
     batch = batch + triage_batch
