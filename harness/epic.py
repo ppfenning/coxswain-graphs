@@ -70,6 +70,7 @@ from harness.checks import (
     _tail_lines,
     all_passed,
     check_feedback,
+    check_timeout,
     checks_evidence,
     collected_ids,
     coverage_floor_holds,
@@ -309,6 +310,11 @@ class _Ctx:
     lease_name: str | None = None
     work_state: str = "files"
     retry: _StoreRetry = field(default_factory=_StoreRetry)
+
+    def __post_init__(self) -> None:
+        """Refuse a bad per-check timeout at build, before any model call; the ValueError names the check."""
+        for check in self.checks:
+            check_timeout(check, 600)
 
     # ── names, in one place, so the topology is readable ─────────────────────
     def phase_branch(self, phase: str) -> str:
