@@ -131,6 +131,9 @@ DECOMPOSE_SCHEMA = {
                     "body": {"type": "string"},
                     "needs": {"type": "array", "items": {"type": "string"}},
                     "surfaces": {"type": "array", "items": {"type": "string"}},
+                    "repo": {"type": "string"},
+                    "interface": {"type": "string"},
+                    "side": {"type": "string", "enum": ["contract", "producer", "consumer"]},
                 },
                 "required": ["id", "phase", "title", "body", "needs", "surfaces"],
                 "additionalProperties": False,
@@ -194,6 +197,7 @@ UNBUILDABLE_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "tasks": DECOMPOSE_SCHEMA["properties"]["tasks"],
         "summary": {"type": "string"},
     },
     "required": ["corrections", "summary"],
@@ -360,15 +364,45 @@ def _drop_foreign_needs(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return new_tasks
 
 
-def _apply_corrections(tasks: list[dict[str, Any]], corrections: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """New task dicts; a corrected surface replaces the prose the adversary named, nothing else."""
+def _apply_corrections(
+    tasks: list[dict[str, Any]],
+    corrections: Sequence[Mapping[str, Any]],
+    added: Sequence[Mapping[str, Any]] = (),
+) -> list[dict[str, Any]]:
+    """New task dicts; a corrected surface replaces the prose the adversary named.
+
+    From `added`, a task whose id is already in the plan contributes its `needs` and nothing else;
+    any other task joins the plan ahead of the rest.
+    """
     by_task: dict[str, dict[str, str]] = {}
     for c in corrections:
         by_task.setdefault(str(c.get("task")), {})[str(c.get("surface"))] = str(c.get("replacement"))
-    return [
-        dict(t, surfaces=[by_task.get(str(t["id"]), {}).get(s, s) for s in t.get("surfaces") or []])
+    known = {str(t["id"]) for t in tasks}
+    restated = {str(t["id"]): list(t.get("needs") or []) for t in added if str(t["id"]) in known}
+    fixed = [
+        dict(
+            t,
+            surfaces=[by_task.get(str(t["id"]), {}).get(s, s) for s in t.get("surfaces") or []],
+            needs=restated.get(str(t["id"]), list(t.get("needs") or [])),
+        )
         for t in tasks
     ]
+    joined = [
+        dict(t, needs=list(t.get("needs") or []), surfaces=list(t.get("surfaces") or []))
+        for t in added
+        if str(t["id"]) not in known
+    ]
+    return [*joined, *fixed]
+
+
+def _gate_added_surfaces(
+    tasks: list[dict[str, Any]], known: set[str], tree: Sequence[Mapping[str, Any]]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """The first plan's surface gates, run on tasks whose id is not in `known`; `(tasks, failures)`."""
+    checked, failures = _validate_plan_surfaces([t for t in tasks if str(t["id"]) not in known], tree)
+    resolved = {str(t["id"]): t for t in _apply_surface_resolutions(checked, tree)}
+    merged = [resolved.get(str(t["id"]), t) for t in tasks]
+    return _split_cross_repo(merged, tree), [*failures, *_unresolved_pairs(checked, tree)]
 
 
 def _split_cross_repo(tasks: list[dict[str, Any]], tree: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -518,7 +552,14 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "Phases are ordered; tasks within a phase are not necessarily. Draw a "
         "dependency edge ONLY where order genuinely matters — an edge that exists "
         "because the work feels sequential blocks work that could have run in "
-        "parallel. Name the surfaces each task touches."
+        "parallel. Name the surfaces each task touches. When the initiative splits one "
+        "interface across repositories, open the plan with a contract task, and give "
+        "every task of that interface `repo`, `interface` and `side` (`contract`, "
+        "`producer` or `consumer`). The contract task commits a JSON fixture of the "
+        "interface in the producer repository; the producer's tests must emit that "
+        "fixture exactly and the consumer's tests must parse it. Producer and consumer "
+        "tasks list the contract task in `needs`. The dash feed's shared v1 fixture "
+        "is the model."
     )
     if task_ids == "ordinal":
         decompose_prompt += (
@@ -636,15 +677,16 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     lint_problems = lint_tickets(tasks, tree, grants, repo_name)
     refusals = [p for p in lint_problems if p.severity == "refusal"]
     if refusals:
-        # reach and coupling block the run, same as an unresolved surface does:
-        # quarantine outright with no adversary bound, otherwise ask it for a
-        # correction and re-lint before trusting the result. The correction
-        # schema only rewrites `surfaces` (see _apply_corrections below), so a
-        # reach hit sourced from body prose rather than a declared surface has
-        # nothing for the correction to match — the wrong belief to hold here
-        # is that a correction can reach into prose; it cannot, and the run
-        # quarantines on the second lint exactly as it would with no adversary
-        # bound at all.
+        # reach, coupling and contract block the run, same as an unresolved
+        # surface does: quarantine outright with no adversary bound, otherwise
+        # ask it for a correction and re-lint before trusting the result. The
+        # correction rewrites declared `surfaces`, restates the `needs` of a
+        # task already in the plan, and adds new tasks (see _apply_corrections
+        # below). It never edits body prose, so a reach hit sourced from the
+        # body has nothing to match and quarantines on the second lint. The
+        # wrong belief is that a correction only touches `surfaces`: it can
+        # now redraw edges and add tasks, so its result goes back through the
+        # surface gates and the cycle check before the re-lint.
         if "review_adversary" not in bound:
             raise LintRefusal(_lint_refusal_text(refusals))
         correction = dict(
@@ -655,12 +697,33 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 schema=UNBUILDABLE_SCHEMA,
                 context=context,
                 prompt=(
-                    "Ticket lint refused these tasks for reach or coupling. Resolve "
-                    "each so the problem no longer holds.\n\n" + (_lint_refusal_text(refusals) or "")
+                    "Ticket lint refused these tasks for reach, coupling or contract. Resolve "
+                    "each so the problem no longer holds. A contract refusal is resolved in "
+                    "`tasks`: add the contract task, and restate each task of the interface "
+                    "with the contract task in its `needs`.\n\n" + (_lint_refusal_text(refusals) or "")
                 ),
             )
         )
-        tasks = _apply_corrections(tasks, correction.get("corrections") or [])
+        added = list(correction.get("tasks") or [])
+        if initiative_id:
+            added = [
+                dict(t, id=_prefixed(initiative_id, t["id"]), needs=[_prefixed(initiative_id, n) for n in t.get("needs") or []])
+                for t in added
+            ]
+        known = {str(t["id"]) for t in tasks}
+        tasks = _apply_corrections(tasks, correction.get("corrections") or [], added)
+        if tree:
+            tasks, added_failures = _gate_added_surfaces(tasks, known, tree)
+            if added_failures:
+                raise ContractViolation(
+                    "a task the correction added names a surface not in the checkout: " + "; ".join(added_failures)
+                )
+        cycles = _local_cycle(tasks)
+        if cycles:
+            raise ContractViolation(
+                "the corrected graph contains a dependency cycle, so nothing in it could "
+                "ever become ready: " + "; ".join(cycles)
+            )
         lint_problems = lint_tickets(tasks, tree, grants, repo_name)
         refusals = [p for p in lint_problems if p.severity == "refusal"]
         if refusals:
