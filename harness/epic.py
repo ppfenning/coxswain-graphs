@@ -1308,7 +1308,8 @@ def _quarantine_task(
             ctx.run_id, task, seq, phase, kind, detail or reason, ts, epoch=ctx.epoch, cause=cause, cause_why=cause_why
         )
         _record_task_cause(ctx, phase, task, cause, cause_why)
-    _quarantine_row(ctx, phase, task)
+    # A merge conflict leaves the row at approved with its work unlanded; approved is not always finished.
+    _quarantine_row(ctx, phase, task, approved_is_open=judged == ("harness", "merge conflict"))
     return entry
 
 
@@ -2965,9 +2966,16 @@ def _execute(
         if not ok:
             _git("-C", str(ctx.phase_worktree(phase)), "merge", "--abort")
             state.quarantined.append(
-                {"id": subject, "phase": phase, "grain": "task", "reason": f"merge conflict: {detail}"}
+                _quarantine_task(
+                    ctx,
+                    by_id,
+                    phase=phase,
+                    task=subject,
+                    reason=f"merge conflict: {detail}",
+                    kind="infra",
+                    cause=("harness", "merge conflict"),
+                )
             )
-            _quarantine_row(ctx, phase, subject, approved_is_open=True)
         state.merged[subject] = ok
         return ok, detail
 
