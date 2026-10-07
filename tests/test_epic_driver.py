@@ -33,6 +33,7 @@ from harness import epic as epic_module
 from harness.epic import (
     EXIT_AWAITING_LAND,
     EXIT_PAUSED,
+    _invoke_failure_kind,
     _lifecycle_invocation,
     _ticket_amend_ramp,
     _trace_evidence,
@@ -1303,6 +1304,71 @@ def test_an_ordinary_runnererror_still_quarantines_and_records_an_attempt(repo, 
     assert entry["kind"] == "infra"
     item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
     assert item["attempts"][0]["kind"] == "infra"
+
+
+class FailOnceRunner(Runner):
+    """The first build call raises `message`; every later call is the scripted `Runner`."""
+
+    def __init__(self, patches: dict[str, str], *, message: str) -> None:
+        super().__init__(patches)
+        self.message = message
+        self.failed = False
+
+    def run(self, *, role, **kw):
+        if role == "build":
+            with self.lock:
+                first, self.failed = not self.failed, True
+            if first:
+                raise RunnerError(self.message)
+        return super().run(role=role, **kw)
+
+
+def _one_task_initiative(tmp_path):
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    return wi, workstore.read_initiative(wi)
+
+
+def test_an_oauth_refresh_collision_is_quarantined_as_infra_and_spends_no_attempt(repo, cart, tmp_path) -> None:
+    wi, work = _one_task_initiative(tmp_path)
+    runner = FailOnceRunner(
+        {"t1-probe": new_file_patch("t1-probe.txt")}, message="Failed to refresh OAuth token: refresh token reused"
+    )
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-collide-1")
+
+    assert not result["phases"][0].get("stopped")
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["kind"] == "infra"
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    assert [a["kind"] for a in item["attempts"]] == ["infra"]
+
+    # The next run builds it: the collision spent nothing against ATTEMPT_CAP.
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=workstore.read_initiative(wi), run_id="epic-collide-2")
+    assert not any("attempt cap" in q["reason"] for q in result["quarantined"])
+    assert is_ancestor(repo, "epic/demo-initiative/p1-foundations--t1-probe", "epic/demo-initiative/p1-foundations")
+
+
+def test_an_unrelated_runnererror_from_the_invoke_still_counts_as_an_attempt(repo, cart, tmp_path) -> None:
+    wi, work = _one_task_initiative(tmp_path)
+    runner = FailOnceRunner({"t1-probe": new_file_patch("t1-probe.txt")}, message="provider-side safeguard error")
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-unrelated-1")
+
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["kind"] == "no_work"
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    assert [a["kind"] for a in item["attempts"]] == ["no_work"]
+
+
+def test_invoke_failure_kind_matches_the_collision_text_case_insensitively() -> None:
+    assert _invoke_failure_kind("t1: node 'build' failed: FAILED TO REFRESH OAUTH TOKEN") == "infra"
+    assert _invoke_failure_kind("t1: provider-side safeguard error") == "no_work"
 
 
 def test_two_infra_attempts_do_not_trip_the_attempt_cap(repo, cart, tmp_path) -> None:
