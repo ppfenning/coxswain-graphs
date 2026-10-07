@@ -1430,6 +1430,24 @@ class ClaudeCodeRunner:
                 priced, reported_now = thread_priced(
                     state.get("reported_usd", 0.0), payload.get("total_cost_usd"), state["calls"] > 0
                 )
+            # The same banner can arrive with is_error true; it must pause the
+            # run, not fall into the plain failure below. The success-path
+            # check further down stays the one for a non-error payload.
+            if payload.get("is_error") and is_limit_banner(payload):
+                banner_ceiling, banner_source = self._shape_ceiling(role, tier, used_model, budget_usd)
+                self._append_call_ledger(
+                    {
+                        **_call_fields(
+                            role, tier, used_model, tools, payload, task,
+                            ceiling_usd=banner_ceiling, ceiling_source=banner_source,
+                            hard_ceiling_usd=self.role_ceiling_usd.get(role) if role is not None else None,
+                            checkpoint_fractions=resolved_fractions, checkpoint_source=checkpoint_source,
+                        ),
+                        "id": call_id, **retry_extra, **priced,
+                    },
+                    ok=False, error="account session limit",
+                )
+                raise LimitStop(detail=str(payload["result"]))
             if not payload.get("is_error"):
                 if thread:
                     # Only a call that did not fail advances the thread's

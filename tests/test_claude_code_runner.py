@@ -45,7 +45,7 @@ from runner.claude_code_runner import (
     trace_commands,
 )
 from runner.decision_log import RouterDecision, to_row
-from runner.protocol import BudgetStop, Capability, ProviderProfile, resolve_profile
+from runner.protocol import BudgetStop, Capability, LimitStop, ProviderProfile, resolve_profile
 from runner.scripted import ScriptedRunner
 
 # An empty tuple has no checkpoint left to target, so the session keeps the
@@ -455,6 +455,25 @@ def test_a_failed_call_records_no_decision_row(fake_claude, tmp_path) -> None:
     with pytest.raises(RunnerError):
         runner.run(role="plan", schema=SCHEMA, prompt="go")
     assert all("decision" not in call for call in runner.calls)
+
+
+def test_a_limit_banner_with_is_error_true_raises_limit_stop(fake_claude, tmp_path) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": True, "result": "You've hit your session limit · resets 3pm"})
+    runner = runner_for(fake_claude, tmp_path)
+    with pytest.raises(LimitStop) as exc_info:
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    assert "session limit" in exc_info.value.detail
+
+
+def test_a_non_banner_is_error_payload_still_raises_a_plain_runner_error(fake_claude, tmp_path) -> None:
+    _, _, set_output = fake_claude
+    set_output({"is_error": True, "result": "Not logged in"})
+    runner = runner_for(fake_claude, tmp_path)
+    with pytest.raises(RunnerError) as exc_info:
+        runner.run(role="plan", schema=SCHEMA, prompt="go")
+    assert not isinstance(exc_info.value, LimitStop)
+    assert "failed in claude" in str(exc_info.value)
 
 
 def test_a_runner_with_nothing_to_count_records_nothing(tmp_path) -> None:

@@ -326,6 +326,24 @@ class LimitStopArm(Runner):
         )
 
 
+class LimitStopBuild(Runner):
+    """Like `Runner`, but the `build` node itself stops on the CLI's session limit."""
+
+    def __init__(self, patches: dict[str, str], *, detail: str) -> None:
+        super().__init__(patches)
+        self.detail = detail
+
+    def run(
+        self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
+        wait_if_paused=None,
+    ):
+        if role == "build":
+            raise LimitStop(detail=self.detail)
+        return super().run(
+            role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread, budget_usd=budget_usd
+        )
+
+
 SPECS = {
     "lifecycle": GraphSpec(name="lifecycle", graph_name="lifecycle-propose", run=lifecycle_propose.run),
     "validate": phase_validate.SPEC,
@@ -1249,6 +1267,52 @@ def test_a_limitstop_halts_the_phase_before_the_next_task_in_batch_order(repo, c
     # t2-bench's own turn, which an infra quarantine (below) would still take.
     assert t2_item["state"] == "ready"
     assert not t2_item.get("attempts")
+
+
+def test_a_limitstop_from_the_build_node_pauses_the_run_with_no_quarantine_or_attempt(repo, cart, tmp_path) -> None:
+    """A session limit inside a fan-out node is not the task's failure: no `no_work` quarantine, no attempt."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    work = workstore.read_initiative(wi)
+    banner = "You've hit your session limit · resets 10:50am (America/New_York)"
+    runner = LimitStopBuild({"t1-probe": new_file_patch("t1-probe.txt")}, detail=banner)
+    result, _ = drive(repo, cart, tmp_path, runner=runner, work=work, run_id="epic-limit-build")
+
+    assert result["paused_until"] == "10:50am (America/New_York)"
+    assert result["exit_code"] == EXIT_PAUSED
+    assert result["quarantined"] == []
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    assert not item.get("attempts")
+
+
+def test_an_ordinary_runnererror_from_the_build_node_still_quarantines_no_work_and_records_an_attempt(
+    repo, cart, tmp_path
+) -> None:
+    """Nothing is scripted for the build, so `Runner` raises a plain `RunnerError` there."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text(
+        "---\nid: demo-initiative\ntitle: demo\n---\n\nmake the vendor join measurable end to end\n"
+    )
+    (wi / "p1-foundations" / "t1-probe.md").write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    work = workstore.read_initiative(wi)
+    result, _ = drive(repo, cart, tmp_path, runner=Runner({}), work=work, run_id="epic-build-fail")
+
+    assert "paused_until" not in result
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert entry["kind"] == "no_work"
+    item = workstore.read_item(wi / "p1-foundations" / "t1-probe.md")
+    assert len(item["attempts"]) == 1
 
 
 class AuthFailRunner(Runner):
