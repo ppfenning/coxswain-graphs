@@ -38,7 +38,7 @@ from typing import Any
 
 from graphs._contract import ContractViolation
 from graphs._spec import GraphSpec
-from runner.protocol import RunnerError
+from runner.protocol import LimitStop, RunnerError
 
 __all__ = ["Invocation", "InvokeError", "invoke_graphs"]
 
@@ -92,6 +92,10 @@ def invoke_graphs(
     failure string and the siblings run on, because their work already happened
     and is still worth gating.
 
+    A `LimitStop` is the exception to that: it is neither quarantined nor
+    continued past. Queued invocations are cancelled, running ones finish, and
+    it propagates so the run pauses.
+
     Every OTHER exception propagates with its traceback intact. A bug in a
     driver is not a failed invocation, and flattening one into a string in a
     list is how it goes unnoticed for a month.
@@ -126,6 +130,11 @@ def invoke_graphs(
             invocation = futures[future]
             try:
                 results[invocation.id] = future.result()
+            except LimitStop:
+                # The account's own limit, not this invocation's failure: drop
+                # what has not started, let what is running finish, and stop.
+                pool.shutdown(wait=True, cancel_futures=True)
+                raise
             except (ContractViolation, RunnerError) as exc:
                 # continue-and-quarantine: this one is set aside with its
                 # diagnosis, the rest of the fan-out finishes.
