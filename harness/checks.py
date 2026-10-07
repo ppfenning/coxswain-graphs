@@ -29,8 +29,11 @@ __all__ = [
     "checks_evidence",
     "collected_ids",
     "coverage_floor_holds",
+    "failed_test_files",
+    "failures_outside",
     "fixable_checks",
     "is_harness_fault",
+    "outside_surface_files",
     "quarantine_reason",
     "refix_route",
     "repo_checks",
@@ -38,6 +41,9 @@ __all__ = [
 ]
 
 HARNESS_FAULT_PREFIX = "harness fault:"
+_OUTSIDE_SURFACES_PREFIX = "configured check failed outside surfaces: "
+_FAILED_LINE_RE = re.compile(r"^FAILED (\S+?)::", re.MULTILINE)
+_SUMMARY_HEADER = "short test summary info"
 
 # Tokens like "12 passed", "2 failed", "1 error"/"errors", "3 skipped". Generic
 # on purpose: it reads whatever a test runner prints rather than special-casing
@@ -335,7 +341,44 @@ def refix_route(
     return "revise"
 
 
-def quarantine_reason(results: Sequence[Mapping[str, Any]]) -> str | None:
+def _norm(path: str) -> str:
+    return path.removeprefix("./").rstrip("/")
+
+
+def _covers(path: str, root: str) -> bool:
+    """Path equality or directory prefix; `tests` covers `tests/a.py` but not `tests_extra/a.py`."""
+    return root in ("", ".") or path == root or path.startswith(root + "/")
+
+
+def failed_test_files(output: str) -> tuple[str, ...]:
+    """Sorted unique file paths from pytest `FAILED <file>::<test>` lines."""
+    return tuple(sorted({_norm(f) for f in _FAILED_LINE_RE.findall(output)}))
+
+
+def failures_outside(output: str, surfaces: Sequence[str], patch_files: Sequence[str]) -> tuple[str, ...]:
+    """The failing files when all lie outside both surfaces and patch files, else ().
+
+    No roots means nothing to be outside of, and an absolute path cannot be placed: both give ().
+    """
+    files = failed_test_files(output)
+    roots = tuple(_norm(r) for r in (*surfaces, *patch_files))
+    if not roots or any(f.startswith("/") or any(_covers(f, r) for r in roots) for f in files):
+        return ()
+    return files
+
+
+def outside_surface_files(reason: str) -> tuple[str, ...]:
+    """The file list from a `configured check failed outside surfaces: ...` reason, else ()."""
+    if not reason.startswith(_OUTSIDE_SURFACES_PREFIX):
+        return ()
+    return tuple(f for f in reason[len(_OUTSIDE_SURFACES_PREFIX):].split(", ") if f)
+
+
+def quarantine_reason(
+    results: Sequence[Mapping[str, Any]],
+    surfaces: Sequence[str] = (),
+    patch_files: Sequence[str] = (),
+) -> str | None:
     if all_passed(results):
         return None
     faults = ("unrunnable", "timed_out")
@@ -346,6 +389,13 @@ def quarantine_reason(results: Sequence[Mapping[str, Any]]) -> str | None:
             return str(fault.get("error"))
         return f"{HARNESS_FAULT_PREFIX} check '{fault['name']}' could not run: {fault.get('error')}"
     failing = [r for r in results if not r.get("passed")]
+    tails = [str(r.get("output_tail") or "") for r in failing]
+    # Each failing check's tail must hold pytest's whole summary block; otherwise a
+    # failure it cannot see (a truncated FAILED line, a lint check) may be in the surfaces.
+    complete = all(_SUMMARY_HEADER in t for t in tails)
+    outside = failures_outside("\n".join(tails), surfaces, patch_files) if complete else ()
+    if outside:
+        return f"{_OUTSIDE_SURFACES_PREFIX}{', '.join(outside)}"
     names = ", ".join(r["name"] for r in failing)
     first_line = next((ln for ln in str(failing[0].get("output_tail") or "").splitlines() if ln.strip()), "")
     detail = f" — {first_line}" if first_line else ""
