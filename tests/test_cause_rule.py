@@ -2,7 +2,7 @@ import ast
 from pathlib import Path
 
 from harness import cause_rule
-from harness.cause_rule import CAUSES, classify_cause, is_auth_failure
+from harness.cause_rule import _TRANSIENT_AUTH, CAUSES, classify_cause, is_auth_failure
 
 
 def test_the_closed_set_of_causes():
@@ -41,6 +41,25 @@ def test_is_auth_failure_is_true_for_an_expired_session_failure():
         'refreshed", "num_turns": 1, "duration_ms": 40}'
     )
     assert is_auth_failure(reason) is True
+
+
+def test_a_no_work_oauth_refresh_collision_is_harness():
+    reason = (
+        "node 'build' failed in claude: Failed to refresh OAuth token: "
+        "another Claude Code process is..."
+    )
+    assert _TRANSIENT_AUTH == ("failed to refresh oauth token",)
+    assert classify_cause("no_work", reason) == "harness"
+
+
+def test_an_oauth_refresh_collision_is_not_an_auth_stop():
+    reason = "Failed to refresh OAuth token: another Claude Code process is..."
+    assert is_auth_failure(reason) is False
+
+
+def test_an_existing_auth_marker_still_classifies_as_harness_and_an_auth_failure():
+    assert classify_cause("no_work", "Not logged in") == "harness"
+    assert is_auth_failure("Not logged in") is True
 
 
 def test_is_auth_failure_is_false_for_a_failed_check():

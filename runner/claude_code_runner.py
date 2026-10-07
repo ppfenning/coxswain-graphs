@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -267,6 +268,12 @@ def files_touched_from_patch(patch: str) -> list[str]:
 # code is the same one a real refusal returns.
 _TRANSIENT_ERRORS = ("safeguards flagged", "reasoning_extraction", "error_max_structured_output_retries")
 
+# Two concurrent sessions refreshing one OAuth token collide, and the loser says
+# so in these words. Not a fault in the node's work: retried once, after a
+# jittered sleep so the two sessions do not collide again. The runner owns the
+# string; it does not import harness/cause_rule.py.
+_TRANSIENT_AUTH = ("failed to refresh oauth token",)
+
 # A `subtype: success` payload whose result text is this banner is the account's
 # own session limit, not a node failure.
 _LIMIT_BANNER_RE = re.compile(r"you've hit your session limit|usage limit", re.IGNORECASE)
@@ -292,10 +299,18 @@ def _is_transient(payload: Mapping[str, Any]) -> bool:
     what it already costs today; a false positive costs one repeated node, once,
     which is why the retry below is capped at one and not made a loop.
     """
-    said = " ".join(
-        str(payload.get(key) or "") for key in ("subtype", "result", "errors")
-    ).lower()
-    return any(marker in said for marker in _TRANSIENT_ERRORS)
+    said = _said(payload)
+    return any(marker in said for marker in _TRANSIENT_ERRORS + _TRANSIENT_AUTH)
+
+
+def _said(payload: Mapping[str, Any]) -> str:
+    return " ".join(str(payload.get(key) or "") for key in ("subtype", "result", "errors")).lower()
+
+
+def _is_oauth_collision(payload: Mapping[str, Any]) -> bool:
+    """Pure: is this the OAuth refresh collision, the one error retried after a sleep?"""
+    said = _said(payload)
+    return any(marker in said for marker in _TRANSIENT_AUTH)
 
 
 def is_safeguard_refusal(payload: Mapping[str, Any]) -> bool:
@@ -625,7 +640,11 @@ class ClaudeCodeRunner:
         runs_dir: Path | str | None = None,
         run_id: str | None = None,
         store: Store | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        uniform: Callable[[float, float], float] = random.uniform,
     ) -> None:
+        self._sleep = sleep
+        self._uniform = uniform
         self.profile = dict(profile)
         self.capabilities = dict(CAPABILITIES)
         self.tiers = dict(self.profile.get("tiers") or {})
@@ -1507,6 +1526,8 @@ class ClaudeCodeRunner:
             elif is_max_structured_output_retries(payload):
                 attempt_model = self._alt_model(cls, tier, used_model)
                 retry_extra = {"retry_of": call_id, "reason": "structured_output"}
+            if _is_oauth_collision(payload):
+                self._sleep(self._uniform(10, 40))
 
             # Keep the failed attempt's trace. The retry writes to the same
             # filename, and a transient error that leaves no record behind is

@@ -32,6 +32,11 @@ _AUTH_MARKERS: tuple[str, ...] = (
     "authentication_error",
 )
 
+# Not an auth stop: concurrent Claude Code processes collided on the OAuth refresh. The
+# credential is fine and a retry works. Keep it out of `_AUTH_MARKERS`, which stop the
+# whole run in harness/epic.py. Lowercase, matched against the lowercased reason.
+_TRANSIENT_AUTH: tuple[str, ...] = ("failed to refresh oauth token",)
+
 
 # Must equal `harness.checks.HARNESS_FAULT_PREFIX`; this module imports nothing from the harness.
 _HARNESS_FAULT_PREFIX = "harness fault:"
@@ -43,10 +48,12 @@ def is_auth_failure(reason: str) -> bool:
 
 
 def classify_cause(kind: str, reason: str) -> Cause | None:
-    """An authentication failure first, then a budget, turn or session limit stop, then harness, code, ticket; None when no rule matches."""
+    """An authentication failure first, then a budget, turn or session limit stop, then a transient OAuth refresh collision, then harness, code, ticket; None when no rule matches."""
     if is_auth_failure(reason):
         return "harness"
     if any(marker in reason.lower() for marker in _LIMIT_MARKERS):
+        return "harness"
+    if any(marker in reason.lower() for marker in _TRANSIENT_AUTH):
         return "harness"
     if kind == "infra" or "patch did not apply" in reason:
         return "harness"

@@ -1810,6 +1810,60 @@ def test_a_safeguard_refusal_that_recurs_on_the_alternate_model_propagates_the_o
     assert rows[1]["model"] == "opus"
 
 
+COLLISION = {
+    "type": "result",
+    "is_error": True,
+    "subtype": "success",
+    "result": "API Error: Failed to refresh OAuth token",
+    "num_turns": 1,
+}
+
+
+def _jitter_runner(script, tmp_path):
+    """A runner whose sleep and uniform are recorded, so no test waits."""
+    slept: list[float] = []
+    bounds: list[tuple[float, float]] = []
+
+    def uniform(lo: float, hi: float) -> float:
+        bounds.append((lo, hi))
+        return 17.5
+
+    runner = ClaudeCodeRunner(PROFILE, claude_bin=str(script), cwd=tmp_path, sleep=slept.append, uniform=uniform)
+    return runner, slept, bounds
+
+
+def test_an_oauth_refresh_collision_sleeps_the_jittered_interval_then_retries_once(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, calls = sequenced_claude
+    set_sequence(COLLISION, OK)
+    runner, slept, bounds = _jitter_runner(script, tmp_path)
+
+    assert dict(runner.run(role="build", schema=SCHEMA, prompt="build it")) == {"ok": True}
+    assert calls() == 2
+    assert slept == [17.5]
+    assert bounds == [(10, 40)]
+
+
+def test_an_oauth_refresh_collision_twice_propagates_after_one_sleep(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, calls = sequenced_claude
+    set_sequence(COLLISION)
+    runner, slept, _ = _jitter_runner(script, tmp_path)
+
+    with pytest.raises(RunnerError, match="Failed to refresh OAuth token"):
+        runner.run(role="build", schema=SCHEMA, prompt="build it")
+    assert calls() == 2
+    assert slept == [17.5]
+
+
+def test_a_different_transient_error_retries_with_no_sleep(sequenced_claude, tmp_path) -> None:
+    script, set_sequence, calls = sequenced_claude
+    set_sequence(SAFEGUARD, OK)
+    runner, slept, _ = _jitter_runner(script, tmp_path)
+
+    assert dict(runner.run(role="arbitrate", schema=SCHEMA, prompt="decide")) == {"ok": True}
+    assert calls() == 2
+    assert slept == []
+
+
 def test_an_error_about_the_work_is_not_retried(sequenced_claude, tmp_path) -> None:
     """A budget stop is a real answer about a real session; asking again spends again."""
     script, set_sequence, calls = sequenced_claude
