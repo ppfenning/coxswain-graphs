@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 
+from harness.traces_url import redact_url
+
 _T = TypeVar("_T")
 
 __all__ = [
@@ -189,8 +191,15 @@ def _sqlite_target(url: str) -> str:
     raise ValueError(f"unreadable sqlite URL {url!r}: use sqlite:///<path> or sqlite:///:memory:")
 
 
+def _driver_free_url(url: str) -> str:
+    """Drop the SQLAlchemy-style `+psycopg` driver tag: libpq does not know it."""
+    prefix = "postgresql+psycopg://"
+    return "postgresql://" + url[len(prefix) :] if url.startswith(prefix) else url
+
+
 def connect(url: str) -> Connection:
-    """Open a connection for a sqlite: or postgresql: URL."""
+    """Open a connection for a sqlite: or postgresql: URL (postgresql+psycopg:// too)."""
+    pg_url = _driver_free_url(url)
     if url.startswith("sqlite://"):
         # isolation_level=None: no implicit BEGIN, so a failed statement holds no lock.
         # check_same_thread=False: the Connection's own lock serialises the threads that share it.
@@ -201,7 +210,7 @@ def connect(url: str) -> Connection:
         # IMMEDIATE takes the write lock at BEGIN, where the busy timeout applies,
         # instead of a late read-to-write upgrade that fails SQLITE_BUSY at once.
         return Connection(raw, SQLITE, begin="BEGIN IMMEDIATE")
-    if url.startswith(("postgresql://", "postgres://")):
+    if pg_url.startswith(("postgresql://", "postgres://")):
         try:
             import psycopg
             from psycopg.types.string import TextLoader
@@ -209,12 +218,14 @@ def connect(url: str) -> Connection:
             raise StoreDriverMissing(
                 "a postgresql URL needs the psycopg driver: install the postgres extra"
             ) from exc
-        raw = psycopg.connect(url, autocommit=True)
+        raw = psycopg.connect(pg_url, autocommit=True)
         # Hand json columns back as text, as sqlite does, so json_load sees one shape.
         raw.adapters.register_loader("json", TextLoader)
         raw.adapters.register_loader("jsonb", TextLoader)
         return Connection(raw, POSTGRES, begin="BEGIN")
-    raise ValueError(f"unsupported store URL {url!r}: accepted schemes are sqlite:// and postgresql://")
+    raise ValueError(
+        f"unsupported store URL {redact_url(url)!r}: accepted schemes are sqlite:// and postgresql://"
+    )
 
 
 def default_url(runs_dir: str | Path) -> str:

@@ -238,9 +238,30 @@ def test_postgres_url_with_a_driver_opens_autocommit_with_json_as_text(monkeypat
     assert raw.sql[-3:] == ["BEGIN", "SELECT 1", "COMMIT"]
 
 
+def test_the_psycopg_scheme_is_normalised_before_it_reaches_the_driver(monkeypatch):
+    calls = []
+    psycopg = types.ModuleType("psycopg")
+    psycopg.connect = lambda url, **kw: calls.append((url, kw)) or _FakePgConnection()
+    string_mod = types.ModuleType("psycopg.types.string")
+    string_mod.TextLoader = object()
+    monkeypatch.setitem(sys.modules, "psycopg", psycopg)
+    monkeypatch.setitem(sys.modules, "psycopg.types", types.ModuleType("psycopg.types"))
+    monkeypatch.setitem(sys.modules, "psycopg.types.string", string_mod)
+
+    conn = connect("postgresql+psycopg://user:secret@host/db")
+    assert conn.dialect is POSTGRES
+    assert calls == [("postgresql://user:secret@host/db", {"autocommit": True})]
+
+
 def test_an_unknown_scheme_is_refused():
     with pytest.raises(ValueError, match="sqlite://"):
         connect("mysql://h/db")
+
+
+def test_a_refused_url_does_not_print_its_password():
+    with pytest.raises(ValueError, match="unsupported store URL") as excinfo:
+        connect("mysql://user:secret@host/db")
+    assert "secret" not in str(excinfo.value)
 
 
 def test_a_connection_opened_in_one_thread_writes_from_another(tmp_path):
