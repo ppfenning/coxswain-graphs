@@ -64,7 +64,7 @@ from graphs.delivery.lifecycle_propose import DEFAULT_FIX_ATTEMPTS
 from harness import rescue_checks, rescue_select, work_mirror
 from harness.autonomy import split_by_policy
 from harness.cause_model import cause_evidence, classify_with_model, one_line
-from harness.cause_rule import classify_cause, is_auth_failure
+from harness.cause_rule import _TRANSIENT_AUTH, classify_cause, is_auth_failure
 from harness.checks import (
     HARNESS_FAULT_PREFIX,
     _tail_lines,
@@ -1777,6 +1777,12 @@ def _ready_view(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _invoke_failure_kind(failure: str) -> Literal["infra", "no_work"]:
+    """`infra` for a transient OAuth refresh collision, which spends no attempt; `no_work` otherwise."""
+    lowered = failure.lower()
+    return "infra" if any(marker in lowered for marker in _TRANSIENT_AUTH) else "no_work"
+
+
 def _run_phase(
     ctx: _Ctx,
     *,
@@ -2091,7 +2097,8 @@ def _run_phase(
         for failure in failures:
             quarantined.append(
                 _quarantine_task(
-                    ctx, by_id, phase=phase, task=failure.split(":", 1)[0], reason=failure, kind="no_work"
+                    ctx, by_id, phase=phase, task=failure.split(":", 1)[0], reason=failure,
+                    kind=_invoke_failure_kind(failure),
                 )
             )
         # A lapsed login fails every task in every later phase the same way.
