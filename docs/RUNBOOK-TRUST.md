@@ -112,7 +112,19 @@ Only four keys are read out of it:
   already set.
 - `landing_areas.checks` — the run's checks. This subsumes `.agent-checks`:
   that file is a shorthand that populates this key only when the overlay
-  itself does not set it.
+  itself does not set it. Each check entry takes `name` and `cmd`, and may
+  take an optional `timeout`: an integer number of seconds greater than zero,
+  applied to that one check only. When `timeout` is absent the check runs
+  under the harness-wide default of 600 seconds. A value that is not an
+  integer greater than zero is refused with `ValueError`.
+
+  ```yaml
+  landing_areas:
+    checks:
+      - name: pytest
+        cmd: pytest -q
+        timeout: 1200
+  ```
 - `description`.
 
 Every other top-level key is refused. `skills`, `cast`, `write_kinds`,
