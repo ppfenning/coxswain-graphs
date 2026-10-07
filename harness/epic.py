@@ -131,7 +131,7 @@ PATCH_FOR_VALIDATION_CHARS = 120_000
 # Two recorded attempts and a third run is refused rather than tried again.
 # A refusal past this point is not itself an attempt, so it must not grow the
 # count it is enforcing — see `_run_phase`, which quarantines these tasks with
-# a plain `quarantined.append` rather than `_quarantine_task`.
+# a plain `quarantined.append` and `_quarantine_row` rather than `_quarantine_task`.
 ATTEMPT_CAP = 2
 
 # Distinct from a clean run's implicit 0, for a caller to act on the pause.
@@ -1457,24 +1457,32 @@ def _store_first(ctx: _Ctx, item: dict[str, Any], state: str) -> str | None:
     return reason
 
 
-def row_should_quarantine(work_state: str, current_state: str | None) -> bool:
-    """True when a quarantine moves the store row: store work state, a row that exists, and not finished or already quarantined."""
-    return work_state == "store" and current_state is not None and current_state not in ("approved", "done", "quarantined")
+def row_should_quarantine(work_state: str, current_state: str | None, *, approved_is_open: bool = False) -> bool:
+    """True when a quarantine moves the store row: store work state, a row that exists, and not finished or already quarantined.
+
+    `approved_is_open` is for a merge into the phase branch that failed: the row reads approved but its work never landed.
+    """
+    finished = ("done", "quarantined") if approved_is_open else ("approved", "done", "quarantined")
+    return work_state == "store" and current_state is not None and current_state not in finished
 
 
-def _quarantine_row(ctx: _Ctx, phase: str, task: str) -> None:
+def _quarantine_row(ctx: _Ctx, phase: str, task: str, *, approved_is_open: bool = False) -> None:
     """Under work_state store, move the task's row to quarantined, so the chair stops relaunching it. Errors are logged, never raised.
 
-    The files work state writes nothing here. Same store write as the move to approved: `_store_first`.
+    The files work state writes nothing here, and neither does a stale leader. Same store write as the move to approved: `_store_first`.
     """
     if not _store_authoritative(ctx):
         return
     try:
+        stale = _fenced(ctx)  # callers in `_run_phase` reach here long after the phase-start fence
+        if stale is not None:
+            _log.warning("quarantined state not written to the store row: task=%s: %s", task, stale)
+            return
         from harness import store_read  # not module level: see `_mirror_read`
 
         row = next((r for r in store_read.work_items(ctx.store.conn, ctx.initiative_id) if r["task_id"] == task), None)
         current = None if row is None else str(row["state"])
-        if row_should_quarantine(ctx.work_state, current):
+        if row_should_quarantine(ctx.work_state, current, approved_is_open=approved_is_open):
             _store_first(ctx, {"id": task, "phase": phase, "state": current}, "quarantined")
     except Exception as exc:
         _log.warning("quarantined state not written to the store row: task=%s: %s: %s", task, type(exc).__name__, exc)
@@ -1921,6 +1929,7 @@ def _run_phase(
             task_id = failure.split(":", 1)[0]
             reason = f"{_attempt_cap_reason(attempts_by_id[task_id])} triage itself failed: {failure}"
             quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
+            _quarantine_row(ctx, phase, task_id)
             print(f"  attempt cap: {task_id} refused; triage could not run ({failure})")
 
         for result in triaged:
@@ -1932,6 +1941,7 @@ def _run_phase(
                     f"({result.get('class')!r}, {result.get('diagnosis')!r}) diagnosis; escalating to a person."
                 )
                 quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
+                _quarantine_row(ctx, phase, task_id)
                 print(f"  attempt cap: {task_id} launched triage, which escalated a repeated diagnosis")
                 continue
 
@@ -1942,6 +1952,7 @@ def _run_phase(
                     f"{result.get('class')!r} with no direct write; a person decides."
                 )
                 quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
+                _quarantine_row(ctx, phase, task_id)
                 print(f"  attempt cap: {task_id} launched triage -> {result.get('class')} (no proposal)")
                 continue
 
@@ -1996,6 +2007,7 @@ def _run_phase(
                 f"build_budget_usd_max {cap} (a per build call ceiling)"
             ),
         })
+        _quarantine_row(ctx, phase, task_id)
         print(f"  build budget: {task_id} refused (budget_usd {task['budget_usd']} > cap {cap})")
     over_budget_ids = {str(task["id"]) for task in over_budget}
     runnable = [task for task in to_run if str(task["id"]) not in over_budget_ids]
@@ -2189,6 +2201,7 @@ def _run_phase(
             # which quarantines without ever calling `_quarantine_task`.
             if is_harness_fault(reason):
                 quarantined.append({"id": task, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
+                _quarantine_row(ctx, phase, task)
             else:
                 # This branch is only reached for a task the fix loop already
                 # approved — `_unapproved` above quarantines anything else as
@@ -2875,6 +2888,7 @@ def _execute(
             state.quarantined.append(
                 {"id": subject, "phase": phase, "grain": "task", "reason": f"merge conflict: {detail}"}
             )
+            _quarantine_row(ctx, phase, subject, approved_is_open=True)
         state.merged[subject] = ok
         return ok, detail
 
