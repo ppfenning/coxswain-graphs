@@ -71,7 +71,9 @@ def test_the_approve_then_conflicting_merge_sequence_ends_quarantined(store_conn
     _fake_merge_git(monkeypatch)
     ok, detail = epic._execute(ctx, {"kind": "merge_stack", "target": "t1"}, slot="merge", subject="t1", phase="p1", state=state, by_id=by_id)
     assert (ok, detail) == (False, CONFLICT)
-    assert state.quarantined == [{"id": "t1", "phase": "p1", "grain": "task", "reason": f"merge conflict: {CONFLICT}"}]
+    assert state.quarantined == [
+        {"id": "t1", "phase": "p1", "grain": "task", "reason": f"merge conflict: {CONFLICT}", "kind": "infra", "patch_kept": True}
+    ]
     assert calls == [("approved", "t1"), ("quarantined", "t1")]
     assert _row_state(ctx) == "quarantined"
 

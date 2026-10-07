@@ -2062,6 +2062,20 @@ def test_a_rebase_conflict_aborts_and_quarantines_the_phase(repo, cart, tmp_path
     assert git("status", "--porcelain", cwd=repo) == ""
 
 
+def test_a_merge_conflict_quarantines_as_infra_with_a_harness_cause(repo, cart, tmp_path, store, monkeypatch) -> None:
+    real = epic_module._git
+    monkeypatch.setattr(
+        epic_module, "_git",
+        lambda *a, **k: (False, "CONFLICT (content)") if "merge" in a and "--no-ff" in a else real(*a, **k),
+    )
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False), store=store)
+
+    [entry] = [q for q in result["quarantined"] if q["id"] == "t1-probe"]
+    assert entry["reason"].startswith("merge conflict") and entry["kind"] == "infra"
+    attempt = store.conn.query_one("SELECT seq, kind, cause, cause_why FROM attempts WHERE task_id = 't1-probe'")
+    assert tuple(attempt) == (0, "infra", "harness", "merge conflict")
+
+
 def test_a_stale_branch_whose_commits_cancel_out_still_blocks(repo, cart, tmp_path) -> None:
     """Two of its own commits, net zero lines — patch-id sees two real, unlanded commits and blocks."""
     branch = "epic/demo-initiative/p1-foundations"
