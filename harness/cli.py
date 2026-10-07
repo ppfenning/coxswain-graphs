@@ -726,6 +726,11 @@ def _main(argv: list[str] | None) -> int:
         return _launch(specs, parser, args, report_out=report_out)
 
 
+# Exit code to the run row's status. 3 is epic.EXIT_PAUSED and 4 is the awaiting-land code; the
+# latter's constant does not exist in epic.py yet, so both stay literals here. Any other nonzero is "failed".
+_EXIT_RUN_STATUS = {0: "ok", 3: "paused", 4: "awaiting_land"}
+
+
 def _launch(
     specs: dict[str, GraphSpec], parser: argparse.ArgumentParser, args: argparse.Namespace, *, report_out: TextIO
 ) -> int:
@@ -859,7 +864,7 @@ def _launch(
             epoch=lease.epoch,
             lease_name=name,
         )
-        status = "ok" if code == 0 else "failed"
+        status = _EXIT_RUN_STATUS.get(code, "failed")
         return code
     except SystemExit as exc:
         terminated = _terminated(exc)
@@ -1137,7 +1142,7 @@ def _run_graph(
         print(f"  ledger   : {args.ledger}")
         for line in result.get("exit_summary") or []:
             print(f"  {line}", file=sys.stderr)
-        return 0
+        return int(result.get("exit_code", 0))
 
     if args.graph == "sweep" and "sweep" not in specs:
         # Listed in `_build_parser`'s choices (docs/design/work-shape.md §1) so

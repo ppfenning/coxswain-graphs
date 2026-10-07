@@ -1298,6 +1298,41 @@ def test_the_epic_path_hands_run_epic_the_epoch_and_the_lease_name(monkeypatch, 
     assert seen == {"epoch": 1, "lease_name": "runs:runS"}
 
 
+@pytest.mark.parametrize(
+    ("result", "code", "status"),
+    [
+        ({"exit_code": 3}, 3, "paused"),
+        ({"exit_code": 4}, 4, "awaiting_land"),
+        ({}, 0, "ok"),
+        ({"exit_code": 1}, 1, "failed"),
+    ],
+)
+def test_the_epic_exit_code_is_the_process_exit_and_names_the_run_status(
+    monkeypatch, tmp_path, result, code, status
+) -> None:
+    import harness.epic
+
+    runner = ScriptedRunner({"plan": {}, "build": {}, "review": {}})
+    args = _Args(tmp_path, "runS")
+    args.worktree_root = str(tmp_path)
+    args.graph = "epic"
+    args.initiative = "demo"
+    args.repo = str(tmp_path)
+    args.max_parallel = 1
+    args.ledger = tmp_path / "ledger.jsonl"
+    args.assume = False
+    args.fix_attempts = 0
+    args.resume_from = None
+    _patch_common(monkeypatch, args, runner)
+    monkeypatch.setattr(cli, "resolve_cartridge", lambda *a, **k: (_CARTRIDGE, {}))
+    monkeypatch.setattr(cli.workstore, "read_initiative", lambda name: {})
+    monkeypatch.setattr(cli, "_provider_profile_scope", lambda profile: "acme")
+    monkeypatch.setattr(harness.epic, "run_epic", lambda **kwargs: result)
+
+    assert cli.main([]) == code
+    assert _rows(tmp_path / "cox.db", "SELECT status FROM runs") == [(status,)]
+
+
 # ── trace compaction at run end ──────────────────────────────────────────────
 
 
