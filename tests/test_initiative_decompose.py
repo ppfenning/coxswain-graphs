@@ -972,3 +972,103 @@ def test_the_default_source_passes_no_decision(cart) -> None:
     for runner in _adversary_runs(cart):
         assert len(runner.calls) == 3
         assert all(c["router_decision"] is None for c in runner.calls)
+
+
+def _settings_task(task_id, side, repo, needs=(), surfaces=()):
+    return {
+        "id": task_id,
+        "phase": "p1",
+        "title": task_id,
+        "body": "b",
+        "needs": list(needs),
+        "surfaces": list(surfaces),
+        "repo": repo,
+        "interface": "settings",
+        "side": side,
+    }
+
+
+def test_the_decompose_prompt_names_the_contract_keys_and_the_dash_fixture(cart) -> None:
+    runner = ScriptedRunner({"decompose": DECOMPOSITION})
+    initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, runner)
+    prompt = runner.calls[0]["prompt"]
+    for phrase in (
+        "open the plan with a contract task",
+        "`repo`, `interface` and `side` (`contract`, `producer` or `consumer`)",
+        "commits a JSON fixture of the interface in the producer repository",
+        "the producer's tests must emit that fixture exactly",
+        "the consumer's tests must parse it",
+        "tasks list the contract task in `needs`",
+        "The dash feed's shared v1 fixture is the model",
+    ):
+        assert phrase in prompt
+
+
+SETTINGS_TREE = [
+    {"path": "agent_tools/settings.py", "repo": "tools"},
+    {"path": "fixtures/settings.v1.json", "repo": "tools"},
+    {"path": "src/settings.rs", "repo": "dash"},
+]
+PRODUCER = _settings_task("t1", "producer", "tools", surfaces=["agent_tools/settings.py"])
+CONSUMER = _settings_task("t2", "consumer", "dash", surfaces=["src/settings.rs"])
+CONTRACT = _settings_task("t0", "contract", "tools", surfaces=["fixtures/settings.v1.json"])
+
+
+def _contract_run(cart, correction_tasks, **args):
+    correction = {"corrections": [], "tasks": correction_tasks, "summary": "added the contract task"}
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": {**DECOMPOSITION, "tasks": [PRODUCER, CONSUMER]}, "review_adversary": [ACCEPTED, correction]})
+    base = {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": SETTINGS_TREE}
+    return runner, initiative_decompose.run({**base, **args}, runner)
+
+
+def test_a_cross_repo_interface_without_a_contract_task_is_corrected_with_one(cart) -> None:
+    restated = [CONTRACT, dict(PRODUCER, needs=["t0"]), dict(CONSUMER, needs=["t0"], title="rewritten")]
+    runner, result = _contract_run(cart, restated)
+    lint_call = runner.calls[-1]
+    assert lint_call["role"] == "review_adversary"
+    assert "t2: contract" in lint_call["prompt"]
+    by_id = {t["id"]: t for t in result["tasks"]}
+    assert {i: t["needs"] for i, t in by_id.items()} == {"t0": [], "t1": ["t0"], "t2": ["t0"]}
+    assert by_id["t0"]["side"] == "contract"
+    assert by_id["t0"]["surfaces"] == ["fixtures/settings.v1.json"]
+    assert by_id["t2"]["title"] == "t2"
+
+
+def test_tasks_a_correction_adds_are_prefixed_with_the_initiative_id(cart) -> None:
+    restated = [CONTRACT, dict(PRODUCER, needs=["t0"]), dict(CONSUMER, needs=["t0"])]
+    _, result = _contract_run(cart, restated, initiative_id="i")
+    needs = {t["id"]: t["needs"] for t in result["tasks"]}
+    assert needs == {"i-t0": [], "i-t1": ["i-t0"], "i-t2": ["i-t0"]}
+
+
+def test_a_correction_that_draws_a_cycle_is_refused(cart) -> None:
+    restated = [dict(CONTRACT, needs=["t2"]), dict(PRODUCER, needs=["t0"]), dict(CONSUMER, needs=["t0"])]
+    with pytest.raises(ContractViolation, match="corrected graph contains a dependency cycle"):
+        _contract_run(cart, restated)
+
+
+def test_a_correction_that_adds_a_task_on_a_surface_outside_the_tree_is_refused(cart) -> None:
+    stray = dict(CONTRACT, surfaces=["elsewhere/settings.v1.json"])
+    restated = [stray, dict(PRODUCER, needs=["t0"]), dict(CONSUMER, needs=["t0"])]
+    with pytest.raises(ContractViolation, match="t0: elsewhere/settings.v1.json"):
+        _contract_run(cart, restated)
+
+
+def test_apply_corrections_opens_the_plan_with_an_added_task_and_takes_only_needs_from_a_restated_one() -> None:
+    fixed = initiative_decompose._apply_corrections([PRODUCER], [], [CONTRACT, dict(PRODUCER, needs=["t0"], body="z")])
+    assert [t["id"] for t in fixed] == ["t0", "t1"]
+    assert fixed[1] == dict(PRODUCER, needs=["t0"])
+
+
+def test_a_plan_inside_one_repository_gets_no_contract_demand(cart) -> None:
+    tasks = [
+        _settings_task("t1", "producer", "tools", surfaces=["agent_tools/settings.py"]),
+        _settings_task("t2", "consumer", "tools", surfaces=["agent_tools/reader.py"]),
+    ]
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": {**DECOMPOSITION, "tasks": tasks}, "review_adversary": ACCEPTED})
+    result = initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, runner)
+    assert [c["role"] for c in runner.calls] == ["decompose", "review_adversary"]
+    assert not any("Ticket lint refused" in c["prompt"] for c in runner.calls)
+    assert {t["id"]: (t["side"], t["needs"]) for t in result["tasks"]} == {"t1": ("producer", []), "t2": ("consumer", [])}
