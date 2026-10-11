@@ -14,7 +14,9 @@ Offline throughout: real `git` and `sys.executable`, no network.
 
 from __future__ import annotations
 
+import io
 import shlex
+import signal
 import subprocess
 import sys
 import textwrap
@@ -212,11 +214,78 @@ def test_run_checks_timeout_is_a_failure_not_an_absence(tmp_path) -> None:
     assert "timed out" in result["output_tail"]
 
 
-def test_a_timed_out_check_keeps_its_bytes_output_and_is_a_harness_fault(tmp_path, monkeypatch) -> None:
-    def fake(cmd, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"], output=b"3 passed\nhalf \xff", stderr=b"warn: slow")
+class _TimingOutPopen:
+    """A Popen whose first communicate() times out with bytes output; the second returns nothing."""
 
-    monkeypatch.setattr("harness.checks.subprocess.run", fake)
+    pid = 4242
+
+    def __init__(self, cmd, **kwargs):
+        self.cmd = cmd
+        self.calls = 0
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+
+    def _times_out(self, timeout):
+        return subprocess.TimeoutExpired(self.cmd, timeout, output=b"3 passed\nhalf \xff", stderr=b"warn: slow")
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise self._times_out(timeout)
+        return "", ""
+
+    def wait(self):
+        return 0
+
+
+class _StuckPopen(_TimingOutPopen):
+    """A group-escaping grandchild holds the pipes: every communicate() times out, and an unbounded one fails."""
+
+    def communicate(self, timeout=None):
+        if timeout is None:
+            raise RuntimeError("unbounded communicate() would hang on a grandchild that left the group")
+        raise self._times_out(timeout)
+
+
+class _CrashingPopen(_TimingOutPopen):
+    def communicate(self, timeout=None):
+        raise KeyboardInterrupt
+
+
+def test_a_check_whose_pipes_stay_held_after_the_kill_still_returns_its_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.checks.subprocess.Popen", _StuckPopen)
+    monkeypatch.setattr("harness.checks.os.killpg", lambda pid, sig: None)
+    [result] = run_checks(tmp_path, [{"name": "slow", "cmd": "x"}], timeout=9)
+    assert result["outcome"] == "timed_out"
+    assert result["counts"] == {"passed": 3}
+
+
+def test_an_error_other_than_a_timeout_still_kills_the_group_and_propagates(tmp_path, monkeypatch) -> None:
+    killed: list = []
+    monkeypatch.setattr("harness.checks.subprocess.Popen", _CrashingPopen)
+    monkeypatch.setattr("harness.checks.os.killpg", lambda pid, sig: killed.append((pid, sig)))
+    with pytest.raises(KeyboardInterrupt):
+        run_checks(tmp_path, [{"name": "slow", "cmd": "x"}], timeout=9)
+    assert killed == [(_CrashingPopen.pid, signal.SIGKILL)]
+
+
+def test_a_timed_out_check_kills_its_process_group_and_tolerates_a_gone_one(tmp_path, monkeypatch) -> None:
+    killed: list = []
+
+    def killpg(pid, sig):
+        killed.append((pid, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr("harness.checks.subprocess.Popen", _TimingOutPopen)
+    monkeypatch.setattr("harness.checks.os.killpg", killpg)
+    [result] = run_checks(tmp_path, [{"name": "slow", "cmd": "x"}], timeout=9)
+    assert killed == [(_TimingOutPopen.pid, signal.SIGKILL)]
+    assert result["outcome"] == "timed_out"
+
+
+def test_a_timed_out_check_keeps_its_bytes_output_and_is_a_harness_fault(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.checks.subprocess.Popen", _TimingOutPopen)
+    monkeypatch.setattr("harness.checks.os.killpg", lambda pid, sig: None)
     results = run_checks(tmp_path, [{"name": "slow", "cmd": "x"}], timeout=9)
     [result] = results
     assert result["outcome"] == "timed_out"
