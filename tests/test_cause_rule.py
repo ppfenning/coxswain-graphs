@@ -2,7 +2,13 @@ import ast
 from pathlib import Path
 
 from harness import cause_rule
-from harness.cause_rule import _TRANSIENT_AUTH, CAUSES, classify_cause, is_auth_failure
+from harness.cause_rule import (
+    _OUTSIDE_SURFACES_WHY,
+    _TRANSIENT_AUTH,
+    CAUSES,
+    classify_cause,
+    is_auth_failure,
+)
 
 
 def test_the_closed_set_of_causes():
@@ -72,6 +78,21 @@ def test_a_no_work_with_no_authentication_marker_is_still_ticket():
 
 def test_a_configured_check_failure_is_code():
     assert classify_cause("unverified", "a configured check failed: pytest") == "code"
+
+
+def test_an_outside_surfaces_check_failure_is_ticket_with_its_why():
+    reason = "configured check failed outside surfaces: tests/test_x.py"
+    assert classify_cause("unverified", reason) == "ticket"
+    assert _OUTSIDE_SURFACES_WHY == "tests outside surfaces"
+
+
+def test_a_plain_configured_check_failure_is_still_code():
+    assert classify_cause("unverified", "configured check failed: pytest exited 1") == "code"
+
+
+def test_the_outside_surfaces_phrase_mid_string_is_not_the_ticket_rule():
+    reason = "node 'build': configured check failed outside surfaces: tests/test_x.py"
+    assert classify_cause("unverified", reason) == "code"
 
 
 def test_the_older_plural_configured_checks_failure_is_code():
