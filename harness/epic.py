@@ -76,6 +76,7 @@ from harness.checks import (
     coverage_floor_holds,
     fixable_checks,
     is_harness_fault,
+    outside_surface_files,
     quarantine_reason,
     refix_route,
     repo_checks,
@@ -192,6 +193,24 @@ def _carry_forward(body: str, attempts: list[dict[str, Any]], patch: str | None,
         else ()
     )
     return "\n".join((body, *header, *reference))
+
+
+def _permit_outside_surfaces(body: str, surfaces: Sequence[str], reason: str) -> tuple[str, list[str]]:
+    """Body and surfaces with the files named by an outside-surfaces `reason` added, once each.
+
+    Original surfaces keep their order and come first. Any other reason returns both unchanged.
+    """
+    extra = tuple(f for f in dict.fromkeys(outside_surface_files(reason)) if f not in surfaces)
+    if not extra:
+        return body, list(surfaces)
+    merged = [*surfaces, *extra]
+    section = (
+        "",
+        "## Permitted surfaces (added by the harness)",
+        "The failing tests lie outside the declared surfaces; they are now permitted:",
+        *(f"- {s}" for s in merged),
+    )
+    return "\n".join((body, *section)), merged
 
 
 def _git(*args: str, cwd: Path | None = None) -> tuple[bool, str]:
@@ -845,14 +864,21 @@ def _refix(
             "phase": phase,
             "reason": f"approved, then failed its configured checks:\n{check_feedback(build['checks'])}",
         }
-        body = _carry_forward(
+        carried = _carry_forward(
             item.get("body") or "",
             [*(item.get("attempts") or []), failed],
             str((result.get("build") or {}).get("patch") or ""),
             limit=PATCH_FOR_VALIDATION_CHARS,
         )
+        body, permitted = _permit_outside_surfaces(
+            carried, item.get("surfaces") or [], str(build.get("quarantine") or "")
+        )
         retried, _, failures = invoke_graphs(
-            [_lifecycle_invocation(ctx, item, body=body, fix_attempts=max(int(left) - 1, 0))],
+            [
+                _lifecycle_invocation(
+                    ctx, {**item, "surfaces": permitted}, body=body, fix_attempts=max(int(left) - 1, 0)
+                )
+            ],
             specs=ctx.specs,
             runner=ctx.runner,
             run_id=f"{ctx.run_id}:{phase}:refix{len(routes) + 1}",
