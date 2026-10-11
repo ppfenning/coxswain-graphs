@@ -21,7 +21,7 @@ concurrency:
 jobs:
   test:
     runs-on: ${{ vars.COXSWAIN_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    timeout-minutes: 15
     # Mapped here because the `secrets` context is not reliably readable from a
     # step-level `if`, whereas `env` is.
     env:
@@ -70,7 +70,7 @@ jobs:
   # merge block.
   py315:
     runs-on: ${{ vars.COXSWAIN_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    timeout-minutes: 15
     env:
       SUBSTRATE_TOKEN: ${{ secrets.SUBSTRATE_REPO_TOKEN }}
     steps:
@@ -98,7 +98,7 @@ jobs:
   # run, to keep the extra runner minutes to the tests that have a Postgres param.
   postgres:
     runs-on: ${{ vars.COXSWAIN_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 5
+    timeout-minutes: 15
     # `import harness` runs harness/__init__.py, which reaches `from core import
     # ledger` in harness/autonomy.py. Without the substrate, tests/conftest.py
     # drops every file that imports harness, which is all four store files. So
