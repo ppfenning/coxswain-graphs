@@ -48,6 +48,37 @@ CARTRIDGE = {
 }
 
 
+def pytest_configure(config) -> None:
+    config.addinivalue_line("markers", "real_courier: leave harness.courier_adapter.send unstubbed for this test")
+
+
+@pytest.fixture(autouse=True)
+def _courier_sends_are_recorded(request, monkeypatch):
+    """Stub the courier send so no test files a real note or waits out its 10 s timeout.
+
+    epic.py binds the function with a from-import (`send_to_courier`), so patching
+    `courier_adapter.send` alone leaves epic holding the real one; both names are patched.
+    The recorded `(ref, to, note)` tuples are the fixture value and also `courier_adapter.send.calls`.
+    A test marked `real_courier` gets the real send.
+    """
+    if request.node.get_closest_marker("real_courier") is not None:
+        return None
+    try:
+        from harness import courier_adapter, epic
+    except ImportError:  # pragma: no cover - the harness needs the substrate
+        return None
+    calls: list[tuple[str, str, str]] = []
+
+    def record(ref: str, to: str, note: str) -> bool:
+        calls.append((ref, to, note))
+        return True
+
+    record.calls = calls  # type: ignore[attr-defined]
+    monkeypatch.setattr(courier_adapter, "send", record)
+    monkeypatch.setattr(epic, "send_to_courier", record)
+    return calls
+
+
 @pytest.fixture
 def cartridge() -> dict:
     return {k: (v.copy() if isinstance(v, (dict, list)) else v) for k, v in CARTRIDGE.items()}
