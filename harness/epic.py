@@ -1584,12 +1584,16 @@ def _fenced(ctx: _Ctx) -> str | None:
     """None when a leader-only write may proceed, else the `stale epoch` reason. No epoch, no fence."""
     if ctx.epoch is None or ctx.store is None:
         return None
-    conn, name = ctx.store.conn, ctx.lease_name or LEASE_NAME
-    if assert_epoch(conn, name, ctx.epoch, _now()):
-        return None
-    row = conn.query_one(f"SELECT epoch FROM leases WHERE name = {conn.dialect.placeholder}", (name,))
-    held = "none" if row is None else row[0]
-    return f"stale epoch: this driver holds epoch {ctx.epoch}, lease '{name}' is at epoch {held} or has expired"
+    conn, name, epoch = ctx.store.conn, ctx.lease_name or LEASE_NAME, ctx.epoch
+
+    def check() -> str | None:
+        if assert_epoch(conn, name, epoch, _now()):
+            return None
+        row = conn.query_one(f"SELECT epoch FROM leases WHERE name = {conn.dialect.placeholder}", (name,))
+        held = "none" if row is None else row[0]
+        return f"stale epoch: this driver holds epoch {epoch}, lease '{name}' is at epoch {held} or has expired"
+
+    return ctx.retry.write(check, _END_WRITE_WINDOW_S)
 
 
 # Only a store error is retried in the pause wait; a bug there still raises with its traceback.
@@ -2591,13 +2595,16 @@ def _run_phase(
     stale = _fenced(ctx)
     if stale is not None:
         return _stale_phase(record, stale)
-    append_ledger(manifest, ledger_path=ctx.ledger_path)
+    append_ledger(manifest, ledger_path=ctx.ledger_path)  # the host file is written once, never inside a retry
     if ctx.store is not None:
+        store = ctx.store
         # Ledger rows are built in `core.manifest.append_ledger`; the store copies this phase's rows back by run id.
         for row in ledger.read(ctx.ledger_path):
             if row.get("run_id") == manifest["run_id"]:
-                ctx.store.record_ledger(row, epoch=ctx.epoch)
-        ctx.store.record_gate_decisions(ctx.run_id, phase, diffs, epoch=ctx.epoch)
+                ctx.retry.write(lambda row=row: store.record_ledger(row, epoch=ctx.epoch), _END_WRITE_WINDOW_S)
+        ctx.retry.write(
+            lambda: store.record_gate_decisions(ctx.run_id, phase, diffs, epoch=ctx.epoch), _END_WRITE_WINDOW_S
+        )
     record["manifest"] = f"{ctx.run_id}:{phase}"
     record["manifest_record"] = manifest
     return record
@@ -3190,12 +3197,16 @@ def _record_rescue_gate(ctx: _Ctx, phase: str, move: Mapping[str, Any], diff: Ma
     )
     if _fenced(ctx) is not None:
         return
-    append_ledger(manifest, ledger_path=ctx.ledger_path)
+    append_ledger(manifest, ledger_path=ctx.ledger_path)  # the host file is written once, never inside a retry
     if ctx.store is not None:
+        store = ctx.store
         for row in ledger.read(ctx.ledger_path):
             if row.get("run_id") == manifest["run_id"]:
-                ctx.store.record_ledger(row, epoch=ctx.epoch)
-        ctx.store.record_gate_decisions(ctx.run_id, f"{phase}:{task}", [diff], epoch=ctx.epoch)
+                ctx.retry.write(lambda row=row: store.record_ledger(row, epoch=ctx.epoch), _END_WRITE_WINDOW_S)
+        ctx.retry.write(
+            lambda: store.record_gate_decisions(ctx.run_id, f"{phase}:{task}", [diff], epoch=ctx.epoch),
+            _END_WRITE_WINDOW_S,
+        )
 
 
 def _rescue_move(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, evidence: list[dict[str, Any]]) -> tuple[bool, str]:

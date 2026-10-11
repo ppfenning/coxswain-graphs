@@ -3506,6 +3506,9 @@ def _fail_each_write_once(monkeypatch) -> list[tuple[str, bool]]:
     flaky("record_attempt", lambda run_id, task, *_: task)
     flaky("record_phase", lambda row: row["phase"])
     flaky("record_task", lambda run_id, phase, task, *_: task)
+    # `row_hash` leaves out `target` and `subject`, so rows differing only there need them in the key.
+    flaky("record_ledger", lambda entry, *_: f"{ledger_row(entry)['row_hash']}:{entry.get('target')}:{entry.get('subject')}")
+    flaky("record_gate_decisions", lambda run_id, phase, *_: phase)
     return events
 
 
@@ -3527,6 +3530,49 @@ def test_a_quarantine_and_a_phase_survive_one_lost_connection_per_store_write(
     assert tuple(attempt) == ("epic-1", "p1-foundations", 0, "unverified")
     states = dict(store.conn.query_all("SELECT task_id, state FROM tasks"))
     assert states["t1-probe"] == "quarantined" and set(states) == {"t1-probe", "t2-bench"}
+
+
+def test_a_full_epic_survives_one_lost_connection_per_write_and_the_host_ledger_gets_one_row(
+    repo, cart, tmp_path, store, monkeypatch
+) -> None:
+    events = _fail_each_write_once(monkeypatch)
+    fence_calls: list[int] = []
+    real_assert_epoch = epic_module.assert_epoch
+
+    def flaky_fence(conn, name, epoch, now):
+        fence_calls.append(len(fence_calls))
+        if not fence_calls[1:]:
+            raise _lost()
+        return real_assert_epoch(conn, name, epoch, now)
+
+    monkeypatch.setattr(epic_module, "assert_epoch", flaky_fence)
+    clock = _FakeClock()
+    retry = epic_module._StoreRetry(clock=clock, sleep=clock.sleep)
+    lease = acquire(store.conn, LEASE, "a", _now(), 3600)
+
+    patches = {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")}
+
+    result, _ = drive(
+        repo, cart, tmp_path, work=initiative(two_phases=False), patches=patches, store=store, retry=retry,
+        epoch=lease.epoch, lease_name=LEASE,
+    )
+
+    assert len(result["phases"]) == 1
+    assert len(fence_calls) > 1 and clock.sleeps
+    keys = {key for key, _ in events}
+    assert any(k.startswith("record_ledger:") for k in keys) and "record_gate_decisions:p1-foundations" in keys
+    for key in keys:
+        # Ledger rows identical outside `target` and `subject` share a key and the store keeps one of them.
+        failures = [failed for k, failed in events if k == key]
+        assert failures[0] and len(failures) >= 2 and not any(failures[1:]), key
+    assert store.total_rows("phases") == 1 and store.total_rows("attempts") >= 1
+    assert store.total_rows("gate_decisions") > 0
+    host = ledger.read(tmp_path / "ledger.jsonl")
+    phase_rows = [row for row in host if row.get("run_id") == "epic-1:p1-foundations"]
+    # One host row per gate decision; a retry that re-ran `append_ledger` would double it.
+    assert len(phase_rows) == store.total_rows("gate_decisions") > 0
+    stored = store.conn.query_all("SELECT row_hash FROM ledger WHERE run_id = 'epic-1:p1-foundations'")
+    assert {r[0] for r in stored} == {ledger_row(row)["row_hash"] for row in phase_rows}
 
 
 def test_reopening_a_sqlite_connection_swaps_the_driver_connection_and_keeps_the_data(tmp_path) -> None:
