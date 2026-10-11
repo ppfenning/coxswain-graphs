@@ -31,8 +31,10 @@ from harness.checks import (
     checks_evidence,
     collected_ids,
     coverage_floor_holds,
+    failed_test_files,
     fixable_checks,
     is_harness_fault,
+    outside_surface_files,
     quarantine_reason,
     refix_route,
     repo_checks,
@@ -408,6 +410,113 @@ def test_quarantine_reason_names_the_check_and_the_first_non_empty_tail_line() -
     reason = quarantine_reason(results)
     assert reason == "configured check failed: lint — F401 harness/x.py:3 unused import"
     assert "see evidence" not in reason
+
+
+_HEADER = "=========================== short test summary info ============================"
+_OLD = f"configured check failed: tests — {_HEADER}"
+
+
+def _summary(*lines: str) -> str:
+    return "\n".join([_HEADER, *lines, "1 failed in 0.12s"])
+
+
+_PYTEST_TAIL = _summary(
+    "FAILED tests/test_other.py::test_a - assert 1 == 2",
+    "FAILED tests/test_other.py::test_b - KeyError: 'x'",
+    "FAILED tests/test_third.py::test_c - assert False",
+)
+
+
+def _failed(tail: str, name: str = "tests") -> dict:
+    return {"name": name, "passed": False, "outcome": "failed", "output_tail": tail}
+
+
+def test_failed_test_files_is_sorted_and_unique_per_file() -> None:
+    assert failed_test_files(_PYTEST_TAIL) == ("tests/test_other.py", "tests/test_third.py")
+
+
+def test_quarantine_reason_names_one_failing_file_outside_the_surfaces() -> None:
+    tail = _summary("FAILED tests/test_other.py::test_a - assert 1 == 2")
+    reason = quarantine_reason([_failed(tail)], ["harness/checks.py"], ["tests/test_checks.py"])
+    assert reason == "configured check failed outside surfaces: tests/test_other.py"
+
+
+def test_quarantine_reason_lists_duplicate_lines_for_one_file_once() -> None:
+    tail = _summary("FAILED tests/test_other.py::test_a - x", "FAILED tests/test_other.py::test_b - y")
+    reason = quarantine_reason([_failed(tail)], ["harness"], [])
+    assert reason == "configured check failed outside surfaces: tests/test_other.py"
+
+
+def test_quarantine_reason_joins_several_outside_files_sorted() -> None:
+    reason = quarantine_reason([_failed(_PYTEST_TAIL)], ["harness"], [])
+    assert reason == "configured check failed outside surfaces: tests/test_other.py, tests/test_third.py"
+
+
+def test_quarantine_reason_keeps_the_old_text_with_the_default_arguments() -> None:
+    tail = "FAILED tests/test_other.py::test_a - x"
+    assert quarantine_reason([_failed(tail)]) == f"configured check failed: tests — {tail}"
+    assert quarantine_reason([_failed(_PYTEST_TAIL)]) == _OLD
+
+
+def test_quarantine_reason_falls_back_when_one_failing_file_is_inside_a_surface() -> None:
+    assert quarantine_reason([_failed(_PYTEST_TAIL)], ["tests/test_third.py"], []) == _OLD
+
+
+def test_quarantine_reason_falls_back_when_the_failing_file_is_in_the_patch() -> None:
+    tail = _summary("FAILED tests/test_other.py::test_a - x")
+    assert quarantine_reason([_failed(tail)], ["harness"], ["tests/test_other.py"]) == _OLD
+
+
+def test_quarantine_reason_falls_back_when_there_are_no_failed_lines() -> None:
+    reason = quarantine_reason([_failed("boom\n1 failed in 0.1s")], ["harness"], [])
+    assert reason == "configured check failed: tests — boom"
+
+
+def test_quarantine_reason_falls_back_when_the_summary_header_was_truncated_away() -> None:
+    tail = "FAILED tests/test_other.py::test_a - x\n1 failed in 0.1s"
+    reason = quarantine_reason([_failed(tail)], ["harness"], [])
+    assert reason == "configured check failed: tests — FAILED tests/test_other.py::test_a - x"
+
+
+def test_quarantine_reason_falls_back_when_another_failing_check_has_no_pytest_summary() -> None:
+    tail = _summary("FAILED tests/test_other.py::test_a - x")
+    lint = _failed("F401 harness/checks.py:3 unused import", name="lint")
+    reason = quarantine_reason([_failed(tail), lint], ["harness"], [])
+    assert reason == f"configured check failed: tests, lint — {_HEADER}"
+
+
+def test_quarantine_reason_matches_a_surface_as_a_directory_prefix() -> None:
+    tail = _summary("FAILED tests/sub/test_x.py::test_a - x")
+    assert quarantine_reason([_failed(tail)], ["tests"], []) == _OLD
+
+
+def test_quarantine_reason_does_not_match_a_sibling_directory_by_string_prefix() -> None:
+    tail = _summary("FAILED tests_extra/test_x.py::test_a - x")
+    assert quarantine_reason([_failed(tail)], ["tests"], []) == (
+        "configured check failed outside surfaces: tests_extra/test_x.py"
+    )
+
+
+def test_quarantine_reason_normalises_dot_slash_and_dot_surfaces() -> None:
+    tail = _summary("FAILED ./tests/test_x.py::test_a - x")
+    assert quarantine_reason([_failed(tail)], ["./tests/"], []) == _OLD
+    assert quarantine_reason([_failed(tail)], ["."], []) == _OLD
+
+
+def test_quarantine_reason_falls_back_on_an_absolute_failing_path() -> None:
+    tail = _summary("FAILED /repo/tests/test_x.py::test_a - x")
+    assert quarantine_reason([_failed(tail)], ["harness"], []) == _OLD
+
+
+def test_outside_surface_files_round_trips_the_reason() -> None:
+    reason = quarantine_reason([_failed(_PYTEST_TAIL)], ["harness"], [])
+    assert outside_surface_files(reason) == ("tests/test_other.py", "tests/test_third.py")
+
+
+def test_outside_surface_files_is_empty_for_any_other_reason() -> None:
+    assert outside_surface_files("configured check failed: tests") == ()
+    assert outside_surface_files("configured check failed outside surfaces: ") == ()
+    assert outside_surface_files("harness fault: check 'x' could not run: y") == ()
 
 
 # ---------------------------------------------------------------------------
