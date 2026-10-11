@@ -197,6 +197,7 @@ def _fake_cox(bin_dir: Path, log_path: Path) -> None:
     log_path.write_text("", encoding="utf-8")
 
 
+@pytest.mark.real_courier
 def test_one_approved_not_landed_task_sends_one_courier_record(repo, cart, tmp_path, monkeypatch) -> None:
     """A single task that merges clean is still unlanded this run (only `cox runs land` writes `done`)."""
     log_path = tmp_path / "cox.log"
@@ -213,6 +214,7 @@ def test_one_approved_not_landed_task_sends_one_courier_record(repo, cart, tmp_p
     assert f"approved but not landed: t1-probe — {expected_command}" in result["exit_summary"]
 
 
+@pytest.mark.real_courier
 def test_a_task_already_landed_sends_no_courier_record(repo, cart, tmp_path, monkeypatch) -> None:
     log_path = tmp_path / "cox.log"
     _fake_cox(tmp_path / "bin", log_path)
@@ -225,6 +227,7 @@ def test_a_task_already_landed_sends_no_courier_record(repo, cart, tmp_path, mon
     assert result["exit_summary"] == []
 
 
+@pytest.mark.real_courier
 def test_missing_cox_on_path_does_not_raise(repo, cart, tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(courier_adapter.shutil, "which", lambda name: None)
 
@@ -232,3 +235,19 @@ def test_missing_cox_on_path_does_not_raise(repo, cart, tmp_path, monkeypatch) -
 
     expected_command = f"cox runs land epic-1 --repo {repo} --task t1-probe --apply"
     assert f"approved but not landed: t1-probe — {expected_command}" in result["exit_summary"]
+
+
+def test_default_stub_keeps_a_real_cox_from_running(repo, cart, tmp_path, monkeypatch) -> None:
+    """Under the autouse stub a `cox` on PATH is never executed; the recorder sees the send instead."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "ran"
+    script = bin_dir / "cox"
+    script.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 0\n', encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    drive(repo, cart, tmp_path, runner=Runner(new_file_patch("t1-probe.txt")), work=initiative())
+
+    assert not marker.exists()
+    assert [(ref, to) for ref, to, _ in courier_adapter.send.calls] == [("coxswain://task/t1-probe", "chair")]
