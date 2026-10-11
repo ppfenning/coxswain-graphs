@@ -11,11 +11,12 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import parse_qs, urlsplit
 
 from harness.traces_url import redact_url
 
@@ -197,6 +198,27 @@ def _driver_free_url(url: str) -> str:
     return "postgresql://" + url[len(prefix) :] if url.startswith(prefix) else url
 
 
+# A dead peer must fail a connect in seconds and a silent drop must surface in about a minute.
+_PG_CONNECT_TIMEOUT_S = 10
+_PG_KEEPALIVES_IDLE_S = 30
+_PG_KEEPALIVES_INTERVAL_S = 10
+_PG_KEEPALIVES_COUNT = 3
+
+
+def _pg_connect_kwargs(pg_url: str, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Keyword arguments for psycopg.connect. A key in `extra` or in the URL query beats the default."""
+    defaults = {
+        "connect_timeout": _PG_CONNECT_TIMEOUT_S,
+        "keepalives": 1,
+        "keepalives_idle": _PG_KEEPALIVES_IDLE_S,
+        "keepalives_interval": _PG_KEEPALIVES_INTERVAL_S,
+        "keepalives_count": _PG_KEEPALIVES_COUNT,
+        "autocommit": True,
+    }
+    in_url = parse_qs(urlsplit(pg_url).query)
+    return {**{k: v for k, v in defaults.items() if k not in in_url}, **(extra or {})}
+
+
 def connect(url: str) -> Connection:
     """Open a connection for a sqlite: or postgresql: URL (postgresql+psycopg:// too)."""
     pg_url = _driver_free_url(url)
@@ -218,7 +240,7 @@ def connect(url: str) -> Connection:
             raise StoreDriverMissing(
                 "a postgresql URL needs the psycopg driver: install the postgres extra"
             ) from exc
-        raw = psycopg.connect(pg_url, autocommit=True)
+        raw = psycopg.connect(pg_url, **_pg_connect_kwargs(pg_url))
         # Hand json columns back as text, as sqlite does, so json_load sees one shape.
         raw.adapters.register_loader("json", TextLoader)
         raw.adapters.register_loader("jsonb", TextLoader)

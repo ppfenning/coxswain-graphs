@@ -3480,6 +3480,55 @@ def test_a_pause_clear_that_exhausts_its_window_does_not_skip_the_exit_record(
     assert _exit_row(store, "epic-pause")[0] is not None
 
 
+def _fail_each_write_once(monkeypatch) -> list[tuple[str, bool]]:
+    """Make each distinct attempt, phase and task write raise a lost connection on its first call only.
+
+    A write is keyed by method and its task or phase, so a retry of the same write succeeds.
+    Returns the ordered (key, failed) calls.
+    """
+    events: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+
+    def flaky(method: str, key_of):
+        real = getattr(Store, method)
+
+        def call(self, *args, **kwargs):
+            key = f"{method}:{key_of(*args)}"
+            failed = key not in seen
+            seen.add(key)
+            events.append((key, failed))
+            if failed:
+                raise _lost()
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Store, method, call)
+
+    flaky("record_attempt", lambda run_id, task, *_: task)
+    flaky("record_phase", lambda row: row["phase"])
+    flaky("record_task", lambda run_id, phase, task, *_: task)
+    return events
+
+
+def test_a_quarantine_and_a_phase_survive_one_lost_connection_per_store_write(
+    repo, cart, tmp_path, store, monkeypatch
+) -> None:
+    events = _fail_each_write_once(monkeypatch)
+    clock = _FakeClock()
+    retry = epic_module._StoreRetry(clock=clock, sleep=clock.sleep)
+    patches = {"t1-probe": new_file_patch("t1-probe.txt", "broken"), "t2-bench": new_file_patch("t2-bench.txt")}
+
+    drive(repo, cart, tmp_path, work=initiative(two_phases=False), patches=patches, store=store, retry=retry)
+
+    for key in ("record_attempt:t1-probe", "record_phase:p1-foundations", "record_task:t1-probe", "record_task:t2-bench"):
+        assert [failed for k, failed in events if k == key] == [True, False], key
+    assert clock.sleeps
+    assert [store.total_rows(t) for t in ("phases", "tasks", "attempts")] == [1, 2, 1]
+    attempt = store.conn.query_one("SELECT run_id, phase_id, seq, kind FROM attempts WHERE task_id = 't1-probe'")
+    assert tuple(attempt) == ("epic-1", "p1-foundations", 0, "unverified")
+    states = dict(store.conn.query_all("SELECT task_id, state FROM tasks"))
+    assert states["t1-probe"] == "quarantined" and set(states) == {"t1-probe", "t2-bench"}
+
+
 def test_reopening_a_sqlite_connection_swaps_the_driver_connection_and_keeps_the_data(tmp_path) -> None:
     conn = open_store(f"sqlite:///{tmp_path / 'cox.db'}", _now())
     store = Store(conn)

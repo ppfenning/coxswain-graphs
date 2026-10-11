@@ -1329,10 +1329,16 @@ def _quarantine_task(
     if ctx.store is not None and judged is not None:
         # The store's attempt exists whether or not the item has a file behind it.
         cause, cause_why = judged
-        seq = _next_attempt_seq(ctx.store, ctx.run_id, task)
-        ctx.store.record_attempt(
-            ctx.run_id, task, seq, phase, kind, detail or reason, ts, epoch=ctx.epoch, cause=cause, cause_why=cause_why
-        )
+        store = ctx.store
+
+        def attempt() -> None:
+            # The count and the insert retry as one unit, so a retry recounts rather than reusing a stale seq.
+            seq = _next_attempt_seq(store, ctx.run_id, task)
+            store.record_attempt(
+                ctx.run_id, task, seq, phase, kind, detail or reason, ts, epoch=ctx.epoch, cause=cause, cause_why=cause_why
+            )
+
+        ctx.retry.write(attempt, _END_WRITE_WINDOW_S)
         _record_task_cause(ctx, phase, task, cause, cause_why)
     # A merge conflict leaves the row at approved with its work unlanded; approved is not always finished.
     _quarantine_row(ctx, phase, task, approved_is_open=judged == ("harness", "merge conflict"))
@@ -1737,7 +1743,8 @@ def _save_result(ctx: _Ctx, result: Mapping[str, Any], *, phase: str, task: str)
 def _record_phase(ctx: _Ctx, record: Mapping[str, Any]) -> None:
     if ctx.store is not None and _fenced(ctx) is None:
         row = {**record, "run_id": f"{ctx.run_id}:{record['phase']}", "ts": _now(), "principal": PRINCIPAL}
-        ctx.store.record_phase(row, epoch=ctx.epoch)
+        store = ctx.store
+        ctx.retry.write(lambda: store.record_phase(row, epoch=ctx.epoch), _END_WRITE_WINDOW_S)
 
 
 def _record_tasks(
@@ -1749,8 +1756,13 @@ def _record_tasks(
     states = {str(q["id"]): "quarantined" for q in quarantined if q.get("grain") == "task"}
     states.update({str(t["id"]): str(t.get("state") or t["status"]) for t in task_records})
     ts = _now()
+    store = ctx.store
     for task, state in sorted(states.items()):
-        ctx.store.record_task(ctx.run_id, phase, task, state, ts, epoch=ctx.epoch)
+        # One retry per row, so a lost connection never replays rows that already landed.
+        ctx.retry.write(
+            lambda task=task, state=state: store.record_task(ctx.run_id, phase, task, state, ts, epoch=ctx.epoch),
+            _END_WRITE_WINDOW_S,
+        )
 
 
 def _refuse_stale(state: _Execution, *, phase: str, subject: str, slot: str, reason: str) -> None:
