@@ -32,7 +32,7 @@ def _merge_ctx(store_conn, work_state):
         (),
         {
             "store": base.store, "initiative_id": base.initiative_id, "run_id": base.run_id,
-            "work_state": work_state, "epoch": None, "cartridge": {}, "runner": None,
+            "work_state": work_state, "epoch": None, "cartridge": {}, "runner": None, "retry": base.retry,
             "draft_branch": lambda self, phase, task: f"draft/{phase}/{task}",
             "phase_worktree": lambda self, phase: f"/nowhere/{phase}",
         },
