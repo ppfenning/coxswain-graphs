@@ -28,7 +28,7 @@ def item(tmp_path):
 
 def _ctx(store_conn, work_state):
     fields = {"store": Store(store_conn), "initiative_id": INITIATIVE, "run_id": RUN, "work_state": work_state}
-    return type("Ctx", (), {**fields, "epoch": None, "cartridge": {}, "runner": None})()
+    return type("Ctx", (), {**fields, "epoch": None, "cartridge": {}, "runner": None, "retry": epic._StoreRetry()})()
 
 
 def _put(ctx, item, state):

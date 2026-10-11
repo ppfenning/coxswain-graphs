@@ -8,9 +8,13 @@ import types
 import pytest
 
 from harness.store_dialect import (
+    _PG_KEEPALIVES_COUNT,
+    _PG_KEEPALIVES_IDLE_S,
+    _PG_KEEPALIVES_INTERVAL_S,
     POSTGRES,
     SQLITE,
     StoreDriverMissing,
+    _pg_connect_kwargs,
     connect,
     default_url,
     forbidden_constructs,
@@ -224,7 +228,8 @@ def test_postgres_url_with_a_driver_opens_autocommit_with_json_as_text(monkeypat
 
     conn = connect("postgresql://u@h/db")
     assert conn.dialect is POSTGRES
-    assert calls == [("postgresql://u@h/db", {"autocommit": True})]
+    assert calls == [("postgresql://u@h/db", _pg_connect_kwargs("postgresql://u@h/db"))]
+    assert calls[0][1]["connect_timeout"] == 10
     assert raw.loaders == {"json": string_mod.TextLoader, "jsonb": string_mod.TextLoader}
     assert conn.execute(insert_ignore(POSTGRES, "r", ["id"], ["id"]), (1,)) == 1
     with pytest.raises(RuntimeError):
@@ -250,7 +255,37 @@ def test_the_psycopg_scheme_is_normalised_before_it_reaches_the_driver(monkeypat
 
     conn = connect("postgresql+psycopg://user:secret@host/db")
     assert conn.dialect is POSTGRES
-    assert calls == [("postgresql://user:secret@host/db", {"autocommit": True})]
+    assert calls == [("postgresql://user:secret@host/db", _pg_connect_kwargs("postgresql://user:secret@host/db"))]
+
+
+def test_pg_connect_kwargs_set_the_timeout_and_keepalives():
+    assert _pg_connect_kwargs("postgresql://h/db") == {
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": _PG_KEEPALIVES_IDLE_S,
+        "keepalives_interval": _PG_KEEPALIVES_INTERVAL_S,
+        "keepalives_count": _PG_KEEPALIVES_COUNT,
+        "autocommit": True,
+    }
+
+
+def test_pg_connect_kwargs_keep_caller_supplied_values():
+    kwargs = _pg_connect_kwargs("postgresql://h/db", {"connect_timeout": 3, "application_name": "x"})
+    assert kwargs["connect_timeout"] == 3
+    assert kwargs["application_name"] == "x"
+    assert kwargs["keepalives"] == 1
+
+
+def test_pg_connect_kwargs_leave_a_url_query_value_alone():
+    kwargs = _pg_connect_kwargs("postgresql://h/db?connect_timeout=5")
+    assert "connect_timeout" not in kwargs
+    assert kwargs["keepalives_idle"] == _PG_KEEPALIVES_IDLE_S
+
+
+def test_pg_connect_kwargs_do_not_mutate_the_extra_mapping():
+    extra = {"application_name": "x"}
+    _pg_connect_kwargs("postgresql://h/db", extra)
+    assert extra == {"application_name": "x"}
 
 
 def test_an_unknown_scheme_is_refused():
