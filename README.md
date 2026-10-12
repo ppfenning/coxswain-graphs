@@ -213,9 +213,7 @@ from the specifications in `graphs/*/**.md` and the contract in `docs/`** —
 nothing was ported from the implementations that exist from prior employment.
 See
 [`coxswain-cartridges/docs/CLEAN-ROOM.md`](https://github.com/ppfenning/coxswain-cartridges/blob/main/docs/CLEAN-ROOM.md)
-for the working rule and
-[`PROVENANCE.md`](https://github.com/ppfenning/coxswain-cartridges/blob/main/docs/PROVENANCE.md)
-for where the ideas came from.
+for the working rule.
 
 Everything deferred from v0 has since landed: the intake queue (a directory
 the coxswain drains, `coxswain-cartridges/core/intake.py`), the bounded fix
