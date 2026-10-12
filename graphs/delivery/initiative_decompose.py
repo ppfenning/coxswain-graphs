@@ -605,6 +605,16 @@ def unexecuted_item_create_reason(diffs: Sequence[Mapping[str, Any]]) -> str | N
     return str(item_creates[0].get("outcome"))
 
 
+def _grant_sentence(grants: Sequence[str]) -> str:
+    """The prompt's statement of the build grant, built from the list lint_tickets checks."""
+    named = ", ".join(grants)
+    return (
+        f"A ticket's checks and done-criteria may name only the build grant: {named}. "
+        if grants
+        else "A ticket's checks and done-criteria may name no command. "
+    ) + "No other command may be named."
+
+
 def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     """Run the graph. The idea arrives as an argument; nothing is read from disk."""
     cartridge = require_cartridge(args)
@@ -621,6 +631,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     context = list(cartridge.get("context") or [])
 
     task_ids = str(args.get("task_ids") or "slug")
+    grants = list(args.get("grants") or [])
 
     decompose_hints = Hints(judgment="high")
     decompose_prompt = (
@@ -635,7 +646,13 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         "interface in the producer repository; the producer's tests must emit that "
         "fixture exactly and the consumer's tests must parse it. Producer and consumer "
         "tasks list the contract task in `needs`. The dash feed's shared v1 fixture "
-        "is the model."
+        "is the model. "
+        + _grant_sentence(grants)
+        + " Do not name ruff, cox, uv, gh, grep or any other command in a check line, "
+        "a code fence or a done-criterion. State the fact to verify in prose, or leave "
+        "it to the reviewer. A ticket's surfaces and body stay inside the repository the "
+        "initiative names. A file in another repository is that repository's own task, "
+        "written with its own `repo` value, never a surface of this ticket."
     )
     if task_ids == "ordinal":
         decompose_prompt += (
@@ -780,7 +797,6 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 raise ContractViolation(surface_problem(problems))
         tasks = _split_cross_repo(_apply_surface_resolutions(tasks, tree), tree)
 
-    grants = list(args.get("grants") or [])
     repo_name = str(args.get("repo") or "")
     lint_problems = lint_tickets(tasks, tree, grants, repo_name)
     refusals = [p for p in lint_problems if p.severity == "refusal"]
