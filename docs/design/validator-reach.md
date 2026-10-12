@@ -1,7 +1,7 @@
 # Validator reach
 
-Status: approved by the chair 2026-09-15 under Pat's standing order (2026-09-08: "work on Gs then Ps,
-keep moving until complete") and his direction that "removing human gates in places like that is the
+Status: approved by the chair 2026-09-15 under the operator's standing order (2026-09-08: "work on Gs then Ps,
+keep moving until complete") and their direction that "removing human gates in places like that is the
 exact goal". Groups intake G4 from `workspace/plans/agent-platform/2026-09-08-intake-grouping.md`:
 `validate-chunk-reads-an-evidence-array-no-build-can-write-to`,
 `validate-chunk-refused-with-reasoning-that-names-no-defect`,

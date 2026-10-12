@@ -38,7 +38,7 @@ pythonpath = ["."]
 
 [tool.ruff]
 line-length = 120
-# Pat, 2026-09-05: "ruff over the repos in CI or pre-commit". The set leans on the
+# Ruff runs over the repos in CI and pre-commit. The set leans on the
 # charter (pure core, no rebinding, no side doors): E/F correctness, I imports,
 # UP modern syntax, B bugbear, SIM, RET, C4, DTZ clocks, RUF. Ignored on purpose:
 # E501/E701/E702 (the codebase uses dense one-liners at the edge), E741 (single

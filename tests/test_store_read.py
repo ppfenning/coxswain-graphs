@@ -32,8 +32,8 @@ def call(conn, call_id, run_id, seq, role, alias, tier, cost, inp, cache, out, t
 
 
 def seed(c):
-    put(c, "runs", run_id="r1", principal="pat", status="done", started_at="2026-09-24T01:00:00Z", graph_id="g1")
-    put(c, "runs", run_id="r2", principal="pat", status="done", started_at="2026-09-24T02:00:00Z")
+    put(c, "runs", run_id="r1", principal="operator", status="done", started_at="2026-09-24T01:00:00Z", graph_id="g1")
+    put(c, "runs", run_id="r2", principal="operator", status="done", started_at="2026-09-24T02:00:00Z")
     call(c, "c1", "r1", 1, "plan", "sonnet", "mid", 0.5, 1000, 250, 100, turns=2, decision_json=json_text({"why": "x"}))
     call(c, "c2", "r1", 2, "build", "sonnet", "mid", 1.0, 3000, 750, 300, turns=3, node_id="n1")
     call(c, "c3", "r1", 3, "build", "haiku", "low", 0.25, 0, 0, 50)
@@ -189,7 +189,7 @@ def test_list_runs_is_newest_first_since_and_limited(conn):
 
 
 def test_a_run_with_a_short_id_set_reads_back_with_that_value(conn):
-    put(conn, "runs", run_id="r3", principal="pat", status="done", started_at="2026-09-24T03:00:00Z", short_id="r3s")
+    put(conn, "runs", run_id="r3", principal="operator", status="done", started_at="2026-09-24T03:00:00Z", short_id="r3s")
     rows = {r["run_id"]: r for r in read.list_runs(conn, "2026-09-24T00:00:00Z", 10)}
     assert rows["r3"]["short_id"] == "r3s"
 

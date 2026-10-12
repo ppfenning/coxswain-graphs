@@ -3,7 +3,7 @@
 The provider profile may carry an optional `object_store` block for an S3-compatible server:
 
     object_store:
-      endpoint: http://garage.lan:3900      # no scheme defaults to https
+      endpoint: http://garage.example.internal:3900  # no scheme defaults to https
       region: garage                        # optional
       access_key_env: GARAGE_ACCESS_KEY_ID  # the NAME of the env var holding the key, never the key
       secret_key_env: GARAGE_SECRET_ACCESS_KEY

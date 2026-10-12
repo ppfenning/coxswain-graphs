@@ -1,6 +1,6 @@
 # Work shape
 
-Status: approved by the chair 2026-09-08 on Pat's direction (2026-09-08): "the coxswain will make the
+Status: approved by the chair 2026-09-08 at the operator's direction (2026-09-08): "the coxswain will make the
 distinction of mechanical vs novel. not everything can work through decomposition"; "this needs to be a
 formal path with coxswain"; "can the chair (or a dedicated agent) attempt to group intake tickets into a
 single spec if they prove to be similar?". Groups intake G3 from

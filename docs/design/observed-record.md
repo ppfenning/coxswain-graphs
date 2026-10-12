@@ -1,6 +1,6 @@
 # The observed record
 
-Status: approved by the chair 2026-09-08 under Pat's standing principle (2026-09-07): "the goal is to
+Status: approved by the chair 2026-09-08 under the operator's standing principle (2026-09-07): "the goal is to
 have nothing in the system become invisible." Groups intake items G1 from
 `workspace/plans/agent-platform/2026-09-08-intake-grouping.md`. This file is committed identically to
 `coxswain-graphs/docs/design/` and `coxswain-tools/docs/design/` so a build seat in either repo can read it.

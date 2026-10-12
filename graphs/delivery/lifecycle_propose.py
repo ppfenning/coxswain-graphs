@@ -810,7 +810,7 @@ def _continue_ok(stop: BudgetStop, *, surfaces: list[str], continuations: int,
 
     untouched = [surface for surface in surfaces if surface not in touched]
     if hard_ceiling is not None:
-        # A role with a runaway ceiling (Pat, 2026-09-28) resumes at every checkpoint that passes the checks above,
+        # A role with a runaway ceiling resumes at every checkpoint that passes the checks above,
         # as many times as it takes, until its session's cumulative spend reaches the failsafe.
         if (stop.spent_usd or 0.0) < hard_ceiling:
             return True, ""

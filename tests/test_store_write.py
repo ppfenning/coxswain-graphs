@@ -17,7 +17,7 @@ from harness.store_write import (
 
 PHASE = {
     "cartridge_sha": "bd20",
-    "cartridge_team": "pat",
+    "cartridge_team": "example-team",
     "gate_diffs": [],
     "human_minutes": 0.0,
     "overlay_sha": None,
@@ -98,7 +98,7 @@ def test_run_row_takes_the_launch_record_and_keeps_the_whole_record():
         "run_id": "graphs-model-router-2",
         "principal": "epic-swarm(lifecycle-propose)",
         "cartridge_sha": "bd20",
-        "cartridge_team": "pat",
+        "cartridge_team": "example-team",
         "overlay_sha": None,
         "provider_profile": "claude-code@f9b9789c88cc",
         "launched_by": "chair-2026-09-23",

@@ -8,7 +8,7 @@ NOW2 = "2026-10-12T01:00:00Z"
 
 @pytest.fixture
 def conn(store_conn):
-    host_upsert(store_conn, "alpha", "ssh://alpha", 2, "active", "pat", NOW1)
+    host_upsert(store_conn, "alpha", "ssh://alpha", 2, "active", "operator", NOW1)
     host_beat(store_conn, "alpha", {"cox": "1.2.3"}, NOW1)
     return store_conn
 

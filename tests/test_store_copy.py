@@ -30,7 +30,7 @@ SEED = {
     "graphs": [{"graph_id": "g1", "name": "demo", "version": "1", "content_hash": "g1", "definition_json": '{"x": 1}'}],
     "graph_nodes": [{"graph_id": "g1", "node_id": "n1", "ord": 0, "role": "plan"}],
     "graph_edges": [{"graph_id": "g1", "src": "n1", "dst": "n2"}],
-    "runs": [{"run_id": "r1", "principal": "pat", "status": "done", "graph_id": "g1", "record_json": '{"a": 1}'}],
+    "runs": [{"run_id": "r1", "principal": "operator", "status": "done", "graph_id": "g1", "record_json": '{"a": 1}'}],
     "phases": [{"run_id": "r1", "phase_id": "p1", "human_minutes": 1.5, "totals_json": "{}"}],
     "tasks": [{"run_id": "r1", "task_id": "t1", "phase_id": "p1", "state": "done"}],
     "task_records": [
@@ -49,7 +49,7 @@ SEED = {
          "reason": "merged", "action_json": '{"kind": "land"}'},
     ],
     "hosts": [
-        {"name": "jarvis", "ssh": "jarvis", "capacity": 8, "state": "active", "beat_at": "", "versions_json": "{}",
+        {"name": "host-a", "ssh": "host-a", "capacity": 8, "state": "active", "beat_at": "", "versions_json": "{}",
          "updated_at": "2026-09-26T00:00:00Z", "updated_by": "chair"},
     ],
     "work_items": [
@@ -188,12 +188,12 @@ def test_a_chair_actions_row_is_in_the_destination_after_a_copy(src_url, dst_url
 
 def test_a_changed_host_state_is_refreshed_in_the_destination(src_url, dst_url):
     sc.copy(src_url, dst_url, T0)
-    _update_source(src_url, "UPDATE hosts SET state = 'draining' WHERE name = 'jarvis'")
+    _update_source(src_url, "UPDATE hosts SET state = 'draining' WHERE name = 'host-a'")
     again = sc.copy(src_url, dst_url, T0)
     assert (again["hosts"]["copied"], again["hosts"]["refreshed"]) == (0, 1)
     dst = open_store(dst_url, T0)
     try:
-        assert dst.query_one("SELECT state FROM hosts WHERE name = 'jarvis'") == ("draining",)
+        assert dst.query_one("SELECT state FROM hosts WHERE name = 'host-a'") == ("draining",)
     finally:
         dst.close()
 
