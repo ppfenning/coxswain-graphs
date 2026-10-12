@@ -1006,6 +1006,28 @@ def test_the_decompose_prompt_names_the_contract_keys_and_the_dash_fixture(cart)
         assert phrase in prompt
 
 
+def test_the_decompose_prompt_names_the_granted_commands_and_the_repository_bound(cart) -> None:
+    runner = ScriptedRunner({"decompose": DECOMPOSITION})
+    grants = ["pytest", "git status", "git diff"]
+    initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "grants": grants}, runner)
+    prompt = runner.calls[0]["prompt"]
+    for phrase in (
+        "may name only the build grant: pytest, git status, git diff.",
+        "No other command may be named.",
+        "Do not name ruff, cox, uv, gh, grep or any other command in a check line, a code fence or a done-criterion",
+        "stay inside the repository the initiative names",
+        "that repository's own task, written with its own `repo` value, never a surface of this ticket",
+    ):
+        assert phrase in prompt
+
+
+def test_the_grant_sentence_follows_the_grants_it_is_given() -> None:
+    sentence = initiative_decompose._grant_sentence(["pytest", "mypy"])
+    assert "pytest, mypy" in sentence
+    assert "git diff" not in sentence
+    assert "No other command may be named." in sentence
+
+
 SETTINGS_TREE = [
     {"path": "agent_tools/settings.py", "repo": "tools"},
     {"path": "fixtures/settings.v1.json", "repo": "tools"},
