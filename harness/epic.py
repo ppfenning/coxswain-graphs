@@ -1053,6 +1053,13 @@ def run_epic(
     repo = Path(repo)
     ctx: _Ctx | None = None
     result: dict[str, Any] | None = None
+    # Bound before the `try` so the `finally` can build a partial result from whatever phases finished.
+    phases: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = []
+    quarantined: list[dict[str, Any]] = []
+    proposals: list[dict[str, Any]] = []
+    stacks_rebased = 0
+    paused_until: str | None = None
     try:
         head_ok, head_out = _git("-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD")
         origin_ok, origin_out = _git("-C", str(repo), "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
@@ -1108,13 +1115,7 @@ def run_epic(
         parents = phase_parents(items)
         ordered, cyclic = phase_order(parents)
 
-        phases: list[dict[str, Any]] = []
-        tasks: list[dict[str, Any]] = []
-        quarantined: list[dict[str, Any]] = []
-        proposals: list[dict[str, Any]] = []
         complete: set[str] = set()
-        stacks_rebased = 0
-        paused_until: str | None = None
 
         def add_phase(record: dict[str, Any]) -> None:
             phases.append(record)
@@ -1177,7 +1178,11 @@ def run_epic(
             close = getattr(ctx.runner, "close", None)
             if callable(close):
                 close()
-            tasks.extend(record.pop("task_records"))
+            phase_tasks = record.pop("task_records")
+            tasks.extend(phase_tasks)
+            # Noted as each phase ends, so a raise in a later phase cannot lose this phase's approvals.
+            for t, command in _unlanded(phase_tasks, run_id, repo):
+                send_to_courier(f"coxswain://task/{t['id']}", "chair", command)
             quarantined.extend(record.pop("quarantined"))
             proposals.extend(record.pop("batch"))
             stacks_rebased += 1 if record.get("rebased") else 0
@@ -1188,50 +1193,11 @@ def run_epic(
             if record["status"] == "complete":
                 complete.add(phase)
 
-        approved_not_landed = [t for t in tasks if t.get("outcome") == "approved_not_landed"]
-        # `outcome == "landed"` only ever meant "merged into the phase stack,
-        # not quarantined" — never a claim that `cox runs land` ran — so any
-        # such task whose item still reads `approved` is unlanded too.
-        merged_not_landed = [t for t in tasks if t.get("outcome") == "landed" and t.get("state") == "approved"]
-        # Same command as the printed line, kept alongside the task so the
-        # courier note below can never drift from what a human already reads.
-        # `land` subsumes `recover` for this purpose and never needs a phase
-        # branch resolved, so it is the one printed here; `recover` stays
-        # available on the command line for a human repairing the stack itself.
-        unlanded = [
-            (t, f"cox runs land {run_id} --repo {repo} --task {t['id']} --apply")
-            for t in approved_not_landed + merged_not_landed
-        ]
-        for t, command in unlanded:
-            send_to_courier(f"coxswain://task/{t['id']}", "chair", command)
-        result = {
-            "run_id": run_id,
-            "date": date,
-            "initiative": ctx.initiative_id,
-            "phases": phases,
-            "tasks": tasks,
-            "quarantined": quarantined,
-            "proposals": proposals,
-            **({"paused_until": paused_until, "exit_code": EXIT_PAUSED} if paused_until else {}),
-            **(
-                {"exit_code": EXIT_AWAITING_LAND}
-                if not paused_until and any(p.get("status") == "awaiting_land" for p in phases)
-                else {}
-            ),
-            "exit_summary": (
-                [f"paused: account session limit, resets {paused_until}"] if paused_until else []
-            ) + [
-                f"approved but not landed: {t['id']} — {command}" for t, command in unlanded
-            ],
-            "totals": {
-                "phases_complete": sum(1 for p in phases if p["status"] == "complete"),
-                "phases_partial": sum(1 for p in phases if p["status"] == "partial"),
-                "phases_blocked": sum(1 for p in phases if p["status"] == "blocked"),
-                "tasks_quarantined": sum(1 for q in quarantined if q.get("grain") == "task"),
-                "approved_not_landed": len(approved_not_landed) + len(merged_not_landed),
-                "stacks_rebased": stacks_rebased,
-            },
-        }
+        result = _build_result(
+            run_id=run_id, date=date, initiative_id=ctx.initiative_id, phases=phases, tasks=tasks,
+            quarantined=quarantined, proposals=proposals, stacks_rebased=stacks_rebased,
+            paused_until=paused_until, repo=repo,
+        )
         return result
     finally:
         # Every exit — the return above, a raise from anywhere in this try, or
@@ -1240,6 +1206,17 @@ def run_epic(
         try:
             _clear_pause_if_held(store, run_id, lease_name or LEASE_NAME, epoch, retry)
         finally:
+            # A raise leaves no result, so the outcome is built from the phases that finished. A failure
+            # building it is logged and must not replace the exception already in flight.
+            if result is None and ctx is not None:
+                try:
+                    result = _build_result(
+                        run_id=run_id, date=date, initiative_id=ctx.initiative_id, phases=phases, tasks=tasks,
+                        quarantined=quarantined, proposals=proposals, stacks_rebased=stacks_rebased,
+                        paused_until=paused_until, repo=repo,
+                    )
+                except Exception as exc:
+                    _log.warning("partial result for %s not built: %s: %s", run_id, type(exc).__name__, exc)
             # A return leaves no exception in flight here; a raise, a signal or an exit leaves one.
             _record_run_exit(store, run_id, "ok" if sys.exc_info()[0] is None else "error", retry, result)
         # Nothing before `ctx` exists can have made a worktree, so there is nothing to do yet.
@@ -1689,6 +1666,65 @@ def build_outcome(result: Mapping[str, Any]) -> dict[str, Any]:
         "blocked": blocked,
         "waiting": waiting,
         **({"blocked_kind": "awaiting_land"} if awaiting_land else {}),
+    }
+
+
+def _unlanded(
+    tasks: Sequence[Mapping[str, Any]], run_id: str, repo: Path | str
+) -> list[tuple[Mapping[str, Any], str]]:
+    """Tasks approved but not landed, each with the `cox runs land` command a human runs for it.
+
+    `outcome == "landed"` only ever meant "merged into the phase stack, not quarantined", never a claim that
+    `cox runs land` ran, so such a task whose item still reads `approved` is unlanded too. `land` subsumes
+    `recover` and never needs a phase branch resolved, so it is the command named here.
+    """
+    approved = [t for t in tasks if t.get("outcome") == "approved_not_landed"]
+    merged = [t for t in tasks if t.get("outcome") == "landed" and t.get("state") == "approved"]
+    return [(t, f"cox runs land {run_id} --repo {repo} --task {t['id']} --apply") for t in approved + merged]
+
+
+def _build_result(
+    *,
+    run_id: str,
+    date: str,
+    initiative_id: str,
+    phases: Sequence[Mapping[str, Any]],
+    tasks: Sequence[Mapping[str, Any]],
+    quarantined: Sequence[Mapping[str, Any]],
+    proposals: Sequence[Mapping[str, Any]],
+    stacks_rebased: int,
+    paused_until: str | None,
+    repo: Path | str,
+) -> dict[str, Any]:
+    """The epic result from the lists as they stand: whole at a normal end, partial when a phase raised."""
+    unlanded = _unlanded(tasks, run_id, repo)
+    return {
+        "run_id": run_id,
+        "date": date,
+        "initiative": initiative_id,
+        "phases": phases,
+        "tasks": tasks,
+        "quarantined": quarantined,
+        "proposals": proposals,
+        **({"paused_until": paused_until, "exit_code": EXIT_PAUSED} if paused_until else {}),
+        **(
+            {"exit_code": EXIT_AWAITING_LAND}
+            if not paused_until and any(p.get("status") == "awaiting_land" for p in phases)
+            else {}
+        ),
+        "exit_summary": (
+            [f"paused: account session limit, resets {paused_until}"] if paused_until else []
+        ) + [
+            f"approved but not landed: {t['id']} — {command}" for t, command in unlanded
+        ],
+        "totals": {
+            "phases_complete": sum(1 for p in phases if p["status"] == "complete"),
+            "phases_partial": sum(1 for p in phases if p["status"] == "partial"),
+            "phases_blocked": sum(1 for p in phases if p["status"] == "blocked"),
+            "tasks_quarantined": sum(1 for q in quarantined if q.get("grain") == "task"),
+            "approved_not_landed": len(unlanded),
+            "stacks_rebased": stacks_rebased,
+        },
     }
 
 
