@@ -6,7 +6,8 @@ parallel, what has to wait — is decided here.
 
 | Node | Role | Tier | Notes |
 |---|---|---|---|
-| `decompose` | `decompose` | standard | idea → phases → tasks, with edges and surfaces |
+| `size` | `size` | cheap | **optional**; runs first when an `intake` is given: `task` or `epic`, a one-sentence reason, surfaces for a task |
+| `decompose` | `decompose` | standard | idea → phases → tasks, with edges and surfaces; skipped on a `task` verdict |
 | `adversary` | `review_adversary` | deep | **attacks the dependency edges** |
 | `emit` | — | — | one `item_create` proposal per task |
 

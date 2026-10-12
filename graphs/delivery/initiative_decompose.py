@@ -26,6 +26,13 @@ from typing import Any
 import yaml
 
 from graphs._contract import ContractViolation, epic_shape, landing_for, proposal, require, require_cartridge
+from graphs.delivery.decompose_size import (
+    SizeError,
+    SizeVerdict,
+    apply_override,
+    parse_size_verdict,
+    single_ticket_initiative,
+)
 from graphs.delivery.phase_split import split_same_phase_needs
 from graphs.delivery.ticket_lint import Problem, lint_tickets
 from runner.decision_log import RouterDecision
@@ -145,6 +152,17 @@ DECOMPOSE_SCHEMA = {
     "additionalProperties": False,
 }
 
+SIZE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["task", "epic"]},
+        "reason": {"type": "string"},
+        "surfaces": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["verdict", "reason"],
+    "additionalProperties": False,
+}
+
 EDGE_CHALLENGE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -203,6 +221,27 @@ UNBUILDABLE_SCHEMA = {
     "required": ["corrections", "summary"],
     "additionalProperties": False,
 }
+
+
+def _threshold_text(cartridge: Mapping[str, Any]) -> str:
+    threshold = cartridge.get("epic_threshold") or {}
+    return yaml.safe_dump(dict(threshold), sort_keys=False).strip() if threshold else "none configured"
+
+
+def _size_prompt(intake_text: str, repo_files: Sequence[str], threshold_text: str) -> str:
+    return (
+        "Size this intake: is it one ticket (`task`) or an epic? Answer `task` only when one "
+        "change to a few files does it, and then list those files in `surfaces`. Give a "
+        "one-sentence `reason`.\n\n"
+        f"Epic threshold:\n{threshold_text}\n\n"
+        f"Intake:\n{intake_text}\n\n"
+        "Repository files:\n" + "\n".join(repo_files)
+    )
+
+
+def _size_route(raw: Mapping[str, Any], frontmatter: Mapping[str, Any]) -> SizeVerdict | SizeError:
+    """The model's verdict with the intake's `size:` override applied; a SizeError means run the epic path."""
+    return apply_override(parse_size_verdict(dict(raw)), dict(frontmatter))
 
 
 def _scalar(value: Any) -> str:
@@ -567,7 +606,30 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "writing a full id yourself, and write every `needs` entry using those "
             "same t-keys instead of a full slug."
         )
-    raw = dict(
+    # The size node is optional like the adversary: unbound, or no intake given,
+    # and the graph runs as it always has. A verdict that does not parse, or an
+    # override that is not task or epic, is an epic.
+    intake = args.get("intake")
+    single: dict[str, Any] | None = None
+    if isinstance(intake, Mapping) and "size" in bound:
+        repo_files = sorted({str(row.get("path")) for row in args.get("tree") or [] if row.get("path")})
+        intake_text = f"{intake.get('title', '')}\n\n{intake.get('body', '')}"
+        sized = dict(
+            runner.run(
+                role="size",
+                tier="cheap",
+                **_decision(source, "size", None),
+                schema=SIZE_SCHEMA,
+                context=context,
+                prompt=_size_prompt(intake_text, repo_files, _threshold_text(cartridge)),
+            )
+        )
+        verdict = _size_route(sized, intake.get("frontmatter") or {})
+        if isinstance(verdict, SizeVerdict) and verdict.verdict == "task":
+            built = single_ticket_initiative(dict(intake), verdict, set(repo_files))
+            single = None if isinstance(built, SizeError) else built
+
+    raw = single if single is not None else dict(
         runner.run(
             role="decompose",
             hints=decompose_hints,
@@ -612,7 +674,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         ]
 
     challenge: dict[str, Any] | None = None
-    if "review_adversary" in bound:
+    if "review_adversary" in bound and single is None:  # one ticket has no edges to attack
         challenge = dict(
             runner.run(
                 role="review_adversary",
@@ -911,6 +973,8 @@ def _item_action(task: Mapping[str, Any], *, landing: str, initiative_id: str | 
         "needs": [str(n) for n in task.get("needs") or []],
         "surfaces": [str(x) for x in task.get("surfaces") or []],
         "lint": list(dict.fromkeys(str(x) for x in task.get("lint") or [])),
+        # Only a one-ticket initiative carries checks; an epic task writes none, as before.
+        **({"checks": [str(x) for x in task["checks"]]} if task.get("checks") else {}),
     }
     # Real YAML, not a hand-quoted guess: the arm copies this block verbatim
     # into the ticket's frontmatter, and a title carrying `: ` broke exactly
@@ -941,6 +1005,9 @@ SPEC = GraphSpec(
         Need("intake_path", flag="--from-intake", required=False,
              help="path to the intake file this idea came from, when it did; links initiative.md "
                   "and the intake file both ways"),
+        Need("intake", flag="--intake-json", kind="json_file", required=False,
+             help="JSON object {id, title, body, checks, frontmatter} of the intake; with the `size` role "
+                  "bound, a one-file intake becomes a one-ticket initiative (default: always decompose)"),
         Need("grants", flag="--grants", kind="json_file", required=False,
              help="JSON array of commands the build seat's sandbox actually permits, for the "
                   "ticket-lint grant rule (default: none granted)"),
