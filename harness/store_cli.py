@@ -17,7 +17,7 @@ import yaml
 from harness.cli import _read_profile, _storage_url
 from harness.store_cli_lease import lease_acquire, lease_release, lease_renew
 from harness.store_dialect import Connection, StoreDriverMissing, insert_ignore, json_text
-from harness.store_hosts import HOST_STATES, host_beat, host_list, host_set_state, host_upsert
+from harness.store_hosts import HOST_STATES, host_beat, host_list, host_set_state, host_upsert, update_host_login
 from harness.store_landed import mark_landed
 from harness.store_migrate import MigrationError, open_store
 from harness.store_pause import clear_paused, set_paused
@@ -29,6 +29,7 @@ from harness.work_mirror import set_frontmatter_state
 # exactly one JSON object on stdout. Exit 2 prints nothing on stdout. Help and every error go to stderr.
 # regenerate-states is an exception: it prints one plain line per change and no JSON, so agreement prints nothing.
 # record-action is the other: it prints `recorded chair action <kind> <target>` and no JSON.
+# host login is the third: it prints nothing on success, and bad JSON or an unknown host is exit 2, not exit 3.
 EXIT_OK = 0
 EXIT_BAD_INPUT = 2
 EXIT_PRECONDITION = 3
@@ -145,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("holder")
     release.add_argument("epoch", type=int)
 
-    host = commands.add_parser("host", help="upsert, beat, set-state or list the hosts table")
+    host = commands.add_parser("host", help="upsert, beat, set-state, login or list the hosts table")
     host_actions = host.add_subparsers(dest="action", required=True)
 
     upsert_host = host_actions.add_parser("upsert", help="insert or overwrite a host, keeping its last beat")
@@ -166,6 +167,11 @@ def build_parser() -> argparse.ArgumentParser:
     host_state.add_argument("name")
     host_state.add_argument("state", choices=HOST_STATES)
     host_state.add_argument("--by", required=True, type=_non_empty, help="who made the change")
+
+    host_login = host_actions.add_parser("login", help="merge login fields into a host's versions, leaving its beat")
+    _common(host_login, top=False)
+    host_login.add_argument("name", type=_non_empty)
+    host_login.add_argument("--login-json", required=True, help="a JSON object: the login fields to merge")
 
     listing = host_actions.add_parser("list", help="print every host, by name")
     _common(listing, top=False)
@@ -283,6 +289,15 @@ def parse_action(text: str) -> dict[str, Any] | str:
     return f"the action lacks {', '.join(missing)}" if missing else action
 
 
+def parse_login(text: str) -> dict[str, Any] | str:
+    """The login object, or a one-line reason it is refused."""
+    try:
+        login = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return f"the login is not JSON: {exc}"
+    return login if isinstance(login, dict) else "the login must be a JSON object"
+
+
 def action_target(action: Mapping[str, Any]) -> str:
     """task_id, else initiative, else the first intake id, else the empty string."""
     intake = action.get("intake_ids")
@@ -310,6 +325,11 @@ def _record_action(conn: Connection, holder: str, action: Mapping[str, Any]) -> 
     conn.execute(sql, list(row.values()))
     print(f"recorded chair action {row['kind']} {row['target']}")
     return EXIT_OK
+
+
+def _host_login(conn: Connection, name: str, login: dict[str, Any]) -> int:
+    """Edge: write through update_host_login only; silent on success, one stderr line on an unknown host."""
+    return EXIT_OK if update_host_login(conn, name, login) else _fail(f"no host {name}")
 
 
 def _run_exists(conn: Connection, run_id: str) -> bool:
@@ -398,6 +418,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     action = parse_action(args.action_json) if args.command == "record-action" else None
     if isinstance(action, str):
         return _fail(action)
+    login = parse_login(args.login_json) if args.command == "host" and args.action == "login" else None
+    if isinstance(login, str):
+        return _fail(login)
     now = _now()
     profile = {} if args.provider_profile is None else _read_profile(args.provider_profile)
     url = resolve_store_url(args.store_url, profile, args.runs_dir)
@@ -410,6 +433,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _regenerate(conn, args)
         if action is not None:
             return _record_action(conn, args.holder, action)
+        if login is not None:
+            return _host_login(conn, args.name, login)
         payload, code = dispatch(conn, args, now)
     except _DB_ERRORS as exc:
         return _fail(f"cannot read the store: {exc}")
