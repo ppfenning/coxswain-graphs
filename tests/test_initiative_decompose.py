@@ -1072,3 +1072,105 @@ def test_a_plan_inside_one_repository_gets_no_contract_demand(cart) -> None:
     assert [c["role"] for c in runner.calls] == ["decompose", "review_adversary"]
     assert not any("Ticket lint refused" in c["prompt"] for c in runner.calls)
     assert {t["id"]: (t["side"], t["needs"]) for t in result["tasks"]} == {"t1": ("producer", []), "t2": ("consumer", [])}
+
+
+INTAKE = {
+    "id": "Fix-Parser",
+    "title": "make parse_row return None on a short row",
+    "body": "parse_row raises on a short row.",
+    "checks": ["pytest -q tests/test_parser.py"],
+}
+TREE = [{"repo": "r", "path": "src/parser.py"}]
+TASK_VERDICT = {"verdict": "task", "reason": "One function in one file.", "surfaces": ["src/parser.py"]}
+EPIC_VERDICT = {"verdict": "epic", "reason": "It spans two phases."}
+
+
+def _sized(cart, responses, intake=INTAKE, tree=TREE):
+    sized = {**cart, "skills": {**cart["skills"], "size": "acme-skills:size"}}
+    runner = ScriptedRunner(responses)
+    args = {"run_id": "r", "date": "d", "cartridge": sized, "idea": "x", "intake": intake, "tree": tree}
+    return initiative_decompose.run(args, runner), runner
+
+
+def _roles(runner) -> list[str]:
+    return [c["role"] for c in runner.calls]
+
+
+def test_a_one_file_intake_becomes_one_ticket_and_never_calls_decompose_or_scope_epic(cart) -> None:
+    result, runner = _sized(cart, {"size": TASK_VERDICT})
+    assert _roles(runner) == ["size"]
+    assert runner.calls[0]["tier"] == "cheap"
+    assert [t["id"] for t in result["tasks"]] == ["fix-parser"]
+    ticket = next(p for p in result["proposals"] if p["target"] == "fix-parser")
+    assert ticket["rationale"] == INTAKE["body"]
+    frontmatter = yaml.safe_load(ticket["suggested_action"].split("frontmatter\n", 1)[1].split("body = ", 1)[0])
+    assert frontmatter["title"] == INTAKE["title"]
+    assert frontmatter["surfaces"] == ["src/parser.py"]
+    assert frontmatter["checks"] == INTAKE["checks"]
+    assert [p["target"] for p in result["proposals"]] == ["fix-parser", "initiative"]
+
+
+def test_a_surface_not_in_the_repository_is_marked_new_on_the_task_path(cart) -> None:
+    sized = {**cart, "skills": {**cart["skills"], "size": "acme-skills:size"}}
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": sized, "idea": "x", "intake": INTAKE},
+        ScriptedRunner({"size": dict(TASK_VERDICT, surfaces=["src/fresh.py"])}),
+    )
+    assert result["tasks"][0]["surfaces"] == ["src/fresh.py (new)"]
+
+
+def test_a_multi_phase_intake_runs_the_epic_path_and_matches_the_unsized_output(cart) -> None:
+    before = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, ScriptedRunner({"decompose": DECOMPOSITION})
+    )
+    after, runner = _sized(cart, {"size": EPIC_VERDICT, "decompose": DECOMPOSITION}, tree=[])
+    assert _roles(runner) == ["size", "decompose"]
+    assert after == before
+
+
+def test_frontmatter_size_epic_overrides_a_task_verdict(cart) -> None:
+    _, runner = _sized(cart, {"size": TASK_VERDICT, "decompose": DECOMPOSITION}, dict(INTAKE, frontmatter={"size": "epic"}), tree=[])
+    assert _roles(runner) == ["size", "decompose"]
+
+
+def test_frontmatter_size_task_overrides_an_epic_verdict_that_named_surfaces(cart) -> None:
+    verdict = dict(EPIC_VERDICT, surfaces=["src/parser.py"])
+    assert initiative_decompose._size_route(verdict, {"size": "task"}).source == "override"
+    result, runner = _sized(cart, {"size": TASK_VERDICT}, dict(INTAKE, frontmatter={"size": "task"}))
+    assert _roles(runner) == ["size"]
+    assert len(result["tasks"]) == 1
+
+
+def test_frontmatter_size_task_on_an_epic_verdict_with_no_surfaces_cannot_build_a_ticket_and_runs_epic(cart) -> None:
+    _, runner = _sized(cart, {"size": EPIC_VERDICT, "decompose": DECOMPOSITION}, dict(INTAKE, frontmatter={"size": "task"}), tree=[])
+    assert _roles(runner) == ["size", "decompose"]
+
+
+def test_a_malformed_verdict_or_a_bad_override_falls_back_to_the_epic_path(cart) -> None:
+    for verdict, frontmatter in (({"verdict": "huge", "reason": "No."}, {}), (TASK_VERDICT, {"size": "huge"})):
+        _, runner = _sized(cart, {"size": verdict, "decompose": DECOMPOSITION}, dict(INTAKE, frontmatter=frontmatter), tree=[])
+        assert _roles(runner) == ["size", "decompose"]
+
+
+def test_without_a_bound_size_role_no_size_call_is_made(cart) -> None:
+    runner = ScriptedRunner({"decompose": DECOMPOSITION})
+    initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "intake": INTAKE}, runner)
+    assert _roles(runner) == ["decompose"]
+
+
+def test_size_prompt_carries_the_intake_the_files_and_the_threshold() -> None:
+    prompt = initiative_decompose._size_prompt("fix the parser", ["src/parser.py"], "tickets_min: 3")
+    assert "fix the parser" in prompt and "src/parser.py" in prompt and "tickets_min: 3" in prompt
+
+
+def test_the_task_ticket_goes_through_ticket_lint(cart, monkeypatch) -> None:
+    seen: list[list[str]] = []
+    real = initiative_decompose.lint_tickets
+
+    def spy(tasks, *rest):
+        seen.append([t["id"] for t in tasks])
+        return real(tasks, *rest)
+
+    monkeypatch.setattr(initiative_decompose, "lint_tickets", spy)
+    _sized(cart, {"size": TASK_VERDICT})
+    assert seen == [["fix-parser"]]
