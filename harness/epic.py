@@ -215,7 +215,10 @@ def _permit_outside_surfaces(body: str, surfaces: Sequence[str], reason: str) ->
 
 def _git(*args: str, cwd: Path | None = None) -> tuple[bool, str]:
     """Run one git command and report what happened, never what was intended."""
-    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return False, f"git {' '.join(args)} timed out after 120s"
     return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
 
 
@@ -229,10 +232,13 @@ def _push_review_branch(ctx: _Ctx, task: str) -> tuple[bool, str]:
 
 def _open_review_pr(ctx: _Ctx, *, title: str, body: str, head: str, base: str) -> tuple[bool, str]:
     """Open a PR for `head` against `base`; the detail is its URL on success."""
-    proc = subprocess.run(
-        ["gh", "pr", "create", "--title", title, "--body", body, "--head", head, "--base", base],
-        cwd=ctx.repo, capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "create", "--title", title, "--body", body, "--head", head, "--base", base],
+            cwd=ctx.repo, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "gh pr create timed out after 120s"
     return proc.returncode == 0, (proc.stdout if proc.returncode == 0 else proc.stderr or proc.stdout).strip()
 
 
@@ -2626,12 +2632,16 @@ def _collected_ids(worktree: Path) -> set[str] | None:
     `None` means unmeasurable: pytest could not launch (mirrors `run_checks`'s
     own `FileNotFoundError`/`OSError` handling, a harness fault rather than a
     reason to end the run), or it collected zero ids (a non-pytest repo, a
-    collection error, a test-less tree). An empty set is not a passing floor,
+    collection error, a test-less tree), or collection ran past 300 seconds.
+    An empty set is not a passing floor,
     `set() <= anything` is true and would let any edit through untested.
     """
     try:
-        proc = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q"], cwd=worktree, capture_output=True, text=True)
-    except (FileNotFoundError, OSError):
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+            cwd=worktree, capture_output=True, text=True, timeout=300,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
     return collected_ids(proc.stdout) or None
 
