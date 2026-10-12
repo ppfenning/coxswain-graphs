@@ -13,8 +13,11 @@ before the gate sees it. `repo_checks` parses a repository's own root
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 import shlex
+import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -51,6 +54,7 @@ _SUMMARY_HEADER = "short test summary info"
 _COUNT_RE = re.compile(r"(\d+)\s+(passed|failed|error|errors|skipped)\b", re.IGNORECASE)
 
 _TAIL_CHARS = 2000
+_REAP_SECONDS = 5  # how long a killed check's pipes get to drain before they are abandoned
 _TAIL_LINES = 20
 _TRUNCATION_MARKER = f"... [truncated to last {_TAIL_LINES} lines]"
 _LINT_NAMES = frozenset({"lint", "ruff"})
@@ -178,6 +182,31 @@ def _text(value: str | bytes | None) -> str:
     return value or ""
 
 
+def _kill_group(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL the check's whole process group; a group that is already gone is fine."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def _kill_and_collect(proc: subprocess.Popen[str], first: subprocess.TimeoutExpired) -> str:
+    """Kill a timed-out check's group and return the output it produced.
+
+    The second `communicate()` returns everything read so far, so the output on
+    `first` is only the fallback. It is bounded: a grandchild that left the
+    group (`setsid`) survives the kill and would hold the pipes open forever.
+    """
+    _kill_group(proc)
+    try:
+        out, err = proc.communicate(timeout=_REAP_SECONDS)
+    except subprocess.TimeoutExpired as late:
+        for pipe in (proc.stdout, proc.stderr):
+            pipe.close()
+        proc.wait()
+        out, err = late.stdout, late.stderr
+    collected = _text(out) + _text(err)
+    return collected if collected else _text(first.stdout) + _text(first.stderr)
+
+
 def run_checks(
     worktree: Path,
     checks: Sequence[Mapping[str, Any]],
@@ -201,16 +230,28 @@ def run_checks(
         limit = check_timeout(check, timeout)
 
         try:
-            proc = subprocess.run(
+            # Own session so a timeout can kill the shell's grandchildren too;
+            # a child left alive keeps the pipes open and communicate() hangs.
+            proc = subprocess.Popen(
                 cmd,
                 shell=True,
                 cwd=worktree,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=limit,
+                start_new_session=True,
             )
+            try:
+                stdout, stderr = proc.communicate(timeout=limit)
+            except subprocess.TimeoutExpired:
+                raise
+            except BaseException:
+                # `subprocess.run` killed its child on any error; so must this.
+                _kill_group(proc)
+                proc.wait()
+                raise
         except subprocess.TimeoutExpired as exc:
-            partial = _text(exc.stdout) + _text(exc.stderr)
+            partial = _kill_and_collect(proc, exc)
             results.append(
                 {
                     "name": name,
@@ -240,7 +281,7 @@ def run_checks(
             )
             continue
 
-        combined = (proc.stdout or "") + (proc.stderr or "")
+        combined = (stdout or "") + (stderr or "")
         not_found = proc.returncode == 127
         error = f"command not found: {cmd}" if not_found else None
         no_tests_ran = (
