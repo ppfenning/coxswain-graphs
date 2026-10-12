@@ -1,6 +1,6 @@
 # The landing model
 
-Status: approved by the chair 2026-09-08 on Pat's direction (2026-09-08): "PRs for tickets within the same
+Status: approved by the chair 2026-09-08 at the operator's direction (2026-09-08): "PRs for tickets within the same
 phase should merge with each other with one parent PR. The tickets get stacked in the phase PR, and the PR is
 diffed to main. Once phase is complete, we only have one merge to main"; and "phase PRs should go through a
 check to remove verbose changes, we want what goes into main to have all the fat trimmed." Groups intake G2

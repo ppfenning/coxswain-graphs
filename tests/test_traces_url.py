@@ -193,7 +193,7 @@ def test_region_and_endpoint_reach_the_s3_filesystem_from_env_only(monkeypatch, 
 
 
 _BLOCK = {
-    "endpoint": "http://garage.lan:3900",
+    "endpoint": "http://garage.example.internal:3900",
     "region": "garage",
     "access_key_env": "G_KEY",
     "secret_key_env": "G_SECRET",
@@ -204,7 +204,7 @@ _BLOCK = {
 def test_the_block_gives_the_exact_kwargs():
     assert _s3_options({"G_KEY": "k1", "G_SECRET": "s1"}, _BLOCK) == {
         "scheme": "http",
-        "endpoint_override": "garage.lan:3900",
+        "endpoint_override": "garage.example.internal:3900",
         "region": "garage",
         "access_key": "k1",
         "secret_key": "s1",

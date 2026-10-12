@@ -332,15 +332,15 @@ VERSIONS = '{"cox": "0.20.0", "login_ok": true}'
 
 def test_host_beat_sets_beat_at_and_versions_on_an_upserted_host(url, run, at):
     at(T20)
-    code, out, _ = run(url, "host", "upsert", "jarvis", "--ssh", "jarvis", "--capacity", "8", "--by", "chair")
+    code, out, _ = run(url, "host", "upsert", "host-a", "--ssh", "host-a", "--capacity", "8", "--by", "chair")
     assert (code, one_object(out)["beat_at"]) == (0, "")
     at(T40)
-    code, out, _ = run(url, "host", "beat", "jarvis", "--versions", VERSIONS)
+    code, out, _ = run(url, "host", "beat", "host-a", "--versions", VERSIONS)
     assert (code, one_object(out)) == (
         0,
         {
-            "name": "jarvis",
-            "ssh": "jarvis",
+            "name": "host-a",
+            "ssh": "host-a",
             "capacity": 8,
             "state": "active",
             "beat_at": T40,
@@ -353,18 +353,18 @@ def test_host_beat_sets_beat_at_and_versions_on_an_upserted_host(url, run, at):
 
 def test_host_set_state_changes_only_state_updated_at_and_updated_by(url, run, at):
     at(T20)
-    run(url, "host", "upsert", "jarvis", "--ssh", "jarvis", "--capacity", "8", "--by", "chair")
-    run(url, "host", "beat", "jarvis", "--versions", VERSIONS)
+    run(url, "host", "upsert", "host-a", "--ssh", "host-a", "--capacity", "8", "--by", "chair")
+    run(url, "host", "beat", "host-a", "--versions", VERSIONS)
     _, before, _ = run(url, "host", "list")
     at(T40)
-    code, out, _ = run(url, "host", "set-state", "jarvis", "draining", "--by", "pat")
+    code, out, _ = run(url, "host", "set-state", "host-a", "draining", "--by", "operator")
     assert code == 0
-    changed = {"state": "draining", "updated_at": T40, "updated_by": "pat"}
+    changed = {"state": "draining", "updated_at": T40, "updated_by": "operator"}
     assert one_object(out) == {**json.loads(before)[0], **changed}
 
 
 def test_host_set_state_outside_the_three_exits_two_with_nothing_on_stdout(url, run):
-    code, out, _ = run(url, "host", "set-state", "jarvis", "parked", "--by", "chair")
+    code, out, _ = run(url, "host", "set-state", "host-a", "parked", "--by", "chair")
     assert (code, out) == (2, "")
 
 
@@ -381,20 +381,20 @@ def test_host_list_prints_every_host_by_name(url, run):
     assert (code, [r["name"] for r in one_object(out)]) == (0, ["a", "b"])
 
 
-LOGIN = '{"login_ok": false, "login_user": "pat"}'
+LOGIN = '{"login_ok": false, "login_user": "operator"}'
 
 
 def test_host_login_merges_the_fields_into_versions_and_leaves_beat_at(url, run, at):
     at(T20)
-    run(url, "host", "upsert", "jarvis", "--ssh", "jarvis", "--capacity", "8", "--by", "chair")
+    run(url, "host", "upsert", "host-a", "--ssh", "host-a", "--capacity", "8", "--by", "chair")
     at(T40)
-    run(url, "host", "beat", "jarvis", "--versions", VERSIONS)
+    run(url, "host", "beat", "host-a", "--versions", VERSIONS)
     _, before, _ = run(url, "host", "list")
-    code, out, err = run(url, "host", "login", "jarvis", "--login-json", LOGIN)
+    code, out, err = run(url, "host", "login", "host-a", "--login-json", LOGIN)
     assert (code, out, err) == (0, "", "")
     _, after, _ = run(url, "host", "list")
     (was,), (now,) = json.loads(before), json.loads(after)
-    assert now["versions_json"] == {"cox": "0.20.0", "login_ok": False, "login_user": "pat"}
+    assert now["versions_json"] == {"cox": "0.20.0", "login_ok": False, "login_user": "operator"}
     assert now["beat_at"] == was["beat_at"] == T40
     assert {k: v for k, v in now.items() if k != "versions_json"} == {k: v for k, v in was.items() if k != "versions_json"}
 
@@ -408,9 +408,9 @@ def test_host_login_on_an_unknown_host_exits_two_with_one_line_naming_it(url, ru
 @pytest.mark.parametrize("bad", ["{not json", "[1, 2]", '"text"'])
 def test_host_login_with_json_that_is_not_an_object_exits_two_with_one_line_and_changes_nothing(url, run, at, bad):
     at(T20)
-    run(url, "host", "upsert", "jarvis", "--ssh", "jarvis", "--capacity", "8", "--by", "chair")
+    run(url, "host", "upsert", "host-a", "--ssh", "host-a", "--capacity", "8", "--by", "chair")
     _, before, _ = run(url, "host", "list")
-    code, out, err = run(url, "host", "login", "jarvis", "--login-json", bad)
+    code, out, err = run(url, "host", "login", "host-a", "--login-json", bad)
     assert (code, out) == (2, "")
     assert len(err.splitlines()) == 1 and err.startswith("error: the login ")
     assert run(url, "host", "list")[1] == before

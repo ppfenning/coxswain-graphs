@@ -1,6 +1,6 @@
 # Cost bounds
 
-Status: approved by the chair 2026-09-15 under Pat's standing order (2026-09-08). Answers Pat's questions
+Status: approved by the chair 2026-09-15 under the operator's standing order (2026-09-08). Answers the operator's questions
 of 2026-09-08 ("should cost bounds be variable? ... should we have a leveling system for cost like
 strict/moderate/liberal?"). Groups intake G5 from
 `workspace/plans/agent-platform/2026-09-08-intake-grouping.md`:

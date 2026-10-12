@@ -41,7 +41,7 @@ GATE = {
 }
 RECORD = {
     "cartridge_sha": "bd20",
-    "cartridge_team": "pat",
+    "cartridge_team": "example-team",
     "gate_diffs": [],
     "human_minutes": 0.0,
     "overlay_sha": None,
@@ -293,7 +293,7 @@ def test_an_epic_run_with_only_phase_manifests_gets_a_run_row_from_its_earliest_
         "SELECT launched_by, launched_at, cartridge_sha, cartridge_team, provider_profile, principal"
         " FROM runs WHERE run_id = 'run-e'"
     )
-    assert tuple(row) == ("chair-e", TS, "early", "pat", "claude-code@f9", "epic-swarm")
+    assert tuple(row) == ("chair-e", TS, "early", "example-team", "claude-code@f9", "epic-swarm")
     assert store.conn.query_one("SELECT COUNT(*) FROM phases WHERE run_id = 'run-e'")[0] == 2
     assert counts(report, "runs") == (3, 3, 0, 0)
     assert balanced(report)
