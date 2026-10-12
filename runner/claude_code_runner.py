@@ -33,6 +33,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,7 +42,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -446,6 +447,36 @@ def self_reported_commands(data: Mapping[str, Any]) -> list[dict[str, str]]:
 
 class _NodeTimeout(RunnerError):
     """A node's subprocess outlived its timeout. A RunnerError, so every existing handler still matches."""
+
+
+# How long to wait for pipes to drain after the group is killed.
+_REAP_SECONDS = 5
+
+
+def _kill_group(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL claude's whole process group; the group is gone already when the lookup fails."""
+    with suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def _kill_and_reap(proc: subprocess.Popen[str]) -> None:
+    """Kill a timed-out claude's group and reap it without waiting on pipes forever.
+
+    Wrong belief: killing claude closes its pipes. A tool it started keeps them
+    open, so the drain is bounded and the pipes are closed by hand if it times out.
+    """
+    _kill_group(proc)
+    try:
+        proc.communicate(timeout=_REAP_SECONDS)
+    except subprocess.TimeoutExpired:
+        _close_pipes(proc)
+        proc.wait()
+
+
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is not None:
+            pipe.close()
 
 
 def _trace_cost(path: Path) -> float | None:
@@ -1227,21 +1258,33 @@ class ClaudeCodeRunner:
             checkpoint_fractions=checkpoint_fractions, checkpoint_index=checkpoint_index, thread=thread,
         )
         try:
-            return subprocess.run(
+            # Its own session, so a timeout can kill every tool claude started
+            # and not only claude: those tools hold the pipes open.
+            proc = subprocess.Popen(
                 argv,
-                input=prompt,
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 # A thread keeps one working directory for its whole life: the
                 # CLI files sessions by directory, and a resume looks there.
                 cwd=scratch or self.cwd,
-                timeout=self.timeout,
                 env=child_env(os.environ, shutil.which("bash")),
+                start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise RunnerError(f"'{self.claude_bin}' not found; is Claude Code installed and on PATH?") from exc
+        try:
+            out, err = proc.communicate(input=prompt, timeout=self.timeout)
         except subprocess.TimeoutExpired as exc:
+            _kill_and_reap(proc)
             raise _NodeTimeout(f"node '{role}' did not finish within {self.timeout}s") from exc
+        except BaseException:
+            _kill_group(proc)
+            proc.wait()
+            _close_pipes(proc)
+            raise
+        return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
     def _ledger_timeout(
         self, *, call_id: str, role: str, tier: str, model: str, tools: Sequence[str], task: str | None,
