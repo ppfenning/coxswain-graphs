@@ -346,6 +346,33 @@ def _lint_refusal_text(problems: Sequence[Problem]) -> str | None:
     return "\n".join(f"{p.task}: {p.rule} — {p.detail} ({p.fix})" for p in problems)
 
 
+# ticket_lint reports these as advisory. Here they are refusals: a ticket naming a command the build
+# was not granted, or a file in another repository, must not be stored ready.
+_REWRITE_RULES = frozenset({"grant", "cross_repo"})
+
+
+def _is_refusal(problem: Problem) -> bool:
+    """Reach, coupling and contract by severity; grant and cross_repo by rule name. Size stays advisory."""
+    return problem.severity == "refusal" or problem.rule in _REWRITE_RULES
+
+
+def _rewrite_correction(problems: Sequence[Problem], grants: Sequence[str]) -> str:
+    """The rewrite prompt's tail: one line per refused ticket naming its rule, then the build grant."""
+    return (
+        "Ticket lint refused these tickets. Rewrite the plan so each problem no longer holds, "
+        "and keep every other ticket as it is.\n\n"
+        + "\n".join(f"{p.task}: {p.rule} — {p.detail} ({p.fix})" for p in problems)
+        + "\n\n"
+        + _grant_sentence(grants)
+    )
+
+
+def _refusal_reason(refusals: Sequence[Problem]) -> str:
+    """`lint-refused: <task> <rule>, ...` on the first line, then one detail line per problem."""
+    heading = "lint-refused: " + ", ".join(dict.fromkeys(f"{p.task} {p.rule}" for p in refusals))
+    return heading + "\n" + (_lint_refusal_text(refusals) or "")
+
+
 def _apply_surface_resolutions(tasks: list[dict[str, Any]], tree: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """New task dicts; each task's surfaces resolved against tree. The caller's tasks are untouched.
 
@@ -615,6 +642,42 @@ def _grant_sentence(grants: Sequence[str]) -> str:
     ) + "No other command may be named."
 
 
+def _plan_from_output(
+    raw: Mapping[str, Any], task_ids: str, initiative_id: Any
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """`(decomposition, reported moves, tasks)` from one decompose output; the same steps for every call.
+
+    Same-phase edges are split, ordinal keys are checked, and ids are scoped to the initiative.
+    """
+    decomposition, moves = split_same_phase_needs(
+        {**raw, "phases": list(raw.get("phases") or []), "tasks": list(raw.get("tasks") or [])}
+    )
+    reported_moves = (
+        [
+            dict(m, task=_prefixed(initiative_id, m["task"]), needs=[_prefixed(initiative_id, n) for n in m["needs"]])
+            for m in moves
+        ]
+        if initiative_id
+        else moves
+    )
+    tasks = [dict(t, needs=list(t.get("needs") or []), surfaces=list(t.get("surfaces") or [])) for t in decomposition.get("tasks") or []]
+    if not tasks:
+        raise ContractViolation("decompose returned no tasks; there is nothing to propose")
+    if task_ids == "ordinal":
+        ordinal_problems = _ordinal_needs_problems(tasks)
+        if ordinal_problems:
+            raise ContractViolation(
+                "the decomposed graph used a needs key that names no listed task: "
+                + "; ".join(ordinal_problems)
+            )
+    if initiative_id:
+        tasks = [
+            dict(t, id=_prefixed(initiative_id, t["id"]), needs=[_prefixed(initiative_id, n) for n in t["needs"]])
+            for t in tasks
+        ]
+    return decomposition, reported_moves, tasks
+
+
 def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     """Run the graph. The idea arrives as an argument; nothing is read from disk."""
     cartridge = require_cartridge(args)
@@ -704,41 +767,11 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     )
     # A deterministic rewrite, not a model call. It runs before the adversary,
     # so the adversary sees the split phases.
-    decomposition, moves = split_same_phase_needs(
-        {**raw, "phases": list(raw.get("phases") or []), "tasks": list(raw.get("tasks") or [])}
-    )
-
     initiative_id = args.get("initiative_id")
-    reported_moves = (
-        [
-            dict(m, task=_prefixed(initiative_id, m["task"]), needs=[_prefixed(initiative_id, n) for n in m["needs"]])
-            for m in moves
-        ]
-        if initiative_id
-        else moves
-    )
+    decomposition, reported_moves, tasks = _plan_from_output(raw, task_ids, initiative_id)
 
-    tasks = [dict(t, needs=list(t.get("needs") or []), surfaces=list(t.get("surfaces") or [])) for t in decomposition.get("tasks") or []]
-    if not tasks:
-        raise ContractViolation("decompose returned no tasks; there is nothing to propose")
-
-    if task_ids == "ordinal":
-        ordinal_problems = _ordinal_needs_problems(tasks)
-        if ordinal_problems:
-            raise ContractViolation(
-                "the decomposed graph used a needs key that names no listed task: "
-                + "; ".join(ordinal_problems)
-            )
-
-    if initiative_id:
-        tasks = [
-            dict(t, id=_prefixed(initiative_id, t["id"]), needs=[_prefixed(initiative_id, n) for n in t["needs"]])
-            for t in tasks
-        ]
-
-    challenge: dict[str, Any] | None = None
-    if "review_adversary" in bound and single is None:  # one ticket has no edges to attack
-        challenge = dict(
+    def challenge_edges(phases: Any, plan: list[dict[str, Any]]) -> dict[str, Any]:
+        return dict(
             runner.run(
                 role="review_adversary",
                 tier="deep",
@@ -749,12 +782,16 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                     "Attack this dependency graph. Your job is to find edges that are "
                     "not real — every one of them serialises work that could have run at "
                     "the same time.\n\n"
-                    f"Idea: {idea}\nPhases: {decomposition.get('phases')}\nTasks: {tasks}\n\n"
+                    f"Idea: {idea}\nPhases: {phases}\nTasks: {plan}\n\n"
                     "For each edge you challenge, say why the dependency does not "
                     "actually hold. Also name any edge that IS real and is missing."
                 ),
             )
         )
+
+    challenge: dict[str, Any] | None = None
+    if "review_adversary" in bound and single is None:  # one ticket has no edges to attack
+        challenge = challenge_edges(decomposition.get("phases"), tasks)
         tasks = _apply_challenge(tasks, challenge)
 
     cycles = _local_cycle(tasks)
@@ -799,7 +836,52 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 
     repo_name = str(args.get("repo") or "")
     lint_problems = lint_tickets(tasks, tree, grants, repo_name)
-    refusals = [p for p in lint_problems if p.severity == "refusal"]
+    rewrite = [p for p in lint_problems if p.rule in _REWRITE_RULES]
+    if rewrite and single is not None:
+        # The single ticket came from the intake, not from decompose; a decompose
+        # rewrite would replace it with an invented epic, so it quarantines as is.
+        raise LintRefusal(_refusal_reason(rewrite))
+    if rewrite:
+        # The adversary's corrections cannot reword a body, so decompose rewrites
+        # the plan once. Its edges are challenged afresh: the first verdicts
+        # named the old plan's edges.
+        rewritten = dict(
+            runner.run(
+                role="decompose",
+                hints=decompose_hints,
+                **_decision(source, "decompose", decompose_hints),
+                schema=DECOMPOSE_SCHEMA,
+                context=context,
+                prompt=decompose_prompt + "\n\n" + _rewrite_correction(rewrite, grants),
+            )
+        )
+        decomposition, reported_moves, tasks = _plan_from_output(rewritten, task_ids, initiative_id)
+        if challenge is not None:
+            challenge = challenge_edges(decomposition.get("phases"), tasks)
+            tasks = _apply_challenge(tasks, challenge)
+        cycles = _local_cycle(tasks)
+        if cycles:
+            raise ContractViolation(
+                "the rewritten graph contains a dependency cycle, so nothing in it could "
+                "ever become ready: " + "; ".join(cycles)
+            )
+        if tree:
+            tasks, surface_failures = _validate_plan_surfaces(tasks, tree)
+            if surface_failures:
+                raise ContractViolation(
+                    "plan surface not found in the checkout: " + "; ".join(surface_failures)
+                )
+            problems = _unresolved_pairs(tasks, tree)
+            if problems:
+                raise ContractViolation(surface_problem(problems))
+            tasks = _split_cross_repo(_apply_surface_resolutions(tasks, tree), tree)
+        lint_problems = lint_tickets(tasks, tree, grants, repo_name)
+        # Only the rewrite rules quarantine here; reach, coupling and contract
+        # fall through to the adversary round below.
+        still = [p for p in lint_problems if p.rule in _REWRITE_RULES]
+        if still:
+            raise LintRefusal(_refusal_reason(still))
+    refusals = [p for p in lint_problems if _is_refusal(p)]
     if refusals:
         # reach, coupling and contract block the run, same as an unresolved
         # surface does: quarantine outright with no adversary bound, otherwise
@@ -849,13 +931,13 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 "ever become ready: " + "; ".join(cycles)
             )
         lint_problems = lint_tickets(tasks, tree, grants, repo_name)
-        refusals = [p for p in lint_problems if p.severity == "refusal"]
+        refusals = [p for p in lint_problems if _is_refusal(p)]
         if refusals:
-            raise LintRefusal(_lint_refusal_text(refusals))
+            raise LintRefusal(_refusal_reason(refusals))
 
-    advisories = [p for p in lint_problems if p.severity == "advisory"]
+    advisories = [p for p in lint_problems if not _is_refusal(p)]
     if advisories:
-        # grant and size never block; they land on the ticket as a `lint:`
+        # size never blocks; it lands on the ticket as a `lint:`
         # entry for the human at the gate to see.
         notes: dict[str, list[str]] = {}
         for p in advisories:

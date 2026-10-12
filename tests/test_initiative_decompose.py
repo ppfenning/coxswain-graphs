@@ -745,18 +745,85 @@ def test_a_coupling_problem_comes_back_through_apply_corrections_as_a_refusal(ca
     assert surfaces["t2"] == ["tests/test_y.py"]
 
 
-def test_a_grant_problem_is_recorded_as_a_lint_entry_not_a_refusal(cart) -> None:
-    decomposition = {
-        **DECOMPOSITION,
-        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "```bash\ncox route lint t1\n```", "needs": [], "surfaces": []}],
-    }
-    result = decompose(cart, decomposition)
-    lint_entry = "grant: names `cox`, which is not granted (name only pytest, git status, git diff)"
+def _one_ticket(body: str, surfaces: list[str] | None = None) -> dict:
+    task = {"id": "t1", "phase": "p1", "title": "a", "body": body, "needs": [], "surfaces": surfaces or []}
+    return {**DECOMPOSITION, "tasks": [task]}
+
+
+RUFF_BODY = "```bash\nruff check .\n```"
+PYTEST_BODY = "```bash\npytest -q\n```"
+GRANT_ARGS = {"run_id": "r", "date": "d", "idea": "x", "grants": ["pytest"]}
+
+
+def test_a_grant_refusal_is_rewritten_by_decompose_and_the_clean_rewrite_is_stored(cart) -> None:
+    runner = ScriptedRunner({"decompose": [_one_ticket(RUFF_BODY), _one_ticket(PYTEST_BODY)]})
+    result = initiative_decompose.run({**GRANT_ARGS, "cartridge": cart}, runner)
+    rewrite_call = runner.calls[-1]
+    assert [c["role"] for c in runner.calls] == ["decompose", "decompose"]
+    assert "t1: grant" in rewrite_call["prompt"]
+    assert initiative_decompose._grant_sentence(["pytest"]) in rewrite_call["prompt"]
     task = next(t for t in result["tasks"] if t["id"] == "t1")
-    assert task["lint"] == [lint_entry]
-    ticket = next(p for p in result["proposals"] if p["target"] == "t1")
-    assert f"lint:\n- '{lint_entry}'" in ticket["suggested_action"]
-    assert {"check": "lint", "output": lint_entry} in ticket["evidence"]
+    assert task["body"] == PYTEST_BODY
+    assert not task.get("lint")
+    assert any(p["target"] == "t1" for p in result["proposals"])
+
+
+def test_a_cross_repo_refusal_is_rewritten_by_decompose_and_the_clean_rewrite_is_stored(cart) -> None:
+    runner = ScriptedRunner(
+        {"decompose": [_one_ticket("b", ["harness/cli.py"]), _one_ticket("b", ["agent_tools/dash.py (new)"])]}
+    )
+    result = initiative_decompose.run({**GRANT_ARGS, "cartridge": cart, "repo": "coxswain-tools"}, runner)
+    assert [c["role"] for c in runner.calls] == ["decompose", "decompose"]
+    assert "t1: cross_repo" in runner.calls[-1]["prompt"]
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert task["surfaces"] == ["agent_tools/dash.py (new)"]
+    assert not any("cross_repo" in entry for entry in task.get("lint") or [])
+
+
+def test_a_grant_refusal_that_survives_the_rewrite_stores_nothing_and_names_ticket_and_rule(cart) -> None:
+    runner = ScriptedRunner({"decompose": [_one_ticket(RUFF_BODY), _one_ticket(RUFF_BODY)]})
+    with pytest.raises(initiative_decompose.LintRefusal) as caught:
+        initiative_decompose.run({**GRANT_ARGS, "cartridge": cart}, runner)
+    assert str(caught.value).splitlines()[0] == "lint-refused: t1 grant"
+    assert len(runner.calls) == 2
+
+
+def test_a_grant_and_a_reach_hit_go_to_the_rewrite_then_the_adversary_correction(cart) -> None:
+    correction = {
+        "corrections": [{"task": "t1", "surface": "~/scratch/notes.md", "replacement": "graphs/notes.py"}],
+        "summary": "resolved",
+    }
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner(
+        {
+            "decompose": [_one_ticket(RUFF_BODY, ["~/scratch/notes.md"]), _one_ticket(PYTEST_BODY, ["~/scratch/notes.md"])],
+            "review_adversary": [ACCEPTED, ACCEPTED, correction],
+        }
+    )
+    result = initiative_decompose.run({**GRANT_ARGS, "cartridge": cart}, runner)
+    assert [c["role"] for c in runner.calls] == [
+        "decompose", "review_adversary", "decompose", "review_adversary", "review_adversary",
+    ]
+    assert "t1: reach" in runner.calls[-1]["prompt"]
+    task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert (task["body"], task["surfaces"]) == (PYTEST_BODY, ["graphs/notes.py"])
+
+
+def test_a_single_ticket_with_a_grant_hit_is_refused_without_a_decompose_rewrite(cart) -> None:
+    intake = {**INTAKE, "body": RUFF_BODY}
+    with pytest.raises(initiative_decompose.LintRefusal) as caught:
+        _sized(cart, {"size": TASK_VERDICT}, intake=intake)
+    assert str(caught.value).splitlines()[0] == "lint-refused: fix-parser grant"
+
+
+def test_the_refusal_reason_names_each_refused_ticket_and_rule_once() -> None:
+    problems = [
+        initiative_decompose.Problem("t1", "grant", "names `ruff`, which is not granted", "fix"),
+        initiative_decompose.Problem("t1", "grant", "names `cox`, which is not granted", "fix"),
+        initiative_decompose.Problem("t2", "cross_repo", "names harness/cli.py, which lives in graphs", "fix"),
+    ]
+    first = initiative_decompose._refusal_reason(problems).splitlines()[0]
+    assert first == "lint-refused: t1 grant, t2 cross_repo"
 
 
 def test_a_size_problem_is_recorded_as_a_lint_entry_not_a_refusal(cart) -> None:
@@ -774,25 +841,21 @@ def test_a_size_problem_is_recorded_as_a_lint_entry_not_a_refusal(cart) -> None:
     assert {"check": "lint", "output": lint_entry} in ticket["evidence"]
 
 
-def test_a_grant_advisory_lands_under_lint_and_never_in_surfaces(cart) -> None:
-    decomposition = {
-        **DECOMPOSITION,
-        "tasks": [
-            {
-                "id": "t1",
-                "phase": "p1",
-                "title": "a",
-                "body": "```bash\ncox route lint t1\n```",
-                "needs": [],
-                "surfaces": ["graphs/schema.py"],
-            },
-        ],
-    }
-    result = decompose(cart, decomposition)
-    lint_entry = "grant: names `cox`, which is not granted (name only pytest, git status, git diff)"
+def test_a_size_advisory_lands_under_lint_and_never_in_surfaces(cart) -> None:
+    runner = ScriptedRunner({"decompose": [_one_ticket(" ".join(["word"] * 750), ["graphs/schema.py"])]})
+    result = initiative_decompose.run({**GRANT_ARGS, "cartridge": cart}, runner)
+    lint_entry = "size: body is 750 words (point at a spec file in the repository)"
     task = next(t for t in result["tasks"] if t["id"] == "t1")
+    assert len(runner.calls) == 1
     assert task["lint"] == [lint_entry]
     assert task["surfaces"] == ["graphs/schema.py"]
+
+
+def test_a_clean_plan_is_stored_on_the_first_output(cart) -> None:
+    runner = ScriptedRunner({"decompose": [_one_ticket(PYTEST_BODY)]})
+    result = initiative_decompose.run({**GRANT_ARGS, "cartridge": cart}, runner)
+    assert [c["role"] for c in runner.calls] == ["decompose"]
+    assert any(p["target"] == "t1" for p in result["proposals"])
 
 
 def test_a_non_path_entry_in_surfaces_is_dropped_to_lint(cart) -> None:
@@ -833,12 +896,13 @@ def test_a_graphs_ticket_naming_its_own_new_files_carries_no_cross_repo_lint(car
     assert "lint" not in task or not any(entry.startswith("cross_repo") for entry in task["lint"])
 
 
-def test_a_tools_ticket_naming_a_graphs_file_carries_a_cross_repo_lint_entry(cart) -> None:
-    result = _decompose_for(cart, "coxswain-tools", ["harness/cli.py"])
-    task = next(t for t in result["tasks"] if t["id"] == "t1")
-    assert task["lint"] == [
-        "cross_repo: names harness/cli.py, which lives in graphs "
-        "(paste the code the build needs into the ticket: a build reads only its own repository)"
+def test_a_tools_ticket_naming_a_graphs_file_is_refused_with_the_cross_repo_reason(cart) -> None:
+    with pytest.raises(initiative_decompose.LintRefusal) as caught:
+        _decompose_for(cart, "coxswain-tools", ["harness/cli.py"])
+    assert str(caught.value).splitlines() == [
+        "lint-refused: t1 cross_repo",
+        "t1: cross_repo — names harness/cli.py, which lives in graphs "
+        "(paste the code the build needs into the ticket: a build reads only its own repository)",
     ]
 
 
@@ -865,12 +929,8 @@ def test_a_body_ending_in_a_closing_tag_is_written_without_it(cart) -> None:
 
 
 def test_duplicated_lint_entries_are_written_once(cart) -> None:
-    decomposition = {
-        **DECOMPOSITION,
-        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "```bash\ncox route lint t1\n```", "needs": [], "surfaces": []}],
-    }
-    result = decompose(cart, decomposition)
-    lint_entry = "grant: names `cox`, which is not granted (name only pytest, git status, git diff)"
+    result = decompose(cart, _one_ticket(PYTEST_BODY))
+    lint_entry = "size: body is 750 words (point at a spec file in the repository)"
     task = dict(next(t for t in result["tasks"] if t["id"] == "t1"), lint=[lint_entry, lint_entry, lint_entry])
     action = initiative_decompose._item_action(task, landing="work", initiative_id=None)
     block = action.split("with frontmatter\n", 1)[1].rsplit("\nbody = ", 1)[0]
