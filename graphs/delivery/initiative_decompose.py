@@ -19,8 +19,10 @@ the work store is written by an apply arm after a human said yes.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -244,6 +246,33 @@ def _size_route(raw: Mapping[str, Any], frontmatter: Mapping[str, Any]) -> SizeV
     return apply_override(parse_size_verdict(dict(raw)), dict(frontmatter))
 
 
+def _size_record(verdict: SizeVerdict | SizeError | None) -> dict[str, str] | None:
+    """The size outcome to record; None when no size step ran. A SizeError ran the epic path as a fallback."""
+    if verdict is None:
+        return None
+    if isinstance(verdict, SizeError):
+        return {"size": "epic", "size_reason": verdict.message, "size_source": "fallback"}
+    return {"size": verdict.verdict, "size_reason": verdict.reason, "size_source": verdict.source}
+
+
+def _size_ledger_entry(record: Mapping[str, str], *, run_id: str, date: str, took_task_path: bool) -> dict[str, Any]:
+    """One ledger line; `skipped` is present only on the task path, which never runs scope_epic or phase planning."""
+    skipped = {"skipped": ["scope_epic", "phase_planning"]} if took_task_path else {}
+    return {"run_id": run_id, "date": date, "graph": GRAPH_NAME, "event": "size", **record, **skipped}
+
+
+def _append_size_ledger(runner: Any, run_id: str, entry: Mapping[str, Any]) -> None:
+    """Append `entry` to `<runs_dir>/<run_id>.size.jsonl`, the runner's runs_dir as the checkpoint ledger uses.
+
+    A no-op when the runner carries no `runs_dir`. Append mode only; a reader lives in coxswain-tools.
+    """
+    runs_dir = getattr(runner, "runs_dir", None)
+    if not runs_dir:
+        return
+    with (Path(runs_dir) / f"{run_id}.size.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+
 def _scalar(value: Any) -> str:
     """One YAML flow scalar, quoted only when YAML requires it."""
     dumped = yaml.safe_dump(value, default_flow_style=True, allow_unicode=True, width=10_000)
@@ -251,11 +280,18 @@ def _scalar(value: Any) -> str:
 
 
 def initiative_text(
-    idea: Mapping[str, Any], phases: Sequence[str], goals: Mapping[str, str], repo: str, *, intake: str | None = None
+    idea: Mapping[str, Any],
+    phases: Sequence[str],
+    goals: Mapping[str, str],
+    repo: str,
+    *,
+    intake: str | None = None,
+    size: Mapping[str, str] | None = None,
 ) -> str:
     """The `initiative.md` shape every hand-written initiative in the workspace carries."""
     goal_lines = "\n".join(f"- {phase_id}: {goals.get(phase_id, '')}" for phase_id in phases)
     intake_line = f"intake: {_scalar(intake)}\n" if intake else ""
+    size_lines = "".join(f"{key}: {_scalar(size[key])}\n" for key in ("size", "size_reason", "size_source")) if size else ""
     return (
         "---\n"
         f"id: {_scalar(idea.get('id'))}\n"
@@ -263,6 +299,7 @@ def initiative_text(
         f"repo: {_scalar(repo)}\n"
         f"budget_usd: {_scalar(idea.get('budget_usd'))}\n"
         f"{intake_line}"
+        f"{size_lines}"
         "---\n\n"
         f"{idea.get('why', '')}\n\n"
         "PHASE GOALS, each judged against ITS OWN line:\n"
@@ -611,6 +648,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     # override that is not task or epic, is an epic.
     intake = args.get("intake")
     single: dict[str, Any] | None = None
+    verdict: SizeVerdict | SizeError | None = None
     if isinstance(intake, Mapping) and "size" in bound:
         repo_files = sorted({str(row.get("path")) for row in args.get("tree") or [] if row.get("path")})
         intake_text = f"{intake.get('title', '')}\n\n{intake.get('body', '')}"
@@ -627,7 +665,15 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         verdict = _size_route(sized, intake.get("frontmatter") or {})
         if isinstance(verdict, SizeVerdict) and verdict.verdict == "task":
             built = single_ticket_initiative(dict(intake), verdict, set(repo_files))
-            single = None if isinstance(built, SizeError) else built
+            if isinstance(built, SizeError):
+                verdict = built  # the task verdict could not become a ticket: the epic path runs, recorded as a fallback
+            else:
+                single = built
+
+    size_record = _size_record(verdict)
+    if size_record is not None:
+        entry = _size_ledger_entry(size_record, run_id=str(run_id), date=str(date), took_task_path=single is not None)
+        _append_size_ledger(runner, str(run_id), entry)
 
     raw = single if single is not None else dict(
         runner.run(
@@ -856,7 +902,9 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     goals = {str(p.get("id")): str(p.get("goal") or "") for p in decomposition.get("phases") or []}
     idea_doc = {"id": initiative_id or run_id, "title": str(idea), "budget_usd": args.get("budget_usd"), "why": str(idea)}
     intake_path = args.get("intake_path")
-    initiative_body = initiative_text(idea_doc, phase_order, goals, str(args.get("repo") or ""), intake=intake_path)
+    initiative_body = initiative_text(
+        idea_doc, phase_order, goals, str(args.get("repo") or ""), intake=intake_path, size=size_record
+    )
     initiative_where = "/".join(part for part in (landing, initiative_id) if part)
 
     proposals = [
