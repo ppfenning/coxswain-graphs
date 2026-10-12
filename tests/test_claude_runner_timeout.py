@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -72,6 +73,7 @@ def test_a_timeout_kills_a_tool_that_holds_the_pipes_open(tmp_path: Path) -> Non
     assert tool_killed, "the tool claude started outlived the timeout: the group was not killed"
 
 
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="setsid is Linux-only")
 def test_a_tool_that_left_the_group_cannot_hold_the_call_open(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(ccr, "_REAP_SECONDS", 1)
     script, pidfile = _stand_in(tmp_path, "setsid sleep 600")
