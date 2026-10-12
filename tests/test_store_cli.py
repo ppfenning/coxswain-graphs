@@ -379,3 +379,38 @@ def test_host_list_prints_every_host_by_name(url, run):
         run(url, "host", "upsert", name, "--ssh", name, "--capacity", "1", "--by", "chair")
     code, out, _ = run(url, "host", "list")
     assert (code, [r["name"] for r in one_object(out)]) == (0, ["a", "b"])
+
+
+LOGIN = '{"login_ok": false, "login_user": "operator"}'
+
+
+def test_host_login_merges_the_fields_into_versions_and_leaves_beat_at(url, run, at):
+    at(T20)
+    run(url, "host", "upsert", "host-a", "--ssh", "host-a", "--capacity", "8", "--by", "chair")
+    at(T40)
+    run(url, "host", "beat", "host-a", "--versions", VERSIONS)
+    _, before, _ = run(url, "host", "list")
+    code, out, err = run(url, "host", "login", "host-a", "--login-json", LOGIN)
+    assert (code, out, err) == (0, "", "")
+    _, after, _ = run(url, "host", "list")
+    (was,), (now,) = json.loads(before), json.loads(after)
+    assert now["versions_json"] == {"cox": "0.20.0", "login_ok": False, "login_user": "operator"}
+    assert now["beat_at"] == was["beat_at"] == T40
+    assert {k: v for k, v in now.items() if k != "versions_json"} == {k: v for k, v in was.items() if k != "versions_json"}
+
+
+def test_host_login_on_an_unknown_host_exits_two_with_one_line_naming_it(url, run):
+    code, out, err = run(url, "host", "login", "nobody", "--login-json", LOGIN)
+    assert (code, out) == (2, "")
+    assert err.splitlines() == ["error: no host nobody"]
+
+
+@pytest.mark.parametrize("bad", ["{not json", "[1, 2]", '"text"'])
+def test_host_login_with_json_that_is_not_an_object_exits_two_with_one_line_and_changes_nothing(url, run, at, bad):
+    at(T20)
+    run(url, "host", "upsert", "host-a", "--ssh", "host-a", "--capacity", "8", "--by", "chair")
+    _, before, _ = run(url, "host", "list")
+    code, out, err = run(url, "host", "login", "host-a", "--login-json", bad)
+    assert (code, out) == (2, "")
+    assert len(err.splitlines()) == 1 and err.startswith("error: the login ")
+    assert run(url, "host", "list")[1] == before
