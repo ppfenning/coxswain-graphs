@@ -25,7 +25,7 @@ GRAPHS_DIR = Path(__file__).resolve().parent.parent / "graphs"
 # employer you remembered to add, and the next one walks straight through.
 FORBIDDEN_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\b\d{15,19}\b", "a bare numeric ID (tracker workspace/project/task GID)"),
-    (r"https?://[\w.-]*\.(?:atlassian\.net|asana\.com|monday\.com)", "a hardcoded tracker host"),
+    (r"https?://[\w.-]*\.(?:atlassian\.net|asana\.com|monday\.com)", "a hardcoded tracker host"),  # clean: allow
     (r"\bs3://[\w.-]+", "a hardcoded bucket URI"),
     (r"\barn:aws:[\w:-]+", "a hardcoded AWS ARN"),
     (r"\b\d{12}\b", "a bare 12-digit AWS account ID"),

@@ -1,6 +1,6 @@
 # Triage and earned autonomy
 
-Status: approved by the chair 2026-09-15 under the operator's standing order (2026-09-08) and his direction of
+Status: approved by the chair 2026-09-15 under the operator's standing order (2026-09-08) and their direction of
 2026-09-08: "should fails pass through a new graph to get the work back into a queue? rather than you just
 picking up the fix?" and "removing human gates in places like that is the exact goal". Groups intake G7
 from `workspace/plans/agent-platform/2026-09-08-intake-grouping.md`:

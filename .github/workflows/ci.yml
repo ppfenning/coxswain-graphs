@@ -34,6 +34,15 @@ jobs:
           python-version: "3.14"
           cache: pip
 
+      # No operator, host, home path or employer may ship. The names live in a
+      # secret, never in the repo; without it the names rule is skipped and the
+      # fixed rules still run. Before the substrate checkout, so only this repo
+      # is scanned.
+      - name: No personal reference
+        run: python .github/check_clean.py .
+        env:
+          COXSWAIN_CLEAN_DENY: ${{ secrets.COXSWAIN_CLEAN_DENY }}
+
       # agent-cartridges is a PRIVATE sibling repo and the default GITHUB_TOKEN
       # is scoped to this repo alone, so it cannot read it — that 404 is what was
       # failing every run. With a token the whole suite runs; without one the
@@ -53,7 +62,7 @@ jobs:
           if [ -d .agent-cartridges ]; then
             pip install ./.agent-cartridges
           else
-            echo "::notice::SUBSTRATE_REPO_TOKEN is not set, so tests needing agent-cartridges are skipped. Add a fine-grained PAT with read access to ppfenning/agent-cartridges to run the full suite."
+            echo "::notice::SUBSTRATE_REPO_TOKEN is not set, so tests needing agent-cartridges are skipped. Add a fine-grained personal access token with read access to ppfenning/agent-cartridges to run the full suite."
           fi
 
       # No API key and no network: the scripted runner is what makes that work.

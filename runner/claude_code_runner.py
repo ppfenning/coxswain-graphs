@@ -697,11 +697,11 @@ class ClaudeCodeRunner:
         # a 101-turn build that finished anyway.
         self.budget_usd = {str(k): float(v) for k, v in (self.profile.get("budget_usd") or {}).items()}
         self.role_budget_usd = {str(k): float(v) for k, v in (self.profile.get("role_budget_usd") or {}).items()}
-        # A hard runaway ceiling per role (the operator, 2026-09-28): a failsafe on the session's cumulative spend. The shape
+        # A hard runaway ceiling per role: a failsafe on the session's cumulative spend. The shape
         # ceiling above stays the size of each slice, so the harness gets a go/no-go checkpoint at every guide's worth
         # of spend, well before the failsafe; the weekly cap bounds everything else.
         self.role_ceiling_usd = {str(k): float(v) for k, v in (self.profile.get("role_ceiling_usd") or {}).items()}
-        # A per-thread ceiling (the operator, 2026-09-28): thread name -> (ceiling, label), set by the harness after
+        # A per-thread ceiling: thread name -> (ceiling, label), set by the harness after
         # construction, like `node_cap_usd` below. `_hard_ceiling` prefers this over the role's runaway ceiling
         # when it is tighter, so a single task's own budget can bind before the role-wide failsafe does.
         self.thread_ceiling_usd: dict[str, tuple[float, str]] = {}
