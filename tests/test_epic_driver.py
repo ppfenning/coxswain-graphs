@@ -524,6 +524,70 @@ def test_a_run_that_raises_still_cleans_up_because_finally_fires(repo, cart, tmp
     assert "epic-raise" not in git("worktree", "list", cwd=repo)
 
 
+class SecondPhaseCloseRaises(Runner):
+    """A close that fails only after the second phase, so phase 1 finished cleanly and phase 2 raised."""
+
+    closes = 0
+
+    def close(self) -> None:
+        self.closes += 1
+        if self.closes == 2:
+            raise RuntimeError("phase two blew up")
+
+
+def _spy_on_run_exit(monkeypatch) -> list[tuple[str, dict | None]]:
+    exits: list[tuple[str, dict | None]] = []
+    real = epic_module._record_run_exit
+
+    def spy(store, run_id, status, retry, result=None):
+        exits.append((status, result))
+        return real(store, run_id, status, retry, result)
+
+    monkeypatch.setattr(epic_module, "_record_run_exit", spy)
+    return exits
+
+
+def test_a_raise_in_phase_two_keeps_phase_one_s_courier_note_and_exit_result(
+    repo, cart, tmp_path, monkeypatch, _courier_sends_are_recorded
+) -> None:
+    exits = _spy_on_run_exit(monkeypatch)
+    runner = SecondPhaseCloseRaises({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+
+    with pytest.raises(RuntimeError, match="phase two blew up"):
+        drive(repo, cart, tmp_path, runner=runner, run_id="epic-keep-p1")
+
+    assert [ref for ref, _, _ in _courier_sends_are_recorded] == [
+        "coxswain://task/t1-probe", "coxswain://task/t2-bench"
+    ]
+    [(status, result)] = exits
+    assert status == "error"
+    assert [p["phase"] for p in result["phases"]] == ["p1-foundations"]
+    assert [t["id"] for t in result["tasks"]] == ["t1-probe", "t2-bench"]
+    assert result["totals"]["approved_not_landed"] == 2
+    assert any("t1-probe" in line for line in result["exit_summary"])
+
+
+def test_a_failure_building_the_partial_result_is_logged_and_the_original_raise_survives(
+    repo, cart, tmp_path, monkeypatch, caplog
+) -> None:
+    exits = _spy_on_run_exit(monkeypatch)
+
+    def broken(**_kwargs):
+        raise ValueError("cannot build")
+
+    monkeypatch.setattr(epic_module, "_build_result", broken)
+    runner = SecondPhaseCloseRaises({t: new_file_patch(f"{t}.txt") for t in TASK_IDS})
+
+    with (
+        caplog.at_level(logging.WARNING, logger=epic_module.__name__),
+        pytest.raises(RuntimeError, match="phase two blew up"),
+    ):
+        drive(repo, cart, tmp_path, runner=runner, run_id="epic-keep-bad")
+
+    assert exits == [("error", None)]
+    assert any("partial result for epic-keep-bad not built" in r.getMessage() for r in caplog.records)
+
+
 def test_keep_worktrees_moves_the_run_dir_under_kept_run_id_instead_of_deleting_it(repo, cart, tmp_path) -> None:
     drive(repo, cart, tmp_path, run_id="epic-keep", keep_worktrees=True)
 
