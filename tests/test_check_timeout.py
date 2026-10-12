@@ -1,11 +1,15 @@
 """A check can carry its own `timeout`; `run_checks` honours it over the argument.
 
-The command runner is faked: nothing here launches a real command or sleeps.
+The command runner is faked, except the one test that proves a timeout kills a backgrounded grandchild.
 """
 
 from __future__ import annotations
 
-import subprocess
+import contextlib
+import os
+import signal
+import time
+from pathlib import Path
 
 import pytest
 
@@ -44,32 +48,73 @@ def _ctx(tmp_path, cartridge_checks=(), repo_checks=()) -> _Ctx:
     )
 
 
-def _fake_run(seen: list):
-    def fake(cmd, **kwargs):
-        seen.append(kwargs["timeout"])
-        return subprocess.CompletedProcess(cmd, 0, stdout="1 passed\n", stderr="")
+def _fake_popen(seen: list):
+    class Fake:
+        returncode = 0
+        pid = 1
 
-    return fake
+        def __init__(self, cmd, **kwargs):
+            pass
+
+        def communicate(self, timeout=None):
+            seen.append(timeout)
+            return "1 passed\n", ""
+
+    return Fake
 
 
 def test_a_per_check_timeout_overrides_the_argument(tmp_path, monkeypatch) -> None:
     seen: list = []
-    monkeypatch.setattr("harness.checks.subprocess.run", _fake_run(seen))
+    monkeypatch.setattr("harness.checks.subprocess.Popen", _fake_popen(seen))
     run_checks(tmp_path, [{"name": "slow", "cmd": "x", "timeout": 7}], timeout=600)
     assert seen == [7]
 
 
 def test_a_check_with_no_timeout_falls_back_to_the_argument(tmp_path, monkeypatch) -> None:
     seen: list = []
-    monkeypatch.setattr("harness.checks.subprocess.run", _fake_run(seen))
+    monkeypatch.setattr("harness.checks.subprocess.Popen", _fake_popen(seen))
     run_checks(tmp_path, [{"name": "quick", "cmd": "x"}], timeout=45)
     assert seen == [45]
+
+
+def _is_dead(pid: int) -> bool:
+    """Gone, or a zombie waiting for its reaper: either way it no longer holds anything open."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rpartition(")")[2].split()[0] == "Z"
+
+
+def test_a_timeout_kills_a_backgrounded_grandchild_holding_the_pipes(tmp_path) -> None:
+    cmd = "echo 3 passed\nsleep 600 &\necho $! > grandchild.pid\nwait"
+    started = time.monotonic()
+    [result] = run_checks(tmp_path, [{"name": "bg", "cmd": cmd}], timeout=1)
+    elapsed = time.monotonic() - started
+    pid = int((tmp_path / "grandchild.pid").read_text())
+    try:
+        deadline = time.monotonic() + 5
+        while not _is_dead(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _is_dead(pid), "the backgrounded sleep outlived the timeout"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    assert elapsed < 1 + 5
+    assert result["outcome"] == "timed_out"
+    assert result["output_tail"].count("3 passed") == 1
+    assert result["passed"] is False
+    assert result["exit_code"] is None
 
 
 @pytest.mark.parametrize("bad", [0, -5, "30", 2.5])
 def test_a_bad_per_check_timeout_is_refused_naming_check_and_value(tmp_path, monkeypatch, bad) -> None:
     seen: list = []
-    monkeypatch.setattr("harness.checks.subprocess.run", _fake_run(seen))
+    monkeypatch.setattr("harness.checks.subprocess.Popen", _fake_popen(seen))
     with pytest.raises(ValueError, match=rf"'slow'.*{bad!r}"):
         run_checks(tmp_path, [{"name": "slow", "cmd": "x", "timeout": bad}])
     assert seen == []
