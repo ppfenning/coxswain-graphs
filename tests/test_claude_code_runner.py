@@ -2235,15 +2235,26 @@ def test_a_transient_retry_with_tracing_ledgers_the_renamed_trace_not_the_reused
 
 
 def _timing_out(monkeypatch, script) -> None:
-    """Make the claude subprocess outlive its timeout; every other subprocess runs for real."""
-    real = subprocess.run
+    """Make the claude subprocess outlive its timeout; every other subprocess runs for real.
+
+    The process is real, so the runner's group kill has a real pid to signal; only
+    its first `communicate` reports a timeout.
+    """
+    real = subprocess.Popen
+
+    class TimingOut(real):
+        expired = False
+
+        def communicate(self, input=None, timeout=None):
+            if not self.expired:
+                self.expired = True
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return super().communicate(input, timeout)
 
     def fake(argv, *args, **kwargs):
-        if argv and argv[0] == str(script):
-            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
-        return real(argv, *args, **kwargs)
+        return (TimingOut if argv and argv[0] == str(script) else real)(argv, *args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", fake)
+    monkeypatch.setattr(subprocess, "Popen", fake)
 
 
 def test_a_node_timeout_ledgers_one_failed_row_with_null_cost_and_still_raises(
