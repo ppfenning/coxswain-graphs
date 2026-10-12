@@ -9,7 +9,7 @@ from typing import Any
 
 from harness.store_dialect import Connection, json_load, json_text, upsert
 
-__all__ = ["HOST_STATES", "host_beat", "host_list", "host_set_state", "host_upsert"]
+__all__ = ["HOST_STATES", "host_beat", "host_list", "host_set_state", "host_upsert", "update_host_login"]
 
 HOST_STATES = ("active", "draining", "offline")
 HOST_COLUMNS = ("name", "ssh", "capacity", "state", "beat_at", "versions_json", "updated_at", "updated_by")
@@ -64,6 +64,27 @@ def host_set_state(conn: Connection, name: str, state: str, by: str, now: str) -
             [state, now, by, name],
         )
         return _find(conn, name) if changed else None
+
+
+def _merge_login(versions: dict[str, Any], login: dict[str, Any]) -> dict[str, Any]:
+    """Keys in login win; keys it does not carry stay. Neither argument is changed."""
+    return {**versions, **login}
+
+
+def update_host_login(conn: Connection, name: str, login: dict[str, Any]) -> bool:
+    """Merge login into versions_json and write that column only. False when no host has the name."""
+    # Login does not survive a beat: host_beat replaces versions_json wholesale. The read takes no row lock,
+    # so two concurrent writers on Postgres can each merge into the same old value and the later one wins.
+    mark = conn.dialect.placeholder
+    with conn.transaction():
+        found = _find(conn, name)
+        if found is None:
+            return False
+        conn.execute(
+            f"UPDATE hosts SET versions_json = {mark} WHERE name = {mark}",
+            [json_text(_merge_login(found["versions_json"], login)), name],
+        )
+        return True
 
 
 def host_list(conn: Connection) -> list[dict[str, Any]]:
