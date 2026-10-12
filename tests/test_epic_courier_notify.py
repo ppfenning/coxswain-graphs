@@ -251,3 +251,44 @@ def test_default_stub_keeps_a_real_cox_from_running(repo, cart, tmp_path, monkey
 
     assert not marker.exists()
     assert [(ref, to) for ref, to, _ in courier_adapter.send.calls] == [("coxswain://task/t1-probe", "chair")]
+
+
+def two_phase_initiative() -> dict:
+    return {
+        "id": "demo-initiative",
+        "title": "demo",
+        "body": "make the vendor join measurable end to end",
+        "phases": ["p1-foundations", "p2-rollout"],
+        "items": [
+            {"id": "t1-probe", "phase": "p1-foundations", "state": "ready",
+             "needs": [], "surfaces": [], "title": "schema probe", "body": "read the vendor schema"},
+            {"id": "t2-next", "phase": "p2-rollout", "state": "ready",
+             "needs": ["t1-probe"], "surfaces": [], "title": "next step", "body": "build on the probe"},
+        ],
+    }
+
+
+class NoteCountRunner(Runner):
+    """Builds a file per task and records how many courier notes existed when each task's build began."""
+
+    def __init__(self) -> None:
+        super().__init__("")
+        self.notes_at_build: dict[str, int] = {}
+
+    def run(self, *, role, prompt, **kwargs):
+        if role == "build":
+            task = "t2-next" if "t2-next" in prompt else "t1-probe"
+            self.patch = new_file_patch(f"{task}.txt")
+            with self.lock:
+                self.notes_at_build[task] = len(courier_adapter.send.calls)
+        return super().run(role=role, prompt=prompt, **kwargs)
+
+
+def test_a_two_phase_run_sends_phase_one_s_note_before_phase_two_runs(repo, cart, tmp_path) -> None:
+    runner = NoteCountRunner()
+
+    result = drive(repo, cart, tmp_path, runner=runner, work=two_phase_initiative())
+
+    assert runner.notes_at_build == {"t1-probe": 0, "t2-next": 1}
+    assert [ref for ref, _, _ in courier_adapter.send.calls] == ["coxswain://task/t1-probe", "coxswain://task/t2-next"]
+    assert result["totals"]["approved_not_landed"] == 2
