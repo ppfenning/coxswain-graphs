@@ -6,6 +6,8 @@ the person who just drew the graph is the last person likely to spot one.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import yaml
 
@@ -1125,7 +1127,20 @@ def test_a_multi_phase_intake_runs_the_epic_path_and_matches_the_unsized_output(
     )
     after, runner = _sized(cart, {"size": EPIC_VERDICT, "decompose": DECOMPOSITION}, tree=[])
     assert _roles(runner) == ["size", "decompose"]
-    assert after == before
+    assert _without_size_lines(after) == before
+
+
+def _without_size_lines(result: dict) -> dict:
+    """The result with the initiative's `size*` frontmatter lines removed, which only a sized run carries."""
+    return {
+        **result,
+        "proposals": [
+            dict(p, suggested_action="\n".join(ln for ln in p["suggested_action"].split("\n") if not ln.startswith("size")))
+            if p["target"] == "initiative"
+            else p
+            for p in result["proposals"]
+        ],
+    }
 
 
 def test_frontmatter_size_epic_overrides_a_task_verdict(cart) -> None:
@@ -1174,3 +1189,110 @@ def test_the_task_ticket_goes_through_ticket_lint(cart, monkeypatch) -> None:
     monkeypatch.setattr(initiative_decompose, "lint_tickets", spy)
     _sized(cart, {"size": TASK_VERDICT})
     assert seen == [["fix-parser"]]
+
+
+def _recorded(cart, responses, tmp_path, intake=INTAKE, tree=TREE):
+    """Run a sized graph with a runs_dir; return the initiative's parsed frontmatter and the ledger lines."""
+    sized = {**cart, "skills": {**cart["skills"], "size": "acme-skills:size"}}
+    runner = ScriptedRunner(responses)
+    runner.runs_dir = tmp_path
+    args = {"run_id": "r", "date": "d", "cartridge": sized, "idea": "x", "intake": intake, "tree": tree}
+    result = initiative_decompose.run(args, runner)
+    action = next(p for p in result["proposals"] if p["target"] == "initiative")["suggested_action"]
+    frontmatter = yaml.safe_load(action.split("---\n")[1])
+    ledger = tmp_path / "r.size.jsonl"
+    lines = [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+    return frontmatter, lines
+
+
+def test_the_task_path_records_size_on_the_initiative_and_in_the_ledger(cart, tmp_path) -> None:
+    frontmatter, lines = _recorded(cart, {"size": TASK_VERDICT}, tmp_path)
+    assert (frontmatter["size"], frontmatter["size_reason"], frontmatter["size_source"]) == (
+        "task",
+        "One function in one file.",
+        "model",
+    )
+    assert lines == [
+        {
+            "run_id": "r",
+            "date": "d",
+            "graph": "initiative-decompose",
+            "event": "size",
+            "size": "task",
+            "size_reason": "One function in one file.",
+            "size_source": "model",
+            "skipped": ["scope_epic", "phase_planning"],
+        }
+    ]
+
+
+def test_the_epic_path_records_size_epic_and_no_skipped_marker(cart, tmp_path) -> None:
+    frontmatter, lines = _recorded(cart, {"size": EPIC_VERDICT, "decompose": DECOMPOSITION}, tmp_path, tree=[])
+    assert (frontmatter["size"], frontmatter["size_reason"], frontmatter["size_source"]) == (
+        "epic",
+        "It spans two phases.",
+        "model",
+    )
+    assert len(lines) == 1 and "skipped" not in lines[0]
+    assert (lines[0]["size"], lines[0]["size_reason"], lines[0]["size_source"]) == ("epic", "It spans two phases.", "model")
+
+
+def test_a_frontmatter_override_records_size_source_override(cart, tmp_path) -> None:
+    frontmatter, lines = _recorded(
+        cart, {"size": TASK_VERDICT, "decompose": DECOMPOSITION}, tmp_path, dict(INTAKE, frontmatter={"size": "epic"}), tree=[]
+    )
+    assert (frontmatter["size"], frontmatter["size_source"], frontmatter["size_reason"]) == (
+        "epic",
+        "override",
+        "intake frontmatter sets size: epic",
+    )
+    assert [(ln["size"], ln["size_source"]) for ln in lines] == [("epic", "override")]
+
+
+def test_a_malformed_verdict_records_the_fallback_with_its_reason(cart, tmp_path) -> None:
+    frontmatter, lines = _recorded(
+        cart, {"size": {"verdict": "huge", "reason": "No."}, "decompose": DECOMPOSITION}, tmp_path, tree=[]
+    )
+    expected = ("epic", "verdict must be task or epic, got 'huge'", "fallback")
+    assert (frontmatter["size"], frontmatter["size_reason"], frontmatter["size_source"]) == expected
+    assert [(ln["size"], ln["size_reason"], ln["size_source"]) for ln in lines] == [expected]
+    assert "skipped" not in lines[0]
+
+
+def test_a_task_verdict_that_cannot_become_a_ticket_records_the_fallback(cart, tmp_path) -> None:
+    intake = {k: v for k, v in INTAKE.items() if k != "body"}
+    frontmatter, lines = _recorded(cart, {"size": TASK_VERDICT, "decompose": DECOMPOSITION}, tmp_path, intake, tree=[])
+    assert (frontmatter["size"], frontmatter["size_source"], frontmatter["size_reason"]) == (
+        "epic",
+        "fallback",
+        "intake is missing body",
+    )
+    assert "skipped" not in lines[0]
+
+
+def test_a_reason_with_a_colon_round_trips_through_the_frontmatter(cart, tmp_path) -> None:
+    reason = "One file: parser.py only."
+    frontmatter, lines = _recorded(cart, {"size": dict(TASK_VERDICT, reason=reason)}, tmp_path)
+    assert frontmatter["size_reason"] == reason
+    assert lines[0]["size_reason"] == reason
+
+
+def test_size_record_for_each_outcome() -> None:
+    task = initiative_decompose.SizeVerdict("task", "r.", ("a.py",), "model")
+    assert initiative_decompose._size_record(task) == {"size": "task", "size_reason": "r.", "size_source": "model"}
+    assert initiative_decompose._size_record(initiative_decompose.SizeError("bad")) == {
+        "size": "epic",
+        "size_reason": "bad",
+        "size_source": "fallback",
+    }
+    assert initiative_decompose._size_record(None) is None
+
+
+def test_no_runs_dir_writes_no_ledger_and_no_size_step_writes_no_size_lines(cart, tmp_path) -> None:
+    _sized(cart, {"size": TASK_VERDICT})
+    assert list(tmp_path.iterdir()) == []
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, ScriptedRunner({"decompose": DECOMPOSITION})
+    )
+    initiative = next(p for p in result["proposals"] if p["target"] == "initiative")
+    assert "size" not in yaml.safe_load(initiative["suggested_action"].split("---\n")[1])
