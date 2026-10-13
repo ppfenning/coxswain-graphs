@@ -35,12 +35,24 @@ def _stand_in(tmp_path: Path, tool: str) -> tuple[Path, Path]:
 
 
 def _gone(pid: int) -> bool:
-    """A killed orphan may linger as a zombie until init reaps it; a zombie counts as gone."""
+    """A killed orphan may linger as a zombie until init reaps it; a zombie counts as gone.
+
+    Wrong belief: a /proc entry that opens can be read. Reaped between the open
+    and the read, the read fails with ESRCH (ProcessLookupError): gone as well.
+    """
     try:
         stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return True
     return stat_line.rsplit(")", 1)[1].split()[0] == "Z"
+
+
+def test_a_proc_entry_reaped_between_open_and_read_counts_as_gone(monkeypatch) -> None:
+    def reaped(self, *a, **kw):
+        raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr(Path, "read_text", reaped)
+    assert _gone(1)
 
 
 def _gone_within(pid: int, seconds: float) -> bool:
