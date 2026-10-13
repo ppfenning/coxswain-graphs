@@ -1,4 +1,4 @@
-from graphs.delivery.ticket_lint import Problem, lint_tickets
+from graphs.delivery.ticket_lint import Problem, idea_reach_problems, lint_tickets
 
 
 def _task(**over):
@@ -275,3 +275,52 @@ def test_a_contract_task_with_only_a_py_surface_gets_one_problem():
 
 def test_two_tasks_with_one_interface_in_one_repo_give_no_contract_problem():
     assert _contract_problems([_PRODUCER, {**_CONSUMER, "repo": "tools", "needs": []}]) == []
+
+
+_TREE = [{"path": "graphs/delivery/ticket_lint.py", "repo": "graphs"}]
+
+
+def test_a_ticket_naming_a_file_under_an_allowed_prefix_gives_no_reach_problem(tmp_path):
+    deploy = tmp_path / "deploy"
+    tasks = [_task(body=f"the unit lives at {deploy / 'app' / 'unit.service'}")]
+    assert lint_tickets(tasks, _TREE, [], "graphs", reach_allow=[str(deploy)]) == []
+
+
+def test_a_ticket_naming_a_path_outside_the_allowed_prefix_gives_one_reach_refusal(tmp_path):
+    tasks = [_task(body=f"the unit lives at {tmp_path / 'elsewhere' / 'unit.service'}")]
+    problems = lint_tickets(tasks, _TREE, [], "graphs", reach_allow=[str(tmp_path / "deploy")])
+    assert [(p.rule, p.severity) for p in problems] == [("reach", "refusal")]
+
+
+def test_a_sibling_sharing_the_prefix_leading_characters_is_not_admitted(tmp_path):
+    tasks = [_task(body=f"the unit lives at {tmp_path / 'deploy-other' / 'unit.service'}")]
+    problems = lint_tickets(tasks, _TREE, [], "graphs", reach_allow=[str(tmp_path / "deploy")])
+    assert [p.rule for p in problems] == ["reach"]
+
+
+def test_an_allowed_prefix_with_a_trailing_slash_admits_the_prefix_and_its_children(tmp_path):
+    deploy = str(tmp_path / "deploy")
+    tasks = [_task(body=f"see {deploy} and {deploy}/unit.service")]
+    assert lint_tickets(tasks, _TREE, [], "graphs", reach_allow=[deploy + "/"]) == []
+
+
+def test_an_allowed_prefix_never_excuses_a_corpus_hit(tmp_path):
+    tasks = [_task(body=f"read {tmp_path / 'deploy' / 'ledger.jsonl'}")]
+    problems = lint_tickets(tasks, _TREE, [], "graphs", reach_allow=[str(tmp_path)])
+    assert [p.detail.endswith("out of the build seat's reach") for p in problems] == [True]
+
+
+def test_idea_prose_naming_a_path_outside_the_repo_is_one_reach_problem_for_task_idea(tmp_path):
+    outside = tmp_path / "deploy" / "unit.service"
+    problems = idea_reach_problems(f"ship the unit to {outside}.", _TREE, "graphs")
+    assert [(p.task, p.rule) for p in problems] == [("idea", "reach")]
+
+
+def test_idea_prose_naming_a_path_under_an_allowed_prefix_gives_no_problem(tmp_path):
+    outside = tmp_path / "deploy" / "unit.service"
+    assert idea_reach_problems(f"ship the unit to {outside}", _TREE, "graphs", [str(tmp_path / "deploy")]) == []
+
+
+def test_idea_prose_with_only_notation_gives_no_problem():
+    idea = "cartridges 1.0 / graphs 1.0 and the record under `runs/<run>/tasks/<task>.json`"
+    assert idea_reach_problems(idea, _TREE, "graphs") == []
