@@ -49,6 +49,7 @@ def _move(ctx, item, monkeypatch, events):
         return True, "stub arm"
 
     monkeypatch.setattr(epic, "auto_apply", arm)
+    monkeypatch.setattr(epic, "_unkept_work", lambda *_: None)  # these tests are about write order, not the kept-branch gate
     state = epic._Execution(landed={}, merged={}, moved={}, quarantined=[])
     move = {"kind": "state_move", "target": "t1"}
     result = epic._execute(ctx, move, slot="state_move", subject="t1", phase="p1", state=state, by_id={"t1": item})

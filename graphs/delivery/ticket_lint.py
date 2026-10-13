@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["Problem", "lint_tickets"]
+__all__ = ["Problem", "idea_reach_problems", "lint_tickets"]
 
 _REFUSAL_RULES = frozenset({"reach", "coupling", "contract"})
 _ROOTED_PREFIXES = ("~/", "/")
@@ -121,7 +121,37 @@ def _inside_by_suffix(path: str, known_paths: set[str]) -> bool:
     return any(path.endswith("/" + known) for known in known_paths if known)
 
 
-def _reach_problems(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[str, Any]], repo: str) -> list[Problem]:
+def _under_allowed(path: str, reach_allow: Sequence[str]) -> bool:
+    """True if `path` is an allowed prefix or lies below one. The match is on the
+    separator, so `/srv/deploy` does not admit `/srv/deploy-other/x`."""
+    roots = [prefix.rstrip("/") for prefix in reach_allow]
+    return any(root and (path == root or path.startswith(root + "/")) for root in roots)
+
+
+def _outside_problems(
+    task_id: str,
+    candidates: Sequence[str],
+    known_paths: set[str],
+    repo: str,
+    reach_allow: Sequence[str],
+    skip: Sequence[str],
+) -> list[Problem]:
+    return [
+        Problem(task_id, "reach", f"names {path}, not inside {repo}", "move the artifact into the repository or drop the reference")
+        for path in candidates
+        if path not in known_paths
+        and path not in skip
+        and not _inside_by_suffix(path, known_paths)
+        and not _under_allowed(path, reach_allow)
+    ]
+
+
+def _reach_problems(
+    tasks: Sequence[Mapping[str, Any]],
+    tree: Sequence[Mapping[str, Any]],
+    repo: str,
+    reach_allow: Sequence[str] = (),
+) -> list[Problem]:
     known_paths = {str(row.get("path")) for row in tree}
     problems: list[Problem] = []
     for task in tasks:
@@ -131,11 +161,22 @@ def _reach_problems(tasks: Sequence[Mapping[str, Any]], tree: Sequence[Mapping[s
             for path in corpus_hits
         )
         problems.extend(
-            Problem(str(task["id"]), "reach", f"names {path}, not inside {repo}", "move the artifact into the repository or drop the reference")
-            for path in _reach_candidates(task)
-            if path not in known_paths and path not in corpus_hits and not _inside_by_suffix(path, known_paths)
+            _outside_problems(str(task["id"]), _reach_candidates(task), known_paths, repo, reach_allow, corpus_hits)
         )
     return problems
+
+
+def idea_reach_problems(
+    idea: str,
+    tree: Sequence[Mapping[str, Any]],
+    repo: str,
+    reach_allow: Sequence[str] = (),
+) -> list[Problem]:
+    """Reach problems for the rooted tokens in idea prose, under the ticket rule's
+    rooted, notation, in-tree-suffix and allow tests. The corpus denylist is a ticket rule and is not applied here."""
+    known_paths = {str(row.get("path")) for row in tree}
+    candidates = list(dict.fromkeys(t.strip("`,.()") for t in _tokens(idea) if _looks_rooted(t)))
+    return _outside_problems("idea", candidates, known_paths, repo, reach_allow, ())
 
 
 def _owner_of(path: str) -> str | None:
@@ -341,10 +382,12 @@ def lint_tickets(
     tree: Sequence[Mapping[str, Any]],
     grants: Sequence[str],
     repo: str,
+    *,
+    reach_allow: Sequence[str] = (),
 ) -> list[Problem]:
     fixed_tasks = list(tasks)
     return [
-        *_reach_problems(fixed_tasks, tree, repo),
+        *_reach_problems(fixed_tasks, tree, repo, reach_allow),
         *_coupling_problems(fixed_tasks, tree),
         *_grant_problems(fixed_tasks, grants),
         *_size_problems(fixed_tasks),

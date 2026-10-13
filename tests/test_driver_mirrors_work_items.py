@@ -105,6 +105,7 @@ def test_file_times_omits_items_with_no_readable_file(tmp_path):
 
 def _moved(ctx, items, applied, monkeypatch):
     monkeypatch.setattr(epic, "auto_apply", lambda item, **_: (applied, "stub arm"))
+    monkeypatch.setattr(epic, "_unkept_work", lambda *_: None)  # the row write is under test, not the kept-branch gate
     ctx.epoch, ctx.cartridge, ctx.runner = None, {}, None
     state = epic._Execution(landed={}, merged={}, moved={}, quarantined=[])
     by_id = {i["id"]: i for i in items}
