@@ -1378,3 +1378,79 @@ def test_no_runs_dir_writes_no_ledger_and_no_size_step_writes_no_size_lines(cart
     )
     initiative = next(p for p in result["proposals"] if p["target"] == "initiative")
     assert "size" not in yaml.safe_load(initiative["suggested_action"].split("---\n")[1])
+
+
+def _deploy_script(tmp_path) -> str:
+    return str(tmp_path / "deploy" / "release.sh")
+
+
+def _decompose_naming(path: str) -> dict:
+    task = {"id": "t1", "phase": "p1", "title": "a", "body": f"run {path} once", "needs": [], "surfaces": []}
+    return {**DECOMPOSITION, "tasks": [task]}
+
+
+def test_an_idea_naming_a_path_outside_the_repo_is_refused_before_any_model_call(cart, tmp_path) -> None:
+    runner = ScriptedRunner({"decompose": DECOMPOSITION})
+    idea = f"ship it with {_deploy_script(tmp_path)}"
+    with pytest.raises(initiative_decompose.LintRefusal) as caught:
+        initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": idea}, runner)
+    assert str(caught.value).startswith("lint-refused: idea reach")
+    assert runner.calls == []
+
+
+def test_an_intake_reach_allow_prefix_lets_the_idea_reach_decompose_and_admits_a_ticket_under_it(cart, tmp_path) -> None:
+    script = _deploy_script(tmp_path)
+    intake = {"id": "i", "title": "t", "body": "b", "checks": [], "frontmatter": {"reach_allow": [str(tmp_path / "deploy")]}}
+    runner = ScriptedRunner({"decompose": _decompose_naming(script)})
+    result = initiative_decompose.run(
+        {"run_id": "r", "date": "d", "cartridge": cart, "idea": f"ship it with {script}", "intake": intake}, runner
+    )
+    assert [c["role"] for c in runner.calls] == ["decompose"]
+    assert any(p["target"] == "t1" for p in result["proposals"])
+
+
+def test_an_idea_whose_only_rooted_path_is_its_frontmatter_repo_line_is_not_refused(cart, tmp_path) -> None:
+    idea = f"---\nrepo: {tmp_path / 'checkout'}\n---\nadd a retry to the parser"
+    runner = ScriptedRunner({"decompose": DECOMPOSITION})
+    initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": idea}, runner)
+    assert [c["role"] for c in runner.calls] == ["decompose"]
+
+
+def test_the_ideas_own_frontmatter_reach_allow_applies_when_no_intake_is_given(cart, tmp_path) -> None:
+    script = _deploy_script(tmp_path)
+    idea = f"---\nreach_allow:\n  - {tmp_path / 'deploy'}\n---\nship it with {script}"
+    runner = ScriptedRunner({"decompose": _decompose_naming(script)})
+    initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": idea}, runner)
+    assert [c["role"] for c in runner.calls] == ["decompose"]
+
+
+def test_split_frontmatter_returns_the_block_and_a_body_without_it() -> None:
+    block, body = initiative_decompose._split_frontmatter("---\nrepo: r\nreach_allow: [a]\n---\nthe idea\nmore")
+    assert (block, body) == ({"repo": "r", "reach_allow": ["a"]}, "the idea\nmore")
+
+
+def test_split_frontmatter_leaves_text_without_a_closed_block_alone() -> None:
+    assert initiative_decompose._split_frontmatter("plain idea") == ({}, "plain idea")
+    assert initiative_decompose._split_frontmatter("---\nrepo: r\nno close") == ({}, "---\nrepo: r\nno close")
+
+
+def test_split_frontmatter_strips_a_block_that_is_not_a_mapping() -> None:
+    assert initiative_decompose._split_frontmatter("---\n- a\n---\nbody") == ({}, "body")
+
+
+@pytest.mark.parametrize(
+    ("frontmatter", "expected"),
+    [
+        ({"reach_allow": ["a", "b"]}, ["a", "b"]),
+        ({"reach_allow": "a"}, []),
+        ({"reach_allow": ["a", 3]}, []),
+        ({}, []),
+    ],
+)
+def test_reach_allow_is_a_list_of_strings_or_empty(frontmatter, expected) -> None:
+    assert initiative_decompose._reach_allow({"intake": {"frontmatter": frontmatter}}, {}) == expected
+
+
+def test_reach_allow_reads_the_ideas_frontmatter_only_without_an_intake() -> None:
+    assert initiative_decompose._reach_allow({}, {"reach_allow": ["a"]}) == ["a"]
+    assert initiative_decompose._reach_allow({"intake": {"frontmatter": {}}}, {"reach_allow": ["a"]}) == []
