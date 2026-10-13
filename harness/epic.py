@@ -1199,6 +1199,8 @@ def run_epic(
             if record["status"] == "complete":
                 complete.add(phase)
 
+        # A pause too: tasks approved before it can have lost their branch. The audit calls no model.
+        _audit_approved_kept(ctx, {str(i["id"]): i for i in items}, tasks, quarantined)
         result = _build_result(
             run_id=run_id, date=date, initiative_id=ctx.initiative_id, phases=phases, tasks=tasks,
             quarantined=quarantined, proposals=proposals, stacks_rebased=stacks_rebased,
@@ -1255,6 +1257,7 @@ def _quarantine_task(
     detail: str | None = None,
     result: Mapping[str, Any] | None = None,
     cause: tuple[str, str] | None = None,
+    approved_is_open: bool = False,
 ) -> dict[str, Any]:
     """Build a task's quarantine entry AND leave a record on its own work item.
 
@@ -1291,6 +1294,8 @@ def _quarantine_task(
 
     `cause`, a (cause, cause_why) the caller already knows, replaces that judgment.
     `rescue_task` passes it for `rescue_failed`, whose cause a rule fixed.
+
+    `approved_is_open` lets the store row leave `approved`: the end-of-run audit quarantines a task already moved there.
     """
     stale = _fenced(ctx)
     if stale is not None:
@@ -1330,7 +1335,7 @@ def _quarantine_task(
         ctx.retry.write(attempt, _END_WRITE_WINDOW_S)
         _record_task_cause(ctx, phase, task, cause, cause_why)
     # A merge conflict leaves the row at approved with its work unlanded; approved is not always finished.
-    _quarantine_row(ctx, phase, task, approved_is_open=judged == ("harness", "merge conflict"))
+    _quarantine_row(ctx, phase, task, approved_is_open=approved_is_open or judged == ("harness", "merge conflict"))
     return entry
 
 
@@ -3041,6 +3046,92 @@ def _unkept_work(ctx: _Ctx, phase: str, subject: str, state: _Execution) -> str 
         escalated=escalated,
         ahead=_branch_ahead(ctx, branch),
     )
+
+
+@dataclass(frozen=True)
+class BranchFacts:
+    """What git says at the end of a run about the branch an approved task's work should be on.
+
+    `holds_merge` is whether the task's draft tip is an ancestor of the phase branch; True for a task that never merged.
+    """
+
+    branch: str
+    draft: str | None
+    exists: bool
+    holds_merge: bool
+    ahead: bool
+
+
+def end_of_run_refusal(facts: BranchFacts, *, merged: bool) -> str | None:
+    """None when an approved task's work is still on its branch, else why not.
+
+    A merged task's phase branch must exist and hold its draft's tip: being ahead of the default ref is not enough,
+    since a recreated or stacked phase branch is ahead on a sibling's or a parent's commits.
+    A task that never merged is the escalated one: its draft branch is the kept work, not the phase branch.
+    """
+    if not facts.exists:
+        return f"branch {facts.branch} no longer exists"
+    if merged and not facts.holds_merge:
+        return f"branch {facts.branch} no longer contains the merge of {facts.draft}"
+    if merged:
+        return kept_work_refusal(landed=True, merged=True, escalated=False, ahead=facts.ahead)
+    return kept_work_refusal(landed=True, merged=None, escalated=True, ahead=facts.ahead)
+
+
+def _holds(ctx: _Ctx, commit_branch: str | None, branch: str) -> bool:
+    """True when `commit_branch`'s tip is an ancestor of `branch`. A missing branch on either side is False."""
+    if not commit_branch:
+        return False
+    ok, _ = _git(
+        "-C", str(ctx.repo), "merge-base", "--is-ancestor", f"refs/heads/{commit_branch}", f"refs/heads/{branch}"
+    )
+    return ok
+
+
+def _gather_branch_facts(ctx: _Ctx, records: Sequence[Mapping[str, Any]]) -> dict[str, BranchFacts]:
+    """Per task id, the git facts `end_of_run_refusal` judges. The only part of the audit that reads git."""
+    facts: dict[str, BranchFacts] = {}
+    for record in records:
+        task = str(record["id"])
+        merged = bool(record.get("merged"))
+        draft = record.get("draft")
+        branch = ctx.phase_branch(str(record["phase"])) if merged else ctx.scratch_branch(task)
+        facts[task] = BranchFacts(
+            branch=branch,
+            draft=draft,
+            exists=_branch_exists(ctx, branch),
+            holds_merge=_holds(ctx, draft, branch) if merged else True,
+            ahead=_branch_ahead(ctx, branch),
+        )
+    return facts
+
+
+def _audit_approved_kept(
+    ctx: _Ctx, by_id: Mapping[str, dict[str, Any]], tasks: Sequence[dict[str, Any]], quarantined: list[dict[str, Any]]
+) -> None:
+    """Quarantine each task this run moved to approved whose work is no longer on a branch. Never recovers it."""
+    approved = [t for t in tasks if t.get("state") == "approved" and not t.get("quarantine")]
+    facts = _gather_branch_facts(ctx, approved)
+    for record in approved:
+        why = end_of_run_refusal(facts[str(record["id"])], merged=bool(record.get("merged")))
+        if why is None:
+            continue
+        # `no_work`, not `infra`: `infra` marks a patch as kept, and the branch that kept it is what went missing.
+        entry = _quarantine_task(
+            ctx,
+            by_id,
+            phase=str(record["phase"]),
+            task=str(record["id"]),
+            reason=f"work not on a surviving branch at the end of the run: {why}",
+            kind="no_work",
+            cause=("harness", "work not on a surviving branch"),
+            approved_is_open=True,
+        )
+        quarantined.append(entry)
+        record.update(
+            status="quarantined", state="quarantined", quarantine=entry["reason"], reason=entry["reason"],
+            outcome="harness_fault",
+        )
 
 
 def _execute(
