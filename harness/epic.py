@@ -82,6 +82,7 @@ from harness.checks import (
     repo_checks,
     run_checks,
 )
+from harness.cos import pid_alive
 from harness.courier_adapter import send as send_to_courier
 from harness.digest import build_digest
 from harness.escalate import escalate_self_modification, touched_paths
@@ -99,6 +100,7 @@ from harness.worktree import (
     keep_worktree,
     link_venv,
     prune_registrations,
+    release_stale_holders,
     remove_worktree,
 )
 from runner.claude_code_runner import files_touched_from_patch
@@ -470,8 +472,27 @@ def _branch_exists(ctx: _Ctx, branch: str) -> bool:
     return ok
 
 
-def _open_phase_worktree(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str, bool]:
-    """Get a worktree on the phase branch. Returns (ok, detail, reused).
+class _Opened(tuple):
+    """`(ok, detail, reused)`, with the worktree paths cleared on the way in as `.cleared`.
+
+    A tuple subclass so every caller and test that unpacks the triple keeps working.
+    """
+
+    cleared: tuple[str, ...]
+
+    def __new__(cls, ok: bool, detail: str, reused: bool, cleared: Sequence[Path] = ()) -> _Opened:
+        opened = super().__new__(cls, (ok, detail, reused))
+        opened.cleared = tuple(str(path) for path in cleared)
+        return opened
+
+
+def _run_alive(ctx: _Ctx) -> Callable[[str], bool]:
+    """A run is alive when it is this one, or its `<run_id>.pid` names a running process."""
+    return lambda run_id: run_id == ctx.run_id or pid_alive(ctx.runs_dir / f"{run_id}.pid")
+
+
+def _open_phase_worktree(ctx: _Ctx, phase: str, base_ref: str) -> _Opened:
+    """Get a worktree on the phase branch. Returns (ok, detail, reused), with `.cleared` on the result.
 
     Re-entrancy is the point: a second driver run over the same initiative
     builds on the branch the first one left, rather than starting a parallel
@@ -480,16 +501,20 @@ def _open_phase_worktree(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, st
     Prunes stale `git worktree` registrations first: a crashed prior run can
     leave a phantom entry pointing at a directory that is already gone, and
     that phantom is what blocked `tools-chair-rename-18` on 2026-09-08.
+
+    A dead run can also leave its worktree in place holding the branch, so a
+    reused branch first releases the holders whose run is no longer alive.
     """
     prune_registrations(ctx.repo)
     branch = ctx.phase_branch(phase)
     worktree = ctx.phase_worktree(phase)
     worktree.parent.mkdir(parents=True, exist_ok=True)
     if _branch_exists(ctx, branch):
+        cleared = release_stale_holders(ctx.repo, branch, ctx.worktree_root, _run_alive(ctx))
         ok, detail = _git("-C", str(ctx.repo), "worktree", "add", str(worktree), branch)
-        return ok, detail, True
+        return _Opened(ok, detail, True, cleared)
     ok, detail = create_worktree(ctx.repo, worktree, branch=branch, base=base_ref)
-    return ok, detail, False
+    return _Opened(ok, detail, False)
 
 
 def _parent_head_moved(ctx: _Ctx, phase: str, base_ref: str) -> bool:
@@ -1906,6 +1931,7 @@ def _run_phase(
         "task_records": [],
         "quarantined": quarantined,
         "batch": [],
+        "cleared_worktrees": [],
     }
 
     # A stale leader opens no branch and builds nothing.
@@ -1913,7 +1939,9 @@ def _run_phase(
     if stale_start:
         return _stale_phase(record, stale_start)
 
-    ok, detail, reused = _open_phase_worktree(ctx, phase, base_ref)
+    opened = _open_phase_worktree(ctx, phase, base_ref)
+    ok, detail, reused = opened
+    record["cleared_worktrees"] = list(getattr(opened, "cleared", ()))
     if not ok:
         record["status"] = "blocked"
         record["reason"] = f"the phase worktree could not be created: {detail}"
@@ -1986,7 +2014,9 @@ def _run_phase(
         _git("-C", str(ctx.phase_worktree(phase)), "checkout", "--detach", "-q")
         _git("-C", str(ctx.repo), "worktree", "remove", "--force", str(ctx.phase_worktree(phase)))
         _git("-C", str(ctx.repo), "branch", "-D", branch)
-        ok, detail, reused = _open_phase_worktree(ctx, phase, base_ref)
+        reopened = _open_phase_worktree(ctx, phase, base_ref)
+        ok, detail, reused = reopened
+        record["cleared_worktrees"] = [*record["cleared_worktrees"], *getattr(reopened, "cleared", ())]
         if not ok:
             record["status"] = "blocked"
             record["reason"] = f"the phase worktree could not be recreated: {detail}"
