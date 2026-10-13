@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 __all__ = [
@@ -13,7 +14,9 @@ __all__ = [
     "link_venv",
     "normalise_patch",
     "prune_registrations",
+    "release_stale_holders",
     "remove_worktree",
+    "stale_holders",
 ]
 
 _TRAILING_MARKERS = ("</patch>", "</diff>", "</code>", "```")
@@ -177,6 +180,39 @@ def remove_worktree(repo: Path, worktree: Path) -> tuple[bool, str]:
     prune_ok, prune_detail = prune_registrations(repo)
     combined = f"{detail}\n{prune_detail}".strip() if prune_detail else detail
     return (not worktree.exists()) and prune_ok, combined
+
+
+def stale_holders(porcelain: str, branch: str, worktree_root: Path, alive: Callable[[str], bool]) -> list[Path]:
+    """Paths under `<worktree_root>/<run_id>/<phase>` holding `branch` whose run_id fails `alive`; outside-root holders never."""
+    ref = f"refs/heads/{branch}"
+    records = [
+        dict(line.split(" ", 1) for line in record.splitlines() if " " in line)
+        for record in porcelain.split("\n\n")
+    ]
+    held = [Path(r["worktree"]) for r in records if r.get("branch") == ref and "worktree" in r]
+    return [
+        path
+        for path in held
+        if path.is_relative_to(worktree_root)
+        and path != worktree_root
+        and not alive(path.relative_to(worktree_root).parts[0])
+    ]
+
+
+def release_stale_holders(repo: Path, branch: str, worktree_root: Path, alive: Callable[[str], bool]) -> list[Path]:
+    """Remove every worktree `stale_holders` finds for `branch`; the branch itself is kept. Returns the removed paths."""
+    listing = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    if listing.returncode != 0:
+        return []
+    return [
+        path
+        for path in stale_holders(listing.stdout, branch, worktree_root, alive)
+        if remove_worktree(repo, path)[0]
+    ]
 
 
 def keep_worktree(repo: Path, worktree: Path, worktree_root: Path, run_id: str) -> tuple[bool, str]:
