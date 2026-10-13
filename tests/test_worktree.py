@@ -5,7 +5,14 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from harness.worktree import apply_patch, keep_worktree, normalise_patch, remove_worktree
+from harness.worktree import (
+    apply_patch,
+    keep_worktree,
+    normalise_patch,
+    release_stale_holders,
+    remove_worktree,
+    stale_holders,
+)
 
 
 def _worktree_paths(repo: Path) -> list[str]:
@@ -210,3 +217,42 @@ def test_markup_only_output_is_refused_not_applied_as_empty(tmp_path: Path) -> N
     ok, detail = apply_patch("</patch>\n", tmp_path / "wt")
     assert ok is False and "markup only" in detail
     assert not (tmp_path / "wt" / ".git").exists() or not any((tmp_path / "wt").glob("*.py")), "git never applied anything"
+
+
+_ROOT = Path("/w/worktrees")
+_PORCELAIN = (
+    "worktree /w/main\nHEAD aaa\nbranch refs/heads/epic/i/p1\n\n"
+    f"worktree {_ROOT}/run-dead/p1\nHEAD bbb\nbranch refs/heads/epic/i/p1\n\n"
+    f"worktree {_ROOT}/run-live/p1\nHEAD ccc\nbranch refs/heads/epic/i/p1\n\n"
+    f"worktree {_ROOT}/run-dead/p2\nHEAD ddd\nbranch refs/heads/epic/i/p2\n\n"
+    f"worktree {_ROOT}-other/run-dead/p1\nHEAD eee\nbranch refs/heads/epic/i/p1\n\n"
+    f"worktree {_ROOT}/run-dead/p3\nHEAD fff\ndetached\n"
+)
+
+
+def test_stale_holders_returns_only_the_dead_run_under_the_root_on_the_branch() -> None:
+    found = stale_holders(_PORCELAIN, "epic/i/p1", _ROOT, lambda run: run == "run-live")
+    assert found == [_ROOT / "run-dead" / "p1"]
+
+
+def test_stale_holders_returns_nothing_when_every_run_is_alive() -> None:
+    assert stale_holders(_PORCELAIN, "epic/i/p1", _ROOT, lambda run: True) == []
+
+
+def test_release_stale_holders_removes_the_directory_keeps_the_branch_and_frees_it(tmp_path: Path) -> None:
+    repo, worktree = _repo_with_worktree(tmp_path)
+    tip = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "feature"], capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    released = release_stale_holders(repo, "feature", tmp_path / "worktrees", lambda run: False)
+    assert released == [worktree]
+    assert not worktree.exists()
+    kept = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "feature"], capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert kept == tip
+    again = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", str(tmp_path / "elsewhere"), "feature"],
+        capture_output=True, text=True,
+    )
+    assert again.returncode == 0, again.stderr
