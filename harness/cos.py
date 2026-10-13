@@ -77,7 +77,7 @@ _KNOWN_GRAPHS = ("retro", "decompose", "triage", "sweep", "triage-quarantine")
 _DEFAULT_MAX_IN_FLIGHT = 3
 
 
-def _pid_alive(pid_file: Path) -> bool:
+def pid_alive(pid_file: Path) -> bool:
     """Is the process a pidfile names still running? Bad content reads as dead.
 
     `PermissionError` means the process exists but belongs to someone else —
@@ -101,6 +101,9 @@ def _pid_alive(pid_file: Path) -> bool:
     except PermissionError:
         return True
     return True
+
+
+_pid_alive = pid_alive  # the private name cos.py and its tests used before the epic driver shared the check
 
 
 def _max_in_flight(cartridge: Mapping[str, Any] | None) -> int:
@@ -252,7 +255,7 @@ def assemble_docket(
     max_in_flight = _max_in_flight(cartridge)
     in_flight = (
         sorted(
-            ({"run_id": pid_file.stem, "alive": _pid_alive(pid_file)} for pid_file in Path(runs_dir).glob("*.pid")),
+            ({"run_id": pid_file.stem, "alive": pid_alive(pid_file)} for pid_file in Path(runs_dir).glob("*.pid")),
             key=lambda row: row["run_id"],
         )
         if runs_dir is not None
