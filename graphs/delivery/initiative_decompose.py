@@ -36,7 +36,7 @@ from graphs.delivery.decompose_size import (
     single_ticket_initiative,
 )
 from graphs.delivery.phase_split import split_same_phase_needs
-from graphs.delivery.ticket_lint import Problem, lint_tickets
+from graphs.delivery.ticket_lint import Problem, idea_reach_problems, lint_tickets
 from runner.decision_log import RouterDecision
 from runner.decision_source import DecisionSource, NoDecisionSource, ask
 from runner.protocol import NodeRunner
@@ -373,6 +373,34 @@ def _refusal_reason(refusals: Sequence[Problem]) -> str:
     return heading + "\n" + (_lint_refusal_text(refusals) or "")
 
 
+def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """The leading `---` block of `text` as a mapping, and the text after it.
+
+    No opening line, or no closing line, is no block: `({}, text)`. A block that is not
+    YAML, or not a mapping, still comes off the body and gives `{}`."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    close = next((i for i, line in enumerate(lines) if i and line.strip() == "---"), None)
+    if close is None:
+        return {}, text
+    try:
+        loaded = yaml.safe_load("\n".join(lines[1:close]))
+    except yaml.YAMLError:
+        loaded = None
+    return (loaded if isinstance(loaded, dict) else {}), "\n".join(lines[close + 1 :])
+
+
+def _reach_allow(args: Mapping[str, Any], idea_frontmatter: Mapping[str, Any]) -> list[str]:
+    """`reach_allow` from the intake's frontmatter when an intake is given, else the idea's own.
+
+    Anything other than a list of strings is an empty allow-list."""
+    intake = args.get("intake")
+    source = intake.get("frontmatter") if isinstance(intake, Mapping) else idea_frontmatter
+    value = source.get("reach_allow") if isinstance(source, Mapping) else None
+    return list(value) if isinstance(value, list) and all(isinstance(item, str) for item in value) else []
+
+
 def _apply_surface_resolutions(tasks: list[dict[str, Any]], tree: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """New task dicts; each task's surfaces resolved against tree. The caller's tasks are untouched.
 
@@ -695,6 +723,17 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
 
     task_ids = str(args.get("task_ids") or "slug")
     grants = list(args.get("grants") or [])
+    tree = list(args.get("tree") or [])
+    repo_name = str(args.get("repo") or "")
+
+    # A path the idea itself puts outside the repo is refused here, before any model call.
+    idea_frontmatter, idea_body = _split_frontmatter(str(idea))
+    reach_allow = _reach_allow(args, idea_frontmatter)
+    # An empty allow-list is lint_tickets' own default, so it is left unpassed.
+    allow_kwargs = {"reach_allow": reach_allow} if reach_allow else {}
+    idea_problems = idea_reach_problems(idea_body, tree, repo_name, reach_allow)
+    if idea_problems:
+        raise LintRefusal(_refusal_reason(idea_problems))
 
     decompose_hints = Hints(judgment="high")
     decompose_prompt = (
@@ -801,7 +840,6 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             "ever become ready: " + "; ".join(cycles)
         )
 
-    tree = list(args.get("tree") or [])
     if tree:
         tasks, surface_failures = _validate_plan_surfaces(tasks, tree)
         if surface_failures:
@@ -834,8 +872,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 raise ContractViolation(surface_problem(problems))
         tasks = _split_cross_repo(_apply_surface_resolutions(tasks, tree), tree)
 
-    repo_name = str(args.get("repo") or "")
-    lint_problems = lint_tickets(tasks, tree, grants, repo_name)
+    lint_problems = lint_tickets(tasks, tree, grants, repo_name, **allow_kwargs)
     rewrite = [p for p in lint_problems if p.rule in _REWRITE_RULES]
     if rewrite and single is not None:
         # The single ticket came from the intake, not from decompose; a decompose
@@ -875,7 +912,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
             if problems:
                 raise ContractViolation(surface_problem(problems))
             tasks = _split_cross_repo(_apply_surface_resolutions(tasks, tree), tree)
-        lint_problems = lint_tickets(tasks, tree, grants, repo_name)
+        lint_problems = lint_tickets(tasks, tree, grants, repo_name, **allow_kwargs)
         # Only the rewrite rules quarantine here; reach, coupling and contract
         # fall through to the adversary round below.
         still = [p for p in lint_problems if p.rule in _REWRITE_RULES]
@@ -930,7 +967,7 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
                 "the corrected graph contains a dependency cycle, so nothing in it could "
                 "ever become ready: " + "; ".join(cycles)
             )
-        lint_problems = lint_tickets(tasks, tree, grants, repo_name)
+        lint_problems = lint_tickets(tasks, tree, grants, repo_name, **allow_kwargs)
         refusals = [p for p in lint_problems if _is_refusal(p)]
         if refusals:
             raise LintRefusal(_refusal_reason(refusals))
