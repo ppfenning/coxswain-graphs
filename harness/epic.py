@@ -470,12 +470,6 @@ def _branch_exists(ctx: _Ctx, branch: str) -> bool:
     return ok
 
 
-def _branch_ahead(ctx: _Ctx, branch: str) -> bool:
-    """True when `branch` holds commits the default ref lacks. A missing branch is not ahead."""
-    ok, out = _git("-C", str(ctx.repo), "rev-list", "--count", f"{ctx.default_ref}..refs/heads/{branch}")
-    return ok and out.isdigit() and int(out) > 0
-
-
 def _open_phase_worktree(ctx: _Ctx, phase: str, base_ref: str) -> tuple[bool, str, bool]:
     """Get a worktree on the phase branch. Returns (ok, detail, reused).
 
@@ -2512,7 +2506,7 @@ def _run_phase(
     decisions, human_minutes = gate(gated, assume=ctx.assume)
     decided = {id(item): (decision, edited) for item, decision, edited in decisions}
 
-    state = _Execution(landed={}, merged={}, moved={}, quarantined=quarantined, escalated=frozenset(escalated))
+    state = _Execution(landed={}, merged={}, moved={}, quarantined=quarantined)
     diffs: list[dict[str, Any]] = []
 
     for item in batch:
@@ -3006,41 +3000,6 @@ class _Execution:
     moved: dict[str, bool]
     quarantined: list[dict[str, Any]]
     review_pr: dict[str, str] = field(default_factory=dict)
-    escalated: frozenset[str] = frozenset()
-
-
-def kept_work_refusal(landed: bool, merged: bool | None, escalated: bool, ahead: bool) -> str | None:
-    """None when the task's work is on a branch that survives the run, else which part of that failed.
-
-    An escalated task never merges: its draft branch is the kept work. `merged` is None when no merge ran.
-    """
-    if escalated:
-        if not landed:
-            return "the draft branch was not created"
-        if not ahead:
-            return "the draft branch has no commits the default ref lacks"
-        return None
-    if not landed:
-        return "the draft did not land"
-    if merged is None:
-        return "the merge into the phase branch was not attempted"
-    if not merged:
-        return "the merge into the phase branch was refused or conflicted"
-    if not ahead:
-        return "the merge added nothing to the phase branch"
-    return None
-
-
-def _unkept_work(ctx: _Ctx, phase: str, subject: str, state: _Execution) -> str | None:
-    """Read what happened to the task's draft and merge, and report why its work is not kept, if it is not."""
-    escalated = subject in state.escalated
-    branch = ctx.scratch_branch(subject) if escalated else ctx.phase_branch(phase)
-    return kept_work_refusal(
-        landed=_branch_exists(ctx, branch) if escalated else bool(state.landed.get(subject)),
-        merged=state.merged.get(subject),
-        escalated=escalated,
-        ahead=_branch_ahead(ctx, branch),
-    )
 
 
 def _execute(
@@ -3153,24 +3112,6 @@ def _execute(
     # already reviewed, adversaried and arbitrated; a `RunnerError` here is the
     # arm's own infrastructure failing, not the task, so it quarantines the
     # task as `infra` and lets the phase continue rather than crashing `run_epic`.
-    if slot == "state_move":
-        # Before any store or apply-arm write: `approved` is only true of work on a branch that survives the run.
-        why = _unkept_work(ctx, phase, subject, state)
-        if why is not None:
-            state.moved[subject] = False
-            if not any(q.get("id") == subject and q.get("grain") == "task" for q in state.quarantined):
-                state.quarantined.append(
-                    _quarantine_task(
-                        ctx,
-                        by_id,
-                        phase=phase,
-                        task=subject,
-                        reason=f"work not on a surviving branch: {why}",
-                        kind="infra",
-                        cause=("harness", "work not on a surviving branch"),
-                    )
-                )
-            return False, why
     if slot == "state_move" and _store_authoritative(ctx) and by_id.get(subject) is not None:
         # The store's acceptance is the move. The file is a cache, so no arm runs; the driver writes its line.
         refused = _store_first(ctx, by_id[subject], "approved")
@@ -3342,8 +3283,7 @@ def _rescue_move(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, evidence: li
         ctx,
         cartridge={**ctx.cartridge, "write_kinds": {**kinds, "state_move": {**(kinds.get("state_move") or {}), "apply_arm": "workstore"}}},
     )
-    # A rescue lands no draft and merges nothing: its kept work is the `agents/<run>/<task>` branch `_land_branch` made.
-    state = _Execution(landed={}, merged={}, moved={}, quarantined=[], escalated=frozenset({task}))
+    state = _Execution(landed={}, merged={}, moved={}, quarantined=[])
     applied, detail = (
         _execute(code_arm, move, slot="state_move", subject=task, phase=phase, state=state, by_id={task: dict(item)})
         if decision == "approved"
