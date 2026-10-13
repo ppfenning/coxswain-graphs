@@ -42,6 +42,7 @@ __all__ = [
     "current_lease",
     "gate_decisions",
     "ledger_rows",
+    "ledger_streak_rows",
     "list_runs",
     "model_row",
     "read_trace",
@@ -230,6 +231,14 @@ def ledger_rows(conn: Connection, run_id: str) -> list[Row]:
     p = conn.dialect.placeholder
     sql = f"{_select(_LEDGER_COLS, 'ledger')} WHERE run_id = {p} ORDER BY epoch, ts, row_hash"
     return [_dict(_LEDGER_COLS, r) for r in conn.query_all(sql, (run_id,))]
+
+
+def ledger_streak_rows(conn: Connection, cartridge_sha: str | None, provider_profile: str) -> list[Row]:
+    """The decoded row_json of every ledger row for one configuration, in epoch, ts order."""
+    p = conn.dialect.placeholder
+    where = f"WHERE cartridge_sha = {p} AND provider_profile = {p}"
+    sql = f"SELECT row_json FROM ledger {where} ORDER BY epoch, ts, row_hash"
+    return [_dict(("row_json",), r)["row_json"] for r in conn.query_all(sql, (cartridge_sha, provider_profile))]
 
 
 def gate_decisions(conn: Connection, run_id: str) -> list[Row]:
