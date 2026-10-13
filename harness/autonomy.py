@@ -4,12 +4,32 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core import ledger
 from core.policy import AUTO, autonomy_policy
 
+if TYPE_CHECKING:
+    from harness.store_write import Store
+
 __all__ = ["split_by_policy"]
+
+
+def _streak_rows(
+    cartridge_sha: str | None, provider_profile: str, ledger_path: Path | str, store: Store | None
+) -> list[dict[str, Any]]:
+    """The ledger rows for one configuration: from the store when given, else from the file."""
+    if store is not None:
+        # Imported here: an eager import loads store_traces for every importer of `harness`,
+        # which breaks `python -m harness.store_traces` with a runpy double-import warning.
+        from harness.store_read import ledger_streak_rows
+
+        return ledger_streak_rows(store.conn, cartridge_sha, provider_profile)
+    return [
+        row
+        for row in ledger.read(ledger_path)
+        if row.get("cartridge_sha") == cartridge_sha and row.get("provider_profile") == provider_profile
+    ]
 
 
 def split_by_policy(
@@ -18,6 +38,7 @@ def split_by_policy(
     cartridge: dict[str, Any],
     ledger_path: Path | str,
     provider_profile: str,
+    store: Store | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Ask the policy which proposals have earned the right to skip the gate.
 
@@ -28,6 +49,9 @@ def split_by_policy(
     call. `model` narrows per item instead, because a batch of proposals can
     carry different bindings; a row recorded under a different model is not
     this item's streak any more than a row from a different cartridge is.
+
+    With a `store`, the rows come from its ledger table and `ledger_path` is not
+    read, so every host sharing the store earns and spends one streak.
 
     Note what an auto-applied proposal does NOT get: a ledger row. The ledger
     records what happened at the gate, and an auto-apply never reached one. If
@@ -56,12 +80,7 @@ def split_by_policy(
     land in one run, which is a question about blast radius, not about which
     entry earned what.
     """
-    rows = [
-        row
-        for row in ledger.read(ledger_path)
-        if row.get("cartridge_sha") == cartridge.get("cartridge_sha")
-        and row.get("provider_profile") == provider_profile
-    ]
+    rows = _streak_rows(cartridge.get("cartridge_sha"), provider_profile, ledger_path, store)
     base = {**(cartridge.get("policy") or {}), "write_kinds": cartridge.get("write_kinds") or {}}
 
     auto: list[dict[str, Any]] = []
