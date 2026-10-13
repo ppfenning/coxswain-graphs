@@ -18,12 +18,15 @@ kept its clean streak until a human happened to refuse something.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from core import ledger
 
-from harness import split_by_policy
+from harness import cli, split_by_policy
 from harness.cli import _default_ledger, _observe_trap_failures
+from harness.epic import _policy_split
+from harness.store_write import Store
 
 SHA = "sha-fixture"
 PROFILE = "anthropic-default"
@@ -361,3 +364,92 @@ def test_the_default_ledger_is_not_inside_the_repo(monkeypatch) -> None:
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     repo_root = Path(__file__).resolve().parent.parent
     assert not _default_ledger().resolve().is_relative_to(repo_root)
+
+
+# ── the callers hand the policy the run's store ────────────────────────────────
+
+
+def _row(i: int) -> dict:
+    return {
+        "run_id": f"store-r{i}",
+        "ts": "2026-08-30T00:00:00Z",
+        "principal": GRAPH,
+        "kind": "doc_update",
+        "risk": "low",
+        "outcome": "clean",
+        "cartridge_sha": SHA,
+        "provider_profile": PROFILE,
+    }
+
+
+def _epic_ctx(cart, path, store):
+    """The fields of the epic driver's `_Ctx` its policy step reads."""
+    return SimpleNamespace(cartridge=cart, ledger_path=path, provider_profile=PROFILE, store=store)
+
+
+def test_the_epic_policy_step_spends_the_streak_the_store_earned(cart, tmp_path, store_conn) -> None:
+    """A lane host whose own file holds no rows still auto-applies a kind the shared table graduated."""
+    store = Store(store_conn)
+    for i in range(3):
+        store.record_ledger(_row(i))
+    path = tmp_path / "host.jsonl"
+    ledger.append([], path)
+
+    auto, gated = _policy_split(_epic_ctx(cart, path, store), [proposal()])
+    assert len(auto) == 1 and gated == []
+
+
+def test_the_epic_policy_step_without_a_store_is_gated_on_an_empty_host_file(cart, tmp_path) -> None:
+    path = tmp_path / "host.jsonl"
+    ledger.append([], path)
+
+    auto, gated = _policy_split(_epic_ctx(cart, path, None), [proposal()])
+    assert auto == [] and len(gated) == 1
+
+
+@pytest.mark.parametrize("with_store", [True, False])
+def test_the_single_graph_run_passes_its_store_to_the_policy(tmp_path, monkeypatch, with_store) -> None:
+    from harness.store_migrate import open_store
+    from runner.scripted import ScriptedRunner
+
+    seen: list = []
+
+    def spy(proposals, **kw):
+        seen.append(kw.get("store"))
+        return [], list(proposals)
+
+    monkeypatch.setattr(cli, "split_by_policy", spy)
+    conn = open_store(f"sqlite:///{tmp_path}/single.db", "2026-09-25T00:00:00+00:00") if with_store else None
+    store = Store(conn) if conn is not None else None
+    profile = tmp_path / "profile.yaml"
+    profile.write_text("provider: test\n", encoding="utf-8")
+    gated = {**proposal(kind="comment_add"), "target": "docs/x.md"}
+    spec = SimpleNamespace(
+        name="review-diff", graph_name="review-diff", needs=(), run=lambda graph_args, runner: {"proposals": [gated]}
+    )
+    args = SimpleNamespace(
+        graph="review-diff",
+        date="2026-09-25",
+        runs_dir=tmp_path / "runs",
+        ledger=tmp_path / "ledger.jsonl",
+        provider_profile=str(profile),
+        repo=None,
+        assume="r",
+        result_out=None,
+    )
+    parser = SimpleNamespace(parse_args=lambda argv: args, error=lambda msg: (_ for _ in ()).throw(SystemExit(msg)))
+    try:
+        code = cli._run_graph(
+            specs={"review-diff": spec},
+            parser=parser,
+            args=args,
+            cartridge={"cartridge_sha": SHA, "team": "acme", "overlay_sha": None, "write_kinds": {"comment_add": {"risk": "low", "ramp": "gated"}}},
+            runner=ScriptedRunner({}),
+            run_id="r1",
+            store=store,
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+    assert code == 0
+    assert seen == [store]

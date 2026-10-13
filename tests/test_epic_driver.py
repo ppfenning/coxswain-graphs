@@ -2310,12 +2310,18 @@ def seed(path: Path, kind: str, risk: str, n: int, outcome: str = "clean") -> No
 
 
 def test_a_graduated_merge_auto_applies_and_records_no_ledger_row(repo, cart, tmp_path) -> None:
-    """Autonomy is spent by acting: an auto-apply never reached a gate."""
+    """Autonomy is spent by acting: an auto-apply never reached a gate.
+
+    The run has a store, so the streak the policy reads is the store's; the host file is seeded too and only exported to.
+    """
     path = tmp_path / "ledger.jsonl"
     seed(path, "merge_stack", "high", 3)
     before = len(ledger.read(path))
+    store = Store(open_store("sqlite:///:memory:", datetime.now(UTC).isoformat()))
+    for row in ledger.read(path):
+        store.record_ledger(row)
 
-    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False))
+    result, _ = drive(repo, cart, tmp_path, work=initiative(two_phases=False), store=store)
 
     rows = ledger.read(path)
     assert [row for row in rows[before:] if row["kind"] == "merge_stack"] == [], (

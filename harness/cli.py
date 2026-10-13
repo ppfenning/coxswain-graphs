@@ -1374,8 +1374,9 @@ def _run_graph(
     # Consult the policy BEFORE the human sees anything. Without this the gate
     # asks about every kind forever, no streak is ever spent, and the whole
     # earned-autonomy argument is decoration.
+    # With a store the streaks come from its shared ledger table, so every host earns and spends one streak.
     auto, gated = split_by_policy(
-        proposals, cartridge=cartridge, ledger_path=args.ledger, provider_profile=provider_profile
+        proposals, cartridge=cartridge, ledger_path=args.ledger, provider_profile=provider_profile, store=store
     )
 
     auto_applied: list[dict[str, Any]] = []

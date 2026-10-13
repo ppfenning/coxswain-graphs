@@ -2510,9 +2510,7 @@ def _run_phase(
     record["batch"] = batch
 
     # ── policy, then the gate, then execution in batch order ────────────────
-    auto, gated = split_by_policy(
-        batch, cartridge=ctx.cartridge, ledger_path=ctx.ledger_path, provider_profile=ctx.provider_profile
-    )
+    auto, gated = _policy_split(ctx, batch)
     auto_ids = {id(item) for item in auto}
     decisions, human_minutes = gate(gated, assume=ctx.assume)
     decided = {id(item): (decision, edited) for item, decision, edited in decisions}
@@ -3405,6 +3403,18 @@ def _record_rescue_gate(ctx: _Ctx, phase: str, move: Mapping[str, Any], diff: Ma
         )
 
 
+def _policy_split(ctx: _Ctx, proposals: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The policy split for one gate batch. With a store the streaks come from its ledger table, so a lane host
+    judges a kind by the streak every host shares; the host file is then only an export."""
+    return split_by_policy(
+        proposals,
+        cartridge=ctx.cartridge,
+        ledger_path=ctx.ledger_path,
+        provider_profile=ctx.provider_profile,
+        store=ctx.store,
+    )
+
+
 def _rescue_move(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, evidence: list[dict[str, Any]]) -> tuple[bool, str]:
     """The approved task's `state_move`, through `split_by_policy` and `gate` as a build's is.
 
@@ -3423,9 +3433,7 @@ def _rescue_move(ctx: _Ctx, item: Mapping[str, Any], *, phase: str, evidence: li
         ),
         **state_move_apply(item.get("path"), "approved"),
     }
-    auto, gated = split_by_policy(
-        [move], cartridge=ctx.cartridge, ledger_path=ctx.ledger_path, provider_profile=ctx.provider_profile
-    )
+    auto, gated = _policy_split(ctx, [move])
     decisions, minutes = gate(gated, assume=ctx.assume)
     decision, edited = ("approved", False) if auto else (decisions[0][1], decisions[0][2])
     kinds = ctx.cartridge.get("write_kinds") or {}
