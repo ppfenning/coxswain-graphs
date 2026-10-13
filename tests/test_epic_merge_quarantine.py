@@ -64,6 +64,7 @@ def test_the_approve_then_conflicting_merge_sequence_ends_quarantined(store_conn
     _put(ctx, item, "ready")
     monkeypatch.setattr(epic, "auto_apply", lambda proposal, **_: (Path(item["path"]).write_bytes(APPROVED), (True, "stub"))[1])
     calls = _spy(monkeypatch)
+    monkeypatch.setattr(epic, "_unkept_work", lambda *_: None)  # the approve-then-conflict order is under test, not the gate
     state = epic._Execution(landed={"t1": True}, merged={}, moved={}, quarantined=[])
     by_id = {"t1": item}
     moved = epic._execute(ctx, {"kind": "state_move", "target": "t1"}, slot="state_move", subject="t1", phase="p1", state=state, by_id=by_id)
