@@ -126,6 +126,16 @@ PRINCIPAL = "epic-swarm(lifecycle-propose)"
 # machine with no global git config, needs no setup to run this.
 _IDENTITY = ("-c", "user.email=epic-swarm@invalid", "-c", "user.name=epic-swarm")
 
+# The initiative that ships card-branch mode itself stays off it. The same rule lives in
+# coxswain-tools agent_tools/card_branch.py, because graphs does not import coxswain-tools.
+SHIPPING_INITIATIVE_ID = "builds-on-one-card-branch-and-opens-one-pr-per"
+
+
+def card_mode(initiative_id: str, fresh: bool) -> bool:
+    """True only for a fresh launch of an initiative other than the shipping one."""
+    return fresh and initiative_id != SHIPPING_INITIATIVE_ID
+
+
 _DRAFT_KINDS = frozenset({"draft_pr_create", "self_modification"})
 
 # How much of a task's patch the validators see. All of it for any real task;
@@ -1229,7 +1239,7 @@ def run_epic(
         result = _build_result(
             run_id=run_id, date=date, initiative_id=ctx.initiative_id, phases=phases, tasks=tasks,
             quarantined=quarantined, proposals=proposals, stacks_rebased=stacks_rebased,
-            paused_until=paused_until, repo=repo,
+            paused_until=paused_until, repo=repo, card_branch=card_mode(ctx.initiative_id, resume_from is None),
         )
         return result
     finally:
@@ -1247,6 +1257,7 @@ def run_epic(
                         run_id=run_id, date=date, initiative_id=ctx.initiative_id, phases=phases, tasks=tasks,
                         quarantined=quarantined, proposals=proposals, stacks_rebased=stacks_rebased,
                         paused_until=paused_until, repo=repo,
+                        card_branch=card_mode(ctx.initiative_id, resume_from is None),
                     )
                 except Exception as exc:
                     _log.warning("partial result for %s not built: %s: %s", run_id, type(exc).__name__, exc)
@@ -1731,6 +1742,7 @@ def _build_result(
     stacks_rebased: int,
     paused_until: str | None,
     repo: Path | str,
+    card_branch: bool = False,
 ) -> dict[str, Any]:
     """The epic result from the lists as they stand: whole at a normal end, partial when a phase raised."""
     unlanded = _unlanded(tasks, run_id, repo)
@@ -1738,6 +1750,7 @@ def _build_result(
         "run_id": run_id,
         "date": date,
         "initiative": initiative_id,
+        **({"card_branch": True} if card_branch else {}),
         "phases": phases,
         "tasks": tasks,
         "quarantined": quarantined,
@@ -1937,6 +1950,7 @@ def _run_phase(
         "parent": parent,
         "branch": branch,
         "base": base_ref,
+        **({"card_branch": True} if card_mode(ctx.initiative_id, ctx.resume_from is None) else {}),
         "status": "partial",
         "rebased": False,
         "task_records": [],
