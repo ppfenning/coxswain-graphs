@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import faulthandler
 import hashlib
 import json
@@ -714,10 +715,19 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signal.SIGTERM, previous)
 
 
+def _expand_repo(args: argparse.Namespace) -> argparse.Namespace:
+    """A copy of `args` whose `repo`, when given, has a leading tilde expanded to the home directory."""
+    if not args.repo:
+        return args
+    expanded = copy.copy(args)
+    expanded.repo = str(Path(args.repo).expanduser())
+    return expanded
+
+
 def _main(argv: list[str] | None) -> int:
     specs = discover()
     parser = _build_parser(specs)
-    args = parser.parse_args(argv)
+    args = _expand_repo(parser.parse_args(argv))
     # A rescue's stdout is its JSON report and nothing else, since its caller parses all of it.
     # Every other line the launch prints, the usage totals included, goes to stderr instead.
     report_out = sys.stdout
