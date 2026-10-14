@@ -27,7 +27,7 @@ def test_a_database_at_version_eleven_gains_priority_and_the_old_row_reads_zero(
 def test_a_fresh_store_reports_version_twelve_and_has_priority_on_work_items(store_conn):
     assert ddl.VERSION == 12
     assert check_version(store_conn) == (LATEST, LATEST)
-    assert store_conn.query_all("SELECT MAX(version) FROM schema_version") == [(12,)]
+    assert store_conn.query_all("SELECT MAX(version) FROM schema_version") == [(LATEST,)]
     assert store_conn.query_all("SELECT priority FROM work_items") == []
 
 
