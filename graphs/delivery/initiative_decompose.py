@@ -279,6 +279,16 @@ def _scalar(value: Any) -> str:
     return dumped.strip().removesuffix("...").rstrip()
 
 
+def _tilde_repo(repo: str, home: str | None) -> str:
+    """`repo` with a leading `home` replaced by `~`; any value not at or under `home` is returned unchanged."""
+    root = (home or "").rstrip("/")
+    if not root:
+        return repo
+    if repo == root:
+        return "~"
+    return "~" + repo[len(root) :] if repo.startswith(root + "/") else repo
+
+
 def initiative_text(
     idea: Mapping[str, Any],
     phases: Sequence[str],
@@ -287,6 +297,7 @@ def initiative_text(
     *,
     intake: str | None = None,
     size: Mapping[str, str] | None = None,
+    home: str | None = None,
 ) -> str:
     """The `initiative.md` shape every hand-written initiative in the workspace carries."""
     goal_lines = "\n".join(f"- {phase_id}: {goals.get(phase_id, '')}" for phase_id in phases)
@@ -296,7 +307,7 @@ def initiative_text(
         "---\n"
         f"id: {_scalar(idea.get('id'))}\n"
         f"title: {_scalar(idea.get('title'))}\n"
-        f"repo: {_scalar(repo)}\n"
+        f"repo: {_scalar(_tilde_repo(repo, home))}\n"
         f"budget_usd: {_scalar(idea.get('budget_usd'))}\n"
         f"{intake_line}"
         f"{size_lines}"
@@ -1038,7 +1049,13 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     idea_doc = {"id": initiative_id or run_id, "title": str(idea), "budget_usd": args.get("budget_usd"), "why": str(idea)}
     intake_path = args.get("intake_path")
     initiative_body = initiative_text(
-        idea_doc, phase_order, goals, str(args.get("repo") or ""), intake=intake_path, size=size_record
+        idea_doc,
+        phase_order,
+        goals,
+        str(args.get("repo") or ""),
+        intake=intake_path,
+        size=size_record,
+        home=str(Path.home()),
     )
     initiative_where = "/".join(part for part in (landing, initiative_id) if part)
 
