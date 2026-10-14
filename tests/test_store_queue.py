@@ -20,6 +20,7 @@ ROW = {
     "updated_at": T0,
     "updated_by": "chair",
 }
+UNKEYED = {"issue_number": None, "project_item_id": None, "parent_item": None}
 
 
 def _claim_cols(conn, initiative, task_id):
@@ -33,7 +34,9 @@ def _claim_cols(conn, initiative, task_id):
 
 def test_upsert_then_read_round_trips_needs_surfaces_and_extra_as_json_values(store_conn):
     upsert(store_conn, ROW)
-    assert read(store_conn, initiative="i1") == [{**ROW, "priority": 0, "holder": None, "epoch": 0, "expires_at": None}]
+    assert read(store_conn, initiative="i1") == [
+        {**ROW, **UNKEYED, "priority": 0, "holder": None, "epoch": 0, "expires_at": None}
+    ]
 
 
 def test_a_second_identical_upsert_leaves_one_row_and_unchanged_claim_columns_and_updated_at(store_conn):
@@ -53,7 +56,7 @@ def test_a_changed_upsert_writes_the_new_values_and_keeps_the_claim(store_conn):
     claim(store_conn, "i1", "t1", "alice", 30, T0)
     changed = {**ROW, "state": "done", "phase": "p2", "extra": {"note": "moved"}, "updated_at": T30}
     assert upsert(store_conn, changed) is True
-    expected = {**changed, "priority": 0, "holder": "alice", "epoch": 1, "expires_at": T30}
+    expected = {**changed, **UNKEYED, "priority": 0, "holder": "alice", "epoch": 1, "expires_at": T30}
     assert read(store_conn, initiative="i1") == [expected]
 
 
