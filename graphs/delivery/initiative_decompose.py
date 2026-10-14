@@ -350,6 +350,17 @@ def first_problem_line(lines: Sequence[str]) -> str | None:
     return next((s for s in (line.strip() for line in lines) if s), None)
 
 
+def _refused_surfaces(tasks: Sequence[Mapping[str, Any]], problems: Sequence[Problem]) -> str:
+    """The surfaces each refused task has now; a correction replaces one only by naming it exactly."""
+    refused = dict.fromkeys(p.task for p in problems)
+    lines = [
+        f"{t['id']}: {', '.join(str(s) for s in t.get('surfaces') or []) or '(none)'}"
+        for t in tasks
+        if str(t["id"]) in refused
+    ]
+    return "Surfaces of the refused tasks as they stand. A correction names one of them exactly as written:\n" + "\n".join(lines)
+
+
 def _lint_refusal_text(problems: Sequence[Problem]) -> str | None:
     """One line per reach/coupling `Problem`; `None` when there is nothing to refuse."""
     if not problems:
@@ -941,20 +952,35 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
         # wrong belief is that a correction only touches `surfaces`: it can
         # now redraw edges and add tasks, so its result goes back through the
         # surface gates and the cycle check before the re-lint.
-        if "review_adversary" not in bound:
+        #
+        # Unbound, a contract refusal alone goes to the decompose seat, once, with the
+        # idea and the refused tasks' surfaces: it answers in this block's correction
+        # schema, and a correction replaces a surface only on an exact match. Reach and
+        # coupling still quarantine outright.
+        if "review_adversary" in bound:
+            seat, seat_tier, seat_hints, lead = "review_adversary", "deep", None, ""
+        elif all(p.rule == "contract" for p in refusals):
+            seat, seat_tier, seat_hints = "decompose", None, decompose_hints
+            lead = f"Idea: {idea}\n\nYour task list was refused by ticket lint. Do not break the idea down again.\n\n"
+        else:
             raise LintRefusal(_lint_refusal_text(refusals))
         correction = dict(
             runner.run(
-                role="review_adversary",
-                tier="deep",
-                **_decision(source, "review_adversary", None),
+                role=seat,
+                tier=seat_tier,
+                hints=seat_hints,
+                **_decision(source, seat, seat_hints),
                 schema=UNBUILDABLE_SCHEMA,
                 context=context,
                 prompt=(
-                    "Ticket lint refused these tasks for reach, coupling or contract. Resolve "
+                    lead
+                    + "Ticket lint refused these tasks for reach, coupling or contract. Resolve "
                     "each so the problem no longer holds. A contract refusal is resolved in "
                     "`tasks`: add the contract task, and restate each task of the interface "
-                    "with the contract task in its `needs`.\n\n" + (_lint_refusal_text(refusals) or "")
+                    "with the contract task in its `needs`.\n\n"
+                    + (_lint_refusal_text(refusals) or "")
+                    + "\n\n"
+                    + _refused_surfaces(tasks, refusals)
                 ),
             )
         )
