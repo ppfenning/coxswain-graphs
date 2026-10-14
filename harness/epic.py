@@ -1081,7 +1081,7 @@ def run_epic(
         )
     work_state = checked_work_state(work_state)
     retry = retry or _StoreRetry.for_store(store)
-    repo = Path(repo)
+    repo = Path(repo).expanduser()
     ctx: _Ctx | None = None
     result: dict[str, Any] | None = None
     # Bound before the `try` so the `finally` can build a partial result from whatever phases finished.
