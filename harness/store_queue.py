@@ -39,12 +39,15 @@ Row = dict[str, Any]
 # never through this tuple.
 _QUEUE_COLS = (
     "initiative", "task_id", "kind", "phase", "state", "needs_json", "title",
-    "surfaces_json", "body", "extra_json", "priority", "updated_at", "updated_by",
-    "holder", "epoch", "expires_at",
+    "surfaces_json", "body", "extra_json", "priority", "issue_number", "project_item_id",
+    "parent_item", "updated_at", "updated_by", "holder", "epoch", "expires_at",
 )  # fmt: skip
 _RENAME = {"needs_json": "needs", "surfaces_json": "surfaces", "extra_json": "extra"}
 # The fields upsert compares to decide whether a repeat changes anything.
-_CONTENT = ("kind", "phase", "state", "needs", "title", "surfaces", "body", "extra", "priority")
+_CONTENT = (
+    "kind", "phase", "state", "needs", "title", "surfaces", "body", "extra", "priority",
+    "issue_number", "project_item_id", "parent_item",
+)  # fmt: skip
 _KEY_COLS = ("initiative", "task_id")
 
 
@@ -76,6 +79,9 @@ def _insert_row(row: Row) -> Row:
         "body": row.get("body"),
         "extra_json": row.get("extra"),
         "priority": row["priority"],
+        "issue_number": row.get("issue_number"),
+        "project_item_id": row.get("project_item_id"),
+        "parent_item": row.get("parent_item"),
         # Every work_items column is NOT NULL (migration 0006); a caller that sends no stamp, as tools' `route import`
         # rows do, gets the write time and this module's name rather than a refused row.
         "updated_at": row.get("updated_at") or datetime.now(UTC).isoformat(),
@@ -104,6 +110,14 @@ def _priority_problem(row: Row) -> str | None:
     return f"priority must be an integer, got {value!r}"
 
 
+def _issue_number_problem(row: Row) -> str | None:
+    """A refusal message when `row` carries an issue_number that is neither None nor an integer; a bool is not one."""
+    value = row.get("issue_number")
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+        return None
+    return f"issue_number must be an integer, got {value!r}"
+
+
 def upsert(conn: Connection, row: Row) -> bool:
     """Insert a new (initiative, task_id) row, or update its queue columns; False when the content was already stored.
 
@@ -111,8 +125,9 @@ def upsert(conn: Connection, row: Row) -> bool:
     A row with no priority key inserts 0 and keeps the stored priority on an update. A bad priority raises ValueError.
     Any other content key the row leaves out keeps its stored value on an update, so a state-only mirror write
     never blanks the kind, title, surfaces or body; a key sent as None still clears its column.
+    The card keys issue_number, project_item_id and parent_item follow that rule; a non-integer issue_number raises ValueError.
     """
-    problem = _priority_problem(row)
+    problem = _priority_problem(row) or _issue_number_problem(row)
     if problem is not None:
         raise ValueError(problem)
     with conn.transaction():
