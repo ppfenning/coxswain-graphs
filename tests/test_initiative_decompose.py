@@ -1454,3 +1454,82 @@ def test_reach_allow_is_a_list_of_strings_or_empty(frontmatter, expected) -> Non
 def test_reach_allow_reads_the_ideas_frontmatter_only_without_an_intake() -> None:
     assert initiative_decompose._reach_allow({}, {"reach_allow": ["a"]}) == ["a"]
     assert initiative_decompose._reach_allow({"intake": {"frontmatter": {}}}, {"reach_allow": ["a"]}) == []
+
+
+CONTRACT_REFUSAL = (
+    "contract task has no .json surface (give the contract task a `.json` fixture surface in the producer repository)"
+)
+PROSE_CONTRACT_PLAN = {
+    **DECOMPOSITION,
+    "tasks": [
+        _settings_task("t0", "contract", "tools", surfaces=["agent_tools/settings.py"]),
+        dict(PRODUCER, needs=["t0"]),
+        dict(CONSUMER, needs=["t0"]),
+    ],
+}
+JSON_SURFACE_FIX = {
+    "corrections": [{"task": "t0", "surface": "agent_tools/settings.py", "replacement": "fixtures/settings.v1.json"}],
+    "tasks": [],
+    "summary": "gave the contract task its fixture",
+}
+NO_CHANGE = {"corrections": [], "tasks": [], "summary": "no change"}
+
+
+def _unbound_contract_args(cart):
+    return {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "tree": SETTINGS_TREE}
+
+
+class SchemaSpy(ScriptedRunner):
+    """ScriptedRunner that also keeps the schema each call was made with."""
+
+    def __init__(self, responses) -> None:
+        super().__init__(responses)
+        self.schemas: list[dict] = []
+
+    def run(self, **kwargs):
+        self.schemas.append(kwargs["schema"])
+        return super().run(**kwargs)
+
+
+def test_a_contract_refusal_is_put_to_the_seat_once_and_the_corrected_plan_passes(cart) -> None:
+    runner = SchemaSpy({"decompose": [PROSE_CONTRACT_PLAN, JSON_SURFACE_FIX]})
+    result = initiative_decompose.run(_unbound_contract_args(cart), runner)
+    assert [c["role"] for c in runner.calls] == ["decompose", "decompose"]
+    assert runner.schemas[1] is initiative_decompose.UNBUILDABLE_SCHEMA
+    second = runner.calls[1]["prompt"]
+    assert CONTRACT_REFUSAL in second
+    assert "Break this idea into phases" not in second
+    # The seat is shown the surface its correction must replace, verbatim.
+    assert "t0: agent_tools/settings.py" in second
+    assert JSON_SURFACE_FIX["corrections"][0]["surface"] in second
+    by_id = {t["id"]: t for t in result["tasks"]}
+    assert by_id["t0"]["surfaces"] == ["fixtures/settings.v1.json"]
+
+
+def test_a_bound_adversary_still_gets_the_contract_refusal_with_the_surfaces(cart) -> None:
+    cart["skills"]["review_adversary"] = "acme-skills:review-adversary"
+    runner = ScriptedRunner({"decompose": PROSE_CONTRACT_PLAN, "review_adversary": [ACCEPTED, JSON_SURFACE_FIX]})
+    result = initiative_decompose.run(_unbound_contract_args(cart), runner)
+    assert [c["role"] for c in runner.calls] == ["decompose", "review_adversary", "review_adversary"]
+    assert CONTRACT_REFUSAL in runner.calls[-1]["prompt"]
+    assert "t0: agent_tools/settings.py" in runner.calls[-1]["prompt"]
+    assert {t["id"]: t for t in result["tasks"]}["t0"]["surfaces"] == ["fixtures/settings.v1.json"]
+
+
+def test_a_reach_refusal_with_no_adversary_still_quarantines_without_a_second_ask(cart) -> None:
+    plan = {
+        **DECOMPOSITION,
+        "tasks": [{"id": "t1", "phase": "p1", "title": "a", "body": "b", "needs": [], "surfaces": ["~/scratch/notes.md"]}],
+    }
+    runner = ScriptedRunner({"decompose": plan})
+    with pytest.raises(initiative_decompose.LintRefusal, match="reach"):
+        initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, runner)
+    assert [c["role"] for c in runner.calls] == ["decompose"]
+
+
+def test_a_second_contract_refusal_fails_the_run_with_the_lint_text_and_no_third_ask(cart) -> None:
+    runner = ScriptedRunner({"decompose": [PROSE_CONTRACT_PLAN, NO_CHANGE]})
+    with pytest.raises(initiative_decompose.LintRefusal) as refused:
+        initiative_decompose.run(_unbound_contract_args(cart), runner)
+    assert CONTRACT_REFUSAL in str(refused.value)
+    assert [c["role"] for c in runner.calls] == ["decompose", "decompose"]
