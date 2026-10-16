@@ -13,13 +13,26 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal
 
-__all__ = ["CLASSES", "TIERS", "TIER_TO_CLASS", "Hints", "Resolution", "rank", "resolve", "to_class", "to_tier"]
+__all__ = [
+    "CLASSES",
+    "TIERS",
+    "TIER_TO_CLASS",
+    "Hints",
+    "Resolution",
+    "clamp_to_chair",
+    "rank",
+    "resolve",
+    "to_class",
+    "to_tier",
+]
 
 TIERS = ("cheap", "standard", "deep")
 CLASSES = ("extract", "reason", "judge", "frontier")
 TIER_TO_CLASS = MappingProxyType({"cheap": "extract", "standard": "reason", "deep": "judge"})
 # The legacy vocabulary has no tier above deep, so frontier reads as deep there.
 _CLASS_TO_TIER = MappingProxyType({"extract": "cheap", "reason": "standard", "judge": "deep", "frontier": "deep"})
+# The chair model aliases COXSWAIN_CHAIR_MODEL may carry, each with the tier that model runs at.
+_CHAIR_ALIAS_TIER = MappingProxyType({"haiku": "cheap", "sonnet": "standard", "opus": "deep"})
 
 
 @dataclass(frozen=True)
@@ -95,3 +108,21 @@ def resolve(
     kept = floor if below else chosen
     reason = f"{source} raised to floor{note}" if below else f"{source}{note}"
     return Resolution(to_tier(kept), reason, to_class(kept))
+
+
+def clamp_to_chair(
+    tier: str,
+    role: str,
+    chair_model: str | None,
+    exempt_roles: tuple[str, ...],
+) -> tuple[str, str]:
+    """Lower `tier` (tier or class name) to the chair model's tier when it ranks above; returns a legacy tier and a reason."""
+    if chair_model is None:
+        return to_tier(tier), "no chair model given"
+    if chair_model not in _CHAIR_ALIAS_TIER:
+        return to_tier(tier), f"unknown chair model {chair_model!r}"
+    if role in exempt_roles:
+        return to_tier(tier), f"role {role!r} is exempt from the chair ceiling"
+    if rank(tier) > rank(_CHAIR_ALIAS_TIER[chair_model]):
+        return _CHAIR_ALIAS_TIER[chair_model], "chair_ceiling"
+    return to_tier(tier), "within ceiling"
