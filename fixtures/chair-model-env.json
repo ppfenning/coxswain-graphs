@@ -1,0 +1,6 @@
+{
+  "interface": "chair_model_env",
+  "env_name": "COXSWAIN_CHAIR_MODEL",
+  "aliases": ["sonnet", "opus", "haiku"],
+  "when_unrecorded": "absent"
+}
