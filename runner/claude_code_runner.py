@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Any
 
 from runner.decision_log import REASON_SEPARATOR, CallDecision, RouterDecision, joined_reasons, to_row
 from runner.protocol import BudgetStop, Capability, LimitStop, NodeResult, RunnerError
-from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, resolve, to_class, to_tier
+from runner.tier_resolution import CLASSES, TIERS, Hints, Resolution, clamp_to_chair, resolve, to_class, to_tier
 
 if TYPE_CHECKING:
     # Type only: importing harness at module load is circular, since harness imports this runner.
@@ -114,6 +114,14 @@ _DIFF_CMD = "git add -A && git diff --cached"
 # Checks led by one of these also run as `python -m <tool>`; builders reach for that form.
 _PY_TOOLS = frozenset({"pytest", "ruff"})
 _PLAIN_PATH = re.compile(r"[\w./-]+")  # no space, quote or glob: the only paths a `git -C` prefix rule may name
+
+
+CHAIR_MODEL_ENV = "COXSWAIN_CHAIR_MODEL"
+
+
+def _chair_model(environ: Mapping[str, str]) -> str | None:
+    """The chair model alias in `environ`; an absent or blank value is None."""
+    return environ.get(CHAIR_MODEL_ENV, "").strip() or None
 
 
 def child_env(environ: Mapping[str, str], bash: str | None) -> dict[str, str]:
@@ -722,6 +730,8 @@ class ClaudeCodeRunner:
         self.tier_overrides = {str(k): str(v) for k, v in (self.profile.get("tier_overrides") or {}).items()}
         # role -> tier applied when the caller names no tier; an override still beats it.
         self.profile_defaults = {str(k): str(v) for k, v in (self.profile.get("defaults") or {}).items()}
+        # Roles the chair ceiling leaves alone. The profile names them; code sets no default.
+        self.chair_ceiling_exempt: tuple[str, ...] = tuple(str(r) for r in (self.profile.get("chair_ceiling_exempt") or ()))
         # Recorded on the CallDecision reason, never enforced: the version is known only after start.
         self.cli_version_pin = _text_or_none(self.profile.get("cli_version_pin"))
         self.cli_version_floor = _text_or_none(self.profile.get("cli_version_floor"))
@@ -827,8 +837,14 @@ class ClaudeCodeRunner:
 
     # ── resolution ──────────────────────────────────────────────────────────
 
-    def _resolve_tier(self, role: str, caller_tier: str | None, hints: Hints | None) -> Resolution:
-        """Override, then the caller's tier, then a profile default, then DEFAULT_TIER.
+    def _resolve_tier(
+        self, role: str, caller_tier: str | None, hints: Hints | None, environ: Mapping[str, str]
+    ) -> Resolution:
+        """Override, then the caller's tier, then a profile default, then DEFAULT_TIER; then the chair ceiling.
+
+        The ceiling lowers the tier to the chair model's (`COXSWAIN_CHAIR_MODEL` in `environ`)
+        and adds `chair_ceiling` to the reason. A missing or unknown chair model clamps nothing
+        and its reason is added instead. An exempt role, or a tier within the ceiling, is unchanged.
 
         A tier the caller named outranks a profile default, so the defaults are
         withheld from the resolver then; it has no slot for a caller's tier, which
@@ -843,8 +859,17 @@ class ClaudeCodeRunner:
         defaults = {} if caller_tier is not None else self.profile_defaults
         chosen = resolve(role, hints, self.tier_overrides, defaults, caller_tier, TIERS[0])
         if chosen.reason == "floor":
-            return Resolution(DEFAULT_TIER, "floor")
-        return Resolution(chosen.tier, "caller", chosen.chosen_class) if chosen.reason == "router" else chosen
+            resolved = Resolution(DEFAULT_TIER, "floor")
+        else:
+            resolved = Resolution(chosen.tier, "caller", chosen.chosen_class) if chosen.reason == "router" else chosen
+        tier, why = clamp_to_chair(
+            resolved.chosen_class or resolved.tier, role, _chair_model(environ), self.chair_ceiling_exempt
+        )
+        if why == "chair_ceiling":
+            return Resolution(tier, REASON_SEPARATOR.join((resolved.reason, why)), to_class(tier))
+        if why.startswith(("no chair model", "unknown chair model")):
+            return Resolution(resolved.tier, REASON_SEPARATOR.join((resolved.reason, why)), resolved.chosen_class)
+        return resolved
 
     def _model_for(self, name: str) -> str:
         """First model bound to a class (or tier name); the `tiers` map when the profile has no `classes`."""
@@ -1345,7 +1370,7 @@ class ClaudeCodeRunner:
         wait_if_paused: Callable[[], None] | None = None,
     ) -> NodeResult:
         requested_tier = tier or DEFAULT_TIER
-        resolution = self._resolve_tier(role, tier, hints)
+        resolution = self._resolve_tier(role, tier, hints, os.environ)
         tier = resolution.tier
         cls = resolution.chosen_class
         model = self._model_for(cls)
