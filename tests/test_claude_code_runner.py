@@ -2809,3 +2809,58 @@ def test_an_unrecognised_router_value_warns_and_acts_as_off(tmp_path, caplog) ->
 def test_a_call_with_no_decision_leaves_the_router_fields_none(fake_claude, tmp_path) -> None:
     decision = _router_run(fake_claude, tmp_path, "shadow", None)
     assert [getattr(decision, f) for f in ROUTER_FIELDS] == [None] * len(ROUTER_FIELDS)
+
+
+# ── the chair ceiling ────────────────────────────────────────────────────────
+
+# The contract as the tools repository publishes it, pasted so no file from that repository is read.
+CHAIR_CONTRACT = '{"env": "COXSWAIN_CHAIR_MODEL", "aliases": ["sonnet", "opus", "haiku"]}'
+CHAIR_ENV = json.loads(CHAIR_CONTRACT)["env"]
+CHAIR_ALIASES = json.loads(CHAIR_CONTRACT)["aliases"]
+
+
+@pytest.fixture(autouse=True)
+def _opus_chair(monkeypatch) -> None:
+    """An opus chair clamps no seat, so the reason strings the older tests assert stay exact."""
+    monkeypatch.setenv(CHAIR_ENV, "opus")
+
+
+def _chair_run(fake_claude, tmp_path, role="build", profile=None):
+    script, _, _ = fake_claude
+    runner = ClaudeCodeRunner({**PROFILE, **(profile or {})}, claude_bin=str(script), cwd=tmp_path)
+    decision = runner.run(role=role, schema=SCHEMA, prompt="go", tier="deep").decision
+    argv = recorded(fake_claude)["argv"]
+    return decision, argv[argv.index("--model") + 1]
+
+
+def test_the_contract_aliases_are_the_three_chair_models() -> None:
+    assert CHAIR_ALIASES == ["sonnet", "opus", "haiku"]
+
+
+def test_a_sonnet_chair_lowers_a_deep_build_to_sonnet_and_logs_chair_ceiling(fake_claude, tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv(CHAIR_ENV, "sonnet")
+    d, model = _chair_run(fake_claude, tmp_path)
+    assert (d.chosen_tier, d.reason, model) == ("reason", "caller; chair_ceiling", "sonnet")
+
+
+def test_an_exempt_role_keeps_opus_under_a_sonnet_chair(fake_claude, tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv(CHAIR_ENV, "sonnet")
+    d, model = _chair_run(fake_claude, tmp_path, "validate_phase", {"chair_ceiling_exempt": ["validate_phase"]})
+    assert (d.chosen_tier, d.reason, model) == ("judge", "caller", "opus")
+
+
+def test_an_opus_chair_clamps_nothing(fake_claude, tmp_path) -> None:
+    d, model = _chair_run(fake_claude, tmp_path)
+    assert (d.chosen_tier, d.reason, model) == ("judge", "caller", "opus")
+
+
+def test_an_unset_chair_clamps_nothing_and_the_log_says_why(fake_claude, tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv(CHAIR_ENV)
+    d, model = _chair_run(fake_claude, tmp_path)
+    assert (d.chosen_tier, d.reason, model) == ("judge", "caller; no chair model given", "opus")
+
+
+def test_an_unknown_chair_alias_clamps_nothing_and_the_log_names_it(fake_claude, tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv(CHAIR_ENV, "gpt-x")
+    d, model = _chair_run(fake_claude, tmp_path)
+    assert (d.chosen_tier, d.reason, model) == ("judge", "caller; unknown chair model 'gpt-x'", "opus")
