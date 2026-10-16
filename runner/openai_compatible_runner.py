@@ -12,12 +12,14 @@ AnthropicRunner built on first use, which owns that call's records and store wri
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import uuid
 import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from runner.anthropic_runner import (
@@ -45,15 +47,17 @@ from runner.pricing import max_output_tokens_for_budget, price_call
 from runner.protocol import BudgetStop, NodeResult, RunnerError
 from runner.schema_answer import retry_prompt, schema_instruction, shape_answer
 from runner.tier_resolution import CLASSES, TIERS, Hints, resolve, to_class
+from runner.tool_loop import AdapterStep, FinalAnswer, ToolCall, run_tool_loop
 
 if TYPE_CHECKING:
     from harness.store_write import Store
 
-__all__ = ["OpenAICompatibleRunner"]
+__all__ = ["OpenAICompatibleRunner", "OpenAICompatibleToolLoopAdapter"]
 
 LOCAL_PREFIX = "local/"
 ANTHROPIC_PREFIX = "anthropic/"
 MAX_TOKENS = 4096
+BUILD_TURN_CAP = 40
 TEMPERATURE = 0.0
 TEXT_SCHEMA = {
     "type": "object",
@@ -87,6 +91,91 @@ class _Ask:
     wire_model_id: str
 
 
+def _wire_message(message: Mapping[str, Any]) -> dict[str, Any]:
+    """One tool_loop message after the system turn as one chat-completions message."""
+    if message["role"] == "assistant":
+        calls = [
+            {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])}}
+            for c in message["tool_calls"]
+        ]
+        return {"role": "assistant", "content": None, "tool_calls": calls}
+    if message["role"] == "tool":
+        return {"role": "tool", "tool_call_id": message["tool_call_id"], "content": message["content"]}
+    return {"role": "user", "content": message["content"]}
+
+
+def _wire_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {"name": tool["name"], "description": tool["description"], "parameters": tool["parameters"]},
+    }
+
+
+class OpenAICompatibleToolLoopAdapter:
+    """`ToolLoopAdapter` over chat completions; `answer` and `billed` outlive the loop, which returns neither."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        model: str,
+        max_tokens: int,
+        timeout: float,
+        prices: Mapping[str, Any],
+        bearer_token: str | None = None,
+        role: str = "build",
+    ) -> None:
+        self._base_url = base_url
+        self._model = model
+        self._max_tokens = max_tokens
+        self._timeout = timeout
+        self._prices = prices
+        self._bearer_token = bearer_token
+        self._role = role
+        self.answer: dict[str, Any] | None = None
+        self.billed: dict[str, float] = {}
+
+    def send(self, messages: list[dict], tools: list[dict]) -> AdapterStep:
+        head = messages[0]
+        schema = dict(head.get("schema") or {})
+        system = "\n\n".join(part for part in (head["content"], schema_instruction(schema) if schema else "") if part)
+        first = _wire_message(messages[1])
+        payload = {
+            **build_request(self._model, system or None, first["content"], self._max_tokens, TEMPERATURE),
+            "tools": [_wire_tool(t) for t in tools],
+        }
+        payload["messages"] = [*payload["messages"], *map(_wire_message, messages[2:])]
+        try:
+            reply = parse_response(
+                post_chat(self._base_url, payload, timeout=self._timeout, role=self._role, bearer_token=self._bearer_token)
+            )
+        except ChatTransportError as exc:
+            raise RunnerError(f"node '{self._role}' could not reach the endpoint: {exc}") from exc
+        if isinstance(reply, ChatError):
+            raise RunnerError(f"node '{self._role}' got an unusable reply: {reply.reason}")
+        cost = price_call(dict(self._prices), self._model, reply.prompt_tokens, reply.completion_tokens)
+        usage = {
+            "input_tokens": reply.prompt_tokens,
+            "output_tokens": reply.completion_tokens,
+            **({} if cost is None else {"cost_usd": cost}),
+        }
+        self.billed = {k: self.billed.get(k, 0) + usage.get(k, 0) for k in {*self.billed, *usage}}
+        try:
+            calls = [
+                ToolCall(c["id"], c["function"]["name"], dict(json.loads(c["function"]["arguments"] or "{}")))
+                for c in reply.tool_calls
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RunnerError(f"tool loop: a tool call in the reply is malformed: {exc}") from exc
+        if calls:
+            return AdapterStep(calls, None, usage)
+        data, errors = shape_answer(reply.text, schema)
+        if not isinstance(data, dict):
+            raise RunnerError(f"tool loop: the final reply does not match the schema: {'; '.join(errors) or 'not an object'}")
+        self.answer = data
+        return AdapterStep([], FinalAnswer(data), usage)
+
+
 class OpenAICompatibleRunner:
     """Runs nodes against a chat-completions endpoint and shapes the reply to the node's schema."""
 
@@ -101,7 +190,9 @@ class OpenAICompatibleRunner:
         store: Store | None = None,
         run_id: str | None = None,
         delegate_factory: Callable[..., Any] = AnthropicRunner,
+        cwd: Path | None = None,
     ) -> None:
+        self.cwd = cwd
         self.profile = dict(profile)
         self.role_skills = dict(role_skills)
         endpoint_env = self.profile.get("endpoint_env")
@@ -277,6 +368,8 @@ class OpenAICompatibleRunner:
         task: str | None = None,
         router_decision: RouterDecision | None = None,
         wait_if_paused: Callable[[], None] | None = None,
+        # The commands `run_check` may run in the build's worktree. Only the tool-loop build path uses them.
+        checks: Sequence[str] = (),
     ) -> NodeResult:
         # `thread` names the bucket `self._spent` accumulates against for a profile `budget_usd`; the call
         # itself is still stateless, with no session or scratch to resume.
@@ -353,6 +446,10 @@ class OpenAICompatibleRunner:
         # A paused run waits before the request and before its one retry, as it does before a Claude Code call.
         wait = wait_if_paused or (lambda: None)
         wait()
+        if role == "build" and self.cwd is not None:
+            return self._build_through_tool_loop(
+                ask, decision, prompt, schema or TEXT_SCHEMA, checks, budget_usd, wait_if_paused
+            )
         if not schema:
             record, reply = self._post(ask, prompt)
             self._record_to_store(record, decision)
@@ -370,6 +467,112 @@ class OpenAICompatibleRunner:
             self._record_to_store(second_record, None)
             raise RunnerError(f"node '{role}' returned no valid answer after one retry: {'; '.join(errors)}")
         return self._answer(second_record, data, decision)
+
+    def _build_through_tool_loop(
+        self,
+        ask: _Ask,
+        decision: CallDecision,
+        prompt: str,
+        schema: Mapping[str, Any],
+        checks: Sequence[str],
+        budget_usd: float | None,
+        wait_if_paused: Callable[[], None] | None,
+    ) -> NodeResult:
+        """A build call driven through the worktree tool loop.
+
+        The loop's ceiling is the smaller of the per-call `budget_usd` and what the profile's cumulative
+        `self.budget_usd` has left on the thread; the per-call figure never replaces the profile's.
+        """
+        spent_before = self._spent.get(ask.thread, 0.0)
+        left = None if self.budget_usd is None else self.budget_usd - spent_before
+        if left is not None and left <= 0:
+            raise BudgetStop(
+                role=ask.role,
+                thread=ask.thread,
+                session=None,
+                spent_usd=spent_before,
+                detail=f"node '{ask.role}' has spent ${spent_before:.4f} of its ${self.budget_usd:.4f} budget",
+            )
+        ceilings = [c for c in (budget_usd, left) if c is not None]
+        max_tokens = self.max_tokens
+        if left is not None:
+            cap = max_output_tokens_for_budget(self.prices, ask.wire_model_id, left)
+            if cap is not None:
+                max_tokens = max(1, min(max_tokens, cap))
+        adapter = OpenAICompatibleToolLoopAdapter(
+            self.base_url,
+            model=ask.wire_model_id,
+            max_tokens=max_tokens,
+            timeout=self.timeout,
+            prices=self.prices,
+            bearer_token=self.auth_token,
+            role=ask.role,
+        )
+        try:
+            loop = run_tool_loop(
+                adapter,
+                worktree=self.cwd,
+                system_prompt=ask.system or "",
+                user_prompt=prompt,
+                schema=dict(schema),
+                checks=checks,
+                turn_cap=BUILD_TURN_CAP,
+                budget_usd=min(ceilings) if ceilings else None,
+                wait_if_paused=wait_if_paused,
+            )
+        except RunnerError as exc:
+            # BudgetStop and LimitStop are RunnerErrors: every turn billed before the raise is charged and recorded.
+            spent = self._charge_loop(ask.thread, adapter.billed)
+            self._record_loop(ask, adapter.billed, ok=False, decision=None)
+            if isinstance(exc, BudgetStop):
+                raise BudgetStop(
+                    role=ask.role,
+                    thread=ask.thread,
+                    session=None,
+                    spent_usd=spent,
+                    detail=exc.detail,
+                    partial_patch=exc.partial_patch,
+                    num_turns=exc.num_turns,
+                ) from exc
+            raise
+        self._charge_loop(ask.thread, adapter.billed)
+        if loop.stop_reason != "final":
+            self._record_loop(ask, adapter.billed, ok=False, decision=None)
+            raise RunnerError(
+                f"node '{ask.role}' used all {BUILD_TURN_CAP} tool-loop turns without a final answer; "
+                f"the worktree {self.cwd} holds its unfinished change ({len(loop.patch)} characters of diff)"
+            )
+        self._record_loop(ask, adapter.billed, ok=True, decision=decision)
+        result = NodeResult(
+            {**(adapter.answer or {}), "patch": loop.patch, **({"patch_error": loop.patch_error} if loop.patch_error else {})}
+        )
+        result.decision = decision
+        return result
+
+    def _charge_loop(self, thread: str | None, billed: Mapping[str, float]) -> float:
+        """Add a loop's spend to the thread's cumulative total and return that total."""
+        total = self._spent.get(thread, 0.0) + billed.get("cost_usd", 0.0)
+        self._spent[thread] = total
+        return total
+
+    def _record_loop(
+        self, ask: _Ask, billed: Mapping[str, float], *, ok: bool, decision: CallDecision | None
+    ) -> None:
+        """One aggregated call record for a whole tool loop; no per-turn rows."""
+        record = {
+            "id": str(uuid.uuid4()),
+            "role": ask.role,
+            "task_id": ask.task,
+            "tier": ask.tier,
+            "model": ask.model_id,
+            "ts": datetime.now(UTC).isoformat(),
+            "ok": ok,
+            "cost_usd": billed.get("cost_usd"),
+            "input_tokens": int(billed.get("input_tokens", 0)),
+            "output_tokens": int(billed.get("output_tokens", 0)),
+        }
+        self.calls.append(record)
+        self._record_to_store(record, decision)
 
     def _answer(self, record: Mapping[str, Any], data: dict[str, Any] | None, decision: CallDecision) -> NodeResult:
         self._record_to_store(record, decision)
