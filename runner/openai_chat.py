@@ -20,6 +20,7 @@ class Reply:
     prompt_tokens: int
     completion_tokens: int
     finish_reason: str | None
+    tool_calls: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,15 +49,18 @@ def parse_response(body: dict) -> Reply | ChatError:
     if not choices:
         return ChatError("response has no choices")
     choice = choices[0]
-    content = (choice.get("message") or {}).get("content")
-    if not content:
+    message = choice.get("message") or {}
+    content = message.get("content")
+    tool_calls = tuple(message.get("tool_calls") or ())
+    if not content and not tool_calls:
         return ChatError("first choice has no message content")
     usage = body.get("usage") or {}
     return Reply(
-        text=content,
+        text=content or "",
         prompt_tokens=usage.get("prompt_tokens") or 0,
         completion_tokens=usage.get("completion_tokens") or 0,
         finish_reason=choice.get("finish_reason"),
+        tool_calls=tool_calls,
     )
 
 
