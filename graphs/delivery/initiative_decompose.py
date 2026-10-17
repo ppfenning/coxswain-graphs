@@ -46,6 +46,7 @@ __all__ = [
     "GRAPH_NAME",
     "LintRefusal",
     "first_problem_line",
+    "idea_parts",
     "initiative_text",
     "resolve_surfaces",
     "run",
@@ -289,6 +290,37 @@ def _tilde_repo(repo: str, home: str | None) -> str:
     return "~" + repo[len(root) :] if repo.startswith(root + "/") else repo
 
 
+_TITLE_MAX = 120
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"" else value
+
+
+def idea_parts(idea: str) -> tuple[str, str, str]:
+    """(title, repo, body) of an idea; an intake file's frontmatter supplies title and repo and is dropped from body.
+
+    The title is one line of at most 120 characters. repo is empty when there is none.
+    """
+    lines = idea.split("\n")
+    close = (
+        next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if lines[0].strip() == "---"
+        else None
+    )
+    block = (
+        {key.strip(): _unquote(value) for key, sep, value in (line.partition(":") for line in lines[1:close]) if sep}
+        if close is not None
+        else {}
+    )
+    body = "\n".join(lines[close + 1 :]).lstrip("\n") if close is not None else idea
+    heading = next((line[2:].strip() for line in body.split("\n") if line.startswith("# ")), "")
+    first = next((line.strip() for line in body.split("\n") if line.strip()), "")
+    title = (block.get("title") or heading or first).strip().split("\n")[0][:_TITLE_MAX]
+    return title, block.get("repo", ""), body
+
+
 def initiative_text(
     idea: Mapping[str, Any],
     phases: Sequence[str],
@@ -299,7 +331,12 @@ def initiative_text(
     size: Mapping[str, str] | None = None,
     home: str | None = None,
 ) -> str:
-    """The `initiative.md` shape every hand-written initiative in the workspace carries."""
+    """The `initiative.md` shape every hand-written initiative in the workspace carries.
+
+    Raises ContractViolation naming the initiative when its title spans more than one line.
+    """
+    if "\n" in str(idea.get("title") or ""):
+        raise ContractViolation(f"initiative {idea.get('id')} has a multi-line title; a title is one line")
     goal_lines = "\n".join(f"- {phase_id}: {goals.get(phase_id, '')}" for phase_id in phases)
     intake_line = f"intake: {_scalar(intake)}\n" if intake else ""
     size_lines = "".join(f"{key}: {_scalar(size[key])}\n" for key in ("size", "size_reason", "size_source")) if size else ""
@@ -1072,13 +1109,20 @@ def run(args: Mapping[str, Any], runner: NodeRunner) -> dict[str, Any]:
     landing = landing_for(cartridge, "planned")
 
     goals = {str(p.get("id")): str(p.get("goal") or "") for p in decomposition.get("phases") or []}
-    idea_doc = {"id": initiative_id or run_id, "title": str(idea), "budget_usd": args.get("budget_usd"), "why": str(idea)}
+    idea_title, idea_repo, idea_body = idea_parts(str(idea))
+    idea_doc = {
+        "id": initiative_id or run_id,
+        "title": idea_title,
+        "budget_usd": args.get("budget_usd"),
+        "why": idea_body,
+        **({"repo": idea_repo} if idea_repo else {}),
+    }
     intake_path = args.get("intake_path")
     initiative_body = initiative_text(
         idea_doc,
         phase_order,
         goals,
-        str(args.get("repo") or ""),
+        str(args.get("repo") or idea_doc.get("repo") or ""),
         intake=intake_path,
         size=size_record,
         home=str(Path.home()),

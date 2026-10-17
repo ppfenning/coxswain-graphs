@@ -1533,3 +1533,31 @@ def test_a_second_contract_refusal_fails_the_run_with_the_lint_text_and_no_third
         initiative_decompose.run(_unbound_contract_args(cart), runner)
     assert CONTRACT_REFUSAL in str(refused.value)
     assert [c["role"] for c in runner.calls] == ["decompose", "decompose"]
+
+
+INTAKE_FILE = '---\ntitle: "Name the initiative: from intake"\nrepo: ~/repos/acme\n---\n\nThe why, in prose.\n'
+
+
+def test_an_intake_file_yields_its_frontmatter_title_and_repo_and_a_body_without_frontmatter() -> None:
+    title, repo, body = initiative_decompose.idea_parts(INTAKE_FILE)
+    assert (title, repo) == ("Name the initiative: from intake", "~/repos/acme")
+    assert body == "The why, in prose.\n"
+
+
+def test_an_idea_with_only_a_heading_takes_the_heading_as_title() -> None:
+    title, repo, body = initiative_decompose.idea_parts("\nintro line\n# The Heading\nmore\n")
+    assert (title, repo) == ("The Heading", "")
+    assert body == "\nintro line\n# The Heading\nmore\n"
+
+
+def test_an_idea_with_neither_takes_the_first_non_empty_line() -> None:
+    assert initiative_decompose.idea_parts("\n\n  go arrow-native  \nsecond\n")[0] == "go arrow-native"
+
+
+def test_a_title_longer_than_120_characters_is_cut_to_120() -> None:
+    assert len(initiative_decompose.idea_parts("x" * 200)[0]) == 120
+
+
+def test_a_multi_line_title_is_refused_naming_the_initiative() -> None:
+    with pytest.raises(ContractViolation, match="init-x"):
+        initiative_decompose.initiative_text({"id": "init-x", "title": "a\nb", "why": "w"}, ["p1"], {}, "")
