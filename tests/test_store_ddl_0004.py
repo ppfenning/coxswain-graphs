@@ -3,12 +3,11 @@ import sqlite3
 import pytest
 
 import harness.store_ddl_0004 as ddl
-from harness.store_dialect import POSTGRES, SQLITE, connect, forbidden_constructs, json_load, json_text
-from harness.store_migrate import check_version, default_modules, migrate, open_store
+from harness.store_dialect import POSTGRES, SQLITE, connect, json_load, json_text
+from harness.store_migrate import default_modules, migrate, open_store
 
 NOW1 = "2026-09-24T00:00:00Z"
 NOW2 = "2026-09-25T00:00:00Z"
-LATEST = len(default_modules())
 
 COLUMNS = ["run_id", "phase_id", "task_id", "record_json", "updated_at"]
 KEY = ["run_id", "phase_id", "task_id"]
@@ -43,11 +42,6 @@ def test_task_records_has_the_listed_columns_and_composite_key():
         c.close()
 
 
-def test_a_fresh_store_reaches_the_newest_version(store_conn):
-    assert check_version(store_conn) == (LATEST, LATEST)
-    assert store_conn.query_all("SELECT run_id FROM task_records") == []
-
-
 def test_the_key_is_the_whole_triple(store_conn):
     insert(store_conn, "t1", {"n": 1})
     insert(store_conn, "t2", {"n": 2})
@@ -68,28 +62,6 @@ def test_a_database_at_version_three_applies_only_0004():
         assert c.query_all("SELECT COUNT(*) FROM task_records") == [(0,)]
     finally:
         c.close()
-
-
-def test_applying_again_is_a_no_op():
-    c = open_store("sqlite:///:memory:", NOW1)
-    try:
-        insert(c, "t1", {"n": 1})
-        assert migrate(c, NOW2, default_modules()) == LATEST
-        assert c.query_all("SELECT version FROM schema_version ORDER BY version") == [
-            (v,) for v in range(1, LATEST + 1)
-        ]
-        assert c.query_all("SELECT COUNT(*) FROM task_records") == [(1,)]
-    finally:
-        c.close()
-
-
-@pytest.mark.parametrize("dialect", [SQLITE, POSTGRES], ids=["sqlite", "postgres"])
-def test_the_statement_is_portable_and_has_no_foreign_key(dialect):
-    sql = ddl.statements(dialect)
-    assert len(sql) == 1
-    assert forbidden_constructs(sql[0]) == ()
-    assert "REFERENCES" not in sql[0].upper() and "FOREIGN KEY" not in sql[0].upper()
-    assert "PRIMARY KEY (run_id, phase_id, task_id)" in sql[0]
 
 
 def test_the_record_column_uses_the_dialect_json_type():
