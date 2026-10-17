@@ -59,6 +59,13 @@ def test_a_real_corpus_path_is_still_a_reach_refusal():
     assert [p.rule for p in problems] == ["reach"]
 
 
+def test_a_path_under_tests_is_repository_code_not_corpus():
+    """runs-triage and ticket-lint, 2026-10-17: the help fixture folder of `cox runs` subcommands ends in runs/ and
+    the corpus rule refused every decompose that named it."""
+    tasks = [_task(body="add `tests/fixtures/help/runs/runs-triage.txt` and list the `tests/fixtures/help/runs/` folder")]
+    assert [p for p in lint_tickets(tasks, [], [], "graphs") if p.rule == "reach"] == []
+
+
 def test_a_command_the_sandbox_does_not_grant_is_a_grant_advisory():
     tasks = [_task(body="verify with `cox route lint t1`")]
     problems = lint_tickets(tasks, [], ["pytest", "git status", "git diff"], "graphs")

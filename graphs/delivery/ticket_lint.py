@@ -99,6 +99,8 @@ def _looks_corpus(candidate: str) -> bool:
     if _is_notation(candidate):
         return False
     stripped = candidate.strip("`,.()")
+    if stripped.startswith("tests/"):  # a repository test path (e.g. the help fixtures under tests/fixtures/help/runs/) is code
+        return False
     for pattern in _CORPUS_DENYLIST:
         if pattern.startswith("*"):
             if stripped.endswith(pattern[1:]):
