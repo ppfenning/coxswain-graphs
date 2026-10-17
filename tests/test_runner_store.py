@@ -68,7 +68,7 @@ def test_a_call_records_the_stream_summary_in_the_call_dict_and_in_detail_json(t
     read = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/a/b.py"}}]}}
     runner = _claude(tmp_path, [INIT, read, RESULT], store=Store(conn), run_id=RUN)
     _go(runner)
-    expected = {"tool_uses": {"Read": 1}, "reads": {"b.py": 1}, "whole_file_reads": 1, "result": "success", "is_error": False}
+    expected = {"tool_uses": {"Read": 1}, "reads": {"b.py": 1}, "whole_file_reads": 1, "result": "success", "is_error": False, "denied": []}
     assert runner.calls[-1]["summary"] == expected
     (detail,) = conn.query_all("SELECT detail_json FROM node_calls")[0]
     assert (json.loads(detail) if isinstance(detail, str) else detail)["summary"] == expected
