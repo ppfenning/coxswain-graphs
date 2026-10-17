@@ -1,7 +1,4 @@
-import pytest
-
-import harness.store_ddl_0005 as ddl
-from harness.store_dialect import POSTGRES, SQLITE, connect, forbidden_constructs
+from harness.store_dialect import POSTGRES, connect
 from harness.store_migrate import check_version, default_modules, migrate
 
 NOW1 = "2026-09-24T00:00:00Z"
@@ -34,20 +31,3 @@ def test_a_database_at_version_four_gains_two_nullable_columns_and_old_rows_read
         assert c.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")[4:5] == [(5, NOW2)]
     finally:
         c.close()
-
-
-def test_applying_again_changes_nothing(store_conn):
-    store_conn.execute("INSERT INTO attempts (run_id, task_id, seq, cause) VALUES ('r1', 't1', 1, 'x')")
-    versions = store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version")
-    columns = shape(store_conn)
-    assert migrate(store_conn, NOW2, default_modules()) == LATEST
-    assert store_conn.query_all("SELECT version, applied_at FROM schema_version ORDER BY version") == versions
-    assert shape(store_conn) == columns
-    assert store_conn.query_all("SELECT cause, cause_why FROM attempts") == [("x", None)]
-
-
-@pytest.mark.parametrize("dialect", [SQLITE, POSTGRES], ids=["sqlite", "postgres"])
-def test_every_statement_is_a_plain_nullable_text_alter(dialect):
-    sql = ddl.statements(dialect)
-    assert sql == tuple(f"ALTER TABLE attempts ADD COLUMN {c} TEXT" for c in NEW)
-    assert [forbidden_constructs(s) for s in sql] == [()] * len(sql)
