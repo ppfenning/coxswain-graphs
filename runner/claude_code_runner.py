@@ -421,8 +421,53 @@ def trace_commands(trace: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     return commands
 
 
+_DENIED_TEXT_LIMIT = 300
+_TARGET_KEYS = ("file_path", "path", "pattern", "url", "command")
+
+
+def _content_blocks(events: Sequence[Mapping[str, Any]], event_type: str, block_type: str) -> list[Mapping[str, Any]]:
+    """Content blocks of `block_type` from events of `event_type`, in trace order."""
+    return [
+        block
+        for event in events
+        if isinstance(event, Mapping) and event.get("type") == event_type and isinstance(event.get("message"), Mapping)
+        for block in event["message"].get("content") or []
+        if isinstance(block, Mapping) and block.get("type") == block_type
+    ]
+
+
+def _call_target(name: Any, tool_input: Any) -> str:
+    """What a call acted on: the command for Bash, else the first identifying input field, else ''."""
+    fields = tool_input if isinstance(tool_input, Mapping) else {}
+    keys = ("command",) if name == "Bash" else _TARGET_KEYS
+    return next((str(fields[key]) for key in keys if fields.get(key)), "")[:_DENIED_TEXT_LIMIT]
+
+
+def _denied_calls(events: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Calls whose tool result is an error not starting "Exit code " (that is a Bash command that ran and failed), in call order.
+
+    Paired by `tool_use_id`. Pure: reads `events`, never mutates them.
+    """
+    denials = {
+        block.get("tool_use_id"): text
+        for block in _content_blocks(events, "user", "tool_result")
+        if block.get("is_error") is True
+        for text in [_tool_result_text(block.get("content"))]
+        if not text.startswith("Exit code ")
+    }
+    return [
+        {
+            "tool": str(block.get("name")),
+            "target": _call_target(block.get("name"), block.get("input")),
+            "message": denials[block["id"]][:_DENIED_TEXT_LIMIT],
+        }
+        for block in _content_blocks(events, "assistant", "tool_use")
+        if block.get("id") in denials
+    ]
+
+
 def call_summary(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Tool counts, the ten most-read basenames, whole-file reads (a Read with no `limit`), and the result's subtype and error flag."""
+    """Tool counts, the ten most-read basenames, whole-file reads (a Read with no `limit`), the result's subtype and error flag, and the denied calls."""
     blocks = [
         block
         for event in events
@@ -442,6 +487,7 @@ def call_summary(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "whole_file_reads": sum(1 for r in reads if r.get("limit") is None),
         "result": result.get("subtype"),
         "is_error": bool(result.get("is_error")),
+        "denied": _denied_calls(events),
     }
 
 

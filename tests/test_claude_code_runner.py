@@ -8,6 +8,7 @@ which tools, what came back — and none of it needs a login.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -1330,11 +1331,47 @@ def test_call_summary_counts_tools_reads_and_takes_the_result_flags() -> None:
         "whole_file_reads": 1,
         "result": "success",
         "is_error": False,
+        "denied": [],
     }
 
 
 def test_call_summary_of_an_empty_stream_has_no_result_and_no_error() -> None:
-    assert call_summary([]) == {"tool_uses": {}, "reads": {}, "whole_file_reads": 0, "result": None, "is_error": False}
+    assert call_summary([]) == {"tool_uses": {}, "reads": {}, "whole_file_reads": 0, "result": None, "is_error": False, "denied": []}
+
+
+def _use(tool_id: str, name: str, **tool_input: object) -> dict:
+    return {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tool_id, "name": name, "input": tool_input}]}}
+
+
+def _result(tool_id: str, text: str, is_error: bool) -> dict:
+    return {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id, "is_error": is_error, "content": text}]}}
+
+
+def test_call_summary_lists_denied_write_and_bash_calls_in_call_order() -> None:
+    long_command = "echo start\n" + "x" * 400
+    events = [
+        _use("w", "Write", file_path="/r/out.txt", content="hi"),
+        _use("b", "Bash", command=long_command),
+        _use("f", "Bash", command="false"),
+        _use("ok", "Read", file_path="/r/f.py"),
+        _result("b", "Permission to run this command was denied. " + "y" * 400, True),
+        _result("w", "Claude requested permissions to write to /r/out.txt, but you haven't granted it yet.", True),
+        _result("f", "Exit code 1\nboom", True),
+        _result("ok", "contents", False),
+    ]
+    before = copy.deepcopy(events)
+    denied = call_summary(events)["denied"]
+    assert denied == [
+        {"tool": "Write", "target": "/r/out.txt", "message": "Claude requested permissions to write to /r/out.txt, but you haven't granted it yet."},
+        {"tool": "Bash", "target": long_command[:300], "message": ("Permission to run this command was denied. " + "y" * 400)[:300]},
+    ]
+    assert len(denied[1]["target"]) == 300
+    assert events == before
+
+
+def test_call_summary_with_no_denials_has_an_empty_denied_list() -> None:
+    events = [_use("a", "Read", file_path="/r/f.py"), _result("a", "contents", False), _use("b", "Bash", command="false"), _result("b", "Exit code 2\nfail", True)]
+    assert call_summary(events)["denied"] == []
 
 
 def test_self_reported_commands_tags_the_models_own_list() -> None:
