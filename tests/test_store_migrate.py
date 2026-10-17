@@ -6,7 +6,7 @@ from types import ModuleType
 import pytest
 
 import harness.store_migrate as store_migrate
-from harness.store_dialect import POSTGRES, SQLITE, Connection, connect
+from harness.store_dialect import POSTGRES, SQLITE, Connection, connect, forbidden_constructs
 from harness.store_migrate import (
     MigrationError,
     check_version,
@@ -299,3 +299,11 @@ def test_a_password_in_the_url_never_appears_in_a_raised_error(tmp_path, monkeyp
     with pytest.raises(MigrationError) as err:
         open_store(url, NOW)
     assert "s3cret-pw" not in str(err.value)
+
+
+@pytest.mark.parametrize("module", default_modules(), ids=lambda m: f"{m.VERSION:04d}")
+@pytest.mark.parametrize("dialect", [SQLITE, POSTGRES], ids=["sqlite", "postgres"])
+def test_every_default_module_statement_is_portable_and_has_no_foreign_key(module, dialect):
+    sql = module.statements(dialect)
+    assert [forbidden_constructs(s) for s in sql] == [()] * len(sql)
+    assert not [s for s in sql if "REFERENCES" in s.upper() or "FOREIGN KEY" in s.upper()]
