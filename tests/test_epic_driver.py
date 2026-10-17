@@ -35,6 +35,7 @@ from harness.epic import (
     EXIT_PAUSED,
     _attempt_cap_for,
     _invoke_failure_kind,
+    _is_append_only,
     _lifecycle_invocation,
     _ticket_amend_ramp,
     _trace_evidence,
@@ -1545,6 +1546,8 @@ def test_a_frontmatter_change_forces_the_amendment_gated() -> None:
 class TriageAttemptRunner(Runner):
     """Like `Runner`, but scripts `role="triage"` with a `ticket_defect` classification."""
 
+    action: ClassVar[str] = "add a note describing the missing fixture"
+
     def run(
         self, *, role, tier=None, hints=None, schema, prompt, context=(), thread=None, budget_usd=None, task=None,
         wait_if_paused=None,
@@ -1556,7 +1559,7 @@ class TriageAttemptRunner(Runner):
                 "class": "ticket_defect",
                 "diagnosis": "the earlier attempts hit check failed: bad output",
                 "cites": ["attempt-1|reason"],
-                "action": "add a note describing the missing fixture",
+                "action": self.action,
             }
         return super().run(
             role=role, tier=tier, schema=schema, prompt=prompt, context=context, thread=thread,
@@ -1687,6 +1690,179 @@ def test_a_stored_harness_or_unknown_cause_or_none_keeps_the_cap_at_two(repo, ca
     result, runner = _drive_with_attempts(repo, cart, tmp_path, [{}], stored=stored)
 
     assert _rebuilt(result, runner)
+
+
+AMEND_ACTION = "add a note describing the missing fixture"  # what `TriageAttemptRunner` scripts as the triage action
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        ("body", "body\n\nnote", True),
+        ("body", "body note", True),
+        ("", "note", True),
+        ("body", "body", False),
+        ("body", "body\n\n  ", False),
+        ("body", "", False),
+        ("body\n", "body", False),
+        ("body one", "body two", False),
+        ("body one", "note\nbody one", False),
+    ],
+)
+def test_the_append_only_check_on_literal_strings(old, new, expected) -> None:
+    assert _is_append_only(old, new) is expected
+
+
+class AmendArmRunner(TriageAttemptRunner):
+    """The `work_state_arm` answers a `ticket_amend`.
+
+    `write` appends the action; `dated` appends it under a dated heading, as docs/design/triage.md §2 says the real arm
+    does; `rewrite` edits a word in place and appends; `silent` claims success and writes nothing; `refuse` reports failure.
+    """
+
+    def __init__(self, patches, *, path, mode) -> None:
+        super().__init__(patches)
+        self.path, self.mode = path, mode
+
+    def run(self, **kwargs):
+        if kwargs["role"] != "work_state_arm" or "ticket_amend" not in kwargs["prompt"]:
+            return super().run(**kwargs)
+        with self.lock:
+            self.calls.append({"role": "work_state_arm", "prompt": kwargs["prompt"]})
+        if self.mode == "refuse":
+            return {"applied": False, "detail": "refused"}
+        item = workstore.read_item(self.path)
+        appended = {"write": self.action, "dated": f"## 2026-10-17\n{self.action}", "rewrite": self.action}
+        if self.mode in appended:
+            body = item["body"].replace("vendor", "supplier") if self.mode == "rewrite" else item["body"]
+            workstore.write_item({**item, "body": f"{body}\n\n{appended[self.mode]}"}, self.path)
+        return {"applied": True, "detail": "done"}
+
+
+def _drive_on_disk(repo, cart, tmp_path, mode, *, body="read the vendor schema", arm="work_state_arm"):
+    """Drive a file-backed `t1-probe` capped by two attempts; the triage amendment goes through `AmendArmRunner`."""
+    wi = tmp_path / "wi"
+    (wi / "p1-foundations").mkdir(parents=True)
+    (wi / "initiative.md").write_text("---\nid: demo-initiative\ntitle: demo\n---\n\nmake the join measurable\n")
+    path = wi / "p1-foundations" / "t1-probe.md"
+    path.write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        f"title: schema probe\n---\n\n{body}\n"
+    )
+    for n in (1, 2):
+        workstore.record_attempt(
+            path, run=f"epic-prior-{n}", phase="p1-foundations", reason="check failed: bad output",
+            ts=f"2026-09-0{n}T00:00:00+00:00",
+        )
+    kind = {"risk": "low", "ramp": "eligible", **({"apply_arm": arm} if arm else {})}
+    local_cart = {**cart, "write_kinds": {**cart["write_kinds"], "ticket_amend": kind}}
+    runner = AmendArmRunner({"t1-probe": new_file_patch("t1-probe.txt")}, path=path, mode=mode)
+    result, _ = drive(
+        repo, local_cart, tmp_path, runner=runner, work=workstore.read_initiative(wi),
+        specs={**SPECS, "triage-quarantine": triage_quarantine.SPEC},
+    )
+    return result, runner, path
+
+
+def _amend_arm_calls(runner) -> list[dict]:
+    return [c for c in runner.calls if c["role"] == "work_state_arm" and "ticket_amend" in c["prompt"]]
+
+
+def test_an_append_only_ticket_amend_is_applied_without_the_gate_and_the_task_is_built_on_it(repo, cart, tmp_path) -> None:
+    result, runner, path = _drive_on_disk(repo, cart, tmp_path, "write")
+
+    assert len(_amend_arm_calls(runner)) == 1
+    assert not any(p["kind"] == "ticket_amend" for p in result["proposals"])
+    ledger_file = tmp_path / "ledger.jsonl"
+    assert "ticket_amend" not in (ledger_file.read_text() if ledger_file.exists() else "")
+    assert workstore.read_item(path)["body"].endswith(AMEND_ACTION)
+    assert builds_per_task(runner)["t1-probe"] == 1
+    build = next(c for c in runner.calls if c["role"] == "build" and "t1-probe" in c["prompt"])
+    assert "read the vendor schema" in build["prompt"] and AMEND_ACTION in build["prompt"]
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+
+
+def test_the_task_is_rebuilt_on_the_body_the_arm_wrote_when_it_adds_a_dated_heading(repo, cart, tmp_path) -> None:
+    result, runner, path = _drive_on_disk(repo, cart, tmp_path, "dated")
+
+    assert len(_amend_arm_calls(runner)) == 1
+    assert not any(p["kind"] == "ticket_amend" for p in result["proposals"])
+    assert workstore.read_item(path)["body"].endswith(f"## 2026-10-17\n{AMEND_ACTION}")
+    build = next(c for c in runner.calls if c["role"] == "build" and "t1-probe" in c["prompt"])
+    assert f"## 2026-10-17\n{AMEND_ACTION}" in build["prompt"]
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+
+
+@pytest.mark.parametrize("mode", ["silent", "rewrite"])
+def test_an_arm_that_wrote_nothing_or_edited_in_place_quarantines_the_task_and_is_not_applied_twice(
+    repo, cart, tmp_path, mode
+) -> None:
+    result, runner, path = _drive_on_disk(repo, cart, tmp_path, mode)
+
+    entries = [q for q in result["quarantined"] if q["id"] == "t1-probe"]
+    assert len(entries) == 1 and "does not hold the old body with text appended" in entries[0]["reason"]
+    assert workstore.read_item(path)["body"] == "read the vendor schema"
+    assert not any(p["kind"] == "ticket_amend" for p in result["proposals"])
+    assert len(_amend_arm_calls(runner)) == 1
+    assert "t1-probe" not in builds_per_task(runner)
+
+
+def test_an_arm_that_reports_failure_quarantines_the_task_once_and_does_not_rebuild(repo, cart, tmp_path) -> None:
+    result, runner, path = _drive_on_disk(repo, cart, tmp_path, "refuse")
+
+    entries = [q for q in result["quarantined"] if q["id"] == "t1-probe"]
+    assert len(entries) == 1 and "applying it failed: refused" in entries[0]["reason"]
+    assert workstore.read_item(path)["body"] == "read the vendor schema"
+    assert not any(p["kind"] == "ticket_amend" for p in result["proposals"])
+    assert "t1-probe" not in builds_per_task(runner)
+
+
+def test_a_cartridge_with_no_apply_arm_for_ticket_amend_leaves_it_to_the_gate(repo, cart, tmp_path) -> None:
+    result, runner, _ = _drive_on_disk(repo, cart, tmp_path, "write", arm=None)
+
+    assert [p["target"] for p in result["proposals"] if p["kind"] == "ticket_amend"] == ["t1-probe"]
+    assert not _amend_arm_calls(runner)
+    assert not any("applying it failed" in q["reason"] for q in result["quarantined"])
+
+
+def test_an_item_with_no_ticket_file_leaves_the_amendment_to_the_gate(repo, cart, tmp_path) -> None:
+    result, runner = _drive_with_attempts(repo, cart, tmp_path, [{"cause": "ticket"}])
+
+    amend = [p for p in result["proposals"] if p["kind"] == "ticket_amend"]
+    assert [p["target"] for p in amend] == ["t1-probe"] and amend[0]["ramp"] == "eligible"
+    assert "t1-probe" not in builds_per_task(runner)
+
+
+def test_an_append_only_amendment_the_ramp_forces_gated_still_goes_to_the_gate(monkeypatch, repo, cart, tmp_path) -> None:
+    old = "---\nread the vendor schema"
+    new = f"{old}\n---\nnote"
+    assert _is_append_only(old, new) and _ticket_amend_ramp(old, new) == "gated"
+    monkeypatch.setattr(epic_module, "_amended_body", lambda old_body, action: f"{old_body}\n---\nnote")
+    result, runner, _ = _drive_on_disk(repo, cart, tmp_path, "write", body=old)
+
+    assert [p["ramp"] for p in result["proposals"] if p["kind"] == "ticket_amend"] == ["gated"]
+    assert len(_amend_arm_calls(runner)) == 1
+    assert "t1-probe" not in builds_per_task(runner)
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        pytest.param(lambda old, action: old[:-1], id="removes-text"),
+        pytest.param(lambda old, action: old.replace("vendor", "supplier") + f"\n\n{action}", id="rewrites-in-place"),
+        pytest.param(lambda old, action: f"{action}\n{old}", id="prepends"),
+    ],
+)
+def test_an_amendment_that_removes_rewrites_or_prepends_goes_to_the_gate_and_the_task_is_not_rebuilt(
+    monkeypatch, repo, cart, tmp_path, rewrite
+) -> None:
+    monkeypatch.setattr(epic_module, "_amended_body", rewrite)
+    result, runner, _ = _drive_on_disk(repo, cart, tmp_path, "silent")
+
+    assert [p["target"] for p in result["proposals"] if p["kind"] == "ticket_amend"] == ["t1-probe"]
+    assert len(_amend_arm_calls(runner)) == 1  # the gate's approval, not a direct apply
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+    assert "t1-probe" not in builds_per_task(runner)
 
 
 def test_the_cli_exit_line_names_an_approved_and_unlanded_task(monkeypatch, tmp_path, capsys) -> None:

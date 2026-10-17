@@ -1899,6 +1899,81 @@ def _ticket_amend_ramp(old_body: str, new_body: str) -> str:
     return "gated" if removed else "eligible"
 
 
+def _amended_body(old_body: str, action: str) -> str:
+    """`old_body`, a blank line, then `action`, with trailing whitespace trimmed."""
+    return f"{old_body}\n\n{action}".rstrip()
+
+
+def _is_append_only(old_body: str, new_body: str) -> bool:
+    """True only when `new_body` is `old_body` byte for byte plus non-blank text after it."""
+    return new_body.startswith(old_body) and bool(new_body[len(old_body):].strip())
+
+
+def _read_ticket(item: Mapping[str, Any]) -> tuple[bytes, dict[str, Any]] | None:
+    """The item's work file as raw bytes and parsed item; None when it has no file or the file cannot be read."""
+    if not item.get("path"):
+        return None
+    try:
+        return Path(str(item["path"])).read_bytes(), dict(workstore.read_item(str(item["path"])))
+    except (OSError, ValueError, workstore.WorkStoreError):
+        return None
+
+
+def _kept_append_only(before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
+    """True when `after` is `before` with text appended to the body and every other field unchanged."""
+    old, new = str(before.get("body") or ""), str(after.get("body") or "")
+    return (
+        _is_append_only(old, new)
+        and _ticket_amend_ramp(old, new) == "eligible"
+        and {**before, "body": ""} == {**after, "body": ""}
+    )
+
+
+def _apply_amend_directly(
+    ctx: _Ctx,
+    proposal: dict[str, Any],
+    item: Mapping[str, Any],
+    *,
+    old_body: str,
+    new_body: str,
+    phase: str,
+    quarantined: list[dict[str, Any]],
+    by_id: Mapping[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Apply an append-only `ticket_amend` outside the gate, then judge the file the arm wrote, not the body predicted.
+
+    `(rebuilt item, None)` when the file holds the old body with text appended. `(None, reason)` when the apply failed
+    or wrote something else; the file is then restored to the bytes read before. `(None, None)` when the gate decides:
+    the ramp is not eligible, the check is false, the cartridge names no model arm, or there is no readable ticket file.
+    """
+    before = _read_ticket(item)
+    arm = apply_arm_for("ticket_amend", ctx.cartridge)
+    if (
+        proposal.get("ramp") != "eligible"
+        or not _is_append_only(old_body, new_body)
+        or arm in (None, "pr", "shell", "workstore")
+        or before is None
+        or str(before[1].get("body") or "").strip() != old_body.strip()
+    ):
+        return None, None
+    applied, detail = _execute(
+        ctx, proposal, slot="other", subject=str(item["id"]), phase=phase, state=_Execution({}, {}, {}, quarantined),
+        by_id=by_id,
+    )
+    after = _read_ticket(item)
+    if applied and after is not None and _kept_append_only(before[1], after[1]):
+        return {**item, "body": str(after[1].get("body") or "")}, None
+    restored = ""
+    if after is not None and after[0] != before[0]:
+        try:
+            Path(str(item["path"])).write_bytes(before[0])
+            restored = "; the ticket file was restored"
+        except OSError:
+            restored = "; the ticket file could not be restored"
+    why = detail if not applied else "the ticket file does not hold the old body with text appended"
+    return None, f"{why}{restored}"
+
+
 def _attempt_cap_reason(attempts: Sequence[Mapping[str, Any]]) -> str:
     """The refusal's reason, naming every earlier run so a person has the history."""
     history = "; ".join(f"{a.get('run')}: {a.get('reason')}" for a in attempts)
@@ -2113,6 +2188,7 @@ def _run_phase(
     # or a repeated `(class, diagnosis)` it refuses to clear twice — still ends
     # up quarantined here, plainly, never through `_quarantine_task`.
     triage_batch: list[dict[str, Any]] = []
+    amended: dict[str, dict[str, Any]] = {}  # task id -> the item rebuilt on its append-only amended body
     capped_ids = sorted(task_id for task_id, attempts in counted_by_id.items() if len(attempts) >= cap_by_id[task_id])
     if capped_ids:
         all_ready_by_id = {str(item["id"]): item for item in all_ready}
@@ -2169,13 +2245,30 @@ def _run_phase(
 
             if emitted["kind"] == "ticket_amend":
                 old_body = str(all_ready_by_id[task_id].get("body") or "")
-                new_body = f"{old_body}\n\n{emitted.get('suggested_action', '')}".rstrip()
+                new_body = _amended_body(old_body, str(emitted.get("suggested_action", "")))
                 emitted["ramp"] = _ticket_amend_ramp(old_body, new_body)
+                rebuilt, failure = _apply_amend_directly(
+                    ctx, emitted, all_ready_by_id[task_id], old_body=old_body, new_body=new_body, phase=phase,
+                    quarantined=quarantined, by_id={str(item["id"]): item for item in items},
+                )
+                if rebuilt is not None:
+                    amended[task_id] = rebuilt
+                    print(f"  attempt cap: {task_id} launched triage -> append-only ticket_amend applied; rebuilding")
+                    continue
+                if failure is not None:
+                    if not any(q.get("id") == task_id and q.get("grain") == "task" for q in quarantined):
+                        reason = f"{_attempt_cap_reason(attempts)} triage proposed an append-only amendment; applying it failed: {failure}"
+                        quarantined.append({"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"})
+                        _quarantine_row(ctx, phase, task_id)
+                    print(f"  attempt cap: {task_id} append-only ticket_amend not applied ({failure})")
+                    continue
             triage_batch.append(emitted)
             print(f"  attempt cap: {task_id} launched triage -> {result.get('class')} ({emitted['kind']})")
+    all_ready = [amended.get(str(item["id"]), item) for item in all_ready]
+    counted_by_id = {**counted_by_id, **{task_id: [] for task_id in amended}}
     ready = [item for item in all_ready if len(counted_by_id[str(item["id"])]) < cap_by_id[str(item["id"])]]
 
-    by_id = {str(item["id"]): item for item in items}
+    by_id = {str(item["id"]): amended.get(str(item["id"]), item) for item in items}
     if hasattr(ctx.runner, "verify_by_task"):
         ctx.runner.verify_by_task = {**ctx.runner.verify_by_task, **{t: _verify_of(by_id, t) for t in by_id}}
     results: list[dict[str, Any]] = []
