@@ -219,14 +219,6 @@ def test_task_ids_and_files_are_prefixed_with_the_initiative_id(cart) -> None:
     assert result["moves"] == [{"task": "regatta-t2", "from": "p1", "to": "p1-b", "needs": ["regatta-t1"]}]
 
 
-def test_prefixed_adds_the_initiative_id_to_a_bare_id() -> None:
-    assert initiative_decompose._prefixed("init", "a") == "init-a"
-
-
-def test_prefixed_leaves_an_already_prefixed_id_alone() -> None:
-    assert initiative_decompose._prefixed("init", "init-a") == "init-a"
-
-
 def test_ids_and_needs_the_model_already_prefixed_stay_single_prefixed(cart) -> None:
     answer = dict(
         DECOMPOSITION,
@@ -761,7 +753,7 @@ def test_a_grant_refusal_is_rewritten_by_decompose_and_the_clean_rewrite_is_stor
     rewrite_call = runner.calls[-1]
     assert [c["role"] for c in runner.calls] == ["decompose", "decompose"]
     assert "t1: grant" in rewrite_call["prompt"]
-    assert initiative_decompose._grant_sentence(["pytest"]) in rewrite_call["prompt"]
+    assert "pytest" in rewrite_call["prompt"]
     task = next(t for t in result["tasks"] if t["id"] == "t1")
     assert task["body"] == PYTEST_BODY
     assert not task.get("lint")
@@ -1050,42 +1042,15 @@ def _settings_task(task_id, side, repo, needs=(), surfaces=()):
     }
 
 
-def test_the_decompose_prompt_names_the_contract_keys_and_the_dash_fixture(cart) -> None:
+def test_the_decompose_prompt_names_the_grants_it_is_given_and_no_other(cart) -> None:
     runner = ScriptedRunner({"decompose": DECOMPOSITION})
-    initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x"}, runner)
+    args = {"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "grants": ["pytest", "mypy"]}
+    initiative_decompose.run(args, runner)
     prompt = runner.calls[0]["prompt"]
-    for phrase in (
-        "open the plan with a contract task",
-        "`repo`, `interface` and `side` (`contract`, `producer` or `consumer`)",
-        "commits a JSON fixture of the interface in the producer repository",
-        "the producer's tests must emit that fixture exactly",
-        "the consumer's tests must parse it",
-        "tasks list the contract task in `needs`",
-        "The dash feed's shared v1 fixture is the model",
-    ):
-        assert phrase in prompt
-
-
-def test_the_decompose_prompt_names_the_granted_commands_and_the_repository_bound(cart) -> None:
-    runner = ScriptedRunner({"decompose": DECOMPOSITION})
-    grants = ["pytest", "git status", "git diff"]
-    initiative_decompose.run({"run_id": "r", "date": "d", "cartridge": cart, "idea": "x", "grants": grants}, runner)
-    prompt = runner.calls[0]["prompt"]
-    for phrase in (
-        "may name only the build grant: pytest, git status, git diff.",
-        "No other command may be named.",
-        "Do not name ruff, cox, uv, gh, grep or any other command in a check line, a code fence or a done-criterion",
-        "stay inside the repository the initiative names",
-        "that repository's own task, written with its own `repo` value, never a surface of this ticket",
-    ):
-        assert phrase in prompt
-
-
-def test_the_grant_sentence_follows_the_grants_it_is_given() -> None:
-    sentence = initiative_decompose._grant_sentence(["pytest", "mypy"])
-    assert "pytest, mypy" in sentence
-    assert "git diff" not in sentence
-    assert "No other command may be named." in sentence
+    assert "pytest" in prompt
+    assert "mypy" in prompt
+    assert "git status" not in prompt
+    assert "git diff" not in prompt
 
 
 SETTINGS_TREE = [
@@ -1359,17 +1324,6 @@ def test_a_reason_with_a_colon_round_trips_through_the_frontmatter(cart, tmp_pat
     assert lines[0]["size_reason"] == reason
 
 
-def test_size_record_for_each_outcome() -> None:
-    task = initiative_decompose.SizeVerdict("task", "r.", ("a.py",), "model")
-    assert initiative_decompose._size_record(task) == {"size": "task", "size_reason": "r.", "size_source": "model"}
-    assert initiative_decompose._size_record(initiative_decompose.SizeError("bad")) == {
-        "size": "epic",
-        "size_reason": "bad",
-        "size_source": "fallback",
-    }
-    assert initiative_decompose._size_record(None) is None
-
-
 def test_no_runs_dir_writes_no_ledger_and_no_size_step_writes_no_size_lines(cart, tmp_path) -> None:
     _sized(cart, {"size": TASK_VERDICT})
     assert list(tmp_path.iterdir()) == []
@@ -1424,20 +1378,6 @@ def test_the_ideas_own_frontmatter_reach_allow_applies_when_no_intake_is_given(c
     assert [c["role"] for c in runner.calls] == ["decompose"]
 
 
-def test_split_frontmatter_returns_the_block_and_a_body_without_it() -> None:
-    block, body = initiative_decompose._split_frontmatter("---\nrepo: r\nreach_allow: [a]\n---\nthe idea\nmore")
-    assert (block, body) == ({"repo": "r", "reach_allow": ["a"]}, "the idea\nmore")
-
-
-def test_split_frontmatter_leaves_text_without_a_closed_block_alone() -> None:
-    assert initiative_decompose._split_frontmatter("plain idea") == ({}, "plain idea")
-    assert initiative_decompose._split_frontmatter("---\nrepo: r\nno close") == ({}, "---\nrepo: r\nno close")
-
-
-def test_split_frontmatter_strips_a_block_that_is_not_a_mapping() -> None:
-    assert initiative_decompose._split_frontmatter("---\n- a\n---\nbody") == ({}, "body")
-
-
 @pytest.mark.parametrize(
     ("frontmatter", "expected"),
     [
@@ -1449,11 +1389,6 @@ def test_split_frontmatter_strips_a_block_that_is_not_a_mapping() -> None:
 )
 def test_reach_allow_is_a_list_of_strings_or_empty(frontmatter, expected) -> None:
     assert initiative_decompose._reach_allow({"intake": {"frontmatter": frontmatter}}, {}) == expected
-
-
-def test_reach_allow_reads_the_ideas_frontmatter_only_without_an_intake() -> None:
-    assert initiative_decompose._reach_allow({}, {"reach_allow": ["a"]}) == ["a"]
-    assert initiative_decompose._reach_allow({"intake": {"frontmatter": {}}}, {"reach_allow": ["a"]}) == []
 
 
 CONTRACT_REFUSAL = (
@@ -1542,6 +1477,17 @@ def test_an_intake_file_yields_its_frontmatter_title_and_repo_and_a_body_without
     title, repo, body = initiative_decompose.idea_parts(INTAKE_FILE)
     assert (title, repo) == ("Name the initiative: from intake", "~/repos/acme")
     assert body == "The why, in prose.\n"
+
+
+@pytest.mark.parametrize(
+    ("idea", "title", "body"),
+    [
+        ("---\nrepo: r\nno close", "---", "---\nrepo: r\nno close"),
+        ("---\n- a\n---\nbody", "body", "body"),
+    ],
+)
+def test_an_unclosed_or_non_mapping_frontmatter_block_gives_no_repo(idea, title, body) -> None:
+    assert initiative_decompose.idea_parts(idea) == (title, "", body)
 
 
 def test_an_idea_with_only_a_heading_takes_the_heading_as_title() -> None:

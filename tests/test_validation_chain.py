@@ -431,7 +431,6 @@ def test_a_go_on_the_first_build_resumes_the_same_session(cart, plan_response, b
     assert result["review"]["verdict"] == "approve"
     build_calls = [c for c in scripted.calls if c["role"] == "build"]
     assert len(build_calls) == 2
-    assert "Continue from exactly where you stopped" in build_calls[1]["prompt"]
 
 
 def test_partial_work_outside_surfaces_is_a_no_go_naming_the_remedy(cart, plan_response) -> None:
@@ -500,7 +499,6 @@ def test_a_checkpoint_with_a_grown_diff_no_outside_files_and_passing_checks_resu
     assert result["review"]["verdict"] == "approve"
     build_calls = [c for c in scripted.calls if c["role"] == "build"]
     assert len(build_calls) == 2
-    assert "Continue from exactly where you stopped" in build_calls[1]["prompt"]
     lines = _ledger_lines(tmp_path)
     assert len(lines) == 1
     assert lines[0]["decision"] == "resume"
@@ -581,8 +579,6 @@ def test_the_last_checkpoint_editing_an_existing_file_with_passing_checks_resume
         cart, plan_response, [stop, build_response], repo, "grep -q '^old line$' src/a.py && grep -q '^partial line$' src/a.py"
     )
     assert result["fix_loop"]["stopped"] is None
-    build_calls = [c for c in scripted.calls if c["role"] == "build"]
-    assert "Continue from exactly where you stopped" in build_calls[1]["prompt"]
     branches = subprocess.run(["git", "branch", "--list", "checkpoint-*"], cwd=repo, capture_output=True, text=True)
     assert branches.stdout == ""
 

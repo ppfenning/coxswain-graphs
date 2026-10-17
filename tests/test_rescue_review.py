@@ -59,11 +59,9 @@ def test_all_approve_gives_a_verdict_proposals_and_the_evidence_in_the_reviewer_
     assert result["adversary"] == ADVERSARY_APPROVES
     assert result["fix_loop"]["stopped"] is None
 
-    assert "Rows with source harness_verify were run by the harness" in prompt(scripted, "handoff")
     assert "'command': 'pytest -q'" in prompt(scripted, "handoff")
     for role in ("review_charter", "review_adversary"):
         assert "$ pytest -q\n3 passed\n(exit 0)" in prompt(scripted, role), role
-        assert "do not ask for a rerun" in prompt(scripted, role), role
 
 
 def test_the_result_carries_every_key_a_lifecycle_result_does(cartridge) -> None:

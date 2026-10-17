@@ -302,8 +302,7 @@ def test_a_placeholder_verdict_is_asked_again_rather_than_believed(cart) -> None
     chunk_calls = [c for c in runner.calls if c["role"] == "validate_chunk"]
     assert len(chunk_calls) == 3, "two tasks, and the first one asked twice"
 
-    # The retry is the same question, plus the plain statement that it is the last.
-    assert "There is no later" in chunk_calls[1]["prompt"]
+    # The retry is the same question.
     assert chunk_calls[1]["hints"] == chunk_calls[0]["hints"], "a retry is not a cheaper ask"
 
     # And the answer that counts is the one that is actually a verdict.

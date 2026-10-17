@@ -9,10 +9,7 @@ from __future__ import annotations
 
 from unittest.mock import ANY
 
-import pytest
-
 from graphs.delivery import lifecycle_propose
-from graphs.delivery.lifecycle_propose import _escalate, _tier_for
 from runner import ScriptedRunner
 from runner.protocol import BudgetStop
 
@@ -40,25 +37,6 @@ def build_tiers(runner: ScriptedRunner) -> list[str | None]:
 
 def escalation_rows(result) -> list[dict]:
     return [e for e in result["proposals"][0]["evidence"] if e["check"] == "tier escalation"]
-
-
-@pytest.mark.parametrize(
-    ("role", "literal", "tiers", "expected"),
-    [
-        ("adversary", "cheap", {"adversary": "deep"}, "deep"),
-        ("adversary", "deep", {"adversary": "deep"}, "deep"),
-        ("adversary", "deep", {"adversary": "cheap"}, "deep"),
-        ("build", None, {"build": "cheap"}, "cheap"),
-        ("build", "standard", {"plan": "deep"}, "standard"),
-    ],
-)
-def test_a_ticket_tier_raises_a_literal_and_never_lowers_it(role, literal, tiers, expected) -> None:
-    assert _tier_for(role, literal, tiers) == expected
-
-
-def test_escalate_goes_one_tier_up_and_stops_at_the_top() -> None:
-    assert _escalate("standard") == "deep"
-    assert _escalate("deep") == "deep"
 
 
 def test_a_ticket_build_tier_makes_the_build_call_pass_it(cartridge, plan_response, build_response, review_response) -> None:

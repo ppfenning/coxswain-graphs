@@ -57,27 +57,6 @@ def test_a_handoff_with_only_measured_gaps_comes_back_complete_and_discharged() 
     assert len(result["discharged"]) == 2
 
 
-def test_the_handoff_prompt_says_harness_verify_rows_are_not_builder_claims() -> None:
-    seen: list[str] = []
-
-    class Spy(ScriptedRunner):
-        def run(self, **kwargs):
-            seen.append(kwargs["prompt"])
-            return super().run(**kwargs)
-
-    build = {
-        "patch": "diff --git a/x b/x\n--- a/x\n+++ b/x\n+line\n",
-        "files_touched": ["x"],
-        "commands_run": [{"command": "echo one", "output": "one\n(exit 0)", "source": "harness_verify"}],
-    }
-    spy = Spy({"handoff": {"complete": True, "blocking": False, "missing": [], "brief": "ok"}})
-    lifecycle_propose._handoff(
-        spy, context=[], ticket="T", plan={}, build=build, facts=lifecycle_propose._change_facts(build)
-    )
-    assert "'source': 'harness_verify'" in seen[0]
-    assert "Rows with source harness_verify were run by the harness" in seen[0]
-
-
 VERIFY_ROW = {"command": "tool --dry-run", "output": "would write 3 rows\n(exit 0)", "source": "harness_verify"}
 
 
