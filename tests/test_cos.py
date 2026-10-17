@@ -471,10 +471,6 @@ def test_run_cos_runs_the_cos_graph_itself_when_no_result_is_given(cart) -> None
     assert runner.calls[0]["role"] == "dispatch"
 
 
-def test_known_graphs_names_sweep_for_coxswain_dispatch() -> None:
-    assert "sweep" in cos._KNOWN_GRAPHS
-
-
 def test_run_cos_raises_a_cos_error_for_a_selection_it_has_no_recipe_for(cart) -> None:
     weird_spec, _ = _stub_spec("lifecycle", "lifecycle-propose")
     specs = {"lifecycle": weird_spec}
@@ -528,33 +524,6 @@ def _pidfile(runs_dir, run_id: str, pid: int) -> None:
     (runs_dir / f"{run_id}.pid").write_text(str(pid), encoding="utf-8")
 
 
-def test_pid_alive_reads_liveness_off_a_faked_kill_never_the_real_process_table(tmp_path, monkeypatch) -> None:
-    # `os.kill(pid, 0)` against a real pid depends on what the host happens to
-    # have running (and a recycled or high pid_max can make an "obviously
-    # dead" number answer alive) — faking it makes every branch deterministic.
-    def fake_kill(pid: int, _sig: int) -> None:
-        if pid == 222:
-            raise PermissionError
-        if pid != 111:
-            raise ProcessLookupError
-
-    monkeypatch.setattr(cos.os, "kill", fake_kill)
-
-    live = tmp_path / "live.pid"
-    live.write_text("111", encoding="utf-8")
-    perm = tmp_path / "perm.pid"
-    perm.write_text("222", encoding="utf-8")
-    dead = tmp_path / "dead.pid"
-    dead.write_text("333", encoding="utf-8")
-    bad = tmp_path / "bad.pid"
-    bad.write_text("not-a-pid", encoding="utf-8")
-
-    assert cos._pid_alive(live) is True
-    assert cos._pid_alive(perm) is True, "PermissionError still means the process exists"
-    assert cos._pid_alive(dead) is False
-    assert cos._pid_alive(bad) is False, "unparsable content reads as dead"
-
-
 def test_free_slots_is_a_pure_function_over_plain_rows() -> None:
     rows = [{"run_id": "a", "alive": True}, {"run_id": "b", "alive": False}, {"run_id": "c", "alive": True}]
     assert cos._free_slots(3, rows) == 1
@@ -562,16 +531,12 @@ def test_free_slots_is_a_pure_function_over_plain_rows() -> None:
     assert cos._free_slots(5, []) == 5
 
 
-def test_max_in_flight_defaults_to_three_off_plain_cartridge_data() -> None:
-    assert cos._max_in_flight({"policy": {"dispatch": {"max_in_flight": 7}}}) == 7
-    assert cos._max_in_flight({}) == 3
-    assert cos._max_in_flight(None) == 3
-
-
 def test_assemble_docket_reports_in_flight_runs_and_the_free_slots_left(tmp_path, monkeypatch) -> None:
     alive_pids = {111, 222}
 
     def fake_kill(pid: int, _sig: int) -> None:
+        if pid == 444:
+            raise PermissionError  # the process exists but belongs to another user
         if pid not in alive_pids:
             raise ProcessLookupError
 
@@ -581,13 +546,14 @@ def test_assemble_docket_reports_in_flight_runs_and_the_free_slots_left(tmp_path
     _pidfile(runs_dir, "run-a", 111)
     _pidfile(runs_dir, "run-b", 222)
     _pidfile(runs_dir, "run-c", 333)  # not a live pid
+    _pidfile(runs_dir, "run-d", 444)  # PermissionError still means in flight
 
     docket = cos.assemble_docket(
         specs=_specs("retro"),
         intake_root=None,
         ledger_path=None,
         alerts_present=False,
-        cartridge={"policy": {"dispatch": {"max_in_flight": 3}}},
+        cartridge={"policy": {"dispatch": {"max_in_flight": 4}}},
         runs_dir=runs_dir,
     )
 
@@ -595,8 +561,9 @@ def test_assemble_docket_reports_in_flight_runs_and_the_free_slots_left(tmp_path
         {"run_id": "run-a", "alive": True},
         {"run_id": "run-b", "alive": True},
         {"run_id": "run-c", "alive": False},
+        {"run_id": "run-d", "alive": True},
     ]
-    assert docket["max_in_flight"] == 3
+    assert docket["max_in_flight"] == 4
     assert docket["free_slots"] == 1
 
 

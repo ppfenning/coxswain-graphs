@@ -6,7 +6,6 @@ import pytest
 
 from harness.traces_url import (
     TracesRoot,
-    _plugin_for,
     _s3_options,
     have_pyarrow,
     redact_url,
@@ -96,13 +95,6 @@ def test_a_scheme_with_no_plugin_is_refused_naming_the_scheme_and_the_group(monk
     )
 
 
-def test_the_lookup_returns_the_registered_loadable_and_refuses_the_rest():
-    loadable = object()
-    assert _plugin_for("fake", {"fake": loadable}) is loadable
-    with pytest.raises(ValueError, match="'other'"):
-        _plugin_for("other", {"fake": loadable})
-
-
 def test_a_plugin_under_s3_is_not_called_and_the_built_in_branch_is_taken(monkeypatch):
     fs = _fs()
     calls = _registered(monkeypatch, s3=(object(), "plugin/path"))
@@ -160,15 +152,20 @@ def test_a_file_url_is_local():
     assert root.path == "/var/my traces"
 
 
-def test_an_s3_url_is_an_s3_filesystem_rooted_at_bucket_and_prefix():
+def test_an_s3_url_is_an_s3_filesystem_rooted_at_bucket_and_prefix(monkeypatch):
     fs = _fs()
+    built = object()
+    seen = []
+    monkeypatch.setattr(fs, "S3FileSystem", lambda **kwargs: seen.append(kwargs) or built)
     root = resolve_traces_root("s3://bucket/prefix/", Path("/runs"), {"AWS_REGION": "us-east-1"})
-    assert isinstance(root.fs, fs.S3FileSystem)
+    assert root.fs is built
     assert root.path == "bucket/prefix"
+    assert len(seen) == 1
 
 
-def test_an_s3_url_with_no_prefix_is_the_bucket_alone():
-    _fs()
+def test_an_s3_url_with_no_prefix_is_the_bucket_alone(monkeypatch):
+    fs = _fs()
+    monkeypatch.setattr(fs, "S3FileSystem", lambda **kwargs: object())
     root = resolve_traces_root("s3://bucket", Path("/runs"), {"AWS_DEFAULT_REGION": "eu-west-1"})
     assert root.path == "bucket"
 

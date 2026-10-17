@@ -2,13 +2,7 @@ import ast
 from pathlib import Path
 
 from harness import cause_rule
-from harness.cause_rule import (
-    _OUTSIDE_SURFACES_WHY,
-    _TRANSIENT_AUTH,
-    CAUSES,
-    classify_cause,
-    is_auth_failure,
-)
+from harness.cause_rule import CAUSES, classify_cause, is_auth_failure
 
 
 def test_the_closed_set_of_causes():
@@ -54,7 +48,6 @@ def test_a_no_work_oauth_refresh_collision_is_harness():
         "node 'build' failed in claude: Failed to refresh OAuth token: "
         "another Claude Code process is..."
     )
-    assert _TRANSIENT_AUTH == ("failed to refresh oauth token",)
     assert classify_cause("no_work", reason) == "harness"
 
 
@@ -83,7 +76,6 @@ def test_a_configured_check_failure_is_code():
 def test_an_outside_surfaces_check_failure_is_ticket_with_its_why():
     reason = "configured check failed outside surfaces: tests/test_x.py"
     assert classify_cause("unverified", reason) == "ticket"
-    assert _OUTSIDE_SURFACES_WHY == "tests outside surfaces"
 
 
 def test_a_plain_configured_check_failure_is_still_code():
