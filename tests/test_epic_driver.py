@@ -34,6 +34,7 @@ from harness.epic import (
     EXIT_AWAITING_LAND,
     EXIT_PAUSED,
     _invoke_failure_kind,
+    _is_append_only,
     _lifecycle_invocation,
     _ticket_amend_ramp,
     _trace_evidence,
@@ -1574,7 +1575,7 @@ def test_the_attempt_cap_launches_triage_instead_of_a_plain_quarantine(repo, car
     local_cart = {**cart, "write_kinds": {**cart["write_kinds"], "ticket_amend": {
         "risk": "low", "ramp": "eligible", "apply_arm": "work_state_arm",
     }}}
-    runner = TriageAttemptRunner({"t2-bench": new_file_patch("t2-bench.txt")})
+    runner = TriageAttemptRunner({t: new_file_patch(f"{t}.txt") for t in ("t1-probe", "t2-bench")})
     result, _ = drive(
         repo, local_cart, tmp_path, runner=runner, work=work,
         specs={**SPECS, "triage-quarantine": triage_quarantine.SPEC},
@@ -1582,9 +1583,168 @@ def test_the_attempt_cap_launches_triage_instead_of_a_plain_quarantine(repo, car
 
     assert any(call["role"] == "triage" for call in runner.calls)
     assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
-    amend = next(p for p in result["proposals"] if p["target"] == "t1-probe")
-    assert amend["kind"] == "ticket_amend"
-    assert amend["ramp"] == "eligible"
+    # The amendment only appends, so it is applied directly and never reaches the gate batch.
+    assert not any(p["kind"] == "ticket_amend" for p in result["proposals"])
+
+
+class AmendingTriageRunner(TriageAttemptRunner):
+    """Like `TriageAttemptRunner`, but triage's action text is chosen by the test."""
+
+    def __init__(self, patches: dict[str, str], *, action: str) -> None:
+        super().__init__(patches)
+        self.action = action
+
+    def run(self, *, role, **kwargs):
+        if role == "triage":
+            with self.lock:
+                self.calls.append({"role": role, "tier": kwargs.get("tier"), "prompt": kwargs["prompt"], "budget_usd": None})
+            return {
+                "class": "ticket_defect",
+                "diagnosis": "the earlier attempts hit check failed: bad output",
+                "cites": ["attempt-1|reason"],
+                "action": self.action,
+            }
+        return Runner.run(self, role=role, **kwargs)
+
+
+def _capped_amend_run(repo, cart, tmp_path, *, action: str):
+    work = initiative(two_phases=False)
+    task = next(item for item in work["items"] if item["id"] == "t1-probe")
+    task["attempts"] = [
+        {"run": f"epic-prior-{n}", "phase": "p1-foundations", "reason": "check failed: bad output",
+         "kind": "refused", "ts": f"2026-09-0{n}T00:00:00+00:00"}
+        for n in (1, 2)
+    ]
+    local_cart = {**cart, "write_kinds": {**cart["write_kinds"], "ticket_amend": {
+        "risk": "low", "ramp": "eligible", "apply_arm": "work_state_arm",
+    }}}
+    runner = AmendingTriageRunner(
+        {"t1-probe": new_file_patch("t1-probe.txt"), "t2-bench": new_file_patch("t2-bench.txt")}, action=action
+    )
+    result, _ = drive(
+        repo, local_cart, tmp_path, runner=runner, work=work,
+        specs={**SPECS, "triage-quarantine": triage_quarantine.SPEC},
+    )
+    return result, runner
+
+
+def _build_prompts(runner, task: str) -> list[str]:
+    return [c["prompt"] for c in runner.calls if c["role"] == "build" and task in c["prompt"]]
+
+
+def test_an_append_only_ticket_amend_is_applied_without_the_gate_and_the_task_builds_on_it(repo, cart, tmp_path) -> None:
+    result, runner = _capped_amend_run(repo, cart, tmp_path, action="the fixture lives in tests/data/probe.json")
+
+    assert not any(p["kind"] == "ticket_amend" for p in result["proposals"])
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+    arm = [c for c in runner.calls if c["role"] == "work_state_arm" and "ticket_amend" in c["prompt"]]
+    assert len(arm) == 1
+    prompts = _build_prompts(runner, "t1-probe")
+    assert len(prompts) == 1
+    assert "read the vendor schema" in prompts[0]
+    assert "the fixture lives in tests/data/probe.json" in prompts[0]
+
+
+class WritingArmRunner(AmendingTriageRunner):
+    """Like `AmendingTriageRunner`, but the `ticket_amend` arm really appends `action` to the ticket file."""
+
+    def __init__(self, patches: dict[str, str], *, action: str, path: Path) -> None:
+        super().__init__(patches, action=action)
+        self.path = path
+
+    def run(self, *, role, **kwargs):
+        if role == "work_state_arm" and "ticket_amend" in kwargs["prompt"]:
+            stored = workstore.read_item(self.path)
+            workstore.write_item({**stored, "body": f"{stored['body']}\n\n{self.action}"}, self.path)
+        return super().run(role=role, **kwargs)
+
+
+def test_the_task_builds_on_the_body_read_back_from_the_ticket_file(repo, cart, tmp_path) -> None:
+    path = tmp_path / "t1-probe.md"
+    path.write_text(
+        "---\nid: t1-probe\nphase: p1-foundations\nstate: ready\nneeds: []\nsurfaces: []\n"
+        "title: schema probe\n---\n\nread the vendor schema\n"
+    )
+    work = initiative(two_phases=False)
+    task = next(item for item in work["items"] if item["id"] == "t1-probe")
+    task["path"] = str(path)
+    task["body"] = workstore.read_item(path)["body"]
+    task["attempts"] = [
+        {"run": f"epic-prior-{n}", "phase": "p1-foundations", "reason": "check failed: bad output",
+         "kind": "refused", "ts": f"2026-09-0{n}T00:00:00+00:00"}
+        for n in (1, 2)
+    ]
+    local_cart = {**cart, "write_kinds": {**cart["write_kinds"], "ticket_amend": {
+        "risk": "low", "ramp": "eligible", "apply_arm": "work_state_arm",
+    }}}
+    runner = WritingArmRunner(
+        {t: new_file_patch(f"{t}.txt") for t in ("t1-probe", "t2-bench")}, action="the fixture is probe.json", path=path
+    )
+    result, _ = drive(
+        repo, local_cart, tmp_path, runner=runner, work=work,
+        specs={**SPECS, "triage-quarantine": triage_quarantine.SPEC},
+    )
+
+    assert not any(q["id"] == "t1-probe" for q in result["quarantined"])
+    assert "the fixture is probe.json" in workstore.read_item(path)["body"]
+    (prompt,) = _build_prompts(runner, "t1-probe")
+    assert "the fixture is probe.json" in prompt
+
+
+def test_a_cartridge_ramp_of_never_keeps_an_append_only_amendment_at_the_gate(repo, cart, tmp_path) -> None:
+    work = initiative(two_phases=False)
+    task = next(item for item in work["items"] if item["id"] == "t1-probe")
+    task["attempts"] = [
+        {"run": f"epic-prior-{n}", "phase": "p1-foundations", "reason": "check failed: bad output",
+         "kind": "refused", "ts": f"2026-09-0{n}T00:00:00+00:00"}
+        for n in (1, 2)
+    ]
+    local_cart = {**cart, "write_kinds": {**cart["write_kinds"], "ticket_amend": {
+        "risk": "low", "ramp": "never", "apply_arm": "work_state_arm",
+    }}}
+    runner = AmendingTriageRunner({"t2-bench": new_file_patch("t2-bench.txt")}, action="a note")
+    result, _ = drive(
+        repo, local_cart, tmp_path, runner=runner, work=work,
+        specs={**SPECS, "triage-quarantine": triage_quarantine.SPEC},
+    )
+
+    assert any(p["kind"] == "ticket_amend" and p["target"] == "t1-probe" for p in result["proposals"])
+    assert "t1-probe" not in builds_per_task(runner)
+
+
+def test_an_amendment_that_removes_text_goes_to_the_gate_and_the_task_is_not_rebuilt_on_it(
+    repo, cart, tmp_path, monkeypatch
+) -> None:
+    # `_amended_body` is the seam: the driver only ever appends, so a removal is made by replacing it.
+    monkeypatch.setattr("harness.epic._amended_body", lambda old, action: "read the vendor")
+    result, runner = _capped_amend_run(repo, cart, tmp_path, action="drop the last word")
+
+    amend = next(p for p in result["proposals"] if p["kind"] == "ticket_amend")
+    assert amend["target"] == "t1-probe"
+    assert amend["ramp"] == "gated"
+    assert "t1-probe" not in builds_per_task(runner)
+
+
+def test_an_amendment_that_rewrites_text_in_place_goes_to_the_gate(repo, cart, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.epic._amended_body", lambda old, action: "read the client schema\n\nand a note")
+    result, runner = _capped_amend_run(repo, cart, tmp_path, action="say client, not vendor")
+
+    amend = next(p for p in result["proposals"] if p["kind"] == "ticket_amend")
+    assert amend["target"] == "t1-probe"
+    assert amend["ramp"] == "gated"
+    assert "t1-probe" not in builds_per_task(runner)
+
+
+def test_the_append_only_check_on_literal_strings() -> None:
+    old = "---\nid: t1\n---\nOriginal text."
+    assert _is_append_only(old, old + "\n\nA note.") is True
+    assert _is_append_only(old, old) is False  # identical
+    assert _is_append_only(old, old + "") is False  # empty append
+    assert _is_append_only(old, old + "\n\n  \n") is False  # blank append
+    assert _is_append_only(old, "---\nid: t1\n---\nOriginal") is False  # removal
+    assert _is_append_only(old, "---\nid: t1\n---\nChanged text.\n\nA note.") is False  # edit in place
+    assert _is_append_only(old, "\n" + old + "\n\nA note.") is False  # prefixed, not appended
+    assert _is_append_only("", "A note.") is True
 
 
 def test_the_cli_exit_line_names_an_approved_and_unlanded_task(monkeypatch, tmp_path, capsys) -> None:

@@ -60,10 +60,15 @@ def test_two_attempts_recorded_before_a_rewrite_do_not_cap_the_task_and_it_build
 def test_two_attempts_recorded_on_the_current_body_cap_the_task_and_it_goes_to_triage(repo, cart, tmp_path) -> None:  # noqa: F811
     wi, _ = _store_with_two_recorded_attempts(tmp_path)
     runner = TriageAttemptRunner({})
-    drive(repo, _amend_cart(cart), tmp_path, runner=runner, work=workstore.read_initiative(wi), specs=TRIAGE_SPECS)
+    result, _ = drive(
+        repo, _amend_cart(cart), tmp_path, runner=runner, work=workstore.read_initiative(wi), specs=TRIAGE_SPECS
+    )
 
     assert any(call["role"] == "triage" for call in runner.calls)
+    # The fake arm reports `applied` but writes nothing, so the read-back finds the old body: no build, a person decides.
     assert "t1-probe" not in builds_per_task(runner)
+    entry = next(q for q in result["quarantined"] if q["id"] == "t1-probe")
+    assert "stored ticket is not an append" in entry["reason"]
 
 
 def test_triage_sees_its_prior_entry_on_an_older_body_and_escalates(repo, cart, tmp_path) -> None:  # noqa: F811

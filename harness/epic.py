@@ -1899,6 +1899,24 @@ def _ticket_amend_ramp(old_body: str, new_body: str) -> str:
     return "gated" if removed else "eligible"
 
 
+def _amended_body(old_body: str, suggested_action: str) -> str:
+    """The body a `ticket_amend` proposes. Trailing whitespace is dropped."""
+    return f"{old_body}\n\n{suggested_action}".rstrip()
+
+
+def _is_append_only(old_body: str, new_body: str) -> bool:
+    """Byte-for-byte prefix plus non-blank appended text; identical, blank-append, removal and edit are False."""
+    return new_body.startswith(old_body) and bool(new_body[len(old_body):].strip())
+
+
+def _stored_body(path: str) -> str:
+    """The body the ticket file holds now; "" when it cannot be read, which no append-only check accepts."""
+    try:
+        return str(workstore.read_item(path).get("body") or "")
+    except (WorkStoreError, OSError):
+        return ""
+
+
 def _attempt_cap_reason(attempts: Sequence[Mapping[str, Any]]) -> str:
     """The refusal's reason, naming every earlier run so a person has the history."""
     history = "; ".join(f"{a.get('run')}: {a.get('reason')}" for a in attempts)
@@ -2102,6 +2120,7 @@ def _run_phase(
     # or a repeated `(class, diagnosis)` it refuses to clear twice — still ends
     # up quarantined here, plainly, never through `_quarantine_task`.
     triage_batch: list[dict[str, Any]] = []
+    amended: dict[str, dict[str, Any]] = {}
     capped_ids = sorted(task_id for task_id, attempts in counted_by_id.items() if len(attempts) >= ATTEMPT_CAP)
     if capped_ids:
         all_ready_by_id = {str(item["id"]): item for item in all_ready}
@@ -2158,11 +2177,49 @@ def _run_phase(
 
             if emitted["kind"] == "ticket_amend":
                 old_body = str(all_ready_by_id[task_id].get("body") or "")
-                new_body = f"{old_body}\n\n{emitted.get('suggested_action', '')}".rstrip()
+                new_body = _amended_body(old_body, str(emitted.get("suggested_action", "")))
+                ramp = ((ctx.cartridge.get("write_kinds") or {}).get("ticket_amend") or {}).get("ramp")
+                if ramp != "never" and _is_append_only(old_body, new_body):
+                    # Nothing removed or changed, so the gate has nothing to judge: apply it as the auto split does,
+                    # with no gate diff and no ledger row, and build on the amended body below. A cartridge ramp of
+                    # "never" still goes to the gate.
+                    applied, detail = _execute(
+                        ctx, emitted, slot="other", subject=task_id, phase=phase,
+                        state=_Execution(landed={}, merged={}, moved={}, quarantined=quarantined),
+                        by_id=all_ready_by_id,
+                    )
+                    if applied:
+                        # The arm's `applied` is a self-report and `new_body` is only what the driver expects it
+                        # wrote. Where a ticket file backs the item, the file is read back and must itself be an
+                        # append to the old body; the builder then reads what is stored. Under work_state store
+                        # the file is a cache and there is nothing to read back.
+                        path = all_ready_by_id[task_id].get("path")
+                        landed_body = _stored_body(str(path)) if path and not _store_authoritative(ctx) else new_body
+                        if not _is_append_only(old_body, landed_body):
+                            reason = (
+                                f"{_attempt_cap_reason(attempts)} triage's ticket_amend was reported applied but the "
+                                "stored ticket is not an append to the old body; a person decides."
+                            )
+                            quarantined.append(
+                                {"id": task_id, "phase": phase, "grain": "task", "reason": reason, "kind": "no_work"}
+                            )
+                            _quarantine_row(ctx, phase, task_id)
+                            print(f"  attempt cap: {task_id} ticket_amend read back wrong; quarantined")
+                            continue
+                        amended[task_id] = {**all_ready_by_id[task_id], "body": landed_body}
+                        print(f"  attempt cap: {task_id} launched triage -> {result.get('class')} (ticket_amend applied)")
+                        continue
+                    print(f"  attempt cap: {task_id} append-only amendment not applied ({detail}); left to the gate")
                 emitted["ramp"] = _ticket_amend_ramp(old_body, new_body)
             triage_batch.append(emitted)
             print(f"  attempt cap: {task_id} launched triage -> {result.get('class')} ({emitted['kind']})")
-    ready = [item for item in all_ready if len(counted_by_id[str(item["id"])]) < ATTEMPT_CAP]
+    # An amended task is a rewritten ticket: the attempts that capped it were on the old body, so it is let through
+    # the cap and builds on the new body. The read-back above is what stops a failed write looping here.
+    ready = [
+        amended.get(str(item["id"]), item)
+        for item in all_ready
+        if str(item["id"]) in amended or len(counted_by_id[str(item["id"])]) < ATTEMPT_CAP
+    ]
 
     by_id = {str(item["id"]): item for item in items}
     if hasattr(ctx.runner, "verify_by_task"):

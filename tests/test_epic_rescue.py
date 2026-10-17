@@ -252,4 +252,5 @@ def test_two_build_attempts_on_the_current_body_still_cap_the_task_and_it_goes_t
     drive(repo, _amend_cart(cart), tmp_path, runner=runner, work=work, specs=TRIAGE_SPECS)
 
     assert any(call["role"] == "triage" for call in runner.calls)
-    assert "t1-probe" not in builds_per_task(runner)
+    # Triage's append-only amendment is applied, so the task builds once, on the amended body, in the same run.
+    assert builds_per_task(runner)["t1-probe"] == 1
