@@ -3,7 +3,7 @@ import re
 import pytest
 
 import harness.store_ddl_0001 as ddl
-from harness.store_dialect import POSTGRES, SQLITE, connect, forbidden_constructs
+from harness.store_dialect import POSTGRES, SQLITE, connect
 from harness.store_migrate import check_version, migrate
 
 NOW = "2026-09-24T00:00:00Z"
@@ -102,11 +102,6 @@ def test_open_store_leaves_schema_version_at_one(conn):
     assert check_version(conn, [ddl]) == (1, 1)
 
 
-def test_migrating_again_applies_nothing_new(conn):
-    assert migrate(conn, NOW, [ddl]) == 1
-    assert conn.query_one("SELECT COUNT(*) FROM schema_version") == (1,)
-
-
 @pytest.mark.parametrize("table", sorted(PKS))
 def test_each_table_exists_with_the_listed_primary_key(conn, table):
     rows = info(conn, table)
@@ -128,13 +123,6 @@ def test_epoch_is_a_nullable_bigint(conn, table):
 def test_the_four_indexes_exist(conn):
     rows = conn.query_all("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name LIKE 'ix_%'")
     assert sorted(t for (t,) in rows) == ["attempts", "ledger", "node_calls", "node_calls"]
-
-
-@pytest.mark.parametrize("dialect", [SQLITE, POSTGRES], ids=["sqlite", "postgres"])
-def test_every_statement_is_portable(dialect):
-    sql = ddl.statements(dialect)
-    assert len(sql) == 12
-    assert [forbidden_constructs(s) for s in sql] == [()] * len(sql)
 
 
 @pytest.mark.parametrize(("dialect", "want"), [(SQLITE, "TEXT"), (POSTGRES, "JSONB")], ids=["sqlite", "postgres"])

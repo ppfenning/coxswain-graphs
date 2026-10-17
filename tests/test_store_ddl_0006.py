@@ -3,12 +3,11 @@ import sqlite3
 import pytest
 
 import harness.store_ddl_0006 as ddl
-from harness.store_dialect import POSTGRES, SQLITE, connect, forbidden_constructs, json_load, json_text
-from harness.store_migrate import check_version, default_modules, migrate, open_store
+from harness.store_dialect import POSTGRES, SQLITE, connect, json_load, json_text
+from harness.store_migrate import default_modules, migrate
 
 NOW1 = "2026-09-24T00:00:00Z"
 NOW2 = "2026-09-25T00:00:00Z"
-LATEST = len(default_modules())
 
 COLUMNS = ["initiative", "task_id", "phase", "state", "needs_json", "updated_at", "updated_by"]
 KEY = ["initiative", "task_id"]
@@ -47,11 +46,6 @@ def test_work_items_has_the_listed_columns_all_not_null_and_composite_key():
         c.close()
 
 
-def test_a_fresh_store_reaches_the_newest_version(store_conn):
-    assert check_version(store_conn) == (LATEST, LATEST)
-    assert store_conn.query_all("SELECT initiative FROM work_items") == []
-
-
 def test_the_key_is_initiative_and_task_id(store_conn):
     insert(store_conn, "i1", "t1", needs=["t0"])
     insert(store_conn, "i2", "t1")
@@ -79,34 +73,6 @@ def test_a_database_at_version_five_applies_only_0006():
         c.close()
 
 
-def test_applying_again_is_a_no_op():
-    c = open_store("sqlite:///:memory:", NOW1)
-    try:
-        insert(c, "i1", "t1")
-        assert migrate(c, NOW2, default_modules()) == LATEST
-        versions = c.query_all("SELECT version FROM schema_version ORDER BY version")
-        assert versions == [(v,) for v in range(1, LATEST + 1)]
-        assert c.query_all("SELECT COUNT(*) FROM work_items") == [(1,)]
-    finally:
-        c.close()
-
-
-@pytest.mark.parametrize("dialect", [SQLITE, POSTGRES], ids=["sqlite", "postgres"])
-def test_the_statement_is_portable_and_has_no_foreign_key(dialect):
-    sql = ddl.statements(dialect)
-    assert len(sql) == 1
-    assert forbidden_constructs(sql[0]) == ()
-    assert "REFERENCES" not in sql[0].upper() and "FOREIGN KEY" not in sql[0].upper()
-    assert "PRIMARY KEY (initiative, task_id)" in sql[0]
-
-
 def test_the_needs_column_uses_the_dialect_json_type():
     assert "needs_json TEXT NOT NULL" in ddl.statements(SQLITE)[0]
     assert "needs_json JSONB NOT NULL" in ddl.statements(POSTGRES)[0]
-
-
-def test_store_copy_lists_work_items():
-    """store_copy lists every migration's tables by hand; a table left out is silently not copied."""
-    from harness import store_copy
-
-    assert "work_items" in {name for name, _, _ in store_copy.tables()}

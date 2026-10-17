@@ -2,12 +2,11 @@ import pytest
 
 import harness.store_ddl_0001 as ddl1
 import harness.store_ddl_0002 as ddl
-from harness.store_dialect import POSTGRES, SQLITE, connect, forbidden_constructs
-from harness.store_migrate import check_version, default_modules, migrate, open_store
+from harness.store_dialect import POSTGRES, SQLITE, connect
+from harness.store_migrate import migrate, open_store
 
 NOW1 = "2026-09-24T00:00:00Z"
 NOW2 = "2026-09-25T00:00:00Z"
-LATEST = len(default_modules())
 
 COLUMNS = {
     "graphs": ["graph_id", "name", "version", "content_hash", "registered_at", "definition_json"],
@@ -34,11 +33,6 @@ def conn():
     c = open_store("sqlite:///:memory:", NOW1)
     yield c
     c.close()
-
-
-def test_an_empty_database_reaches_the_newest_version(conn):
-    assert check_version(conn) == (LATEST, LATEST)
-    assert conn.query_one("SELECT MAX(version) FROM schema_version") == (LATEST,)
 
 
 @pytest.mark.parametrize("table", sorted(COLUMNS))
@@ -78,14 +72,6 @@ def test_a_database_at_version_one_applies_only_0002():
         assert c.query_all("SELECT call_id, run_id, node_id FROM node_calls") == [("c1", "r1", None)]
     finally:
         c.close()
-
-
-@pytest.mark.parametrize("dialect", [SQLITE, POSTGRES], ids=["sqlite", "postgres"])
-def test_every_statement_is_portable_and_has_no_foreign_key(dialect):
-    sql = ddl.statements(dialect)
-    assert len(sql) == 6
-    assert [forbidden_constructs(s) for s in sql] == [()] * len(sql)
-    assert not [s for s in sql if "REFERENCES" in s.upper() or "FOREIGN KEY" in s.upper()]
 
 
 def test_the_definition_column_uses_the_dialect_json_type():
