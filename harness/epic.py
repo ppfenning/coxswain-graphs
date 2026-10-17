@@ -1908,6 +1908,12 @@ def _attempt_cap_reason(attempts: Sequence[Mapping[str, Any]]) -> str:
     )
 
 
+def _attempt_cap_for(attempts: Sequence[Mapping[str, Any]]) -> int:
+    """1 when the newest attempt by `ts` (ties keep list order) was caused by the ticket or the code, else `ATTEMPT_CAP`."""
+    newest = sorted(attempts, key=lambda a: str(a.get("ts") or ""))[-1:]
+    return 1 if any(a.get("cause") in ("ticket", "code") for a in newest) else ATTEMPT_CAP
+
+
 def _ready_view(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """`items`, with a merged-but-unlanded parent presented as `done` for `needs`.
 
@@ -2096,13 +2102,18 @@ def _run_phase(
         )
         for item in all_ready
     }
+    caused_by_id = {
+        task_id: with_stored_causes({"attempts": counted}, _stored_causes(ctx, task_id))["attempts"] if counted else counted
+        for task_id, counted in counted_by_id.items()
+    }
+    cap_by_id = {task_id: _attempt_cap_for(caused) for task_id, caused in caused_by_id.items()}
     # A capped task is launched into `triage` (docs/design/triage.md §1) rather
     # than quarantined outright: the graph classifies the attempt record and
     # emits by class, and only a class `triage` could not turn into a write —
     # or a repeated `(class, diagnosis)` it refuses to clear twice — still ends
     # up quarantined here, plainly, never through `_quarantine_task`.
     triage_batch: list[dict[str, Any]] = []
-    capped_ids = sorted(task_id for task_id, attempts in counted_by_id.items() if len(attempts) >= ATTEMPT_CAP)
+    capped_ids = sorted(task_id for task_id, attempts in counted_by_id.items() if len(attempts) >= cap_by_id[task_id])
     if capped_ids:
         all_ready_by_id = {str(item["id"]): item for item in all_ready}
         _wait_if_paused(ctx)
@@ -2162,7 +2173,7 @@ def _run_phase(
                 emitted["ramp"] = _ticket_amend_ramp(old_body, new_body)
             triage_batch.append(emitted)
             print(f"  attempt cap: {task_id} launched triage -> {result.get('class')} ({emitted['kind']})")
-    ready = [item for item in all_ready if len(counted_by_id[str(item["id"])]) < ATTEMPT_CAP]
+    ready = [item for item in all_ready if len(counted_by_id[str(item["id"])]) < cap_by_id[str(item["id"])]]
 
     by_id = {str(item["id"]): item for item in items}
     if hasattr(ctx.runner, "verify_by_task"):
