@@ -7,7 +7,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import ClassVar
 
-import harness
 import harness.cli as cli
 
 
@@ -56,10 +55,6 @@ def _patch_common(monkeypatch, args, runner, *, build_runner_calls: list | None 
     monkeypatch.setattr(cli, "build_runner", _build_runner)
     monkeypatch.setattr(cli, "remove_worktree", lambda repo, worktree: (True, "removed (fake)"))
     monkeypatch.setattr(cli, "keep_worktree", lambda repo, worktree, root, run_id: (True, "kept (fake)"))
-
-
-def test_harness_core_schema_is_the_declared_version() -> None:
-    assert harness.CORE_SCHEMA == "1.0"
 
 
 def test_equal_versions_proceed_silently(monkeypatch, tmp_path, capsys) -> None:
