@@ -33,6 +33,7 @@ from harness import epic as epic_module
 from harness.epic import (
     EXIT_AWAITING_LAND,
     EXIT_PAUSED,
+    _attempt_cap_for,
     _invoke_failure_kind,
     _lifecycle_invocation,
     _ticket_amend_ramp,
@@ -1585,6 +1586,107 @@ def test_the_attempt_cap_launches_triage_instead_of_a_plain_quarantine(repo, car
     amend = next(p for p in result["proposals"] if p["target"] == "t1-probe")
     assert amend["kind"] == "ticket_amend"
     assert amend["ramp"] == "eligible"
+
+
+@pytest.mark.parametrize(
+    ("attempts", "cap"),
+    [
+        ([{"cause": "ticket"}], 1),
+        ([{"cause": "code"}], 1),
+        ([{"cause": "harness"}], 2),
+        ([{"cause": "ticket"}, {"cause": "harness"}], 2),
+        ([{"cause": "harness"}, {"cause": "code"}], 1),
+        ([{"cause": "code", "ts": "2026-09-02"}, {"cause": "harness", "ts": "2026-09-01"}], 1),
+        ([{"cause": "harness", "ts": "2026-09-02"}, {"cause": "ticket", "ts": "2026-09-01"}], 2),
+        ([{}], 2),
+        ([{"cause": ""}], 2),
+        ([{"cause": "weather"}], 2),
+        ([], 2),
+    ],
+)
+def test_the_cap_follows_the_cause_of_the_newest_attempt(attempts, cap) -> None:
+    assert _attempt_cap_for(attempts) == cap
+
+
+OLDER_BODY = "sha-of-the-body-before-the-amend"
+
+
+def _drive_with_attempts(repo, cart, tmp_path, attempts, *, stored=()):
+    """Drive `t1-probe` with `attempts` as file attempts on its current body unless one sets `body_sha`.
+
+    `stored` is (run, cause) pairs written to the store as `refused` attempts on `p1-foundations`.
+    """
+    work = initiative(two_phases=False)
+    task = next(item for item in work["items"] if item["id"] == "t1-probe")
+    task["attempts"] = [
+        {"run": f"epic-prior-{n}", "phase": "p1-foundations", "reason": "check failed: bad output", "kind": "refused",
+         "body_sha": workstore.body_sha(task["body"]), "ts": f"2026-09-0{n}T00:00:00+00:00", **attempt}
+        for n, attempt in enumerate(attempts, start=1)
+    ]
+    store = Store(open_store("sqlite:///:memory:", datetime.now(UTC).isoformat()))
+    for n, (run, cause) in enumerate(stored, start=1):
+        store.record_attempt(run, "t1-probe", n, "p1-foundations", "refused", "check failed: bad output",
+                             "2026-09-01T00:00:00+00:00", cause=cause, cause_why="seeded")
+    local_cart = {**cart, "write_kinds": {**cart["write_kinds"], "ticket_amend": {
+        "risk": "low", "ramp": "eligible", "apply_arm": "work_state_arm",
+    }}}
+    runner = TriageAttemptRunner({"t1-probe": new_file_patch("t1-probe.txt"), "t2-bench": new_file_patch("t2-bench.txt")})
+    result, _ = drive(
+        repo, local_cart, tmp_path, runner=runner, work=work, store=store,
+        specs={**SPECS, "triage-quarantine": triage_quarantine.SPEC},
+    )
+    return result, runner
+
+
+def _triaged(runner) -> bool:
+    return any(call["role"] == "triage" for call in runner.calls) and "t1-probe" not in builds_per_task(runner)
+
+
+def _rebuilt(result, runner) -> bool:
+    quarantined = any(q["id"] == "t1-probe" for q in result["quarantined"])
+    return not any(c["role"] == "triage" for c in runner.calls) and builds_per_task(runner)["t1-probe"] == 1 and not quarantined
+
+
+@pytest.mark.parametrize("cause", ["ticket", "code"])
+def test_one_ticket_or_code_caused_quarantine_sends_the_task_to_triage_on_relaunch(repo, cart, tmp_path, cause) -> None:
+    result, runner = _drive_with_attempts(repo, cart, tmp_path, [{"cause": cause}])
+
+    assert _triaged(runner)
+    assert any(p["target"] == "t1-probe" for p in result["proposals"])
+
+
+def test_one_harness_caused_quarantine_is_rebuilt_and_not_triaged(repo, cart, tmp_path) -> None:
+    result, runner = _drive_with_attempts(repo, cart, tmp_path, [{"cause": "harness"}])
+
+    assert _rebuilt(result, runner)
+
+
+def test_two_harness_caused_quarantines_are_triaged_as_before(repo, cart, tmp_path) -> None:
+    _, runner = _drive_with_attempts(repo, cart, tmp_path, [{"cause": "harness"}, {"cause": "harness"}])
+
+    assert _triaged(runner)
+
+
+def test_a_ticket_caused_quarantine_on_an_older_body_does_not_lower_the_cap(repo, cart, tmp_path) -> None:
+    """The older-body ticket attempt is the newest by `ts` and last in the list: only the body filter can ignore it."""
+    attempts = [{"cause": "harness"}, {"cause": "ticket", "body_sha": OLDER_BODY, "ts": "2026-09-09T00:00:00+00:00"}]
+    result, runner = _drive_with_attempts(repo, cart, tmp_path, attempts)
+
+    assert _rebuilt(result, runner)
+
+
+@pytest.mark.parametrize("cause", ["ticket", "code"])
+def test_a_stored_ticket_or_code_cause_on_a_causeless_file_attempt_sends_the_task_to_triage(repo, cart, tmp_path, cause) -> None:
+    _, runner = _drive_with_attempts(repo, cart, tmp_path, [{}], stored=[("epic-prior-1", cause)])
+
+    assert _triaged(runner)
+
+
+@pytest.mark.parametrize("stored", [[("epic-prior-1", "harness")], [("epic-prior-1", "weather")], []])
+def test_a_stored_harness_or_unknown_cause_or_none_keeps_the_cap_at_two(repo, cart, tmp_path, stored) -> None:
+    result, runner = _drive_with_attempts(repo, cart, tmp_path, [{}], stored=stored)
+
+    assert _rebuilt(result, runner)
 
 
 def test_the_cli_exit_line_names_an_approved_and_unlanded_task(monkeypatch, tmp_path, capsys) -> None:
